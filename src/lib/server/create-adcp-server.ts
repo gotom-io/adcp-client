@@ -1620,9 +1620,35 @@ export interface AdcpServerConfig<TAccount = unknown> {
    * that wire the verifier manually via `serve({ preTransport })` are
    * unaffected — auto-wiring only kicks in through this field.
    */
-  signedRequests?: SignedRequestsConfig;
+   signedRequests?: SignedRequestsConfig;
 
-  /**
+   /**
+    * Per-tool input schemas for MCP tool hints (tools/list).
+    *
+    * Keys are tool names (e.g. `'get_products'`), values are Zod objects.
+    * The SDK uses these instead of the passthrough schema so MCP clients
+    * (Claude, Cursor, etc.) surface meaningful parameter hints to LLM
+    * consumers. The framework's AJV validator remains the authoritative
+    * schema — this is purely for discovery.
+    *
+    * @example
+    * ```ts
+    * createAdcpServer({
+    *   toolSchemas: {
+    *     get_products: z.object({
+    *       buying_mode: z.enum(['brief', 'wholesale', 'refine']).describe(
+    *         'How the buyer wants products.'
+    *       ),
+    *       brief: z.string().optional().describe('Free-text brief.'),
+    *       account: z.any().optional().describe('Account context.'),
+    *     }),
+    *   },
+    * });
+    * ```
+    */
+   toolSchemas?: Record<string, z.AnyZodObject>;
+
+   /**
    * Schema-driven validation of requests and responses against the bundled
    * AdCP JSON schemas. When enabled, the dispatcher rejects bad requests
    * with `VALIDATION_ERROR` before the handler runs and catches drift in
@@ -1823,8 +1849,8 @@ interface ToolAnnotation {
 }
 
 interface ToolMeta {
-  wrap: ((data: any, summary?: string) => McpToolResponse) | null;
-  annotations?: ToolAnnotation;
+   wrap: ((data: any, summary?: string) => McpToolResponse) | null;
+   annotations?: ToolAnnotation;
 }
 
 /**
@@ -3426,6 +3452,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     credentialPolicy,
     testController: testControllerBridge,
     responseEnhancer,
+    toolSchemas,
   } = config;
 
   // One-shot construction-time warn when `testController` is wired without
@@ -5767,16 +5794,25 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       // `get_schema` capability tool for programmatic per-tool shape
       // discovery.
       //
+      // Adopters can opt specific tools into schema hints via
+      // `toolSchemas` on {@link AdcpServerConfig}. All other tools
+      // keep the passthrough schema.
+      //
       // Implication for downstream consumers: if you need a tool's shape
       // (cross-version field-stripping, gating, validation), read raw
       // JSON from `schemas/cache/{version}/` via `schema-loader.ts` —
       // see `schemaAllowsTopLevelField` for the canonical pattern (#940).
       // Don't try to recover the shape from `tools/list`; it's empty by
       // design and will fail open.
+      const adopterSchemas = toolSchemas ?? {};
+      const inputSchema =
+        adopterSchemas[toolName] ??
+        PASSTHROUGH_INPUT_SCHEMA;
+
       server.registerTool(
         toolName,
         {
-          inputSchema: PASSTHROUGH_INPUT_SCHEMA,
+          inputSchema,
           ...(meta?.annotations != null && { annotations: meta.annotations }),
         },
         toolHandler as Parameters<typeof server.registerTool>[2]
