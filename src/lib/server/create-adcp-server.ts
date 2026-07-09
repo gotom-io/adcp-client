@@ -1622,7 +1622,33 @@ export interface AdcpServerConfig<TAccount = unknown> {
    */
   signedRequests?: SignedRequestsConfig;
 
-  /**
+   /**
+    * Per-tool input schemas for MCP tool hints (tools/list).
+    *
+    * Keys are tool names (e.g. `'get_products'`), values are Zod objects.
+    * The SDK uses these instead of the passthrough schema so MCP clients
+    * (Claude, Cursor, etc.) surface meaningful parameter hints to LLM
+    * consumers. The framework's AJV validator remains the authoritative
+    * schema — this is purely for discovery.
+    *
+    * @example
+    * ```ts
+    * createAdcpServer({
+    *   toolSchemas: {
+    *     get_products: z.object({
+    *       buying_mode: z.enum(['brief', 'wholesale', 'refine']).describe(
+    *         'How the buyer wants products.'
+    *       ),
+    *       brief: z.string().optional().describe('Free-text brief.'),
+    *       account: z.any().optional().describe('Account context.'),
+    *     }),
+    *   },
+    * });
+    * ```
+    */
+   toolSchemas?: Record<string, z.ZodObject<any>>;
+
+   /**
    * Schema-driven validation of requests and responses against the bundled
    * AdCP JSON schemas. When enabled, the dispatcher rejects bad requests
    * with `VALIDATION_ERROR` before the handler runs and catches drift in
