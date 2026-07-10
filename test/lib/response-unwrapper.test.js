@@ -1216,6 +1216,35 @@ describe('Response Unwrapper', () => {
       assert.strictEqual(isAdcpError({ adcp_error: { code: 'RATE_LIMITED', message: 'slow' } }), true);
     });
 
+    test('flat error_code responses are terminal for permissive expected-error handling', () => {
+      const response = {
+        error_code: 'INVALID_REQUEST',
+        message: 'Invalid request',
+      };
+
+      assert.strictEqual(isAdcpError(response), false);
+      assert.strictEqual(isTerminalAdcpError(response, 'get_products'), true);
+      assert.strictEqual(isAdcpSuccess(response, 'get_products'), false);
+    });
+
+    test('task-aware terminal detection treats flat error_code as advisory on success payloads', () => {
+      const advisorySuccess = {
+        status: 'completed',
+        cache_scope: 'public',
+        products: [createTestProduct({ product_id: 'prod-advisory-flat-error-code' })],
+        error_code: 'FORMAT_DECLARATION_DIVERGENT',
+      };
+
+      assert.strictEqual(hasAdvisorySuccessPayload(advisorySuccess, 'get_products'), true);
+      assert.strictEqual(isTerminalAdcpError(advisorySuccess, 'get_products'), false);
+      assert.strictEqual(isTerminalAdcpError(advisorySuccess), true);
+
+      const mcpResponse = { structuredContent: advisorySuccess };
+      const result = unwrapProtocolResponse(mcpResponse, 'get_products', 'mcp');
+      assert.strictEqual(result.products[0].product_id, 'prod-advisory-flat-error-code');
+      assert.strictEqual(result.error_code, 'FORMAT_DECLARATION_DIVERGENT');
+    });
+
     test('should return false for adcp_error with non-string code', () => {
       assert.strictEqual(isAdcpError({ adcp_error: { code: 42 } }), false);
     });

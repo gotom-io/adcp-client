@@ -78,6 +78,59 @@ const inlineCreativeGatedStoryboard = {
   ],
 };
 
+const proposalLifecycleGatedStoryboard = {
+  id: 'proposal_lifecycle_optional_feature_gate_test',
+  version: '1.0.0',
+  title: 'Proposal lifecycle (optional feature gated)',
+  category: 'test',
+  summary: 'Skipped when media-buy proposal lifecycle support is not advertised.',
+  narrative: '',
+  agent: { interaction_model: 'media_buy_seller', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  requires_capability: { path: 'media_buy.supports_proposals', equals: true },
+  phases: [
+    {
+      id: 'proposal_lifecycle',
+      title: 'Proposal lifecycle phase',
+      steps: [
+        {
+          id: 'proposal_finalize',
+          title: 'Finalize a proposal',
+          task: 'proposal_finalize',
+          sample_request: { proposal_id: 'proposal_test' },
+        },
+      ],
+    },
+  ],
+};
+
+const creativeApprovalModeGatedStoryboard = {
+  id: 'creative_approval_mode_equals_gate_test',
+  version: '1.0.0',
+  title: 'Creative approval auto-approve mode (equals-gated)',
+  category: 'test',
+  summary: 'Runs only when media_buy.creative_approval_mode is auto_approve.',
+  narrative: '',
+  agent: { interaction_model: 'media_buy_seller', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  requires_capability: { path: 'media_buy.creative_approval_mode', equals: 'auto_approve' },
+  phases: [
+    {
+      id: 'creative_approval',
+      title: 'Creative approval phase',
+      steps: [
+        {
+          id: 'discover_products',
+          title: 'Discover products',
+          task: 'get_products',
+          sample_request: { brief: 'coffee' },
+          validations: [],
+        },
+      ],
+    },
+  ],
+};
+
 describe('requires_capability storyboard skip gate (#933)', () => {
   test('emits capability_unsupported skip when agent declares supported: false', async () => {
     // _profile bypasses discoverAgentProfile; no network calls made because
@@ -118,14 +171,113 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     assert.equal(step.extraction.path, 'none');
   });
 
-  // Negative-path coverage (gate-passes and absent-capabilities) is provided
-  // by the resolveCapabilityPath unit tests below and the "RUN-not-skip"
-  // condition in the runner (`actual !== undefined && actual !== equals`).
-  // Earlier drafts had two integration-style smoke tests for these cases
-  // that ended with `assert.ok(true, '...')` after a try/catch — they
-  // passed regardless of gate behavior. Dropped: false-confidence tests
-  // are worse than no test, and the unit coverage below pins the actual
-  // contract that the gate evaluates.
+  test('equals gate skips when the capability path is absent', async () => {
+    const result = await runStoryboard('http://fake-local-99988', creativeApprovalModeGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (no creative approval mode declared)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: { media_buy: {} },
+      },
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.passed_count, 0);
+    assert.equal(result.failed_count, 0);
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.step_id, 'capability_unsupported');
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
+    assert.ok(step.skip.detail.includes('auto_approve'));
+    assert.ok(step.skip.detail.includes('did not declare'));
+  });
+
+  test('equals gate runs when the declared value exactly matches', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', creativeApprovalModeGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'get_products'],
+      _profile: {
+        name: 'Test Agent (auto-approve creative approval)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: { media_buy: { creative_approval_mode: 'auto_approve' } },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 0);
+    assert.equal(result.passed_count, 1);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.phases[0].phase_id, 'creative_approval');
+    assert.equal(result.phases[0].steps[0].skipped, undefined);
+    assert.equal(result.phases[0].steps[0].passed, true);
+    assert.deepEqual(
+      calls.map(c => c.name),
+      ['get_products']
+    );
+  });
+
+  test('equals gate skips when the declared value mismatches', async () => {
+    const result = await runStoryboard('http://fake-local-99987', creativeApprovalModeGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (human-review creative approval)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: { media_buy: { creative_approval_mode: 'require_human' } },
+      },
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
+    assert.ok(step.skip.detail.includes('auto_approve'));
+    assert.ok(step.skip.detail.includes('require_human'));
+  });
+
+  test('equals gate skips when raw capabilities are unavailable', async () => {
+    const result = await runStoryboard('http://fake-local-99986', creativeApprovalModeGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (no raw capabilities available)',
+        tools: ['get_products'],
+      },
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
+    assert.ok(step.skip.detail.includes('did not declare'));
+  });
+
+  test('equals gate skips with caller-owned client and agentTools but no profile', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', creativeApprovalModeGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_products'],
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
+    assert.ok(step.skip.detail.includes('did not declare'));
+    assert.deepEqual(calls, [], 'top-level gate should skip before dispatching');
+  });
 
   test('resolveCapabilityPath: dotted path traversal (real exported helper)', () => {
     // Tests the actual function the gate uses — not an inline copy. If
@@ -149,23 +301,14 @@ describe('requires_capability storyboard skip gate (#933)', () => {
   test('resolveCapabilityPath: prototype-chain keys are NOT walkable', () => {
     // Defensive: a malicious or malformed capabilities response shouldn't
     // be able to expose Object.prototype values via dotted-path lookup.
-    // `__proto__` is a real key on object literals, so it walks through
-    // — that's expected. But values inherited from Object.prototype
-    // (e.g., `constructor`) should NOT be reachable as if they were
-    // declared on the agent.
+    // Values inherited from Object.prototype must not be reachable as if
+    // they were declared on the agent.
     const obj = {};
-    // `toString` is on the prototype but not own-property
-    const result = resolveCapabilityPath(obj, 'toString');
-    // Either undefined (own-property check) or the function (no check).
-    // The current implementation does not enforce own-property — this
-    // test pins the current behavior so a future tightening is visible.
-    // If this assertion ever needs to flip, the call site (which only
-    // matches `actual === equals` against scalars) is unaffected: a
-    // function or any complex value will fail the equality predicate.
-    assert.ok(typeof result === 'function' || result === undefined);
+    assert.equal(resolveCapabilityPath(obj, 'toString'), undefined);
+    assert.equal(resolveCapabilityPath(obj, 'constructor'), undefined);
   });
 
-  test('optional inline creative feature skips when omitted', async () => {
+  test('inline creative equals gate skips when omitted', async () => {
     const result = await runStoryboard('http://fake-local-99994', inlineCreativeGatedStoryboard, {
       _profile: {
         name: 'Test Agent (no inline creative feature declared)',
@@ -184,7 +327,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     assert.ok(step.skip.detail.includes('did not declare'));
   });
 
-  test('optional inline creative feature skips when raw capabilities are unavailable', async () => {
+  test('inline creative equals gate skips when raw capabilities are unavailable', async () => {
     const result = await runStoryboard('http://fake-local-99993', inlineCreativeGatedStoryboard, {
       _profile: {
         name: 'Test Agent (no raw capabilities available)',
@@ -199,6 +342,43 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     assert.equal(step.skip_reason, 'capability_unsupported');
     assert.equal(step.skip.reason, 'unsatisfied_contract');
     assert.ok(step.skip.detail.includes('media_buy.features.inline_creative_management'));
+    assert.ok(step.skip.detail.includes('did not declare'));
+  });
+
+  test('proposal lifecycle equals gate skips when omitted', async () => {
+    const result = await runStoryboard('http://fake-local-99990', proposalLifecycleGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (no proposal support declared)',
+        tools: ['get_adcp_capabilities', 'proposal_finalize'],
+        raw_capabilities: { media_buy: {} },
+      },
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.ok(step.skip.detail.includes('media_buy.supports_proposals'));
+    assert.ok(step.skip.detail.includes('false'));
+  });
+
+  test('proposal lifecycle equals gate skips when raw capabilities are unavailable', async () => {
+    const result = await runStoryboard('http://fake-local-99989', proposalLifecycleGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (proposal capability unavailable)',
+        tools: ['proposal_finalize'],
+      },
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.ok(step.skip.detail.includes('media_buy.supports_proposals'));
     assert.ok(step.skip.detail.includes('did not declare'));
   });
 
@@ -247,6 +427,36 @@ const presentAbsentGatedStoryboard = {
   ...conversionTrackingGatedStoryboard,
   id: 'conversion_tracking_absent_gate_test',
   requires_capability: { path: 'media_buy.conversion_tracking', present: false },
+};
+
+// `signals.discovery_modes` is a presence-gated field that ALSO carries a
+// schema default (`["brief"]`). It is the one capability where the #2278
+// default-materialization could collide with `present:` semantics, so it gets
+// dedicated coverage below.
+const discoveryModesPresentGatedStoryboard = {
+  id: 'signals_discovery_present_gate_test',
+  version: '1.0.0',
+  title: 'Signal discovery (presence-gated, schema-defaulted field)',
+  category: 'test',
+  summary: 'Runs only when the seller advertises signals.discovery_modes.',
+  narrative: '',
+  agent: { interaction_model: 'sync', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  requires_capability: { path: 'signals.discovery_modes', present: true },
+  phases: [
+    {
+      id: 'discovery',
+      title: 'Discovery phase',
+      steps: [
+        {
+          id: 'get_signals_step',
+          title: 'Discover signals',
+          task: 'get_signals',
+          sample_request: {},
+        },
+      ],
+    },
+  ],
 };
 
 describe('requires_capability `present:` matcher (#1811)', () => {
@@ -328,14 +538,39 @@ describe('requires_capability `present:` matcher (#1811)', () => {
     );
   });
 
+  test('present: true — schema defaults are NOT materialized; absent defaulted field still skips (#2278)', async () => {
+    // signals.discovery_modes has schema default ["brief"]. The #2278 default
+    // materialization must NOT apply to `present:` — absence is the gate's
+    // signal. A seller that declares a `signals` block but omits
+    // discovery_modes must still skip, not run. (Without the present-matcher
+    // exclusion, the default would materialize and flip this gate skip→run.)
+    const profile = {
+      name: 'Test Agent (signals declared, discovery_modes omitted)',
+      tools: ['get_adcp_capabilities', 'get_signals'],
+      raw_capabilities: { signals: { data_providers: ['example.com'] } },
+    };
+    const result = await runStoryboard('http://fake-local-99995', discoveryModesPresentGatedStoryboard, {
+      _profile: profile,
+    });
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'capability_unsupported');
+    assert.ok(
+      step.skip.detail.includes('signals.discovery_modes'),
+      `detail must mention the capability path: ${step.skip.detail}`
+    );
+    assert.ok(
+      step.skip.detail.includes('must be present'),
+      `detail must explain presence requirement: ${step.skip.detail}`
+    );
+  });
+
   test('evaluateCapabilityPredicate: pins matcher semantics', () => {
     const presentTrue = { path: 'x.y', present: true };
     const presentFalse = { path: 'x.y', present: false };
     const equalsTrue = { path: 'x.y', equals: true };
-    const inlineFeatureEqualsTrue = {
-      path: 'media_buy.features.inline_creative_management',
-      equals: true,
-    };
 
     // present: true
     assert.equal(evaluateCapabilityPredicate(presentTrue, undefined)?.includes('must be present'), true);
@@ -350,20 +585,18 @@ describe('requires_capability `present:` matcher (#1811)', () => {
     assert.equal(evaluateCapabilityPredicate(presentFalse, null), null);
     assert.equal(evaluateCapabilityPredicate(presentFalse, {})?.includes('must be absent'), true);
 
-    // equals semantics unchanged: absence is unresolvable, run the storyboard.
-    assert.equal(evaluateCapabilityPredicate(equalsTrue, undefined), null, 'absent: equals runs the storyboard');
+    // equals
+    assert.equal(
+      evaluateCapabilityPredicate(equalsTrue, undefined)?.includes('did not declare'),
+      true,
+      'absent equals gate skips as unsupported'
+    );
     assert.equal(evaluateCapabilityPredicate(equalsTrue, true), null);
     assert.equal(
       evaluateCapabilityPredicate(equalsTrue, false)?.includes('not satisfied'),
       true,
       'declared mismatch skips with `not satisfied` detail'
     );
-    assert.equal(
-      evaluateCapabilityPredicate(inlineFeatureEqualsTrue, undefined)?.includes('did not declare'),
-      true,
-      'inline_creative_management is an optional feature gate: absent skips'
-    );
-    assert.equal(evaluateCapabilityPredicate(inlineFeatureEqualsTrue, true), null);
   });
 });
 
@@ -396,6 +629,36 @@ const supportedTargetsGatedStoryboard = {
           title: 'Log conversion event',
           task: 'log_event',
           sample_request: {},
+        },
+      ],
+    },
+  ],
+};
+
+const propagationSurfacesGatedStoryboard = {
+  id: 'dependency_impairment_snapshot_gate_test',
+  version: '1.0.0',
+  title: 'Dependency impairment snapshot surface (array-membership-gated)',
+  category: 'test',
+  summary: 'Runs only when seller surfaces dependency impairments on snapshots.',
+  narrative: '',
+  agent: { interaction_model: 'sync', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  requires_capability: {
+    path: 'media_buy.propagation_surfaces',
+    contains: 'snapshot',
+  },
+  phases: [
+    {
+      id: 'snapshot_impairment',
+      title: 'Snapshot impairment phase',
+      steps: [
+        {
+          id: 'get_products_step',
+          title: 'Discover products after snapshot gate',
+          task: 'get_products',
+          sample_request: { brief: 'snapshot impairment gated flow' },
+          validations: [],
         },
       ],
     },
@@ -443,6 +706,85 @@ describe('requires_capability `contains:` matcher (#1817)', () => {
     assert.equal(result.phases[0].steps[0].skip_reason, 'capability_unsupported');
   });
 
+  test('contains: materializes get_adcp_capabilities schema default when parent capability is present (#2278)', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', propagationSurfacesGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'get_products'],
+      _profile: {
+        name: 'Test Agent (implicit snapshot propagation surface)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: {
+          media_buy: { buying_modes: ['brief'] },
+        },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 0);
+    assert.equal(result.passed_count, 1);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.phases[0].phase_id, 'snapshot_impairment');
+    assert.equal(result.phases[0].steps[0].skipped, undefined);
+    assert.equal(result.phases[0].steps[0].passed, true);
+    assert.deepEqual(
+      calls.map(c => c.name),
+      ['get_products']
+    );
+  });
+
+  test('contains: does not apply nested schema defaults when the parent capability is absent (#2278)', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', propagationSurfacesGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'get_products'],
+      _profile: {
+        name: 'Test Agent (no media-buy capability block)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: {
+          supported_protocols: ['media_buy'],
+        },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.passed_count, 0);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.phases[0].steps[0].skip_reason, 'capability_unsupported');
+    assert.deepEqual(calls, [], 'top-level gate should skip before dispatching');
+  });
+
+  test('contains: explicit propagation_surfaces declaration overrides the schema default (#2278)', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', propagationSurfacesGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'get_products'],
+      _profile: {
+        name: 'Test Agent (webhook-only propagation surface)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: {
+          media_buy: { propagation_surfaces: ['webhook'] },
+        },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.phases[0].steps[0].skip_reason, 'capability_unsupported');
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('media_buy.propagation_surfaces'));
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('snapshot'));
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('webhook'));
+    assert.deepEqual(calls, [], 'top-level gate should skip before dispatching');
+  });
+
   test('evaluateCapabilityPredicate: pins contains semantics', () => {
     const containsString = { path: 'x.y', contains: 'per_ad_spend' };
     const containsNumber = { path: 'x.y', contains: 42 };
@@ -480,5 +822,301 @@ describe('requires_capability `contains:` matcher (#1817)', () => {
     // Strict equality — no type coercion across number/string
     assert.ok(evaluateCapabilityPredicate(containsNumber, ['42'])?.includes('must contain'));
     assert.ok(evaluateCapabilityPredicate(containsString, [42])?.includes('must contain'));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase-level `requires_capability` gates (adcp-client#2224) — same matcher
+// dialect as storyboard-level gates, but scoped to one phase.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const deterministicSessionPhaseGatedStoryboard = {
+  id: 'phase_capability_gate_deterministic_session_test',
+  version: '1.0.0',
+  title: 'Deterministic testing with SI-gated phase',
+  category: 'test',
+  summary: 'Skips deterministic_session for non-SI sellers.',
+  narrative: '',
+  agent: { interaction_model: 'sync', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  phases: [
+    {
+      id: 'deterministic_session',
+      title: 'Deterministic SI session',
+      requires_capability: {
+        path: 'supported_protocols',
+        contains: 'sponsored_intelligence',
+      },
+      steps: [
+        {
+          id: 'si_initiate_session',
+          title: 'Start deterministic SI session',
+          task: 'si_initiate_session',
+          sample_request: {},
+        },
+      ],
+    },
+  ],
+};
+
+const creativeApprovalPhaseGatedStoryboard = {
+  id: 'phase_capability_gate_creative_approval_test',
+  version: '1.0.0',
+  title: 'Creative approval with equals-gated phase',
+  category: 'test',
+  summary: 'Skips creative approval phase when the mode is absent.',
+  narrative: '',
+  agent: { interaction_model: 'sync', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  phases: [
+    {
+      id: 'creative_approval',
+      title: 'Creative approval phase',
+      requires_capability: {
+        path: 'media_buy.creative_approval_mode',
+        equals: 'auto_approve',
+      },
+      steps: [
+        {
+          id: 'approval_step',
+          title: 'Exercise auto-approve flow',
+          task: 'get_products',
+          sample_request: { brief: 'auto-approve gated phase' },
+          validations: [],
+        },
+      ],
+    },
+    {
+      id: 'ungated_discovery',
+      title: 'Ungated discovery',
+      steps: [
+        {
+          id: 'get_products',
+          title: 'Discover products',
+          task: 'get_products',
+          sample_request: { brief: 'ungated discovery phase' },
+          validations: [],
+        },
+      ],
+    },
+  ],
+};
+
+function makeCapabilityGateClient(responder = () => ({ success: true, data: {} })) {
+  const calls = [];
+  const client = {
+    async executeTask(name, params) {
+      calls.push({ name, params });
+      return responder({ name, params });
+    },
+  };
+  return { client, calls };
+}
+
+describe('phase-level requires_capability gate (#2224)', () => {
+  test('skips deterministic_session as not_applicable when sponsored_intelligence is not advertised', async () => {
+    const result = await runStoryboard('http://fake-local-99992', deterministicSessionPhaseGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (media-buy only)',
+        tools: ['get_adcp_capabilities', 'comply_test_controller'],
+        raw_capabilities: { supported_protocols: ['media_buy'] },
+      },
+    });
+
+    assert.equal(result.overall_passed, true, 'phase gate is not a failure');
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.passed_count, 0);
+    assert.equal(result.phases.length, 1);
+
+    const phase = result.phases[0];
+    assert.equal(phase.phase_id, 'deterministic_session');
+    assert.equal(phase.passed, true);
+    assert.equal(phase.steps.length, 1);
+
+    const step = phase.steps[0];
+    assert.equal(step.step_id, 'si_initiate_session');
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'not_applicable');
+    assert.equal(step.skip.reason, 'not_applicable');
+    assert.ok(step.skip.detail.includes('supported_protocols'));
+    assert.ok(step.skip.detail.includes('sponsored_intelligence'));
+    assert.ok(step.skip.detail.includes('media_buy'));
+  });
+
+  test('runs the phase gate when sponsored_intelligence is advertised, preserving missing_tool', async () => {
+    const result = await runStoryboard('http://fake-local-99991', deterministicSessionPhaseGatedStoryboard, {
+      _profile: {
+        name: 'Test Agent (SI declared, tool omitted)',
+        tools: ['get_adcp_capabilities', 'comply_test_controller'],
+        raw_capabilities: { supported_protocols: ['media_buy', 'sponsored_intelligence'] },
+      },
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'missing_tool');
+    assert.equal(step.skip.reason, 'missing_tool');
+    assert.ok(step.skip.detail.includes('si_initiate_session'));
+  });
+
+  test('skips only the gated phase and continues later phases', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const storyboard = {
+      ...deterministicSessionPhaseGatedStoryboard,
+      phases: [
+        deterministicSessionPhaseGatedStoryboard.phases[0],
+        {
+          id: 'media_buy_discovery',
+          title: 'Media buy discovery',
+          steps: [
+            {
+              id: 'get_products',
+              title: 'Discover products',
+              task: 'get_products',
+              sample_request: { brief: 'coffee' },
+              validations: [],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = await runStoryboard('https://example.invalid/mcp', storyboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'get_products'],
+      _profile: {
+        name: 'Test Agent (media-buy only)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: { supported_protocols: ['media_buy'] },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.phases.length, 2);
+    assert.equal(result.phases[0].phase_id, 'deterministic_session');
+    assert.equal(result.phases[0].steps[0].skip_reason, 'not_applicable');
+    assert.equal(result.phases[1].phase_id, 'media_buy_discovery');
+    assert.equal(result.phases[1].steps[0].skipped, undefined);
+    assert.equal(result.phases[1].steps[0].passed, true);
+    assert.deepEqual(
+      calls.map(c => c.name),
+      ['get_products'],
+      'only the ungated later phase should dispatch'
+    );
+  });
+
+  test('phase-level equals gate skips when the capability path is absent', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', creativeApprovalPhaseGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'get_products'],
+      _profile: {
+        name: 'Test Agent (no creative approval mode declared)',
+        tools: ['get_adcp_capabilities', 'get_products'],
+        raw_capabilities: { media_buy: {} },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.phases.length, 2);
+    assert.equal(result.phases[0].phase_id, 'creative_approval');
+    assert.equal(result.phases[0].steps[0].skipped, true);
+    assert.equal(result.phases[0].steps[0].skip_reason, 'not_applicable');
+    assert.equal(result.phases[0].steps[0].skip.reason, 'not_applicable');
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('media_buy.creative_approval_mode'));
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('did not declare'));
+    assert.equal(result.phases[1].phase_id, 'ungated_discovery');
+    assert.equal(result.phases[1].steps[0].passed, true);
+    assert.deepEqual(
+      calls.map(c => c.name),
+      ['get_products']
+    );
+    assert.deepEqual(
+      calls.map(c => c.params.brief),
+      ['ungated discovery phase']
+    );
+  });
+
+  test('phase-level equals gate skips with caller-owned client and agentTools but no profile', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', creativeApprovalPhaseGatedStoryboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_products'],
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.phases.length, 2);
+    assert.equal(result.phases[0].phase_id, 'creative_approval');
+    assert.equal(result.phases[0].steps[0].skipped, true);
+    assert.equal(result.phases[0].steps[0].skip_reason, 'not_applicable');
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('media_buy.creative_approval_mode'));
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('did not declare'));
+    assert.equal(result.phases[1].steps[0].passed, true);
+    assert.deepEqual(
+      calls.map(c => c.name),
+      ['get_products']
+    );
+    assert.deepEqual(
+      calls.map(c => c.params.brief),
+      ['ungated discovery phase']
+    );
+  });
+
+  test('optional-only gated phases do not create a vacuous overall pass', async () => {
+    const result = await runStoryboard(
+      'http://fake-local-99990',
+      {
+        ...deterministicSessionPhaseGatedStoryboard,
+        phases: [{ ...deterministicSessionPhaseGatedStoryboard.phases[0], optional: true }],
+      },
+      {
+        _profile: {
+          name: 'Test Agent (media-buy only)',
+          tools: ['get_adcp_capabilities'],
+          raw_capabilities: { supported_protocols: ['media_buy'] },
+        },
+      }
+    );
+
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.passed_count, 0);
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.overall_passed, false, 'optional-only skip remains no executed required coverage');
+  });
+
+  test('does not run controller seeding when every executable phase is gated not_applicable', async () => {
+    const { client, calls } = makeCapabilityGateClient(({ name }) => {
+      throw new Error(`unexpected call: ${name}`);
+    });
+    const storyboard = {
+      ...deterministicSessionPhaseGatedStoryboard,
+      prerequisites: { description: 'needs seeds', controller_seeding: true },
+      fixtures: { products: [{ product_id: 'p-1' }] },
+    };
+
+    const result = await runStoryboard('https://example.invalid/mcp', storyboard, {
+      protocol: 'mcp',
+      allow_http: false,
+      agentTools: ['get_adcp_capabilities', 'comply_test_controller'],
+      _profile: {
+        name: 'Test Agent (media-buy only)',
+        tools: ['get_adcp_capabilities', 'comply_test_controller'],
+        raw_capabilities: { supported_protocols: ['media_buy'] },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.phases.length, 1);
+    assert.equal(result.phases[0].phase_id, 'deterministic_session');
+    assert.equal(result.phases[0].steps[0].skip_reason, 'not_applicable');
+    assert.deepEqual(calls, [], 'phase gate should skip before controller seeding or step dispatch');
   });
 });

@@ -146,6 +146,13 @@ export type WebhookUrlTemplate =
 export interface TaskOptions {
   /** Timeout for entire task (ms) */
   timeout?: number;
+  /**
+   * Caller-owned cancellation signal for the read path and in-flight protocol
+   * call. Aborting this signal cancels discovery probes (`getAgentInfo`,
+   * `getCapabilities`, feature/version preflight) and the tool request where
+   * the underlying official protocol client supports it.
+   */
+  signal?: AbortSignal;
   /** Maximum clarification rounds before failing */
   maxClarifications?: number;
   /**
@@ -453,6 +460,17 @@ export interface TaskResultMetadata {
       resolution_error?: string;
     };
     diagnostics: ProductPropertyPolicyDiagnostic[];
+  };
+  /**
+   * Buyer-side pricing-options enforcement summary for `get_products`. Present
+   * when the client drops one or more products that arrived without a usable
+   * `pricing_options[]` array (a required, non-empty field in AdCP 3.1).
+   */
+  productPricingPolicy?: {
+    ok: boolean;
+    accepted_count: number;
+    rejected_count: number;
+    rejected_products: Array<{ index: number; product_id?: string }>;
   };
 }
 

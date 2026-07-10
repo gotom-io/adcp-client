@@ -42,6 +42,26 @@ components:
             profile: User profile information
             email: User email address
   schemas:
+    BrandEventPayload:
+      type: object
+      properties:
+        domain:
+          type: string
+          description: Brand domain; brand.* events are identified by entity_id (the brand) and carry hierarchy context here.
+        chain:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+          description: "On brand.resolved/hierarchy_updated: the resolved brand chain (root → leaf)."
+        ancestor_domains:
+          type: array
+          items:
+            type: string
+        domains:
+          type: array
+          items:
+            type: string
     ResolvedBrand:
       type: object
       properties:
@@ -2170,6 +2190,960 @@ components:
         - policy_id
         - total
         - revisions
+    RegistryFeedEvent:
+      oneOf:
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - agent.discovered
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AgentEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - agent.removed
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AgentEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - agent.profile_updated
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AgentEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - agent.compliance_changed
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AgentEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - agent.verification_earned
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AgentEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - agent.verification_lost
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AgentEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - property.created
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PropertyEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - property.updated
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PropertyEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - property.merged
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PropertyEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - property.stale
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PropertyEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - property.reactivated
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PropertyEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - collection.created
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/CollectionEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - collection.updated
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/CollectionEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - collection.merged
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/CollectionEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - collection.removed
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/CollectionEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - authorization.granted
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AuthorizationEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - authorization.revoked
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AuthorizationEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - authorization.modified
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/AuthorizationEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - publisher.adagents_changed
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PublisherEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+        - type: object
+          properties:
+            event_id:
+              type: string
+              format: uuid
+            event_type:
+              type: string
+              enum:
+                - publisher.adagents_discovered
+            entity_type:
+              type: string
+            entity_id:
+              type: string
+            payload:
+              $ref: "#/components/schemas/PublisherEventPayload"
+            actor:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+          required:
+            - event_id
+            - event_type
+            - entity_type
+            - entity_id
+            - payload
+            - actor
+            - created_at
+    AgentEventPayload:
+      type: object
+      properties:
+        agent_url:
+          type: string
+          description: Canonical agent URL; the routing key for agent.* events (agents span many publishers).
+        name:
+          type: string
+        type:
+          type: string
+        channels:
+          type: array
+          items:
+            type: string
+        property_types:
+          type: array
+          items:
+            type: string
+        markets:
+          type: array
+          items:
+            type: string
+        categories:
+          type: array
+          items:
+            type: string
+        category_taxonomy:
+          type:
+            - string
+            - "null"
+        tags:
+          type: array
+          items:
+            type: string
+        delivery_types:
+          type: array
+          items:
+            type: string
+        format_ids:
+          type: array
+          items:
+            type: string
+        property_count:
+          type: integer
+        publisher_count:
+          type: integer
+        has_tmp:
+          type: boolean
+        updated_at:
+          type: string
+        changed_fields:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        inventory_profile:
+          type: object
+          additionalProperties: {}
+          description: "On agent.profile_updated: the agent's refreshed inventory profile."
+        compliance_summary:
+          type: object
+          additionalProperties: {}
+        previous_status:
+          type: string
+          description: "On agent.compliance_changed: prior compliance/verification status."
+        current_status:
+          type: string
+          description: "On agent.compliance_changed: new compliance/verification status."
+        headline:
+          type:
+            - string
+            - "null"
+          description: "On agent.compliance_changed: human-readable summary of the compliance transition."
+        tracks:
+          type: object
+          additionalProperties:
+            type: string
+            enum:
+              - pass
+              - fail
+              - partial
+              - skip
+              - silent
+              - warning
+              - unknown
+              - skipped
+          description: "On agent.compliance_changed: map of compliance track id to track status."
+        storyboards_passing:
+          type: integer
+          minimum: 0
+        storyboards_total:
+          type: integer
+          minimum: 0
+        storyboards:
+          type: array
+          items:
+            type: object
+            properties:
+              storyboard_id:
+                type: string
+              status:
+                type: string
+              steps_passed:
+                type: integer
+                minimum: 0
+              steps_total:
+                type: integer
+                minimum: 0
+            required:
+              - storyboard_id
+              - status
+            additionalProperties: {}
+        role:
+          type: string
+          description: "On agent.verification_earned/lost: verified role affected by the badge transition."
+        verified_specialisms:
+          type: array
+          items:
+            type: string
+          description: "On agent.verification_earned: specialisms covered by the earned badge."
+        reason:
+          type: string
+          description: "On agent.verification_lost: reason the badge was revoked."
+        adcp_version:
+          type: string
+          description: "On agent.verification_earned/lost: AdCP version the badge applies to, when known."
+      required:
+        - agent_url
+      additionalProperties: {}
+    PropertyEventPayload:
+      type: object
+      properties:
+        property_rid:
+          type: string
+        publisher_domain:
+          type: string
+          description: Publisher domain that owns the property; the routing key for property.* events.
+        identifiers:
+          type: array
+          items:
+            $ref: "#/components/schemas/PropertyIdentifier"
+        classification:
+          type: string
+        source:
+          type: string
+          enum:
+            - authoritative
+            - enriched
+            - contributed
+        property:
+          type: object
+          additionalProperties: {}
+          description: Optional full post-change property object when available.
+        changed_fields:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        last_resolved_at:
+          type: string
+          description: "On property.stale: last successful resolution timestamp."
+        reactivated_at:
+          type: string
+          description: "On property.reactivated: reactivation timestamp when available."
+        reason:
+          type: string
+          description: "On property.stale: reason the property aged out of active resolution."
+        alias_rid:
+          type: string
+          description: "On property.merged: the RID merged away."
+        canonical_rid:
+          type: string
+          description: "On property.merged: the surviving RID."
+        evidence:
+          type: string
+      additionalProperties: {}
+    CollectionEventPayload:
+      type: object
+      properties:
+        collection_rid:
+          type: string
+        publisher_domain:
+          type: string
+          description: Publisher domain that owns the collection; the routing key for collection.* events.
+        collection_id:
+          type:
+            - string
+            - "null"
+        name:
+          type:
+            - string
+            - "null"
+        kind:
+          type:
+            - string
+            - "null"
+        source:
+          type: string
+        status:
+          type: string
+        identifiers:
+          type: array
+          items:
+            type: object
+            properties:
+              publisher_domain:
+                type: string
+              type:
+                type: string
+              value:
+                type: string
+            required:
+              - publisher_domain
+              - type
+              - value
+          description: Distribution identifiers; the per-identifier publisher_domain (e.g. youtube.com) is the distribution surface, distinct from the owning publisher_domain above.
+        collection:
+          type: object
+          additionalProperties: {}
+        changed_fields:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        alias_rid:
+          type: string
+          description: "On collection.merged: the RID merged away."
+        canonical_rid:
+          type: string
+          description: "On collection.merged: the surviving RID."
+        evidence:
+          type: string
+      additionalProperties: {}
+    AuthorizationEventPayload:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Registry authorization row id when the event is backed by a materialized effective authorization row.
+        agent_url:
+          type: string
+        agent_url_canonical:
+          type: string
+          description: Registry-canonicalized form of agent_url for equality checks.
+        publisher_domain:
+          type: string
+          description: Publisher domain the authorization applies to; the routing key for authorization.* events.
+        authorization_type:
+          type: string
+          description: Present on authorization.granted; authorization.revoked carries only agent_url + publisher_domain.
+        authorized_for:
+          type:
+            - string
+            - "null"
+        property_ids:
+          type: array
+          items:
+            type: string
+        property_tags:
+          type: array
+          items:
+            type: string
+        properties:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        publisher_properties:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        property_rid:
+          type:
+            - string
+            - "null"
+          description: Catalog property_rid for materialized per-property authorization rows. Null for publisher-wide rows.
+        property_id_slug:
+          type:
+            - string
+            - "null"
+          description: Publisher-local property id for materialized per-property authorization rows.
+        placement_ids:
+          type: array
+          items:
+            type: string
+        placement_tags:
+          type: array
+          items:
+            type: string
+        collections:
+          type: array
+          items:
+            type: object
+            properties:
+              publisher_domain:
+                type: string
+              collection_ids:
+                type: array
+                items:
+                  type: string
+                minItems: 1
+            required:
+              - publisher_domain
+              - collection_ids
+            additionalProperties: {}
+        countries:
+          type: array
+          items:
+            type: string
+        delegation_type:
+          type: string
+        exclusive:
+          type: boolean
+        effective_from:
+          type: string
+        effective_until:
+          type: string
+        signing_keys:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        evidence:
+          type: string
+        disputed:
+          type: boolean
+        created_by:
+          type:
+            - string
+            - "null"
+        expires_at:
+          type:
+            - string
+            - "null"
+        created_at:
+          type:
+            - string
+            - "null"
+        updated_at:
+          type:
+            - string
+            - "null"
+        override_applied:
+          type: boolean
+        override_reason:
+          type:
+            - string
+            - "null"
+      required:
+        - agent_url
+        - publisher_domain
+      additionalProperties: {}
+    PublisherEventPayload:
+      type: object
+      properties:
+        publisher_domain:
+          type: string
+          description: Publisher domain whose adagents.json was discovered/changed; the routing key for publisher.* events.
+        domain:
+          type: string
+          description: Legacy alias for publisher_domain retained for early feed examples.
+        properties_added:
+          type: integer
+          minimum: 0
+        properties_removed:
+          type: integer
+          minimum: 0
+        agents_added:
+          type: array
+          items:
+            type: string
+        agents_removed:
+          type: array
+          items:
+            type: string
+        agent_count:
+          type: integer
+        property_count:
+          type: integer
+        collection_count:
+          type: integer
+        discovery_method:
+          type: string
+        manager_domain:
+          type:
+            - string
+            - "null"
+        source:
+          type: string
+      additionalProperties: {}
     AgentComplianceDetail:
       type: object
       properties:
@@ -2310,6 +3284,26 @@ components:
                 type: integer
               steps_total:
                 type: integer
+              failure_count:
+                type: integer
+              skipped_count:
+                type: integer
+              first_failed_step_id:
+                type:
+                  - string
+                  - "null"
+              first_failed_step_title:
+                type:
+                  - string
+                  - "null"
+              first_failed_step_task:
+                type:
+                  - string
+                  - "null"
+              first_failure_message:
+                type:
+                  - string
+                  - "null"
               last_tested_at:
                 type:
                   - string
@@ -2326,6 +3320,12 @@ components:
               - status
               - steps_passed
               - steps_total
+              - failure_count
+              - skipped_count
+              - first_failed_step_id
+              - first_failed_step_title
+              - first_failed_step_task
+              - first_failure_message
               - last_tested_at
               - last_passed_at
           description: Owner-scoped per-storyboard diagnostics used by the dashboard. Empty for non-owners.
@@ -2511,6 +3511,32 @@ components:
           type: integer
         steps_total:
           type: integer
+        failure_count:
+          type: integer
+          description: Root failing or actionable skipped step count. Cascaded prerequisite skips are excluded.
+        skipped_count:
+          type: integer
+          description: Cascaded prerequisite skip count for this storyboard verdict.
+        first_failed_step_id:
+          type:
+            - string
+            - "null"
+          description: First root failing or actionable skipped step id, when captured.
+        first_failed_step_title:
+          type:
+            - string
+            - "null"
+          description: First root failing or actionable skipped step title, when captured.
+        first_failed_step_task:
+          type:
+            - string
+            - "null"
+          description: Task/tool name for the first root failing or actionable skipped step, when captured.
+        first_failure_message:
+          type:
+            - string
+            - "null"
+          description: Runner error/detail text for the first root failing or actionable skipped step, when captured.
         last_tested_at:
           type:
             - string
@@ -2527,6 +3553,12 @@ components:
         - status
         - steps_passed
         - steps_total
+        - failure_count
+        - skipped_count
+        - first_failed_step_id
+        - first_failed_step_title
+        - first_failed_step_task
+        - first_failure_message
         - last_tested_at
         - last_passed_at
     ComplianceRun:
@@ -3155,6 +4187,313 @@ components:
         - 250m_1b
         - 1b_plus
       description: Annual revenue band, USD. Drives membership-tier eligibility for company-tier seats.
+    ResolveResponse:
+      type: object
+      properties:
+        resolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResolvedEntry"
+        summary:
+          type: object
+          properties:
+            total:
+              type: integer
+            resolved:
+              type: integer
+            created:
+              type: integer
+            excluded:
+              type: integer
+            not_found:
+              type: integer
+          required:
+            - total
+            - resolved
+            - created
+            - excluded
+            - not_found
+        server_timestamp:
+          type: string
+      required:
+        - resolved
+        - summary
+        - server_timestamp
+    ResolvedEntry:
+      type: object
+      properties:
+        identifier:
+          $ref: "#/components/schemas/CatalogIdentifier"
+        property_rid:
+          type:
+            - string
+            - "null"
+          description: Stable catalog handle for joining/dedup and TMP matching. NOT an authorization credential. `null` for excluded (ad_infra / publisher_mask) or unresolved-in-lookup identifiers.
+        classification:
+          type: string
+          example: property
+        status:
+          type: string
+          enum:
+            - existing
+            - created
+            - excluded
+        source:
+          type:
+            - string
+            - "null"
+      required:
+        - identifier
+        - property_rid
+        - classification
+        - status
+        - source
+    CatalogIdentifier:
+      type: object
+      properties:
+        type:
+          type: string
+          example: domain
+        value:
+          type: string
+          example: nytimes.com
+      required:
+        - type
+        - value
+    ResolveRequest:
+      type: object
+      properties:
+        identifiers:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogIdentifier"
+          minItems: 1
+          maxItems: 10000
+          description: Identifiers to resolve (and, in resolve mode, contribute). Max 10,000 per call for all callers.
+        provenance:
+          $ref: "#/components/schemas/FactProvenance"
+        mode:
+          type: string
+          enum:
+            - resolve
+            - lookup
+          default: resolve
+          description: "`resolve` (default) contributes the identifiers, auto-creates missing catalog entries, logs demand activity, and returns rids — requires authentication. `lookup` is a pure read: no write, no activity log, no auth."
+      required:
+        - identifiers
+        - provenance
+    FactProvenance:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - agency_allowlist
+            - publisher_declaration
+            - impression_log
+            - ssp_inventory
+            - deal_history
+            - crawl
+            - data_partner
+            - member_assertion
+          description: How the caller knows these identifiers — the trust/audit envelope on the fact. Determines the confidence the catalog assigns. `crawl` is reserved for server-side pipelines; callers use the others.
+        context:
+          type: string
+          example: unilever_q3
+          description: Optional free-text annotation (campaign, dataset).
+      required:
+        - type
+    CatalogDisputeTriageResult:
+      type: object
+      properties:
+        dispute_id:
+          type: string
+        action_taken:
+          type: string
+          enum:
+            - link_suspended
+            - queued_for_review
+            - escalated
+          description: "What filing the dispute did: a medium/weak link is suspended immediately; otherwise the dispute is queued or escalated for review."
+        reason:
+          type: string
+      required:
+        - dispute_id
+        - action_taken
+        - reason
+    CatalogDisputeRequest:
+      type: object
+      properties:
+        dispute_type:
+          type: string
+          enum:
+            - identifier_link
+            - classification
+            - property_data
+            - false_merge
+        subject_type:
+          type: string
+          example: identifier
+          description: What is being disputed — e.g. `identifier` or `property_rid`.
+        subject_value:
+          type: string
+          example: com.example.app
+        claim:
+          type: string
+          minLength: 10
+          maxLength: 2000
+          description: The dispute claim (10–2000 chars).
+        evidence:
+          type: string
+          maxLength: 5000
+          description: Optional supporting evidence (≤5000 chars).
+      required:
+        - dispute_type
+        - subject_type
+        - subject_value
+        - claim
+    CatalogDisputeRecord:
+      type: object
+      properties:
+        id:
+          type: string
+        dispute_type:
+          type: string
+          enum:
+            - identifier_link
+            - classification
+            - property_data
+            - false_merge
+        subject_type:
+          type: string
+        subject_value:
+          type: string
+        claim:
+          type: string
+        evidence:
+          type:
+            - string
+            - "null"
+        status:
+          type: string
+          example: suspended
+          description: Current dispute status.
+        created_at:
+          type: string
+      required:
+        - id
+        - dispute_type
+        - subject_type
+        - subject_value
+        - claim
+        - status
+        - created_at
+      additionalProperties: {}
+    CatalogBrowseResponse:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogBrowseEntry"
+        total:
+          type: integer
+        next_cursor:
+          type:
+            - string
+            - "null"
+          description: Opaque cursor for the next page; null when exhausted.
+      required:
+        - entries
+        - total
+        - next_cursor
+    CatalogBrowseEntry:
+      type: object
+      properties:
+        property_rid:
+          type: string
+        property_id:
+          type:
+            - string
+            - "null"
+        classification:
+          type: string
+          example: property
+        source:
+          type: string
+          example: adagents_json
+        status:
+          type: string
+          example: active
+        identifiers:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogIdentifier"
+      required:
+        - property_rid
+        - property_id
+        - classification
+        - source
+        - status
+        - identifiers
+    CatalogSyncResponse:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/CatalogSyncEntry"
+        server_timestamp:
+          type: string
+          description: Watermark to pass as `since` on the next sync (avoids clock skew).
+        next_cursor:
+          type:
+            - string
+            - "null"
+      required:
+        - entries
+        - server_timestamp
+        - next_cursor
+    CatalogSyncEntry:
+      type: object
+      properties:
+        property_rid:
+          type: string
+        property_id:
+          type:
+            - string
+            - "null"
+        classification:
+          type: string
+        source:
+          type: string
+        status:
+          type: string
+        adagents_url:
+          type:
+            - string
+            - "null"
+        created_by:
+          type:
+            - string
+            - "null"
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        source_updated_at:
+          type: string
+      required:
+        - property_rid
+        - property_id
+        - classification
+        - source
+        - status
+        - adagents_url
+        - created_by
+        - created_at
+        - updated_at
+        - source_updated_at
     AdagentsJson:
       type: object
       properties:
@@ -3959,7 +5298,10 @@ paths:
     post:
       operationId: saveProperty
       summary: Save property
-      description: Save or update a hosted property in the registry. Requires authentication. For existing properties, creates a revision-tracked edit. For new properties, creates the property directly. Cannot edit authoritative properties managed via adagents.json.
+      description: |-
+        Save or update a hosted property in the registry. Requires authentication. For existing properties, creates a revision-tracked edit. For new properties, creates the property directly. Cannot edit authoritative properties managed via adagents.json.
+
+        This is an identity-only write surface: the stored document always carries `authorized_agents: []`. Sales authorization lives solely in the publisher's own origin `adagents.json`; the community registry cannot mint or carry it. Any `authorized_agents` sent in the request body is ignored.
       tags:
         - Property Resolution
       security:
@@ -3985,8 +5327,8 @@ paths:
                         type: string
                     required:
                       - url
-                  example:
-                    - url: https://agent.example.com
+                  description: Ignored. Community-registry rows never assert sales authorization — the owner's origin adagents.json is the sole authorization source — so any value here is dropped and the stored document carries authorized_agents:[].
+                  example: []
                 properties:
                   type: array
                   items:
@@ -4011,7 +5353,6 @@ paths:
                       type: string
               required:
                 - publisher_domain
-                - authorized_agents
       responses:
         "200":
           description: Property saved or updated
@@ -4058,6 +5399,73 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/properties/hosted/{domain}/claim:
+    post:
+      operationId: claimHostedPropertyDomain
+      summary: Claim a domain for bind-on-verify
+      description: |-
+        Issue a pending domain claim for the caller's organization and return a claim-specific `authoritative_location` URL (`…/adagents.json?adcp_claim=<token>`). The caller places that single pointer at their own origin `/.well-known/adagents.json`; a subsequent verify-origin reads the token and binds the domain to the caller's org. The token is the per-account artifact that proves WHICH account owns the domain — a plain domain-keyed pointer proves only that the origin endorses AAO hosting, not who the owner is.
+
+        The community write surface stays open; this does not gate writes — it establishes ownership on successful verification. Refused with 409 only when the domain is already verified and locked to a different owner.
+      tags:
+        - Property Resolution
+      security:
+        - bearerAuth: []
+        - oauth2: []
+      parameters:
+        - schema:
+            type: string
+            example: examplepub.com
+          required: true
+          name: domain
+          in: path
+      responses:
+        "200":
+          description: Claim issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum:
+                      - true
+                  domain:
+                    type: string
+                  authoritative_location:
+                    type: string
+                  instructions:
+                    type: string
+                required:
+                  - success
+                  - domain
+                  - authoritative_location
+                  - instructions
+        "400":
+          description: Invalid domain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Caller is not a member of any organization
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Domain already verified and locked to another owner
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /api/properties/hosted/{domain}/verify-origin:
     post:
       operationId: verifyHostedPropertyOrigin
@@ -4065,7 +5473,7 @@ paths:
       description: |-
         Trigger origin verification for an AAO-hosted publisher: fetches the publisher's own `/.well-known/adagents.json` and checks for an `authoritative_location` field pointing at the AAO-hosted URL. On success, promotes `agent_publisher_authorizations` rows from `source='aao_hosted'` to `source='adagents_json'` for the manifest's authorized agents — buyers reading the registry then see them as origin-attested.
 
-        Requires authentication and either AAO admin OR org-membership matching the hosted property's owner. Fail-closed on NULL ownership.
+        Bind-on-verify: when the pointer carries an `adcp_claim` token (see the claim endpoint), a successful verification binds the domain to that claim's organization and returns `bound_org_id`. Binding is driven by which token the origin pointer carries, never by who triggers verification, so any authenticated caller may trigger it and a squatter cannot bind a domain they don't control. An existing verified owner is never overwritten.
 
         Failure classification:
         - `not_found`: publisher origin returned 404 (permanent — demotes if previously verified).
@@ -4108,6 +5516,8 @@ paths:
                     type: string
                   detail:
                     type: string
+                  bound_org_id:
+                    type: string
                 required:
                   - verified
                   - reason
@@ -4120,12 +5530,6 @@ paths:
                 $ref: "#/components/schemas/Error"
         "401":
           description: Authentication required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "403":
-          description: Caller does not own this hosted property (and is not an AAO admin)
           content:
             application/json:
               schema:
@@ -4993,6 +6397,151 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/registry/publisher/{domain}/adagents/revalidate:
+    post:
+      operationId: revalidatePublisherAdagents
+      summary: Revalidate publisher adagents.json
+      description: |-
+        Admin-only endpoint for support/operator tooling to synchronously fetch a publisher's live `/.well-known/adagents.json`, run the registry validator, persist the refreshed verdict and fetch metadata, and return the validation result. `force=true` is accepted for operator tooling; the current validator always fetches the live origin.
+
+        **Rate limits:** 5 minutes per domain, 30 requests per user per hour.
+      tags:
+        - Authorization Lookups
+      security:
+        - bearerAuth: []
+        - oauth2: []
+      parameters:
+        - schema:
+            type: string
+            example: publisher.example
+          required: true
+          name: domain
+          in: path
+        - schema:
+            type: string
+            enum:
+              - "1"
+              - "true"
+            description: Accepted for tooling compatibility; live origin validation is always performed.
+          required: false
+          description: Accepted for tooling compatibility; live origin validation is always performed.
+          name: force
+          in: query
+      responses:
+        "200":
+          description: Revalidation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  domain:
+                    type: string
+                  adagents_valid:
+                    type: boolean
+                  checked_at:
+                    type: string
+                    format: date-time
+                  error:
+                    type: string
+                  issues:
+                    type: object
+                    properties:
+                      errors:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            field:
+                              type: string
+                            message:
+                              type: string
+                            severity:
+                              type: string
+                              enum:
+                                - error
+                          required:
+                            - field
+                            - message
+                            - severity
+                      warnings:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            field:
+                              type: string
+                            message:
+                              type: string
+                            suggestion:
+                              type: string
+                          required:
+                            - field
+                            - message
+                    required:
+                      - errors
+                      - warnings
+                  properties_count:
+                    type: integer
+                    minimum: 0
+                  authorized_agents_count:
+                    type: integer
+                    minimum: 0
+                  status_code:
+                    type: integer
+                    minimum: 100
+                    maximum: 599
+                  response_bytes:
+                    type: integer
+                    minimum: 0
+                  resolved_url:
+                    type: string
+                  discovery_method:
+                    type: string
+                    enum:
+                      - direct
+                      - authoritative_location
+                      - ads_txt_managerdomain
+                      - adagents_authoritative
+                  manager_domain:
+                    type: string
+                required:
+                  - domain
+                  - adagents_valid
+                  - checked_at
+        "400":
+          description: Invalid domain format, private IP, or unresolvable domain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Admin access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  retry_after:
+                    type: integer
+                    description: Seconds to wait before retrying
+                required:
+                  - error
+                  - retry_after
   /api/registry/publisher/authorization:
     get:
       operationId: lookupPublisherAgentAuthorization
@@ -6293,7 +7842,7 @@ paths:
       operationId: getRegistryFeed
       summary: Registry change feed
       description: |-
-        Poll a cursor-based feed of registry changes. Events are ordered by UUID v7 event_id for monotonic cursor progression. The feed retains events for 90 days.
+        Poll a cursor-based feed of registry changes. Events are ordered by UUID v7 event_id for monotonic cursor progression. The feed retains events for 90 days. The `freshness` object reports when the response was generated, the newest matching event currently visible to the feed, and the resulting feed lag.
 
         Type filtering supports glob patterns: `property.*` matches `property.created`, `property.updated`, etc.
       tags:
@@ -6338,35 +7887,7 @@ paths:
                   events:
                     type: array
                     items:
-                      type: object
-                      properties:
-                        event_id:
-                          type: string
-                          format: uuid
-                        event_type:
-                          type: string
-                          example: property.created
-                        entity_type:
-                          type: string
-                          example: property
-                        entity_id:
-                          type: string
-                        payload:
-                          type: object
-                          additionalProperties: {}
-                        actor:
-                          type: string
-                        created_at:
-                          type: string
-                          format: date-time
-                      required:
-                        - event_id
-                        - event_type
-                        - entity_type
-                        - entity_id
-                        - payload
-                        - actor
-                        - created_at
+                      $ref: "#/components/schemas/RegistryFeedEvent"
                   cursor:
                     type:
                       - string
@@ -6375,10 +7896,39 @@ paths:
                     description: Pass as cursor in the next request to continue polling
                   has_more:
                     type: boolean
+                  freshness:
+                    type: object
+                    properties:
+                      generated_at:
+                        type: string
+                        format: date-time
+                        description: Server timestamp when this feed page was generated.
+                      latest_event_created_at:
+                        type:
+                          - string
+                          - "null"
+                        format: date-time
+                        description: Newest event creation timestamp currently visible in the feed for the requested type filter. Null when no matching event exists inside retention.
+                      lag_seconds:
+                        type:
+                          - integer
+                          - "null"
+                        minimum: 0
+                        description: Seconds between generated_at and latest_event_created_at. Null when no matching event exists.
+                      retention_days:
+                        type: integer
+                        exclusiveMinimum: 0
+                        description: Number of days the registry retains feed cursors and events.
+                    required:
+                      - generated_at
+                      - latest_event_created_at
+                      - lag_seconds
+                      - retention_days
                 required:
                   - events
                   - cursor
                   - has_more
+                  - freshness
         "400":
           description: Invalid cursor format or type filter
           content:
@@ -6393,6 +7943,87 @@ paths:
                 $ref: "#/components/schemas/Error"
         "410":
           description: Cursor expired (older than 90-day retention window)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum:
+                      - cursor_expired
+                  message:
+                    type: string
+                required:
+                  - error
+                  - message
+  /api/registry/feed/stream:
+    get:
+      operationId: streamRegistryFeed
+      summary: Registry change feed stream
+      description: "Subscribe to registry feed pages over Server-Sent Events. This is a push-friendly transport for the same cursor contract as `/api/registry/feed`: clients still persist `cursor`, apply only feed events, and recover from `cursor_expired` by re-bootstrapping. The stream emits `feed` events containing a full feed page, `heartbeat` events while caught up, and `error` before closing when the cursor expires or the server cannot query the feed."
+      tags:
+        - Change Feed
+      security:
+        - bearerAuth: []
+        - oauth2: []
+      parameters:
+        - schema:
+            type: string
+            format: uuid
+            description: Resume after this event ID
+          required: false
+          description: Resume after this event ID
+          name: cursor
+          in: query
+        - schema:
+            type: string
+            description: Comma-separated event type filters with glob support (e.g. property.*)
+            example: authorization.*,publisher.adagents_changed
+          required: false
+          description: Comma-separated event type filters with glob support (e.g. property.*)
+          name: types
+          in: query
+        - schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+            description: Max events per SSE feed page (default 100, max 10,000)
+          required: false
+          description: Max events per SSE feed page (default 100, max 10,000)
+          name: limit
+          in: query
+        - schema:
+            type: integer
+            minimum: 5
+            maximum: 60
+            description: Server-side interval while caught up (default 15 seconds). Backlog pages are sent without waiting.
+          required: false
+          description: Server-side interval while caught up (default 15 seconds). Backlog pages are sent without waiting.
+          name: poll_interval_seconds
+          in: query
+      responses:
+        "200":
+          description: "SSE stream. `event: feed` data validates as a registry feed page."
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream. `feed` events carry JSON matching the RegistryFeedPage schema; `heartbeat` events carry `{ generated_at, cursor }`.
+        "400":
+          description: Invalid cursor format, type filter, limit, or poll interval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: Initial cursor expired
           content:
             application/json:
               schema:
@@ -8083,7 +9714,7 @@ paths:
       description: |-
         Re-probe the agent and update its registry health (online, tools_count, response_time_ms), capability snapshot (inferred type, discovered tools), and compliance verdict (storyboard pass/fail counts). Use after fixing your agent so the registry shows fresh data without waiting for the periodic heartbeat (~1h).
 
-        **Compliance re-run:** when the caller owns the agent or is an AAO admin and the capability probe succeeds, the full storyboard suite runs (~30–90s) with a fresh test session and `agent_storyboard_status` is updated. Owner-triggered runs use `triggered_by: 'owner_test'`; admin-triggered support runs use `triggered_by: 'manual'`. Badge fan-out reissues verification badges off the new run. If the compliance call fails (timeout, OAuth wall, internal error), the capability/health portion still returns successfully — `compliance.ran` is `false` with an `error` string.
+        **Compliance re-run:** when the caller owns the agent or is an AAO admin and the capability probe succeeds, the full storyboard suite can run for several minutes on capability-rich agents with a fresh test session, and `agent_storyboard_status` is updated. Owner-triggered runs use `triggered_by: 'owner_test'`; admin-triggered support runs use `triggered_by: 'manual'`. Badge fan-out reissues verification badges off the new run. If the compliance call fails (timeout, OAuth wall, internal error), the capability/health portion still returns successfully — `compliance.ran` is `false` with an `error` string.
 
         **Auth:** owner of the agent, AAO admin, or static `ADMIN_API_KEY`.
 
@@ -8146,7 +9777,7 @@ paths:
                         description: Fresh test session id used for the compliance run. Useful when matching seller-side logs to the refresh.
                       requested_compliance_target:
                         type: string
-                        description: Requested compliance target before alias resolution, e.g. 3.0, 3.1-rc, or 3.1-beta. Present when `ran` is true.
+                        description: Requested compliance target before alias resolution, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta. Present when `ran` is true.
                       adcp_version:
                         type: string
                         description: Concrete AdCP compliance bundle version used for the run, e.g. 3.0.12 or 3.1.0-beta.7. Present when `ran` is true.
@@ -8763,9 +10394,9 @@ paths:
           in: query
         - schema:
             type: string
-            description: Compliance target to inspect, e.g. 3.0, 3.1-rc, or 3.1-beta
+            description: Compliance target to inspect, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta
           required: false
-          description: Compliance target to inspect, e.g. 3.0, 3.1-rc, or 3.1-beta
+          description: Compliance target to inspect, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta
           name: compliance_target
           in: query
       responses:
@@ -8814,9 +10445,9 @@ paths:
           in: path
         - schema:
             type: string
-            description: Compliance target to inspect, e.g. 3.0, 3.1-rc, or 3.1-beta
+            description: Compliance target to inspect, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta
           required: false
-          description: Compliance target to inspect, e.g. 3.0, 3.1-rc, or 3.1-beta
+          description: Compliance target to inspect, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta
           name: compliance_target
           in: query
       responses:
@@ -8920,6 +10551,10 @@ paths:
                   example: acmecorp.com
                 brand_name:
                   type: string
+                brand_json:
+                  type: object
+                  additionalProperties: {}
+                  description: Optional full brand.json draft to host in the registry
                 logo_url:
                   type: string
                 brand_color:
@@ -9280,9 +10915,9 @@ paths:
           in: path
         - schema:
             type: string
-            description: Compliance target to inspect, e.g. 3.0, 3.1-rc, or 3.1-beta
+            description: Compliance target to inspect, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta
           required: false
-          description: Compliance target to inspect, e.g. 3.0, 3.1-rc, or 3.1-beta
+          description: Compliance target to inspect, e.g. 3.1, 3.0, 3.1-rc, or 3.1-beta
           name: compliance_target
           in: query
       responses:
@@ -9388,8 +11023,98 @@ paths:
                     type: array
                     items:
                       type: string
+                  run_id:
+                    type: string
+                    description: Compliance run id written by this owner-triggered storyboard run.
+                  storyboard_status:
+                    type: object
+                    properties:
+                      storyboard_id:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - passing
+                          - failing
+                          - partial
+                          - untested
+                      steps_passed:
+                        type: integer
+                      steps_total:
+                        type: integer
+                      failure_count:
+                        type: integer
+                      skipped_count:
+                        type: integer
+                      first_failed_step_id:
+                        type:
+                          - string
+                          - "null"
+                      first_failed_step_title:
+                        type:
+                          - string
+                          - "null"
+                      first_failed_step_task:
+                        type:
+                          - string
+                          - "null"
+                      first_failure_message:
+                        type:
+                          - string
+                          - "null"
+                      first_failure_validations:
+                        type: array
+                        items: {}
+                    required:
+                      - storyboard_id
+                      - status
+                      - steps_passed
+                      - steps_total
+                      - failure_count
+                      - skipped_count
+                      - first_failed_step_id
+                      - first_failed_step_title
+                      - first_failed_step_task
+                      - first_failure_message
+                      - first_failure_validations
+                    description: Persisted storyboard verdict for this run, using the same executable-step semantics as agent_storyboard_status.
                   phases: {}
                   summary: {}
+                  diagnostics:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        run_id:
+                          type: string
+                        agent_url:
+                          type: string
+                        storyboard_id:
+                          type: string
+                        phase_id:
+                          type: string
+                        step_id:
+                          type: string
+                        task:
+                          type: string
+                        response_status:
+                          type:
+                            - integer
+                            - "null"
+                        error_text:
+                          type:
+                            - string
+                            - "null"
+                        failed_validations_jsonb: {}
+                        adcp_error_jsonb: {}
+                      required:
+                        - run_id
+                        - agent_url
+                        - storyboard_id
+                        - phase_id
+                        - step_id
+                        - task
+                    description: Owner-scoped failing-step validation summary for this run. Full request/response diagnostics remain available via /compliance/diagnostics?run_id=...
                   observations: {}
                   total_duration_ms:
                     type: number
@@ -9401,6 +11126,9 @@ paths:
                   - requested_compliance_target
                   - badge_eligible
                   - badge_eligible_adcp_versions
+                  - run_id
+                  - storyboard_status
+                  - diagnostics
                   - total_duration_ms
         "400":
           description: Invalid agent URL
@@ -9820,7 +11548,7 @@ paths:
 
         - **Already-active conflict**: the org exists and is already claimed by another paying member or a previously joined user. Returns `409` with the existing org id so the caller can switch to a join-request flow (`POST /api/organizations/:orgId/join-requests`) instead of trying to register a duplicate.
 
-        Tier transitions happen via the billing flow only — there is no `membership_tier` field on this endpoint. After org creation, send the user to `POST /api/checkout-session` (or the dashboard `/membership` page) to start a subscription; the Stripe webhook is the sole writer of `organizations.membership_tier`.
+        Tier transitions happen via the billing flow only — there is no `membership_tier` field on this endpoint. After org creation, send the user to `POST /api/checkout-session` (or the `/dashboard/membership` page) to start a subscription; the Stripe webhook is the sole writer of `organizations.membership_tier`.
 
         Rate-limited per user: `15` failed attempts per hour; successful calls do not count against the limit so a legitimate registration is never penalized by earlier validation errors.
       tags:
@@ -9875,6 +11603,208 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /api/registry/resolve:
+    post:
+      operationId: resolveIdentifiers
+      summary: Resolve identifiers to property_rids (and contribute them)
+      description: The primary fact-contribution path. Takes identifiers plus a provenance envelope and returns stable `property_rid`s. In `resolve` mode (default) it auto-creates missing catalog entries and logs demand activity — so resolving your own identifier list IS the contribution. `property_rid` is a non-authoritative join/match handle, never an authorization credential. Re-resolving is idempotent on the identifier→rid mapping but additive on the activity log.
+      tags:
+        - Property Catalog
+      security:
+        - bearerAuth: []
+        - oauth2: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveRequest"
+      responses:
+        "200":
+          description: Resolve/lookup result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolveResponse"
+        "400":
+          description: Invalid request (bad identifiers, unknown provenance type, batch > 10,000)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required for resolve mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/registry/catalog/disputes:
+    post:
+      operationId: fileCatalogDispute
+      summary: Dispute a catalog fact
+      description: "Challenge or correct a catalog claim — the community disavow/challenge verb. Adding links is hard; suspending suspicious ones is easy: a disputed medium/weak link is suspended immediately (`action_taken: 'link_suspended'`); stronger claims queue for review. Poll status with getCatalogDispute."
+      tags:
+        - Property Catalog
+      security:
+        - bearerAuth: []
+        - oauth2: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogDisputeRequest"
+      responses:
+        "200":
+          description: Dispute filed and triaged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogDisputeTriageResult"
+        "400":
+          description: Invalid dispute request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/registry/catalog/disputes/{id}:
+    get:
+      operationId: getCatalogDispute
+      summary: Get a catalog dispute
+      description: Fetch the current state of a filed dispute by id.
+      tags:
+        - Property Catalog
+      parameters:
+        - schema:
+            type: string
+            example: 019539a0-b1c2-7d3e-8f4a-5b6c7d8e9f0a
+          required: true
+          name: id
+          in: path
+      responses:
+        "200":
+          description: Dispute record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogDisputeRecord"
+        "404":
+          description: Dispute not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/registry/catalog:
+    get:
+      operationId: browseCatalog
+      summary: Browse the property catalog
+      description: Browse the property fact-graph with filters. Cursor-paginated (opaque `cursor` → `next_cursor`). Each entry carries the property's identifiers. `property_rid` is a non-authoritative join/match handle, never an authorization credential.
+      tags:
+        - Property Catalog
+      parameters:
+        - schema:
+            type: string
+            example: property
+          required: false
+          name: classification
+          in: query
+        - schema:
+            type: string
+          required: false
+          name: source
+          in: query
+        - schema:
+            type: string
+            example: active
+          required: false
+          name: status
+          in: query
+        - schema:
+            type: string
+            example: domain
+          required: false
+          name: identifier_type
+          in: query
+        - schema:
+            type: string
+          required: false
+          name: search
+          in: query
+        - schema:
+            type: string
+            description: Minimum lifetime resolve count (integer).
+          required: false
+          description: Minimum lifetime resolve count (integer).
+          name: min_resolves
+          in: query
+        - schema:
+            type: string
+            description: ISO 8601 — only properties with resolve activity since this time.
+          required: false
+          description: ISO 8601 — only properties with resolve activity since this time.
+          name: active_since
+          in: query
+        - schema:
+            type: string
+            description: Page size (integer).
+          required: false
+          description: Page size (integer).
+          name: limit
+          in: query
+        - schema:
+            type: string
+            description: Opaque pagination cursor from a prior `next_cursor`.
+          required: false
+          description: Opaque pagination cursor from a prior `next_cursor`.
+          name: cursor
+          in: query
+      responses:
+        "200":
+          description: Catalog page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogBrowseResponse"
+  /api/registry/catalog/sync:
+    get:
+      operationId: syncCatalog
+      summary: Sync catalog changes since a watermark
+      description: "Delta sync for local mirrors: returns catalog entries created/updated since `since` (a prior `server_timestamp`), capped at 10,000 per page. Pagination is by the returned `server_timestamp` watermark, distinct from browseCatalog's opaque cursor."
+      tags:
+        - Property Catalog
+      parameters:
+        - schema:
+            type: string
+            description: Watermark from a prior response `server_timestamp` (required).
+            example: 2026-03-27T10:00:00Z
+          required: true
+          description: Watermark from a prior response `server_timestamp` (required).
+          name: since
+          in: query
+        - schema:
+            type: string
+            description: Page size, capped at 10,000.
+          required: false
+          description: Page size, capped at 10,000.
+          name: limit
+          in: query
+      responses:
+        "200":
+          description: Catalog delta
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogSyncResponse"
+        "400":
+          description: Missing required `since` parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 tags:
   - name: Onboarding
     description: Explicitly bootstrap a third-party integration into the AAO registry. Most callers don't need this tag — `POST /api/me/agents` auto-creates the org (for fresh users) and the member profile (for first-time agent registration) without a separate round trip. Use `POST /api/organizations` only when you need to override the auto-derived org name / company_type / revenue_tier. Tier transitions happen via the billing flow only; the Stripe webhook is the sole writer of `organizations.membership_tier`.
@@ -9904,3 +11834,5 @@ tags:
     description: Agent compliance status, storyboard test results, and compliance history.
   - name: Policy Registry
     description: Browse, resolve, and contribute governance policies for campaign compliance.
+  - name: Property Catalog
+    description: "Contribute facts to the property fact-graph: resolve identifiers to stable property_rids (which also contributes them, with provenance) and dispute catalog claims."

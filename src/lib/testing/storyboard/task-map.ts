@@ -129,7 +129,7 @@ export async function executeStoryboardTask(
   client: any,
   taskName: string,
   params: Record<string, unknown>,
-  opts: { skipIdempotencyAutoInject?: boolean; skipAccountValidation?: boolean } = {}
+  opts: { skipIdempotencyAutoInject?: boolean; skipAccountValidation?: boolean; signal?: AbortSignal } = {}
 ): Promise<TaskResult> {
   const methodName = Object.hasOwn(TASK_TO_METHOD, taskName) ? TASK_TO_METHOD[taskName] : undefined;
 
@@ -158,7 +158,7 @@ export async function executeStoryboardTask(
   const BASE_DELAY_MS = 2000;
   for (let attempt = 0; ; attempt++) {
     try {
-      result = await invoke();
+      result = await raceWithSignal(invoke(), opts.signal);
       break;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -167,7 +167,7 @@ export async function executeStoryboardTask(
       if (isRateLimit && attempt < MAX_RETRIES) {
         const jitter = Math.random() * 1000;
         const delay = BASE_DELAY_MS * 2 ** attempt + jitter;
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await raceWithSignal(new Promise(resolve => setTimeout(resolve, delay)), opts.signal);
         continue;
       }
       throw err;
@@ -179,13 +179,20 @@ export async function executeStoryboardTask(
   // submitted), use that data. Only poll when there's no data at all.
   const hasData = result.data !== undefined && result.data !== null;
   const isAsync = result.status === 'submitted' || result.status === 'working';
+  const prePollingDebugLogs = Array.isArray(result.debug_logs) ? [...result.debug_logs] : [];
+  let replacedByPolling = false;
   if (!hasData && isAsync && result.submitted?.waitForCompletion) {
     try {
       const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('Task polling timeout')), 30_000)
       );
-      result = await Promise.race([result.submitted.waitForCompletion(2000), timeout]);
-    } catch {
+      result = await raceWithSignal(
+        Promise.race([result.submitted.waitForCompletion(2000, opts.signal), timeout]),
+        opts.signal
+      );
+      replacedByPolling = true;
+    } catch (err) {
+      if (opts.signal?.aborted) throw err;
       // Polling failed or timed out — return the intermediate result as-is
     }
   }
@@ -200,11 +207,34 @@ export async function executeStoryboardTask(
   const success = normalizeStoryboardTaskSuccess(result, taskName, terminalDataError, adcpError);
   const error = result.error ?? (!success ? errorMessageFrom(adcpError, undefined) : undefined);
   const extractionPath = readExtractionPath(data);
+  const debugLogs = Array.isArray(result.debug_logs) ? result.debug_logs : [];
+  const mergedDebugLogs = replacedByPolling ? [...prePollingDebugLogs, ...debugLogs] : debugLogs;
   return {
     success,
     data,
     error,
     ...(adcpError && { adcp_error: adcpError }),
     ...(extractionPath !== undefined && { _extraction_path: extractionPath }),
+    ...(mergedDebugLogs.length > 0 && { debug_logs: mergedDebugLogs }),
   };
+}
+
+function raceWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      err => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      }
+    );
+  });
 }

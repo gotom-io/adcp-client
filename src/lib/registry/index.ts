@@ -1,12 +1,30 @@
 import type {
   ResolvedBrand,
+  BrandHierarchyResolution,
+  BrandHierarchyBulkResolution,
+  ResolveBrandHierarchyOptions,
   ResolvedProperty,
   PropertyInfo,
   RegistryClientConfig,
   SaveBrandRequest,
   SaveBrandResponse,
+  ListBrandLogosOptions,
+  ListBrandLogosResponse,
+  SaveBrandLogoInput,
+  SaveBrandLogoResponse,
+  UploadBrandLogoInput,
+  UploadBrandLogoResponse,
+  SavePropertyIdentity,
+  RegistryPropertyIdentity,
   SavePropertyRequest,
   SavePropertyResponse,
+  ResolveIdentifiersRequest,
+  ResolveIdentifiersResponse,
+  FileCatalogDisputeRequest,
+  FileCatalogDisputeResponse,
+  GetCatalogDisputeResponse,
+  ClaimHostedPropertyDomainResponse,
+  VerifyHostedPropertyOriginResponse,
   BrandRegistryItem,
   PropertyRegistryItem,
   ValidationResult,
@@ -14,11 +32,14 @@ import type {
   FederatedPublisher,
   DomainLookupResult,
   ListBrandsOptions,
+  ListBrandsResponse,
+  GetBrandJsonResponse,
   ListOptions,
   ListAgentsOptions,
   ListAgentsResponse,
   ListPublishersResponse,
   ValidateAdagentsRequest,
+  ValidateAdagentsResponse,
   CreateAdagentsRequest,
   CreateAdagentsResponse,
   CommunityMirrorAdagentsConfig,
@@ -38,6 +59,8 @@ import type {
   AgentSearchResponse,
   CrawlRequest,
   CrawlRequestResponse,
+  ManagerRevalidationRequest,
+  ManagerRevalidationResponse,
   BrandActivity,
   PropertyActivity,
   PolicySummary,
@@ -67,15 +90,42 @@ import type {
   GetAgentStoryboardStatusBulkResponse,
 } from './types';
 
+import { openFeedStream } from './feed-stream';
+import type { FeedStreamQuery, FeedStreamMessage } from './feed-stream';
+import type { PropertyType } from '../discovery/types';
+
 export type {
   ResolvedBrand,
+  BrandHierarchyResolution,
+  BrandHierarchyBulkResolution,
+  ResolveBrandHierarchyOptions,
   ResolvedProperty,
   PropertyInfo,
   RegistryClientConfig,
   SaveBrandRequest,
   SaveBrandResponse,
+  BrandLogoReviewStatus,
+  ApprovedBrandLogoAsset,
+  PendingBrandLogoAsset,
+  ReviewedBrandLogoAsset,
+  BrandLogoAsset,
+  ListBrandLogosOptions,
+  ListBrandLogosResponse,
+  SaveBrandLogoInput,
+  SaveBrandLogoResponse,
+  UploadBrandLogoInput,
+  UploadBrandLogoResponse,
+  SavePropertyIdentity,
+  RegistryPropertyIdentity,
   SavePropertyRequest,
   SavePropertyResponse,
+  ResolveIdentifiersRequest,
+  ResolveIdentifiersResponse,
+  FileCatalogDisputeRequest,
+  FileCatalogDisputeResponse,
+  GetCatalogDisputeResponse,
+  ClaimHostedPropertyDomainResponse,
+  VerifyHostedPropertyOriginResponse,
   BrandRegistryItem,
   PropertyRegistryItem,
   ValidationResult,
@@ -83,11 +133,14 @@ export type {
   FederatedPublisher,
   DomainLookupResult,
   ListBrandsOptions,
+  ListBrandsResponse,
+  GetBrandJsonResponse,
   ListOptions,
   ListAgentsOptions,
   ListAgentsResponse,
   ListPublishersResponse,
   ValidateAdagentsRequest,
+  ValidateAdagentsResponse,
   CreateAdagentsRequest,
   CreateAdagentsResponse,
   AdagentsAuthorizedAgent,
@@ -115,6 +168,8 @@ export type {
   FeedQuery,
   AgentSearchQuery,
   CrawlRequest,
+  ManagerRevalidationRequest,
+  ManagerRevalidationResponse,
   ListPoliciesQuery,
   ListPoliciesResponse,
   ResolvePolicyQuery,
@@ -163,6 +218,17 @@ export type {
   PolicySummary,
   Policy,
   PolicyHistory,
+  RegistryFeedEvent,
+  AgentEventPayload,
+  PropertyEventPayload,
+  CollectionEventPayload,
+  AuthorizationEventPayload,
+  PublisherEventPayload,
+  BrandEventPayload,
+  CatalogBrowseResponse,
+  CatalogBrowseEntry,
+  CatalogSyncResponse,
+  CatalogSyncEntry,
   CommunityMirrorListResponse,
   CommunityMirrorSummary,
   CommunityMirrorGetResponse,
@@ -175,7 +241,35 @@ export type {
 
 // Re-export RegistrySync
 export { RegistrySync } from './sync';
-export type { RegistrySyncConfig, RegistrySyncState, RegistrySyncEvents, AgentFilter } from './sync';
+export type {
+  RegistrySyncConfig,
+  RegistrySyncState,
+  RegistrySyncTransport,
+  RegistrySyncEvents,
+  AgentFilter,
+  RegistrySyncProperty,
+} from './sync';
+
+// Re-export the feed SSE transport
+export {
+  openFeedStream,
+  parseSseStream,
+  sanitizeStreamText,
+  DEFAULT_MAX_SSE_FRAME_BYTES,
+  FeedStreamError,
+  FeedStreamUnsupportedError,
+  FeedStreamCursorExpiredError,
+  FeedStreamHttpError,
+  FeedStreamParseError,
+} from './feed-stream';
+export type {
+  FeedStreamQuery,
+  FeedStreamMessage,
+  FeedHeartbeat,
+  FeedStreamErrorData,
+  OpenFeedStreamOptions,
+} from './feed-stream';
+export type { FeedFreshness } from './types.generated';
 
 // Re-export CursorStore
 export { InMemoryCursorStore, FileCursorStore } from './cursor-store';
@@ -191,6 +285,7 @@ const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_LARGE_RESPONSE_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const ERROR_BODY_PREVIEW_CHARS = 200;
 const MAX_BULK_DOMAINS = 100;
+const MAX_BRAND_HIERARCHY_CACHE_ENTRIES = 1000;
 const MAX_CHECK_DOMAINS = 10000; // per OpenAPI spec maxItems
 const COMMUNITY_MIRROR_PLATFORM_RE = /^[a-z0-9_-]{1,64}$/;
 
@@ -255,6 +350,10 @@ export class RegistryClient {
   private readonly hasCustomMaxBodyBytes: boolean;
   private readonly redirect: 'follow' | 'error';
   private readonly fetchImpl: typeof globalThis.fetch;
+  private readonly brandHierarchyCache = new Map<
+    string,
+    { expiresAt: number; value: BrandHierarchyResolution | null }
+  >();
 
   constructor(config?: RegistryClientConfig) {
     this.baseUrl = (config?.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
@@ -301,10 +400,99 @@ export class RegistryClient {
     return data.results;
   }
 
+  /**
+   * Resolve a domain to its ordered corporate brand hierarchy.
+   *
+   * The returned `chain` is ordered from the resolved brand itself through each
+   * parent to the house brand. A 404 from the registry returns `null`.
+   */
+  async resolveBrandHierarchy(
+    domain: string,
+    options?: ResolveBrandHierarchyOptions
+  ): Promise<BrandHierarchyResolution | null> {
+    const normalizedDomain = this.normalizeBrandHierarchyDomain(domain);
+    const ttlMs = this.resolveBrandHierarchyCacheTtlMs(options);
+    const cacheKey = this.brandHierarchyCacheKey(normalizedDomain);
+    const cached = this.getCachedBrandHierarchy(cacheKey, options, ttlMs);
+    if (cached !== undefined) return cached;
+
+    const params = new URLSearchParams({ domain: normalizedDomain });
+    if (options?.fresh) params.set('fresh', 'true');
+    const value = await this.get<BrandHierarchyResolution | null>(`${this.baseUrl}/api/brands/hierarchy?${params}`, {
+      nullOn404: true,
+    });
+    this.setCachedBrandHierarchy(cacheKey, value, options, ttlMs);
+    return this.cloneBrandHierarchy(value);
+  }
+
+  /**
+   * Resolve up to 100 domains to ordered corporate brand hierarchies.
+   *
+   * Results are keyed by the caller-supplied domain. Unknown domains map to
+   * `null`, matching `lookupBrands()`.
+   */
+  async resolveBrandHierarchies(
+    domains: string[],
+    options?: ResolveBrandHierarchyOptions
+  ): Promise<Record<string, BrandHierarchyResolution | null>> {
+    if (domains.length === 0) return {};
+    if (domains.length > MAX_BULK_DOMAINS) {
+      throw new Error(`Cannot resolve more than ${MAX_BULK_DOMAINS} domains at once (got ${domains.length})`);
+    }
+    const normalizedDomains = domains.map(domain => this.normalizeBrandHierarchyDomain(domain));
+    const ttlMs = this.resolveBrandHierarchyCacheTtlMs(options);
+
+    const results: Record<string, BrandHierarchyResolution | null> = Object.create(null);
+    const unresolved: string[] = [];
+    const unresolvedInputsByKey = new Map<string, string[]>();
+
+    for (let i = 0; i < domains.length; i++) {
+      const domain = domains[i]!;
+      const normalizedDomain = normalizedDomains[i]!;
+      const cacheKey = this.brandHierarchyCacheKey(normalizedDomain);
+      const cached = this.getCachedBrandHierarchy(cacheKey, options, ttlMs);
+      if (cached !== undefined) {
+        results[domain] = cached;
+        continue;
+      }
+      const inputs = unresolvedInputsByKey.get(cacheKey);
+      if (inputs) {
+        inputs.push(domain);
+      } else {
+        unresolved.push(normalizedDomain);
+        unresolvedInputsByKey.set(cacheKey, [domain]);
+      }
+    }
+
+    if (unresolved.length > 0) {
+      const body: { domains: string[]; fresh?: boolean } = { domains: unresolved };
+      if (options?.fresh) body.fresh = true;
+      const data = await this.post<BrandHierarchyBulkResolution>(`${this.baseUrl}/api/brands/hierarchy/bulk`, body);
+      if (!data || typeof data !== 'object' || !data.results || typeof data.results !== 'object') {
+        throw new Error('Registry hierarchy bulk response missing results');
+      }
+      const matchedKeys = new Set<string>();
+      for (const [domain, value] of Object.entries(data.results)) {
+        const cacheKey = this.brandHierarchyCacheKey(domain);
+        const inputs = unresolvedInputsByKey.get(cacheKey);
+        if (!inputs) continue;
+        matchedKeys.add(cacheKey);
+        for (const input of inputs) {
+          results[input] = this.cloneBrandHierarchy(value);
+        }
+        this.setCachedBrandHierarchy(cacheKey, value, options, ttlMs);
+      }
+      for (const [cacheKey, inputs] of unresolvedInputsByKey.entries()) {
+        if (matchedKeys.has(cacheKey)) continue;
+        throw new Error(`Registry hierarchy bulk response missing result for ${inputs[0]}`);
+      }
+    }
+
+    return results;
+  }
+
   /** List brands in the registry with optional search and pagination. */
-  async listBrands(
-    options?: ListBrandsOptions
-  ): Promise<{ brands: BrandRegistryItem[]; stats: Record<string, unknown> }> {
+  async listBrands(options?: ListBrandsOptions): Promise<ListBrandsResponse> {
     const params = this.buildParams(options);
     return this.get(`${this.baseUrl}/api/brands/registry${params}`);
   }
@@ -316,7 +504,7 @@ export class RegistryClient {
    * This returns registry-supplied manifest content. Sanitize strings before
    * using them in LLM prompts, instructions, or other executable context.
    */
-  async getBrandJson(domain: string): Promise<Record<string, unknown> | null> {
+  async getBrandJson(domain: string): Promise<GetBrandJsonResponse | null> {
     if (!domain?.trim()) throw new Error('domain is required');
     const url = `${this.baseUrl}/api/brands/brand-json?domain=${encodeURIComponent(domain)}`;
     return this.get(url, { nullOn404: true });
@@ -326,6 +514,47 @@ export class RegistryClient {
   async enrichBrand(domain: string): Promise<Record<string, unknown>> {
     if (!domain?.trim()) throw new Error('domain is required');
     return this.get(`${this.baseUrl}/api/brands/enrich?domain=${encodeURIComponent(domain)}`);
+  }
+
+  /**
+   * List AAO brand logo assets for a domain, optionally filtered by tags.
+   *
+   * @remarks
+   * Passing a raw `string[]` as the second argument is deprecated; pass
+   * `{ tags }` instead.
+   */
+  async listBrandLogos(domain: string, options?: ListBrandLogosOptions | string[]): Promise<ListBrandLogosResponse> {
+    if (!domain?.trim()) throw new Error('domain is required');
+    const params = new URLSearchParams();
+    const tags = Array.isArray(options) ? options : options?.tags;
+    if (tags?.length) params.set('tags', tags.join(','));
+    const qs = params.toString();
+    const response = await this.get<Record<string, unknown>>(
+      `${this.baseUrl}/api/brands/${encodeURIComponent(domain)}/logos${qs ? `?${qs}` : ''}`
+    );
+    return this.normalizeBrandLogoList(response);
+  }
+
+  /** Save an AAO brand logo asset for review. Requires authentication. */
+  async saveBrandLogo(input: SaveBrandLogoInput): Promise<SaveBrandLogoResponse> {
+    if (!input?.domain?.trim()) throw new Error('domain is required');
+    if (!input?.filename?.trim()) throw new Error('filename is required');
+    if (!input?.mimeType?.trim()) throw new Error('mimeType is required');
+    if (input.data == null) throw new Error('data is required');
+    if (!input.tags?.length) throw new Error('tags are required');
+    if (!this.apiKey) throw new Error('apiKey is required for save operations');
+
+    const form = new FormData();
+    form.append('file', this.toBrandLogoBlob(input.data, input.mimeType), input.filename);
+    if (input.note) form.append('note', input.note);
+    form.append('tags', input.tags.join(','));
+
+    return this.postFormData(`${this.baseUrl}/api/brands/${encodeURIComponent(input.domain)}/logos`, form);
+  }
+
+  /** @deprecated Use `saveBrandLogo()`. */
+  async uploadBrandLogo(input: UploadBrandLogoInput): Promise<UploadBrandLogoResponse> {
+    return this.saveBrandLogo(input);
   }
 
   /** Save or update a community brand. Requires authentication. */
@@ -410,9 +639,31 @@ export class RegistryClient {
   /** Save or update a hosted property. Requires authentication. */
   async saveProperty(property: SavePropertyRequest): Promise<SavePropertyResponse> {
     if (!property?.publisher_domain?.trim()) throw new Error('publisher_domain is required');
-    if (!Array.isArray(property?.authorized_agents)) throw new Error('authorized_agents is required');
     if (!this.apiKey) throw new Error('apiKey is required for save operations');
-    return this.post(`${this.baseUrl}/api/properties/save`, property);
+    const payload = this.normalizeSavePropertyRequest(property);
+    return this.post(`${this.baseUrl}/api/properties/save`, payload);
+  }
+
+  /**
+   * Issue a hosted-property domain claim for bind-on-verify.
+   *
+   * The registry returns a claim-specific `authoritative_location` URL for the
+   * publisher to place at its origin `/.well-known/adagents.json`.
+   */
+  async claimHostedPropertyDomain(domain: string): Promise<ClaimHostedPropertyDomainResponse> {
+    if (!domain?.trim()) throw new Error('domain is required');
+    if (!this.apiKey) throw new Error('apiKey is required for hosted property claims');
+    return this.post(`${this.baseUrl}/api/properties/hosted/${encodeURIComponent(domain.trim())}/claim`, undefined);
+  }
+
+  /** Trigger origin verification for an AAO-hosted publisher domain. */
+  async verifyHostedPropertyOrigin(domain: string): Promise<VerifyHostedPropertyOriginResponse> {
+    if (!domain?.trim()) throw new Error('domain is required');
+    if (!this.apiKey) throw new Error('apiKey is required for hosted property verification');
+    return this.post(
+      `${this.baseUrl}/api/properties/hosted/${encodeURIComponent(domain.trim())}/verify-origin`,
+      undefined
+    );
   }
 
   /**
@@ -436,6 +687,36 @@ export class RegistryClient {
       }
     }
     return results;
+  }
+
+  /**
+   * Resolve catalog identifiers to stable property_rids.
+   * In default `resolve` mode the registry also records a provenance-backed
+   * contribution; `lookup` mode is read-only.
+   */
+  async resolveIdentifiers(request: ResolveIdentifiersRequest): Promise<ResolveIdentifiersResponse> {
+    if (!request?.identifiers?.length) throw new Error('identifiers are required');
+    if ((request.mode ?? 'resolve') !== 'lookup' && !this.apiKey) {
+      throw new Error('apiKey is required for resolveIdentifiers in resolve mode');
+    }
+    return this.post(`${this.baseUrl}/api/registry/resolve`, request);
+  }
+
+  /** File a catalog fact dispute. Requires authentication. */
+  async fileCatalogDispute(request: FileCatalogDisputeRequest): Promise<FileCatalogDisputeResponse> {
+    if (!request?.subject_type?.trim()) throw new Error('subject_type is required');
+    if (!request?.subject_value?.trim()) throw new Error('subject_value is required');
+    if (!request?.claim?.trim()) throw new Error('claim is required');
+    if (!this.apiKey) throw new Error('apiKey is required for catalog disputes');
+    return this.post(`${this.baseUrl}/api/registry/catalog/disputes`, request);
+  }
+
+  /** Fetch a catalog dispute by id. */
+  async getCatalogDispute(id: string): Promise<GetCatalogDisputeResponse | null> {
+    if (!id?.trim()) throw new Error('id is required');
+    return this.get(`${this.baseUrl}/api/registry/catalog/disputes/${encodeURIComponent(id.trim())}`, {
+      nullOn404: true,
+    });
   }
 
   // ====== Agent Discovery ======
@@ -728,7 +1009,7 @@ export class RegistryClient {
   // ====== Adagents Tooling ======
 
   /** Validate a domain's adagents.json compliance. */
-  async validateAdagents(domain: string): Promise<Record<string, unknown>> {
+  async validateAdagents(domain: string): Promise<ValidateAdagentsResponse> {
     if (!domain?.trim()) throw new Error('domain is required');
     return this.post(`${this.baseUrl}/api/adagents/validate`, { domain });
   }
@@ -947,7 +1228,42 @@ export class RegistryClient {
     if (options?.types) params.set('types', options.types);
     if (options?.limit != null) params.set('limit', String(options.limit));
     const qs = params.toString();
-    return this.get(`${this.baseUrl}/api/registry/feed${qs ? '?' + qs : ''}`);
+    const url = `${this.baseUrl}/api/registry/feed${qs ? '?' + qs : ''}`;
+    const { res, text } = await this.requestText(url, { headers: this.getHeaders() });
+    if (res.status === 410) {
+      // Cursor aged out of the 90-day retention window. Surface as a recoverable
+      // signal so callers re-bootstrap instead of treating it as a hard error.
+      return { events: [], cursor: null, has_more: false, cursor_expired: true };
+    }
+    if (!res.ok) {
+      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+    }
+    return this.parseJson(text);
+  }
+
+  /**
+   * Stream the registry change feed over Server-Sent Events
+   * (`GET /api/registry/feed/stream`).
+   *
+   * Yields typed `feed` / `heartbeat` / `error` messages until the stream
+   * closes. The connection is long-lived — no body-size cap or request timeout
+   * applies; pass an `AbortSignal` to close it. Cursor state lives in the `feed`
+   * page payloads: persist `page.cursor` and reconnect with `{ cursor }`.
+   *
+   * Requires authentication. Most consumers should use `RegistrySync` with
+   * `transport: 'auto'`, which layers reconnect, polling fallback, and
+   * cursor-expiry recovery on top of this method.
+   */
+  streamFeed(query?: FeedStreamQuery, init?: { signal?: AbortSignal }): AsyncGenerator<FeedStreamMessage> {
+    if (!this.apiKey) throw new Error('apiKey is required for feed stream access');
+    return openFeedStream({
+      fetchImpl: this.fetchImpl,
+      baseUrl: this.baseUrl,
+      apiKey: this.apiKey,
+      query,
+      redirect: this.redirect,
+      signal: init?.signal,
+    });
   }
 
   /**
@@ -986,6 +1302,20 @@ export class RegistryClient {
     if (!domain?.trim()) throw new Error('domain is required');
     if (!this.apiKey) throw new Error('apiKey is required for crawl requests');
     return this.post(`${this.baseUrl}/api/registry/crawl-request`, { domain });
+  }
+
+  /**
+   * Request fan-out re-validation for publishers delegating to a manager domain.
+   * Use after rotating a manager's adagents.json so MANAGERDOMAIN publishers
+   * are queued without waiting for the next routine crawl cycle.
+   *
+   * Requires authentication.
+   */
+  async requestManagerRevalidation(managerDomain: string): Promise<ManagerRevalidationResponse> {
+    if (!managerDomain?.trim()) throw new Error('managerDomain is required');
+    if (!this.apiKey) throw new Error('apiKey is required for manager revalidation requests');
+    const body: ManagerRevalidationRequest = { manager_domain: managerDomain };
+    return this.post(`${this.baseUrl}/api/registry/manager-revalidation-request`, body);
   }
 
   // ====== Policy Management ======
@@ -1081,6 +1411,18 @@ export class RegistryClient {
     return this.parseJson(text);
   }
 
+  private async postFormData<T = any>(url: string, body: FormData): Promise<T> {
+    const { res, text } = await this.requestText(url, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body,
+    });
+    if (!res.ok) {
+      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+    }
+    return this.parseJson(text);
+  }
+
   private async put<T = any>(url: string, body: unknown): Promise<T> {
     const { res, text } = await this.requestText(url, {
       method: 'PUT',
@@ -1104,6 +1446,61 @@ export class RegistryClient {
     return this.parseJson(text);
   }
 
+  private normalizeBrandLogoList(response: Record<string, unknown>): ListBrandLogosResponse {
+    const assets = Array.isArray(response.assets)
+      ? (response.assets as ListBrandLogosResponse['assets'])
+      : Array.isArray(response.logos)
+        ? (response.logos as ListBrandLogosResponse['assets'])
+        : [];
+    const logos = Array.isArray(response.logos) ? (response.logos as ListBrandLogosResponse['assets']) : assets;
+
+    const normalized: ListBrandLogosResponse = {
+      assets,
+      logos,
+    };
+    if (typeof response.domain === 'string') normalized.domain = response.domain;
+    if (response.stats != null && typeof response.stats === 'object' && !Array.isArray(response.stats)) {
+      normalized.stats = response.stats as Record<string, unknown>;
+    }
+    return normalized;
+  }
+
+  private normalizeSavePropertyRequest(property: SavePropertyRequest): SavePropertyRequest {
+    const payload: SavePropertyRequest = {
+      ...property,
+      authorized_agents: [],
+    };
+    if (Array.isArray(property.properties)) {
+      payload.properties = property.properties.map(p => this.normalizeSavePropertyIdentity(p));
+    }
+    return payload;
+  }
+
+  private normalizeSavePropertyIdentity(property: SavePropertyIdentity): SavePropertyIdentity {
+    const normalized = { ...property } as SavePropertyIdentity & {
+      property_type?: PropertyType | string;
+      type?: PropertyType | string;
+    };
+    if (normalized.property_type === undefined && normalized.type !== undefined) {
+      normalized.property_type = normalized.type as PropertyType;
+    }
+    if (normalized.type === undefined && normalized.property_type !== undefined) {
+      normalized.type = normalized.property_type;
+    }
+    return normalized as SavePropertyIdentity;
+  }
+
+  private toBrandLogoBlob(data: SaveBrandLogoInput['data'], mimeType: string): Blob {
+    if (data instanceof Blob) return new Blob([data], { type: mimeType });
+    if (data instanceof ArrayBuffer) return new Blob([data], { type: mimeType });
+    if (ArrayBuffer.isView(data)) {
+      const bytes = new Uint8Array(data.byteLength);
+      bytes.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      return new Blob([bytes], { type: mimeType });
+    }
+    throw new Error('data must be a Blob, Buffer, ArrayBuffer, or ArrayBufferView');
+  }
+
   private normalizeCommunityMirrorPlatform(platform: string): string {
     const normalizedPlatform = platform?.trim().toLowerCase();
     if (!normalizedPlatform) throw new Error('platform is required');
@@ -1111,6 +1508,68 @@ export class RegistryClient {
       throw new Error('platform must match ^[a-z0-9_-]{1,64}$');
     }
     return normalizedPlatform;
+  }
+
+  private brandHierarchyCacheKey(domain: string): string {
+    return domain.trim().toLowerCase();
+  }
+
+  private normalizeBrandHierarchyDomain(domain: string): string {
+    const normalized = domain?.trim();
+    if (!normalized) throw new Error('domain is required');
+    if (normalized.length > 253) throw new Error('domain must be 253 characters or fewer');
+    return normalized;
+  }
+
+  private resolveBrandHierarchyCacheTtlMs(options: ResolveBrandHierarchyOptions | undefined): number | undefined {
+    if (options?.ttlMs == null) return undefined;
+    if (!Number.isFinite(options.ttlMs) || options.ttlMs < 0) {
+      throw new Error('ttlMs must be a finite non-negative number');
+    }
+    return options.ttlMs;
+  }
+
+  private getCachedBrandHierarchy(
+    cacheKey: string,
+    options: ResolveBrandHierarchyOptions | undefined,
+    ttlMs: number | undefined
+  ): BrandHierarchyResolution | null | undefined {
+    if (options?.fresh || ttlMs == null || ttlMs === 0) return undefined;
+    const cached = this.brandHierarchyCache.get(cacheKey);
+    if (!cached) return undefined;
+    if (cached.expiresAt <= Date.now()) {
+      this.brandHierarchyCache.delete(cacheKey);
+      return undefined;
+    }
+    this.brandHierarchyCache.delete(cacheKey);
+    this.brandHierarchyCache.set(cacheKey, cached);
+    return this.cloneBrandHierarchy(cached.value);
+  }
+
+  private setCachedBrandHierarchy(
+    cacheKey: string,
+    value: BrandHierarchyResolution | null,
+    options: ResolveBrandHierarchyOptions | undefined,
+    ttlMs: number | undefined
+  ): void {
+    if (ttlMs == null || ttlMs === 0) {
+      if (options?.fresh) this.brandHierarchyCache.delete(cacheKey);
+      return;
+    }
+    this.brandHierarchyCache.delete(cacheKey);
+    this.brandHierarchyCache.set(cacheKey, {
+      expiresAt: Date.now() + ttlMs,
+      value: this.cloneBrandHierarchy(value),
+    });
+    while (this.brandHierarchyCache.size > MAX_BRAND_HIERARCHY_CACHE_ENTRIES) {
+      const oldest = this.brandHierarchyCache.keys().next().value;
+      if (oldest == null) break;
+      this.brandHierarchyCache.delete(oldest);
+    }
+  }
+
+  private cloneBrandHierarchy(value: BrandHierarchyResolution | null): BrandHierarchyResolution | null {
+    return value == null ? null : { ...value, chain: value.chain.map(brand => ({ ...brand })) };
   }
 
   private resolveCommunityMirrorPublishArgs(

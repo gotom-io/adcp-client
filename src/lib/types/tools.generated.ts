@@ -124,6 +124,7 @@ export type GetProductsRequest = {
     | 'publisher_properties'
     | 'channels'
     | 'video_placement_types'
+    | 'audio_distribution_types'
     | 'sponsored_placement_types'
     | 'social_placement_surfaces'
     | 'format_ids'
@@ -369,6 +370,17 @@ export type MediaChannel =
  * Declared video placement classification for OLV and other video inventory, using the IAB Tech Lab/OpenRTB 2.6 video.plcmt definitions with AdCP-native value names. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
  */
 export type VideoPlacementType = 'instream' | 'accompanying_content' | 'interstitial' | 'standalone';
+/**
+ * Declared audio distribution classification for radio, streaming-audio, podcast, and other audio inventory, using IAB Tech Lab/OpenRTB 2.6 audio.feed definitions with AdCP-native value names. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
+ */
+export type AudioDistributionType =
+  | 'music_streaming_service'
+  | 'fm_am_broadcast'
+  | 'podcast'
+  | 'catch_up_radio'
+  | 'web_radio'
+  | 'video_game'
+  | 'text_to_speech';
 /**
  * Declared sponsored-placement classification for catalog-driven retail-media inventory, distinguishing where the sponsored placement renders on the retailer surface. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
  */
@@ -982,6 +994,10 @@ export interface ProductFilters {
    */
   video_placement_types?: VideoPlacementType[];
   /**
+   * Filter audio products by acceptable declared audio distribution types, using IAB Tech Lab/OpenRTB 2.6 audio.feed definitions with AdCP-native names. Sellers SHOULD return only products they can satisfy with at least one requested type. Products whose only available delivery is a mixed, non-targetable bundle that includes unrequested audio distribution types SHOULD NOT match unless the seller can constrain delivery to the requested type during planning or purchase. This filter has set semantics for wholesale feed canonicalization.
+   */
+  audio_distribution_types?: AudioDistributionType[];
+  /**
    * Filter retail-media products by acceptable declared sponsored-placement types (sponsored search, sponsored display, or sponsored native). Sellers SHOULD return only products they can satisfy with at least one requested type. Products whose only available delivery is a mixed, non-targetable bundle that includes unrequested sponsored-placement types SHOULD NOT match unless the seller can constrain delivery to the requested type during planning or purchase. This filter has set semantics for wholesale feed canonicalization.
    */
   sponsored_placement_types?: SponsoredPlacementType[];
@@ -1320,7 +1336,7 @@ export interface PushNotificationConfig {
    */
   token?: string;
   /**
-   * Legacy authentication configuration (A2A-compatible). Opts the seller into Bearer or HMAC-SHA256 signing instead of the default RFC 9421 webhook profile. Deprecated; removed in AdCP 4.0. **Precedence is a switch, not a fallback:** presence of this block selects the legacy scheme; absence selects 9421. A seller MUST NOT sign the same webhook both ways, and a buyer MUST NOT attempt 'try 9421 first, fall back to HMAC' verification — signature mode is determined solely by whether this block was present at registration time. The seller's baseline 9421 webhook-signing key published at its brand.json `agents[]` `jwks_uri` does not override this selector; it is always discoverable but only used when `authentication` is omitted. See docs/building/implementation/security.mdx#webhook-callbacks for the full precedence and downgrade-resistance rules (including the `webhook_mode_mismatch` rejection a buyer MUST apply when a received webhook's signing mode does not match the registered mode).
+   * Legacy authentication configuration (A2A-compatible). Opts the seller into Bearer or HMAC-SHA256 signing instead of the default RFC 9421 webhook profile. Deprecated; removed in AdCP 4.0. **Precedence is a switch, not a fallback:** presence of this block selects the legacy scheme; absence selects 9421. A seller MUST NOT sign the same webhook both ways, and a buyer MUST NOT attempt 'try 9421 first, fall back to HMAC' verification — signature mode is determined solely by whether this block was present at registration time. The seller's baseline 9421 webhook key is published at its brand.json `agents[]` `jwks_uri` using `adcp_use: "request-signing"` (deprecated `webhook-signing` keys remain accepted during the compatibility window); it does not override this selector and is only used when `authentication` is omitted. See docs/building/by-layer/L1/security.mdx#webhook-callbacks for the full precedence and downgrade-resistance rules (including the `webhook_mode_mismatch` rejection a buyer MUST apply when a received webhook's signing mode does not match the registered mode).
    */
   authentication?: {
     /**
@@ -1335,7 +1351,7 @@ export interface PushNotificationConfig {
   };
 }
 /**
- * Standard cursor-based pagination parameters for list operations
+ * Cursor-based pagination controls for get_products. Valid in all buying modes. In brief mode, pagination bounds the seller's returned products[] for the curated answer to the brief and is not an exhaustive catalog-enumeration contract. In refine mode, pagination bounds the refined products[] result implied by refine[] and filters; proposals may accompany a page as plan metadata but are not independently counted by this pagination envelope. In wholesale mode, pagination walks the wholesale product feed and may be combined with wholesale feed versioning.
  */
 export interface PaginationRequest {
   /**
@@ -1417,6 +1433,10 @@ export type Product = {
      * Declared video placement types that may be included in this product, using IAB Tech Lab/OpenRTB 2.6 video.plcmt definitions with AdCP-native names. Use on OLV, CTV, and other video products when buyers need to distinguish instream, accompanying-content, interstitial, and standalone/no-content inventory. Aggregate products and ad-network products MAY declare multiple values. When `placements[]` also carry `video_placement_types`, this product-level array SHOULD be the union of the placement-level declarations the seller may deliver under the product. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
      */
     video_placement_types?: VideoPlacementType[];
+    /**
+     * Declared audio distribution types that may be included in this product, using IAB Tech Lab/OpenRTB 2.6 audio.feed definitions with AdCP-native names. Use on radio, streaming-audio, podcast, gaming, and other audio products when buyers need to distinguish music streaming services, FM/AM broadcast, podcasts, catch-up radio, web radio, video-game audio, and text-to-speech inventory without changing the buyer-facing channel or adagents.json property type. Aggregate products and ad-network products MAY declare multiple values. When `placements[]` also carry `audio_distribution_types`, this product-level array SHOULD be the union of the placement-level declarations the seller may deliver under the product. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
+     */
+    audio_distribution_types?: AudioDistributionType[];
     /**
      * Declared sponsored-placement types that may be included in this product, distinguishing where catalog-driven retail-media placements render on the retailer surface (sponsored search, sponsored display, or sponsored native). Use on retail-media products when buyers need to distinguish search-keyed, display, and native in-grid sponsored inventory. Aggregate products and ad-network products MAY declare multiple values. When `placements[]` also carry `sponsored_placement_types`, this product-level array SHOULD be the union of the placement-level declarations the seller may deliver under the product. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
      */
@@ -2401,6 +2421,10 @@ export type Placement = {
    */
   video_placement_types?: VideoPlacementType[];
   /**
+   * Declared audio distribution types for this product placement, using IAB Tech Lab/OpenRTB 2.6 audio.feed definitions with AdCP-native names. Most concrete placements SHOULD declare a single value; aggregate placements MAY declare multiple values. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
+   */
+  audio_distribution_types?: AudioDistributionType[];
+  /**
    * Declared sponsored-placement types for this product placement, distinguishing where the catalog-driven retail-media placement renders on the retailer surface. Most concrete placements SHOULD declare a single value; aggregate placements MAY declare multiple values. This is seller-declared discovery metadata, not independent verification of inventory quality or delivery context.
    */
   sponsored_placement_types?: SponsoredPlacementType[];
@@ -2881,6 +2905,7 @@ export type UIDType =
   | 'maid'
   | 'hashed_email'
   | 'publisher_first_party'
+  | 'world_id_nullifier'
   | 'other';
 /**
  * Days of the week for daypart targeting
@@ -6297,7 +6322,7 @@ export interface InsertionOrder {
   requires_signature: boolean;
 }
 /**
- * Standard cursor-based pagination metadata for list responses
+ * Cursor metadata for paginated get_products responses. In brief/refine mode, continuation pages bound returned products[] for the seller's curated or refined answer; proposals may accompany a page as plan metadata but are not independently counted by this pagination envelope, and pagination does not convert the response into an exhaustive feed contract. In wholesale mode, continuation pages walk the wholesale product feed.
  */
 export interface PaginationResponse {
   /**
@@ -7174,7 +7199,7 @@ export type FormatOptionReference = PublisherCatalogFormatOptionReference | Prod
  */
 export type Pacing = 'even' | 'asap' | 'front_loaded';
 /**
- * A single optimization target for a package. Packages accept an array of optimization_goals. When multiple goals are present, priority determines which the seller focuses on — 1 is highest priority (primary goal); higher numbers are secondary. Duplicate priority values result in undefined seller behavior.
+ * A single optimization target for a package. Packages accept an array of optimization_goals. When multiple goals are present, priority determines which the seller focuses on — 1 is highest priority (primary goal); higher numbers are secondary. When priorities are present but no goal is priority 1, the goal with the lowest priority value is primary (e.g., priorities of 2 and 3 mean 2 is primary). Duplicate priority values result in undefined seller behavior.
  */
 export type OptimizationGoal =
   | {
@@ -7535,7 +7560,7 @@ export type MoovAtomPosition = 'start' | 'end';
  */
 export type AudioChannelLayout = 'mono' | 'stereo' | '5.1' | '7.1';
 /**
- * VAST (Video Ad Serving Template) tag for third-party video ad serving
+ * VAST (Video Ad Serving Template) tag for third-party video ad serving. Unlike the hosted `video` asset, a VAST tag carries no `width`/`height`: a VAST response can return multiple renditions of differing dimensions, and the player selects one per device at serve time, so there is no single width/height for the ad. Dimensional, duration, and codec *constraints* for a placement live on the format/requirements layer, not on this asset.
  */
 export type VASTAsset = {
   /**
@@ -7572,7 +7597,7 @@ export type VASTAsset = {
        */
       delivery_type: 'url';
       /**
-       * URL endpoint that returns VAST XML
+       * URL endpoint that returns VAST XML. May carry unsubstituted ad-server macros — VAST-style `[MACRO]` and `${MACRO}` placeholders are accepted as-is (RFC 6570 syntax); buyers MUST NOT pre-encode macro delimiters, since players match the literal token at substitution time.
        */
       url: string;
     }
@@ -7685,7 +7710,7 @@ export type DAASTAsset = {
        */
       delivery_type: 'url';
       /**
-       * URL endpoint that returns DAAST XML
+       * URL endpoint that returns DAAST XML. May carry unsubstituted ad-server macros — DAAST/VAST-style `[MACRO]` and `${MACRO}` placeholders are accepted as-is (RFC 6570 syntax); buyers MUST NOT pre-encode macro delimiters, since players match the literal token at substitution time.
        */
       url: string;
     }
@@ -8528,7 +8553,7 @@ export interface CreativeAssignment {
   placement_ids?: string[];
 }
 /**
- * Video asset with URL and technical specifications including audio track properties
+ * A hosted video file delivered directly (e.g., an MP4 you host), with URL and technical specifications including audio track properties. `width` and `height` are required because a hosted video file has intrinsic, native pixel dimensions that are known when the file is created. Tag-delivered video uses the separate `vast` asset, which carries no `width`/`height`: a VAST response resolves geometry per-`MediaFile` at serve time, so there is no single width/height for the ad. Aspect-ratio and size *constraints* (what a placement accepts) belong on the format/requirements layer, not on the asset.
  */
 export interface VideoAsset {
   /**
@@ -8540,12 +8565,12 @@ export interface VideoAsset {
    */
   url: string;
   /**
-   * Width in pixels
+   * Width in pixels — the video file's intrinsic native width. Required: a hosted file always has concrete dimensions. (Tag-delivered video carries no width; see the `vast` asset.)
    * @minimum 1
    */
   width: number;
   /**
-   * Height in pixels
+   * Height in pixels — the video file's intrinsic native height. Required: a hosted file always has concrete dimensions. (Tag-delivered video carries no height; see the `vast` asset.)
    * @minimum 1
    */
   height: number;
@@ -10570,7 +10595,7 @@ export interface UpdateMediaBuySuccess {
   implementation_date?: string | null;
   invoice_recipient?: BusinessEntity;
   /**
-   * Array of packages that were modified with complete state information
+   * For package-level updates, array of full Package objects showing complete post-update state for each directly modified package. This is a state snapshot, not a sparse delta: sellers MUST NOT return package_id-only stubs. Campaign-level updates that do not modify packages may return an empty array.
    */
   affected_packages?: Package[];
   /**
@@ -10778,6 +10803,11 @@ export interface GetMediaBuysResponseMediaBuy {
   account?: Account;
   invoice_recipient?: BusinessEntity;
   status: MediaBuyStatus;
+  /**
+   * ISO 8601 timestamp indicating when the seller last refreshed the returned media-buy-level `status` from its source of truth. Use this to interpret cached or rolled-up list statuses, especially for curator/storefront aggregators where one buyer-facing buy maps to multiple upstream legs. For rolled-up statuses, this timestamp MUST NOT be later than the oldest upstream status observation that could affect the returned roll-up, so it never overstates freshness. Omit or return null to make no freshness assertion; buyers MUST NOT infer that an omitted or null value means the status is live. This is distinct from `updated_at`, which records when the media buy was last modified.
+   * @format date-time
+   */
+  status_as_of?: string | null;
   /**
    * Dependency health of the media buy, orthogonal to `status`. `ok` (default) when no upstream resource that this buy depends on is in an offline state. `impaired` when at least one such resource (audience, creative, catalog_item, event_source, property) is offline and affects delivery for one or more packages — `impairments[]` MUST be non-empty in that case. On terminal-status buys, the seller MAY leave this field in whatever state held at the terminal transition. See lifecycle.mdx § Compliance and the impairment.coherence assertion.
    */
@@ -11641,11 +11671,11 @@ export interface GetMediaBuyDeliveryResponse {
      */
     cost_per_acquisition?: number;
     /**
-     * Aggregate completion rate across all media buys (weighted by impressions, not a simple average of per-buy rates)
+     * Aggregate completion rate across all media buys (weighted by impressions, not a simple average of per-buy rates). Null indicates the metric is not applicable to the aggregated buys (e.g. all non-video inventory).
      * @minimum 0
      * @maximum 1
      */
-    completion_rate?: number;
+    completion_rate?: number | null;
     /**
      * Deduplicated reach across all media buys (if the seller can deduplicate across buys; otherwise sum of per-buy reach). Only present when all media buys share the same reach_unit. Omitted when reach units are heterogeneous — use per-buy reach values instead.
      * @minimum 0
@@ -12020,11 +12050,11 @@ export interface DeliveryMetrics {
    */
   completed_views?: number;
   /**
-   * Completion rate (completed_views/impressions)
+   * Completion rate (completed_views/impressions). Null indicates the metric is not applicable to this package/buy (e.g. completion rate on a non-video buy).
    * @minimum 0
    * @maximum 1
    */
-  completion_rate?: number;
+  completion_rate?: number | null;
   /**
    * Total conversions attributed to this delivery. When by_event_type is present, this equals the sum of all by_event_type[].count entries.
    * @minimum 0
@@ -12139,7 +12169,7 @@ export interface DeliveryMetrics {
    */
   frequency?: number;
   /**
-   * Audio/video quartile completion data
+   * Audio/video quartile completion data. Null indicates the metric is not applicable to this package/buy (e.g. quartile data on a non-video buy).
    */
   quartile_data?: {
     /**
@@ -12162,7 +12192,7 @@ export interface DeliveryMetrics {
      * @minimum 0
      */
     q4_views?: number;
-  };
+  } | null;
   /**
    * DOOH-specific metrics (only included for DOOH campaigns)
    */
@@ -17410,6 +17440,13 @@ export interface ActivateSignalRequest {
    * The pricing option selected from the signal's pricing_options in the get_signals response. Required when the signal has pricing options. Records the buyer's pricing commitment at activation time; pass this same value in report_usage for billing verification.
    */
   pricing_option_id?: string;
+  /**
+   * Opaque governance context returned by check_governance for this signal activation. Required when the account has a registered governance agent; signal agents MUST reject governed activations that omit a valid context.
+   * @minLength 1
+   * @maxLength 4096
+   * @pattern ^[\x20-\x7E]+$
+   */
+  governance_context?: string;
   account?: AccountReference;
   /**
    * Client-generated unique key for this request. Prevents duplicate activations on retries. MUST be unique per (seller, request) pair to prevent cross-seller correlation. Use a fresh UUID v4 for each request.
@@ -18140,6 +18177,8 @@ export type DistributionIdentifierType =
   | 'iheart_id'
   | 'podcast_index_id'
   | 'youtube_channel_id'
+  | 'youtube_channel_handle'
+  | 'youtube_channel_url'
   | 'youtube_playlist_id'
   | 'amazon_title_id'
   | 'roku_channel_id'
@@ -21460,6 +21499,11 @@ export type OfferingAvailabilityStatus =
   | 'region_restricted'
   | 'inactive';
 /**
+ * Declared host-side use mode for this sponsored context.
+ */
+export type SIContextUse = 'presentation_only' | 'comparison_set' | 'reasoning_context';
+
+/**
  * Offering details, availability status, and optionally matching products. Use the offering_token in si_initiate_session for correlation.
  */
 export interface SIGetOfferingResponse {
@@ -21598,6 +21642,7 @@ export interface SIGetOfferingResponse {
      */
     url?: string;
   }[];
+  sponsored_context?: SISponsoredContext;
   /**
    * Total number of products matching the context (may be more than returned in matching_products)
    * @minimum 0
@@ -21615,6 +21660,94 @@ export interface SIGetOfferingResponse {
    * Errors during offering lookup
    */
   errors?: Error[];
+  ext?: ExtensionObject;
+}
+/**
+ * Declaration for the sponsored context carried by this offering response. When present, it applies to the returned offering and matching_products package as a whole unless a future extension narrows the declaration to individual items. Hosts MUST either honor the declared context_use and disclosure_obligation or reject the context before using it.
+ */
+export interface SISponsoredContext {
+  /**
+   * Economic accountability fact: the brand that funded or sponsored this context, with optional account/operator context. This identifies who paid for the sponsored context; it is distinct from the host's later receipt and use commitment.
+   */
+  paying_principal: {
+    brand: BrandReference;
+    /**
+     * Optional seller-assigned account context for the paying principal. This intentionally carries only an account_id so the canonical economic principal remains paying_principal.brand.
+     */
+    account?: {
+      /**
+       * Seller-assigned account identifier for the paying principal.
+       */
+      account_id: string;
+    };
+    /**
+     * Domain of the operator acting for the paying principal, when different from the brand domain.
+     * @pattern ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$
+     */
+    operator?: string;
+    /**
+     * Human-readable label for disclosure rendering. The canonical identity remains the brand/account reference.
+     */
+    display_name?: string;
+  };
+  context_use: SIContextUse;
+  /**
+   * Disclosure obligation the receiving host must either accept and satisfy or reject before using this sponsored context. This is a declared obligation and audit input, not a protocol-level legal determination.
+   */
+  disclosure_obligation: {
+    /**
+     * Whether the declaring party requires disclosure for this sponsored context.
+     */
+    required: boolean;
+    /**
+     * Disclosure label text the host should render when disclosure is required.
+     */
+    label_text?: string;
+    /**
+     * When the disclosure must be presented relative to the sponsored context's influence.
+     */
+    timing?: 'before_use' | 'at_first_influenced_output' | 'near_each_influenced_output';
+    /**
+     * Where the disclosure should appear relative to the affected output.
+     */
+    proximity?: 'session_level' | 'near_rendered_unit' | 'near_influenced_output';
+    /**
+     * Jurisdictions where this declared disclosure obligation applies.
+     */
+    jurisdictions?: {
+      /**
+       * ISO 3166-1 alpha-2 country code.
+       */
+      country: string;
+      /**
+       * Optional sub-national region code.
+       */
+      region?: string;
+      /**
+       * Regulation or policy identifier.
+       */
+      regulation: string;
+    }[];
+  };
+  /**
+   * When this sponsored-context declaration was made.
+   * @format date-time
+   */
+  declared_at?: string;
+  /**
+   * Agent or service that attached the declaration.
+   */
+  declared_by?: {
+    /**
+     * HTTPS URL of the declaring agent or service.
+     * @pattern ^https:\/\/
+     */
+    agent_url?: string;
+    /**
+     * Role of the declaring party.
+     */
+    role: 'brand_agent' | 'seller' | 'network' | 'platform';
+  };
   ext?: ExtensionObject;
 }
 
@@ -21654,6 +21787,7 @@ export interface SIInitiateSessionRequest {
    * Token from si_get_offering response for session continuity. Brand uses this to recall what products were shown to the user, enabling natural references like 'the second one' or 'that blue shoe'.
    */
   offering_token?: string;
+  sponsored_context_receipt?: SISponsoredContextReceipt;
   /**
    * Client-generated unique key for this request. Prevents duplicate session creation on retries. MUST be unique per (seller, request) pair to prevent cross-seller correlation. Use a fresh UUID v4 for each request.
    * @minLength 16
@@ -21828,6 +21962,53 @@ export interface SICapabilities {
    */
   mcp_apps?: boolean;
 }
+/**
+ * Host receipt for sponsored context accepted from a prior si_get_offering response or other pre-session context package. This records the accepted context_use, disclosure commitment, paying_principal, and host receipt for audit.
+ */
+export interface SISponsoredContextReceipt {
+  sponsored_context: SISponsoredContext;
+  /**
+   * Receiving-surface accountability fact: the use mode the host accepted and committed to honor for this sponsored context.
+   */
+  host_receipt: {
+    /**
+     * Whether the host accepted the declared sponsored context for use.
+     */
+    status: 'accepted' | 'rejected';
+    accepted_context_use?: SIContextUse;
+    /**
+     * When the host received the sponsored context.
+     * @format date-time
+     */
+    received_at: string;
+    /**
+     * Host-defined surface or placement where the context was accepted, such as an assistant session, search result page, or comparison module.
+     */
+    host_surface?: string;
+    /**
+     * How the host committed to handle the declared disclosure obligation. Required when host_receipt.status is accepted.
+     */
+    disclosure_commitment?: {
+      /**
+       * Host commitment status for the disclosure obligation. Use accepted when the declaration requires disclosure and the host will satisfy it; use not_required only when the declaration's disclosure_obligation.required is false. A host that will not satisfy a required disclosure rejects the sponsored context.
+       */
+      status: 'accepted' | 'not_required';
+      /**
+       * Disclosure label text the host committed to render, if different from or copied from the declaration.
+       */
+      label_text?: string;
+      /**
+       * Optional host explanation for the disclosure commitment.
+       */
+      notes?: string;
+    };
+    /**
+     * Optional explanation when status is rejected, for example unsupported context_use or inability to satisfy the disclosure obligation.
+     */
+    rejection_reason?: string;
+  };
+  ext?: ExtensionObject;
+}
 
 // si_initiate_session response
 /**
@@ -21901,6 +22082,7 @@ export interface SIInitiateSessionResponse {
     ui_elements?: SIUIElement[];
   };
   negotiated_capabilities?: SICapabilities;
+  sponsored_context?: SISponsoredContext;
   session_status: SISessionStatus;
   /**
    * Session inactivity timeout in seconds. After this duration without a message, the brand agent may terminate the session. Hosts SHOULD warn users before timeout when possible.
@@ -21976,6 +22158,7 @@ export interface SISendMessageRequest {
      */
     payload?: {};
   };
+  sponsored_context_receipt?: SISponsoredContextReceipt;
   context?: ContextObject;
   ext?: ExtensionObject;
 }
@@ -22052,6 +22235,7 @@ export interface SISendMessageResponse {
    * MCP resource URI for hosts with MCP Apps support (e.g., ui://si/session-abc123)
    */
   mcp_resource_uri?: string;
+  sponsored_context?: SISponsoredContext;
   session_status: SISessionStatus;
   /**
    * Handoff request when session_status is pending_handoff
@@ -22473,6 +22657,10 @@ export interface GetAdCPCapabilitiesResponse {
      */
     supports_proposals?: boolean;
     /**
+     * Conformance declaration that this seller consults a registered governance agent (via sync_governance plus an outbound check_governance call) before committing a media buy, and surfaces GOVERNANCE_DENIED when the governance agent denies. A declaration of true opts the seller into governance-denial grading (media_buy_seller/governance_denied, media_buy_seller/governance_denied_recovery). When false or absent, conformance runners skip those storyboards - a seller that does not implement outbound governance consultation is not expected to produce GOVERNANCE_DENIED. This is independent of baseline sync_governance registration, which remains gradeable on its own.
+     */
+    governance_aware?: boolean;
+    /**
      * Where this seller surfaces dependency-resource impairments (creative suspended/rejected post-approval, audience suspended, catalog item withdrawn, event source insufficient, property depublished) to buyers. Non-exclusive: a seller mirroring impairments on both the buy snapshot AND firing webhooks declares `["snapshot", "webhook"]` (the common case for premium guaranteed sellers). Each value names one surface where buyers can observe an impairment:
      *
      * - **`snapshot`** — seller propagates resource transitions into `media_buy.health` and `media_buy.impairments[]` on the next `get_media_buys` read. The `impairment.coherence` compliance assertion grades this surface; storyboards that exercise it (`media_buy_seller/dependency_impairment`, `media_buy_seller/dependency_impairment_cardinality`) require `"snapshot"` to be declared, else they grade `not_applicable`.
@@ -22736,7 +22924,7 @@ export interface GetAdCPCapabilitiesResponse {
       supported_window_units?: string[];
     };
     /**
-     * Content standards implementation details. Presence of this object indicates the seller supports content_standards configuration including sampling rates and category filtering. Gives buyers pre-buy visibility into local evaluation and artifact delivery capabilities.
+     * Content standards implementation details. Presence of this object indicates the seller supports content_standards configuration including sampling rates and category filtering. Gives buyers pre-buy visibility into local evaluation and artifact delivery capabilities. This is a seller-side media-buy capability; governance agents providing content standards services declare `specialisms: ["content-standards"]` instead.
      */
     content_standards?: {
       /**
@@ -23122,7 +23310,7 @@ export interface GetAdCPCapabilitiesResponse {
      */
     per_principal_key_isolation?: boolean;
     /**
-     * Map of signing-key purpose → publishing origin, so counterparties can verify origin separation (e.g., governance keys served from a separate origin than transport/webhook keys) at onboarding. Absent means the operator has not declared a separation scheme; receivers SHOULD assume shared-origin. Every purpose listed MUST have a corresponding signing posture declared elsewhere — `request_signing` requires non-empty `request_signing.supported_for`/`required_for`/`protocol_methods_supported_for`/`protocol_methods_required_for`; `webhook_signing` requires `webhook_signing.supported === true` — otherwise the consistency check at signature-verification time has nothing to anchor against. See `x-adcp-validation` and docs/building/implementation/security.mdx §Origin separation.
+     * Map of signing-key surface/purpose → publishing origin, so counterparties can verify origin separation (e.g., governance keys served from a separate origin than transport/webhook keys) at onboarding. Absent means the operator has not declared a separation scheme; receivers SHOULD assume shared-origin. Every entry listed MUST have a corresponding signing posture declared elsewhere — `request_signing` requires non-empty `request_signing.supported_for`/`required_for`/`protocol_methods_supported_for`/`protocol_methods_required_for`; `webhook_signing` requires `webhook_signing.supported === true` and names the webhook delivery surface, not a required live `adcp_use: "webhook-signing"` key purpose — otherwise the consistency check at signature-verification time has nothing to anchor against. See `x-adcp-validation` and docs/building/implementation/security.mdx §Origin separation.
      */
     key_origins?: {
       /**
@@ -23134,7 +23322,7 @@ export interface GetAdCPCapabilitiesResponse {
        */
       request_signing?: string;
       /**
-       * Origin (scheme + host) serving the webhook-signing JWKS.
+       * Origin (scheme + host) serving the JWKS used for webhook delivery. Webhooks are signed with `adcp_use: "request-signing"` keys; the deprecated `adcp_use: "webhook-signing"` value remains accepted during the backward-compatibility window.
        */
       webhook_signing?: string;
       /**
@@ -24591,7 +24779,7 @@ export interface ProvisioningMode {
   /**
    * Account-level webhook subscriptions for notifications whose lifecycle outlives any single media buy (`creative.status_changed`, `creative.purged`, wholesale feed change payloads, future account-anchored resource events after those event types are added to `notification-type.json`). This surface does not currently carry lifecycle events for the account object itself (for example, there is no `account.status_changed` event type); account status changes are observed through `list_accounts` polling or the one-shot `sync_accounts.push_notification_config` async result channel. Declarative replace semantics: when this field is present, the buyer sends the full desired array and the seller replaces the account's current set with that array, keyed by account-scoped `subscriber_id`. Omit this field to leave existing subscribers unchanged; send `[]` to remove all subscribers. Re-sending an existing `subscriber_id` for the account replaces that subscriber's config rather than creating a duplicate; persisted entries whose `subscriber_id` does not appear in the sent array are removed, so the seller MUST NOT merge the new array with persisted state. Paused entries (`active: false`) use the same replacement semantics; a buyer that wants to preserve a paused subscriber MUST re-include it with `active: false`. Duplicate `subscriber_id` values within one submitted array are rejected. Permitted in both provisioning and settings-update modes. Each entry registers a URL, the event types the subscriber wants, and optional legacy auth — see [`notification-config.json`](/schemas/core/notification-config.json). The seller MUST echo applied state on the response and on `list_accounts` reads, with `authentication.credentials` omitted (write-only). Sellers MUST reject entries whose `event_types` include any type whose contract anchors at a media buy or below (today: `scheduled`, `final`, `delayed`, `adjusted`, `impairment`) or account-lifecycle names not present in the enum as per-account validation failures with `INVALID_REQUEST` or `VALIDATION_ERROR` and `error.field` pointing at the invalid `event_types` entry — those events do not belong on this surface. Wholesale feed webhook registrations carry the actual change payload in `/schemas/core/wholesale-feed-webhook.json`; receivers use `get_products` / `get_signals` with `if_wholesale_feed_version` to repair or reconcile. This is distinct from sync_catalogs, which manages buyer-provided campaign input feeds on a seller account.
    *
-   * Activation proof: before activating a new or changed active subscriber, the seller MUST validate the URL, complete the account-level webhook proof-of-control challenge, and only then persist or expose the subscriber as `active: true`. A valid existing proof for the same `(account_id, subscriber_id, normalized url, authentication mode/credential binding, normalized event_types)` tuple MAY be reused; changing any element of that tuple requires fresh proof. The challenge POST itself MUST be signed with the seller's RFC 9421 webhook-signing key and MUST include seller_agent_url, delivery_auth, and event_types so the receiver can verify the pending registration before echoing the challenge. Entries sent with `active: false` may skip only the outbound proof challenge while inactive; sellers MUST still enforce URL parsing, HTTPS, hostname normalization, and reserved-range rejection at write time, and those entries MUST NOT receive fires until reactivated. If proof fails or times out, the seller rejects the account entry with `action: "failed"`, leaves the prior notification_configs[] set unchanged, and reports `VALIDATION_ERROR` (or `INVALID_REQUEST` for malformed URLs) at the failing `notification_configs[j].url` field.
+   * Activation proof: before activating a new or changed active subscriber, the seller MUST validate the URL, complete the account-level webhook proof-of-control challenge, and only then persist or expose the subscriber as `active: true`. A valid existing proof for the same `(account_id, subscriber_id, normalized url, authentication mode/credential binding, normalized event_types)` tuple MAY be reused; changing any element of that tuple requires fresh proof. The challenge POST itself MUST be signed with the seller's RFC 9421 webhook profile key and MUST include seller_agent_url, delivery_auth, and event_types so the receiver can verify the pending registration before echoing the challenge. New signers use `adcp_use: "request-signing"`; deprecated `webhook-signing` keys remain accepted during the compatibility window. Entries sent with `active: false` may skip only the outbound proof challenge while inactive; sellers MUST still enforce URL parsing, HTTPS, hostname normalization, and reserved-range rejection at write time, and those entries MUST NOT receive fires until reactivated. If proof fails or times out, the seller rejects the account entry with `action: "failed"`, leaves the prior notification_configs[] set unchanged, and reports `VALIDATION_ERROR` (or `INVALID_REQUEST` for malformed URLs) at the failing `notification_configs[j].url` field.
    *
    * **Cap rationale:** `maxItems: 16` is a practical fan-out cap (governance + buyer ingestion + audit bus + dx team + a few partner hooks). The cap exists to prevent unbounded subscriber arrays in storage and to bound the seller's per-event fan-out work. Sellers that hit the cap with legitimate subscribers should surface this on the protocol roadmap rather than work around it.
    */
@@ -24612,7 +24800,7 @@ export interface SettingsUpdateMode {
   /**
    * Account-level webhook subscriptions for notifications whose lifecycle outlives any single media buy (`creative.status_changed`, `creative.purged`, wholesale feed change payloads, future account-anchored resource events after those event types are added to `notification-type.json`). This surface does not currently carry lifecycle events for the account object itself (for example, there is no `account.status_changed` event type); account status changes are observed through `list_accounts` polling or the one-shot `sync_accounts.push_notification_config` async result channel. Declarative replace semantics: when this field is present, the buyer sends the full desired array and the seller replaces the account's current set with that array, keyed by account-scoped `subscriber_id`. Omit this field to leave existing subscribers unchanged; send `[]` to remove all subscribers. Re-sending an existing `subscriber_id` for the account replaces that subscriber's config rather than creating a duplicate; persisted entries whose `subscriber_id` does not appear in the sent array are removed, so the seller MUST NOT merge the new array with persisted state. Paused entries (`active: false`) use the same replacement semantics; a buyer that wants to preserve a paused subscriber MUST re-include it with `active: false`. Duplicate `subscriber_id` values within one submitted array are rejected. Permitted in both provisioning and settings-update modes. Each entry registers a URL, the event types the subscriber wants, and optional legacy auth — see [`notification-config.json`](/schemas/core/notification-config.json). The seller MUST echo applied state on the response and on `list_accounts` reads, with `authentication.credentials` omitted (write-only). Sellers MUST reject entries whose `event_types` include any type whose contract anchors at a media buy or below (today: `scheduled`, `final`, `delayed`, `adjusted`, `impairment`) or account-lifecycle names not present in the enum as per-account validation failures with `INVALID_REQUEST` or `VALIDATION_ERROR` and `error.field` pointing at the invalid `event_types` entry — those events do not belong on this surface. Wholesale feed webhook registrations carry the actual change payload in `/schemas/core/wholesale-feed-webhook.json`; receivers use `get_products` / `get_signals` with `if_wholesale_feed_version` to repair or reconcile. This is distinct from sync_catalogs, which manages buyer-provided campaign input feeds on a seller account.
    *
-   * Activation proof: before activating a new or changed active subscriber, the seller MUST validate the URL, complete the account-level webhook proof-of-control challenge, and only then persist or expose the subscriber as `active: true`. A valid existing proof for the same `(account_id, subscriber_id, normalized url, authentication mode/credential binding, normalized event_types)` tuple MAY be reused; changing any element of that tuple requires fresh proof. The challenge POST itself MUST be signed with the seller's RFC 9421 webhook-signing key and MUST include seller_agent_url, delivery_auth, and event_types so the receiver can verify the pending registration before echoing the challenge. Entries sent with `active: false` may skip only the outbound proof challenge while inactive; sellers MUST still enforce URL parsing, HTTPS, hostname normalization, and reserved-range rejection at write time, and those entries MUST NOT receive fires until reactivated. If proof fails or times out, the seller rejects the account entry with `action: "failed"`, leaves the prior notification_configs[] set unchanged, and reports `VALIDATION_ERROR` (or `INVALID_REQUEST` for malformed URLs) at the failing `notification_configs[j].url` field.
+   * Activation proof: before activating a new or changed active subscriber, the seller MUST validate the URL, complete the account-level webhook proof-of-control challenge, and only then persist or expose the subscriber as `active: true`. A valid existing proof for the same `(account_id, subscriber_id, normalized url, authentication mode/credential binding, normalized event_types)` tuple MAY be reused; changing any element of that tuple requires fresh proof. The challenge POST itself MUST be signed with the seller's RFC 9421 webhook profile key and MUST include seller_agent_url, delivery_auth, and event_types so the receiver can verify the pending registration before echoing the challenge. New signers use `adcp_use: "request-signing"`; deprecated `webhook-signing` keys remain accepted during the compatibility window. Entries sent with `active: false` may skip only the outbound proof challenge while inactive; sellers MUST still enforce URL parsing, HTTPS, hostname normalization, and reserved-range rejection at write time, and those entries MUST NOT receive fires until reactivated. If proof fails or times out, the seller rejects the account entry with `action: "failed"`, leaves the prior notification_configs[] set unchanged, and reports `VALIDATION_ERROR` (or `INVALID_REQUEST` for malformed URLs) at the failing `notification_configs[j].url` field.
    *
    * **Cap rationale:** `maxItems: 16` is a practical fan-out cap (governance + buyer ingestion + audit bus + dx team + a few partner hooks). The cap exists to prevent unbounded subscriber arrays in storage and to bound the seller's per-event fan-out work. Sellers that hit the cap with legitimate subscribers should surface this on the protocol roadmap rather than work around it.
    */

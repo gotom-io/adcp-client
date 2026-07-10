@@ -13,20 +13,60 @@ export {
 export type {
   RegistrySyncConfig,
   RegistrySyncState,
+  RegistrySyncTransport,
   RegistrySyncEvents,
   AgentFilter,
+  RegistrySyncProperty,
   CursorStore,
   PropertyRegistryConfig,
+  FeedStreamQuery,
+  FeedStreamMessage,
+  FeedHeartbeat,
+  FeedStreamErrorData,
+  OpenFeedStreamOptions,
+  FeedFreshness,
+} from './registry';
+export {
+  openFeedStream,
+  parseSseStream,
+  sanitizeStreamText,
+  DEFAULT_MAX_SSE_FRAME_BYTES,
+  FeedStreamError,
+  FeedStreamUnsupportedError,
+  FeedStreamCursorExpiredError,
+  FeedStreamHttpError,
+  FeedStreamParseError,
 } from './registry';
 export type {
   ResolvedBrand,
+  BrandHierarchyResolution,
+  BrandHierarchyBulkResolution,
+  ResolveBrandHierarchyOptions,
   ResolvedProperty as ResolvedRegistryProperty,
   PropertyInfo,
   RegistryClientConfig,
   SaveBrandRequest,
   SaveBrandResponse,
+  BrandLogoReviewStatus,
+  ApprovedBrandLogoAsset,
+  PendingBrandLogoAsset,
+  ReviewedBrandLogoAsset,
+  BrandLogoAsset,
+  ListBrandLogosOptions,
+  ListBrandLogosResponse,
+  SaveBrandLogoInput,
+  SaveBrandLogoResponse,
+  UploadBrandLogoInput,
+  UploadBrandLogoResponse,
+  SavePropertyIdentity,
+  RegistryPropertyIdentity,
   SavePropertyRequest,
   SavePropertyResponse,
+  ResolveIdentifiersRequest,
+  ResolveIdentifiersResponse,
+  FileCatalogDisputeRequest,
+  FileCatalogDisputeResponse,
+  GetCatalogDisputeResponse,
   BrandRegistryItem,
   PropertyRegistryItem,
   ValidationResult as RegistryValidationResult,
@@ -34,11 +74,14 @@ export type {
   FederatedPublisher,
   DomainLookupResult,
   ListBrandsOptions,
+  ListBrandsResponse,
+  GetBrandJsonResponse,
   ListOptions,
   ListAgentsOptions,
   ListAgentsResponse,
   ListPublishersResponse,
   ValidateAdagentsRequest,
+  ValidateAdagentsResponse,
   CreateAdagentsRequest,
   CreateAdagentsResponse,
   AdagentsAuthorizedAgent,
@@ -61,6 +104,8 @@ export type {
   PublisherPropertySelector,
   CompanySearchResult,
   FindCompanyResult,
+  ManagerRevalidationRequest,
+  ManagerRevalidationResponse,
   ListPoliciesQuery,
   ListPoliciesResponse,
   ResolvePolicyQuery,
@@ -75,6 +120,17 @@ export type {
   GetBrandHistoryResponse,
   GetPropertyHistoryQuery,
   GetPropertyHistoryResponse,
+  RegistryFeedEvent,
+  AgentEventPayload,
+  PropertyEventPayload,
+  CollectionEventPayload,
+  AuthorizationEventPayload,
+  PublisherEventPayload,
+  BrandEventPayload,
+  CatalogBrowseResponse,
+  CatalogBrowseEntry,
+  CatalogSyncResponse,
+  CatalogSyncEntry,
   AgentCompliance,
   AgentComplianceDetail,
   StoryboardStatus,
@@ -90,6 +146,8 @@ export {
   COMMON_LOGO_SLOTS,
   applyBrandAssetMappings,
   checkLogoSlotCoverage,
+  extractBrandWebsiteAliasDomains,
+  extractBrandWebsiteAliases,
   selectLogoForSlot,
   updateBrandJsonFromMappings,
   validateBrandAssetMappings,
@@ -106,11 +164,15 @@ export type {
   BrandAssetMappingTarget,
   BrandAssetMappingValidationResult,
   BrandAssetReviewStatus,
+  BrandWebsiteAlias,
+  BrandWebsiteAliasRelationship,
+  BrandWebsiteAliasSource,
   BrandJsonRecord,
   BrandLogoBackground,
   BrandLogoOrientation,
   BrandLogoProposal,
   BrandLogoVariant,
+  ExtractBrandWebsiteAliasesOptions,
   LogoSelectionOptions,
   LogoSlotCoverage,
   LogoSlotCoverageOptions,
@@ -177,6 +239,7 @@ export {
 export {
   resolveAgentProperties,
   listAgentPropertyMap,
+  getAllProperties,
   canonicalizeAgentUrl,
   type ResolvedAgentScope,
   type ResolveUnresolvableReason,
@@ -737,6 +800,7 @@ export type {
   SyncCatalogsError,
   // Format Assets
   Overlay,
+  Placement,
   // Creative Agent Domain
   CreativeManifest,
   CreativeVariable,
@@ -1157,9 +1221,17 @@ export {
   closeMCPConnections,
   closeOAuthConnections,
   bundleSupportsAdcpVersionField,
+  sanitizeTransportHeaders,
+  sanitizeTransportUrl,
 } from './protocols';
 export { toReleasePrecisionWire, validateAdcpVersionWire } from './validation/schema-loader';
-export type { CallToolOptions, TransportOptions } from './protocols';
+export type {
+  CallToolOptions,
+  TransportActivity,
+  TransportActivityContext,
+  TransportActivityHandler,
+  TransportOptions,
+} from './protocols';
 
 // ====== WIRE VERSION HELPERS (NAMESPACE) ======
 // Grouped re-exports of the three AdCP `adcp_version` envelope helpers
@@ -1186,7 +1258,9 @@ export {
   hasAdvisorySuccessPayload,
   getAuthoritativeMediaBuyStatus,
   isMediaBuyStatus,
+  resolveTaskState,
 } from './utils';
+export type { EffectiveTaskState, ResolvedTaskState, ResolveTaskStateOptions } from './utils';
 export { injectLegacyEnvelopeStatus } from './utils/envelope-status-compat';
 export { extractResult, type ToolCallResultLike } from './utils';
 export { REQUEST_TIMEOUT, MAX_CONCURRENT, STANDARD_FORMATS } from './utils';
@@ -1333,17 +1407,25 @@ export {
 export {
   augmentProductWithFormatOptions,
   withFormatOptions,
+  toCanonicalOnlyProduct,
+  toCanonicalOnlyResponse,
   packageRefsForCapabilities,
   legacyFormatIdsFromOptions,
   tryLegacyFormatIdsFromOptions,
   legacyFormatIdsForCapability,
+  canonicalDeclarationFromBareId,
+  resolveCanonicalFormatKind,
   CapabilityIdsLookupError,
+  type BareFormatIdResolveOptions,
+  type CanonicalOnlyProduct,
   type CapabilityIdsLookupErrorCode,
   type PackageFormatRefs,
   type ProjectionDiagnostic,
   type V1FormatId,
   type V1Product,
+  type V2AugmentedProduct,
   type V2Product,
+  type V2ProductFormatDeclaration,
 } from './v2/projection';
 
 // ====== ACTIVATION KEY BUILDERS ======
@@ -1680,6 +1762,7 @@ export {
   equalUnderHexCasePolicy,
   isUnreservedOnly,
   divergenceOffset,
+  translateUniversalMacros,
 } from './substitution';
 export type {
   ObserverFetchOptions,
@@ -1693,6 +1776,8 @@ export type {
   PolicyResult as SubstitutionPolicyResult,
   SsrfPolicy,
   TrackerUrlRecord,
+  MacroMapping,
+  TranslateResult,
 } from './substitution';
 
 // ====== TEST HELPERS ======

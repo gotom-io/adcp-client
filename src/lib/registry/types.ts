@@ -7,12 +7,10 @@
 
 // Re-export generated component schema types
 export type {
-  ResolvedBrand,
   LocalizedName,
   BrandRegistryItem,
   ResolvedProperty,
   PropertyIdentifier,
-  PropertyRegistryItem,
   ValidationResult,
   RegistryError,
   PublisherPropertySelector,
@@ -28,8 +26,14 @@ export type {
   PolicySummary,
   Policy,
   PolicyHistory,
-  CatalogEvent,
-  FeedResponse,
+  RegistryFeedEvent,
+  CollectionEventPayload,
+  AuthorizationEventPayload,
+  PublisherEventPayload,
+  CatalogBrowseResponse,
+  CatalogBrowseEntry,
+  CatalogSyncResponse,
+  CatalogSyncEntry,
   AgentInventoryProfile,
   AgentSearchResult,
   AgentSearchResponse,
@@ -57,6 +61,16 @@ export type { paths, operations, components } from './types.generated';
 // Types extracted from inline OpenAPI operation schemas
 
 import type {
+  CatalogEvent as GeneratedCatalogEvent,
+  FeedResponse as GeneratedFeedResponse,
+  ResolvedBrand as GeneratedResolvedBrand,
+  ResolvedProperty as GeneratedResolvedProperty,
+  PropertyRegistryItem as GeneratedPropertyRegistryItem,
+  AgentEventPayload as GeneratedAgentEventPayload,
+  PropertyEventPayload as GeneratedPropertyEventPayload,
+  BrandEventPayload as GeneratedBrandEventPayload,
+  AgentCompliance as GeneratedAgentCompliance,
+  AgentInventoryProfile as GeneratedAgentInventoryProfile,
   operations,
   CommunityMirrorListResponse,
   CommunityMirrorSummary,
@@ -66,7 +80,107 @@ import type {
   CommunityMirrorPublishRequest,
   CommunityMirrorDeleteResponse,
 } from './types.generated';
+import type { PropertyIdentifierType, PropertyType } from '../discovery/types';
 import type { MediaChannel, ProductFormatDeclaration } from '../types/tools.generated';
+
+export type AgentEventPayload = Omit<GeneratedAgentEventPayload, 'inventory_profile' | 'compliance_summary'> & {
+  /** On agent.profile_updated: the agent's refreshed inventory profile. */
+  inventory_profile?: GeneratedAgentInventoryProfile;
+  compliance_summary?: GeneratedAgentCompliance;
+};
+
+export type PropertyEventPayload = Omit<GeneratedPropertyEventPayload, 'property'> & {
+  /** Optional full post-change property object when available. */
+  property?: GeneratedResolvedProperty | RegistryPropertyIdentity;
+};
+
+export type BrandEventPayload = Omit<GeneratedBrandEventPayload, 'chain'> & {
+  /** On brand.resolved/hierarchy_updated: the resolved brand chain. */
+  chain?: ResolvedBrand[];
+};
+
+type RegistryFeedEventBase<TEventType extends string, TPayload> = {
+  event_id: string;
+  event_type: TEventType;
+  entity_type: string;
+  entity_id: string;
+  payload: TPayload;
+  actor: string;
+  created_at: string;
+};
+
+export type RegistryBrandEventType =
+  | 'brand.hierarchy_updated'
+  | 'brand.updated'
+  | 'brand.resolved'
+  | 'brand.removed'
+  | 'brand.deleted';
+
+/** Brand feed events emitted by older/self-hosted registry deployments. */
+export type RegistryBrandEvent = RegistryFeedEventBase<RegistryBrandEventType, BrandEventPayload>;
+
+/** Forward-compatible feed event shape for event types newer than this SDK. */
+export type UnknownRegistryFeedEvent = RegistryFeedEventBase<string, Record<string, unknown>>;
+
+/**
+ * SDK-facing registry feed event.
+ *
+ * The generated `RegistryFeedEvent` export mirrors the current OpenAPI union.
+ * `CatalogEvent` stays intentionally wider because RegistrySync accepts
+ * older/self-hosted brand events and must ignore future event types safely.
+ * Consumers should keep a default switch arm: the catch-all event type is
+ * intentionally non-exhaustive for forward compatibility.
+ */
+export type CatalogEvent = GeneratedCatalogEvent | RegistryBrandEvent | UnknownRegistryFeedEvent;
+
+/** Full response from GET /api/registry/feed, using the SDK-facing event union. */
+export type FeedResponse = Omit<GeneratedFeedResponse, 'events'> & {
+  events: CatalogEvent[];
+};
+
+/**
+ * Brand identity returned by the registry resolver.
+ *
+ * `parent_brand` is a registry hierarchy reference. New registry responses use
+ * the parent brand's canonical domain when the parent has one; older rows may
+ * still carry a portfolio-internal brand id from `brand.json#/brands[].id`.
+ * Consumers that need ancestry should use `RegistrySync.getAncestors()` rather
+ * than walking `parent_brand` directly.
+ */
+export interface ResolvedBrand extends Omit<GeneratedResolvedBrand, 'parent_brand'> {
+  parent_brand?: string;
+}
+
+/**
+ * Ordered corporate brand hierarchy for a domain, from self to house.
+ *
+ * This is retained for SDK compatibility with older/self-hosted registry
+ * deployments. AdCP 3.1.1 removed the hierarchy endpoints from the public
+ * registry OpenAPI; new ancestry consumers should prefer `RegistrySync`.
+ */
+export interface BrandHierarchyResolution {
+  chain: ResolvedBrand[];
+}
+
+/**
+ * Bulk ordered corporate brand hierarchy result keyed by the requested domain.
+ *
+ * Retained for SDK compatibility with older/self-hosted registry deployments.
+ */
+export interface BrandHierarchyBulkResolution {
+  results: Record<string, BrandHierarchyResolution | null>;
+}
+
+/** Options for client-side brand hierarchy resolution caching. */
+export interface ResolveBrandHierarchyOptions {
+  /**
+   * Cache this resolution in-memory for the provided number of milliseconds.
+   * Omit or set to `0` to bypass the SDK cache.
+   */
+  ttlMs?: number;
+  /** Force a registry read and refresh any matching cache entry. */
+  fresh?: boolean;
+}
 
 /** Request body for POST /api/brands/save */
 export type SaveBrandRequest = NonNullable<operations['saveBrand']['requestBody']>['content']['application/json'];
@@ -74,16 +188,111 @@ export type SaveBrandRequest = NonNullable<operations['saveBrand']['requestBody'
 /** Response from POST /api/brands/save (200) */
 export type SaveBrandResponse = operations['saveBrand']['responses']['200']['content']['application/json'];
 
+type RegistrySavePropertyRequest = NonNullable<
+  operations['saveProperty']['requestBody']
+>['content']['application/json'];
+
+// TODO(#2318): Once the official registry OpenAPI publishes saveProperty
+// identity facts, regenerate the registry types and collapse these hand-written
+// write types onto the generated request shape, or assert they are structurally equal.
+type SavePropertyIdentityBase = {
+  /** Human-readable property name. */
+  name: string;
+  /** Register this property by known identifiers such as domain, bundle id, or app-store id. */
+  identifiers?: { type: PropertyIdentifierType; value: string }[];
+  /** Tags used by downstream `by_tag` property selection. */
+  tags?: string[];
+};
+
+/** Property identity accepted by POST /api/properties/save. */
+export type SavePropertyIdentity = SavePropertyIdentityBase &
+  (
+    | {
+        /** Preferred field name, aligned with adagents.json property declarations. */
+        property_type: PropertyType;
+        /** Current registry wire field; emitted alongside `property_type` while the OpenAPI catches up. */
+        type?: PropertyType | string;
+      }
+    | {
+        /** Current registry wire field; accepts custom/self-hosted registry values for compatibility. */
+        type: PropertyType | string;
+        property_type?: PropertyType;
+      }
+  );
+
+/** Property identity facts returned by registry property read/list APIs. */
+export type RegistryPropertyIdentity = {
+  /** Stable property identifier when the registry has assigned one. */
+  id?: string;
+  /** Preferred field name, aligned with adagents.json property declarations. */
+  property_type?: PropertyType;
+  /** Legacy read/write alias for `property_type`. */
+  type?: PropertyType | string;
+  /** Human-readable property name. */
+  name?: string;
+  /** Known identifiers such as domain, bundle id, or app-store id. */
+  identifiers?: { type: PropertyIdentifierType; value: string }[];
+  /** Tags used by downstream `by_tag` property selection. */
+  tags?: string[];
+};
+
+/** Property registry list item, including identity facts when returned by the registry. */
+export type PropertyRegistryItem = GeneratedPropertyRegistryItem & {
+  properties?: RegistryPropertyIdentity[];
+};
+
 /** Request body for POST /api/properties/save */
-export type SavePropertyRequest = NonNullable<operations['saveProperty']['requestBody']>['content']['application/json'];
+export type SavePropertyRequest = Omit<RegistrySavePropertyRequest, 'authorized_agents' | 'properties'> & {
+  /** Ignored by the registry client; identity-only property saves always write `authorized_agents: []`. */
+  authorized_agents?: [];
+  properties?: SavePropertyIdentity[];
+};
 
 /** Response from POST /api/properties/save (200) */
 export type SavePropertyResponse = operations['saveProperty']['responses']['200']['content']['application/json'];
+
+type RegistryResolveIdentifiersRequest = NonNullable<
+  operations['resolveIdentifiers']['requestBody']
+>['content']['application/json'];
+
+/** Request body for POST /api/registry/resolve. `mode` defaults to `resolve` server-side. */
+export type ResolveIdentifiersRequest = Omit<RegistryResolveIdentifiersRequest, 'mode'> & {
+  mode?: RegistryResolveIdentifiersRequest['mode'];
+};
+
+/** Response from POST /api/registry/resolve (200) */
+export type ResolveIdentifiersResponse =
+  operations['resolveIdentifiers']['responses']['200']['content']['application/json'];
+
+/** Request body for POST /api/registry/catalog/disputes */
+export type FileCatalogDisputeRequest = NonNullable<
+  operations['fileCatalogDispute']['requestBody']
+>['content']['application/json'];
+
+/** Response from POST /api/registry/catalog/disputes (200) */
+export type FileCatalogDisputeResponse =
+  operations['fileCatalogDispute']['responses']['200']['content']['application/json'];
+
+/** Response from GET /api/registry/catalog/disputes/{id} (200) */
+export type GetCatalogDisputeResponse =
+  operations['getCatalogDispute']['responses']['200']['content']['application/json'];
+
+/** Response from POST /api/properties/hosted/{domain}/claim (200) */
+export type ClaimHostedPropertyDomainResponse =
+  operations['claimHostedPropertyDomain']['responses']['200']['content']['application/json'];
+
+/** Response from POST /api/properties/hosted/{domain}/verify-origin (200) */
+export type VerifyHostedPropertyOriginResponse =
+  operations['verifyHostedPropertyOrigin']['responses']['200']['content']['application/json'];
 
 /** Request body for POST /api/adagents/validate */
 export type ValidateAdagentsRequest = NonNullable<
   operations['validateAdagents']['requestBody']
 >['content']['application/json'];
+
+/** Response from POST /api/adagents/validate (200) */
+export type ValidateAdagentsResponse =
+  operations['validateAdagents']['responses']['200']['content']['application/json'];
 
 /** Request body for POST /api/adagents/create */
 type RegistryCreateAdagentsRequest = NonNullable<
@@ -255,6 +464,12 @@ export type ExpandProductIdentifiersRequest = NonNullable<
 /** Query parameters for GET /api/brands/registry */
 export type ListBrandsOptions = NonNullable<operations['listBrands']['parameters']['query']>;
 
+/** Response from GET /api/brands/registry (200) */
+export type ListBrandsResponse = operations['listBrands']['responses']['200']['content']['application/json'];
+
+/** Response from GET /api/brands/brand-json (200) */
+export type GetBrandJsonResponse = operations['getBrandJson']['responses']['200']['content']['application/json'];
+
 /** Query parameters for GET /api/registry/agents */
 export type ListAgentsQuery = NonNullable<operations['listAgents']['parameters']['query']>;
 
@@ -289,6 +504,15 @@ export type AgentSearchQuery = NonNullable<operations['searchAgentProfiles']['pa
 
 /** Request body for POST /api/registry/crawl-request */
 export type CrawlRequest = NonNullable<operations['requestCrawl']['requestBody']>['content']['application/json'];
+
+/** Request body for POST /api/registry/manager-revalidation-request */
+export type ManagerRevalidationRequest = NonNullable<
+  operations['requestManagerRevalidation']['requestBody']
+>['content']['application/json'];
+
+/** Response from POST /api/registry/manager-revalidation-request (202) */
+export type ManagerRevalidationResponse =
+  operations['requestManagerRevalidation']['responses']['202']['content']['application/json'];
 
 /** Query parameters for GET /api/policies/registry */
 export type ListPoliciesQuery = NonNullable<operations['listPolicies']['parameters']['query']>;
@@ -351,6 +575,109 @@ export interface ComplianceChangedPayload {
   current_status: import('./types.generated').AgentCompliance['status'];
   compliance_summary?: import('./types.generated').AgentCompliance;
 }
+
+// ====== Brand logo asset types ======
+
+/** Review status for a brand logo asset in the AAO registry. */
+export type BrandLogoReviewStatus = 'approved' | 'pending' | 'rejected' | 'deleted';
+
+type BrandLogoAssetBase = {
+  /** Registry-assigned stable asset ID. */
+  id: string;
+  /** Asset MIME type, for example `image/svg+xml` or `image/png`. */
+  content_type: string;
+  /** Registry source, for example `brandfetch` or `community`. */
+  source: string;
+  /** Caller- or registry-assigned asset tags. */
+  tags: string[];
+  /** Legacy relative asset URL, when returned by AAO. */
+  legacy_url?: string;
+  /** Pixel width for raster assets, when known. */
+  width?: number;
+  /** Pixel height for raster assets, when known. */
+  height?: number;
+};
+
+/** Approved brand logo assets are ready to reference from brand.json. */
+export type ApprovedBrandLogoAsset = BrandLogoAssetBase & {
+  review_status: 'approved';
+  url: string;
+};
+
+/**
+ * Pending community logo assets are still under review and must not be treated
+ * as brand.json-ready until a later list call returns them as approved.
+ */
+export type PendingBrandLogoAsset = BrandLogoAssetBase & {
+  review_status: 'pending';
+  url?: string;
+  message?: string;
+  review_sla_hours?: number;
+};
+
+/** Review-only logo assets that are no longer eligible for public brand.json use. */
+export type ReviewedBrandLogoAsset = BrandLogoAssetBase & {
+  review_status: 'rejected' | 'deleted';
+  url?: string;
+};
+
+/**
+ * A logo asset returned by AAO brand-logo endpoints.
+ *
+ * @remarks
+ * These endpoints are not yet present in the generated registry OpenAPI
+ * types, so this hand-rolled shape mirrors the current AAO response contract.
+ */
+export type BrandLogoAsset = ApprovedBrandLogoAsset | PendingBrandLogoAsset | ReviewedBrandLogoAsset;
+
+/** Response from GET /api/brands/:domain/logos. */
+export interface ListBrandLogosResponse {
+  domain?: string;
+  assets: BrandLogoAsset[];
+  stats?: Record<string, unknown>;
+  /** @deprecated Use `assets`. Preserved for older AAO responses and callers. */
+  logos?: BrandLogoAsset[];
+}
+
+/** Options for listing brand logo assets. */
+export interface ListBrandLogosOptions {
+  /** Optional tag filters, serialized as a comma-separated `tags` query parameter. */
+  tags?: string[];
+}
+
+/** Input for POST /api/brands/:domain/logos. */
+export interface SaveBrandLogoInput {
+  domain: string;
+  data: Blob | Buffer | ArrayBuffer | ArrayBufferView;
+  filename: string;
+  mimeType: string;
+  tags: string[];
+  note?: string;
+}
+
+/** @deprecated Use `SaveBrandLogoInput`. */
+export type UploadBrandLogoInput = SaveBrandLogoInput;
+
+/**
+ * Response from POST /api/brands/:domain/logos.
+ *
+ * @remarks
+ * These endpoints are not yet present in the generated registry OpenAPI
+ * types, so this hand-rolled shape mirrors the current AAO response contract.
+ */
+export type SaveBrandLogoResponse = {
+  success?: boolean;
+  domain: string;
+  logo_id: string;
+  review_status: BrandLogoReviewStatus;
+  url?: string;
+  legacy_url?: string;
+  message?: string;
+  review_sla_hours?: number;
+};
+
+/** @deprecated Use `SaveBrandLogoResponse`. */
+export type UploadBrandLogoResponse = SaveBrandLogoResponse;
 
 // ====== Backward compatibility ======
 

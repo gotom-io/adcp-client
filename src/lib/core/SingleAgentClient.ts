@@ -6,6 +6,8 @@ import type { AgentConfig } from '../types';
 import { ADCP_ENVELOPE_FIELDS } from '../types/adcp';
 import { parseAdcpMajorVersion, type AdcpVersion } from '../version';
 import { isAdcpVersionSupported, isPre31AdcpVersion, resolveAdcpVersion } from '../utils/adcp-version-config';
+import { getVersionAdapter, resolveAdapterKey } from '../adapters/version';
+import { schemaAllowsTopLevelField } from '../validation/schema-loader';
 import type {
   GetProductsRequest,
   GetProductsResponse,
@@ -87,6 +89,7 @@ import type { Task as A2ATask, TaskStatusUpdateEvent } from '@a2a-js/sdk';
 import { TaskExecutor, DeferredTaskError } from './TaskExecutor';
 import { attachMatch } from './match';
 import { createMCPAuthHeaders } from '../auth';
+import { isAbortOrTimeoutError } from '../protocols/abort';
 import {
   AuthenticationRequiredError,
   ConfigurationError,
@@ -122,6 +125,14 @@ import {
   stripTransportSuffix,
 } from '../utils/a2a-discovery';
 import * as crypto from 'crypto';
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  createTimeoutError,
+  resolveClientRequestTimeoutMs,
+  resolveRequestTimeoutMs,
+  throwIfAborted,
+  withAbortSignal,
+} from '../protocols/abort';
 
 // v3.0 compatibility utilities
 import type { AdcpCapabilities, AdcpMajorVersion, ToolInfo, FeatureName } from '../utils/capabilities';
@@ -135,6 +146,7 @@ import {
   listDeclaredFeatures,
   TASK_FEATURE_MAP,
 } from '../utils/capabilities';
+
 import { normalizeRequestParams } from '../utils/request-normalizer';
 import { validateUserAgent } from '../utils/validate-user-agent';
 import { resolveWebhookUrl, selectWebhookTemplate } from './webhook-url';
@@ -149,6 +161,8 @@ import {
   type ProductPropertyPolicyValidationResult,
 } from '../media-buy/property-policy';
 import { resolvePropertyList, type ResolveListOptions } from '../server/targeting-helpers';
+
+type ReadRequestOptions = Pick<TaskOptions, 'signal' | 'transport'>;
 
 /**
  * Error class for v3 feature compatibility issues
@@ -301,14 +315,14 @@ const WEBHOOK_TASK_STATUSES = new Set<string>([
   'unknown',
 ]);
 
-const MCP_WEBHOOK_REQUIRED_FIELDS = [
-  'idempotency_key',
-  'operation_id',
-  'task_id',
-  'task_type',
-  'status',
-  'timestamp',
-] as const;
+// Top-level fields that every MCP webhook envelope must carry, regardless of
+// negotiated AdCP version. `operation_id` is intentionally NOT here: it became
+// a required webhook field in AdCP 3.1, but 3.0 senders are spec-compliant
+// without it. The receiver can't reliably know the sender's negotiated version
+// from the POST body alone, so requiring `operation_id` here broke 3.0
+// interop. When absent we fall back to the routing-context operationId (see
+// normalizeWebhookPayload), so its omission is non-fatal for dispatch.
+const MCP_WEBHOOK_REQUIRED_FIELDS = ['idempotency_key', 'task_id', 'task_type', 'status', 'timestamp'] as const;
 
 /**
  * Configuration for SingleAgentClient (and multi-agent client)
@@ -350,6 +364,14 @@ export interface SingleAgentClientConfig extends ConversationConfig {
   headers?: Record<string, string>;
   /** Activity callback for observability (logging, UI updates, etc) */
   onActivity?: (activity: Activity) => void | Promise<void>;
+  /**
+   * Transport-level diagnostics callback for outbound HTTP requests.
+   *
+   * Receives sanitized request/response/failure events from the SDK's
+   * protocol fetch layer. Header maps are allowlisted/redacted and URLs have
+   * credentials, query strings, and fragments stripped before emission.
+   */
+  onTransportActivity?: import('../protocols').TransportActivityHandler;
   /**
    * Task completion handlers — called for both sync responses and webhook
    * completions.
@@ -474,6 +496,25 @@ export interface SingleAgentClientConfig extends ConversationConfig {
      */
     filterInvalidProducts?: boolean;
     /**
+     * Reject products that arrive without a usable `pricing_options[]` array
+     * from completed `get_products` responses (default: true).
+     *
+     * `pricing_options` is a required, non-empty field in AdCP 3.1 — a product
+     * that advertises no pricing model is non-transactable, so the SDK drops it
+     * from the product list before callers and completion handlers see it. This
+     * runs on every completion path (sync, polling, `track`, webhook) and is
+     * independent of the response `validation` mode, so unpriced products are
+     * removed even under `responses: 'warn' | 'off'`. The rejection is recorded
+     * in `result.metadata.productPricingPolicy` and a
+     * `product_missing_pricing_options` debug-log notice.
+     *
+     * Set to `false` to pass products through untouched (e.g. when the caller
+     * deliberately inspects malformed seller responses).
+     *
+     * @default true
+     */
+    rejectProductsWithoutPricingOptions?: boolean;
+    /**
      * Buyer-side property policy applied to completed `get_products`
      * responses before completion handlers and callers receive the product
      * list. A request-level `property_list` is enforced automatically by
@@ -494,7 +535,9 @@ export interface SingleAgentClientConfig extends ConversationConfig {
    *
    * Set `maxResponseBytes` when crawling untrusted agents (registries,
    * federated discovery layers) to prevent a hostile vendor from buffering
-   * a large reply before any application-layer schema validation runs.
+   * a large reply before any application-layer schema validation runs. Set
+   * `requestTimeoutMs` to override the default 60s cap on A2A agent-card
+   * discovery; use `0` to disable the SDK-imposed discovery timeout.
    */
   transport?: import('../protocols').TransportOptions;
 }
@@ -555,6 +598,18 @@ function valueMatchesSchemaType(value: unknown, propSchema: unknown): boolean {
   if (typeof declared === 'string') return declared === valueType;
   if (Array.isArray(declared)) return declared.includes(valueType);
   return false;
+}
+
+function productHasPricingOptions(product: unknown): boolean {
+  if (!product || typeof product !== 'object') return false;
+  const options = (product as { pricing_options?: unknown }).pricing_options;
+  return Array.isArray(options) && options.length > 0;
+}
+
+function productIdForPricingDiagnostics(product: unknown): string | undefined {
+  if (!product || typeof product !== 'object') return undefined;
+  const id = (product as { product_id?: unknown }).product_id;
+  return typeof id === 'string' ? id : undefined;
 }
 
 function propertyListReferenceFromRequest(params: Record<string, unknown>): PropertyListReference | undefined {
@@ -669,6 +724,7 @@ export class SingleAgentClient {
         ...(config.validation?.responses != null && { responses: config.validation.responses }),
       },
       onActivity: config.onActivity,
+      onTransportActivity: config.onTransportActivity,
       governance: config.governance,
       adcpVersion: this.resolvedAdcpVersion,
       ...(config.wireAdcpVersion !== undefined && { wireAdcpVersion: config.wireAdcpVersion }),
@@ -703,7 +759,8 @@ export class SingleAgentClient {
    * Returns the agent config with the discovered endpoint.
    * Also computes the canonical base URL by stripping /mcp suffix.
    */
-  private async ensureEndpointDiscovered(): Promise<AgentConfig> {
+  private async ensureEndpointDiscovered(options?: ReadRequestOptions): Promise<AgentConfig> {
+    throwIfAborted(options?.signal);
     const needsDiscovery = this.normalizedAgent._needsDiscovery;
 
     if (!needsDiscovery) {
@@ -723,7 +780,7 @@ export class SingleAgentClient {
     }
 
     // Perform discovery
-    this.discoveredEndpoint = await this.discoverMCPEndpoint(this.normalizedAgent.agent_uri);
+    this.discoveredEndpoint = await this.discoverMCPEndpoint(this.normalizedAgent.agent_uri, options);
 
     // Compute canonical base URL by stripping /mcp suffix
     this.canonicalBaseUrl = this.computeBaseUrl(this.discoveredEndpoint);
@@ -741,7 +798,8 @@ export class SingleAgentClient {
    * Fetches the agent card and extracts the canonical URL.
    * Returns the agent config with the canonical URL.
    */
-  private async ensureCanonicalUrlResolved(): Promise<AgentConfig> {
+  private async ensureCanonicalUrlResolved(options?: ReadRequestOptions): Promise<AgentConfig> {
+    throwIfAborted(options?.signal);
     const needsCanonicalUrl = this.normalizedAgent._needsCanonicalUrl;
 
     if (!needsCanonicalUrl) {
@@ -757,7 +815,7 @@ export class SingleAgentClient {
     }
 
     // Fetch agent card to get canonical URL
-    const canonicalUrl = await this.fetchA2ACanonicalUrl(this.normalizedAgent.agent_uri);
+    const canonicalUrl = await this.fetchA2ACanonicalUrl(this.normalizedAgent.agent_uri, options);
     this.canonicalBaseUrl = canonicalUrl;
 
     return {
@@ -773,7 +831,7 @@ export class SingleAgentClient {
    * - If the agent card fetch returns 401, throw AuthenticationRequiredError
    * - Check for OAuth metadata to provide helpful guidance
    */
-  private async fetchA2ACanonicalUrl(agentUri: string): Promise<string> {
+  private async fetchA2ACanonicalUrl(agentUri: string, readOptions?: ReadRequestOptions): Promise<string> {
     const clientModule = require('@a2a-js/sdk/client');
     const A2AClient = clientModule.A2AClient;
 
@@ -783,15 +841,17 @@ export class SingleAgentClient {
     // active ALS slot enforces the cap on the wire call. Matches the same
     // pattern in `getAgentInfo` (closed #1799 via PR #1802).
     const { withResponseSizeLimit, wrapFetchWithSizeLimit } = await import('../protocols/responseSizeLimit');
-    const maxResponseBytes = this.config.transport?.maxResponseBytes;
+    const transport = readOptions?.transport ?? this.config.transport;
+    const maxResponseBytes = transport?.maxResponseBytes;
+    const requestTimeoutMs = resolveRequestTimeoutMs(transport?.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
     const sizeLimitedFetch = wrapFetchWithSizeLimit((input, init) => fetch(input as RequestInfo | URL, init));
 
     const authToken = this.normalizedAgent.auth_token;
     let got401 = false;
 
-    const fetchImpl = async (url: string | URL | Request, options?: RequestInit) => {
+    const fetchImpl = async (url: string | URL | Request, requestInit?: RequestInit) => {
       const headers: Record<string, string> = {
-        ...(options?.headers as Record<string, string>),
+        ...(requestInit?.headers as Record<string, string>),
         ...this.normalizedAgent.headers,
         ...(authToken && {
           Authorization: `Bearer ${authToken}`,
@@ -799,7 +859,11 @@ export class SingleAgentClient {
         }),
       };
 
-      const response = await sizeLimitedFetch(url as RequestInfo | URL, { ...options, headers });
+      const response = await withAbortSignal<Response>(
+        [readOptions?.signal, requestInit?.signal],
+        requestTimeoutMs,
+        signal => sizeLimitedFetch(url as RequestInfo | URL, { ...requestInit, headers, signal })
+      );
 
       // Track 401 errors for later handling
       if (response.status === 401) {
@@ -895,7 +959,8 @@ export class SingleAgentClient {
    *
    * Note: This is async and called lazily on first agent interaction
    */
-  private async discoverMCPEndpoint(providedUri: string): Promise<string> {
+  private async discoverMCPEndpoint(providedUri: string, options?: ReadRequestOptions): Promise<string> {
+    throwIfAborted(options?.signal);
     const { connectMCPWithFallback } = await import('../protocols/mcp');
 
     const authToken = this.agent.auth_token;
@@ -910,10 +975,16 @@ export class SingleAgentClient {
 
     const testEndpoint = async (url: string): Promise<EndpointTestResult> => {
       try {
-        const client = await connectMCPWithFallback(new URL(url), authHeaders);
+        const client = await connectMCPWithFallback(new URL(url), authHeaders, [], 'endpoint discovery', undefined, {
+          signal: options?.signal,
+          requestTimeoutMs: options?.transport?.requestTimeoutMs ?? this.config.transport?.requestTimeoutMs,
+        });
         await client.close();
         return { success: true };
       } catch (error: unknown) {
+        if (isAbortOrTimeoutError(error)) {
+          throw error;
+        }
         if (is401Error(error)) {
           return { success: false, status: 401, error };
         }
@@ -1576,12 +1647,21 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: TaskOptions
   ): Promise<TaskResult<T>> {
+    throwIfAborted(options?.signal);
     // Normalize params for backwards compatibility before validation
     let normalizedParams = normalizeRequestParams(taskType, params, {
       skipIdempotencyAutoInject: options?.skipIdempotencyAutoInject,
       skipAccountValidation: options?.skipAccountValidation,
     });
     this.assertRequestSupportedByConfiguredVersion(taskType, normalizedParams, options);
+
+    // Degrade an auto-injected discovery webhook to polling for pre-3.1 pins
+    // (get_products / get_signals). `effectiveOptions` carries disableWebhook
+    // so no push_notification_config reaches a seller that can't accept it.
+    const { options: effectiveOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
+      taskType,
+      options
+    );
 
     // Inject an idempotency_key for mutating tools before schema validation
     // so callers don't have to supply one. TaskExecutor also guards against
@@ -1611,20 +1691,20 @@ export class SingleAgentClient {
     }
 
     // Validate required features before sending request
-    await this.validateTaskFeatures(taskType);
+    await this.validateTaskFeatures(taskType, options);
 
     // Guard mutating calls against pre-v3 sellers when opted in.
     if (this.config.requireV3ForMutations && isMutatingTask(taskType)) {
-      await this.requireSupportedMajor(taskType);
+      await this.requireSupportedMajor(taskType, options);
     }
 
     // Check for v3 features used against v2 servers - return empty result if unsupported
-    const earlyResult = await this.getEarlyResultForUnsupportedFeatures<T>(taskType, normalizedParams);
+    const earlyResult = await this.getEarlyResultForUnsupportedFeatures<T>(taskType, normalizedParams, options);
     if (earlyResult) {
       return attachMatch(earlyResult);
     }
 
-    const agent = await this.ensureEndpointDiscovered();
+    const agent = await this.ensureEndpointDiscovered(options);
 
     // Schema-driven pre-send validation runs on the unadapted v3 shape so
     // wire-format adapters (e.g. adaptGetProductsRequestForV2) don't strip
@@ -1635,9 +1715,15 @@ export class SingleAgentClient {
       this.executor.validateRequest(taskType, normalizedParams);
     }
 
-    // Adapt request for v2 servers if needed
-    const serverVersion = await this.detectServerVersion();
-    const adaptedParams = await this.adaptRequestForServerVersion(taskType, normalizedParams);
+    // Adapt request for the detected server and AdCP protocol versions.
+    const serverVersion = await this.detectServerVersion(options);
+    const inputSchemaStripLogs: any[] = [];
+    const { params: adaptedParams, driftLogs: adaptDriftLogs } = this.adaptRequest(
+      taskType,
+      normalizedParams,
+      serverVersion,
+      inputSchemaStripLogs
+    );
 
     // Symmetric to the pre-adapter v3 pass above: when the adapter
     // rewrote the request for a v2 server, warn-validate the adapted
@@ -1645,7 +1731,8 @@ export class SingleAgentClient {
     // here and merged into result.metadata.debug_logs after executeTask
     // returns — without that merge the warning would silently drop on
     // the floor and adapter drift would land in production unnoticed.
-    const v25DriftLogs: any[] = [];
+    const v25DriftLogs: any[] = [...adaptDriftLogs];
+    if (webhookDriftLog) v25DriftLogs.push(webhookDriftLog);
     if (serverVersion === 'v2') {
       this.executor.validateAdaptedRequestAgainstV2(taskType, adaptedParams, v25DriftLogs);
     }
@@ -1655,17 +1742,19 @@ export class SingleAgentClient {
       taskType,
       adaptedParams,
       inputHandler,
-      options,
+      effectiveOptions,
       serverVersion
     );
 
     // Merge collected drift into the executor's debug_logs so adopters
-    // reading result.debug_logs see post-adapter v2.5 warnings alongside
+    // reading result.debug_logs see input-schema stripping, post-adapter
+    // v2.5 warnings, and any pre-3.1 webhook-degradation notice alongside
     // the executor's own logs. On error paths the executor may not surface
-    // result.debug_logs at all — drift collected before the failure is
+    // result.debug_logs at all; logs collected before the failure are
     // dropped, matching the executor's own debug-log behavior.
-    if (v25DriftLogs.length > 0) {
-      result.debug_logs = [...(result.debug_logs ?? []), ...v25DriftLogs];
+    const postAdapterLogs = [...inputSchemaStripLogs, ...v25DriftLogs];
+    if (postAdapterLogs.length > 0) {
+      result.debug_logs = [...(result.debug_logs ?? []), ...postAdapterLogs];
     }
 
     // Normalize response to v3 format
@@ -1698,11 +1787,82 @@ export class SingleAgentClient {
     return result;
   }
 
+  /**
+   * Drop products that arrive without a usable `pricing_options[]` array from a
+   * completed `get_products` response. `pricing_options` is required and
+   * non-empty in AdCP 3.1; a product with no pricing model can't be bought, so
+   * the SDK rejects it before callers and completion handlers see the list.
+   *
+   * Controlled by `config.validation.rejectProductsWithoutPricingOptions`
+   * (default `true`) and applied on every completion path via
+   * {@link applyProductPropertyPolicy}, independent of the response validation
+   * mode.
+   */
+  private enforceProductPricingOptions<T>(result: TaskResult<T>, taskType: string): TaskResult<T> {
+    if (taskType !== 'get_products') return result;
+    if (this.config.validation?.rejectProductsWithoutPricingOptions === false) return result;
+    if (!result.success || result.status !== 'completed' || !result.data) return result;
+
+    const response = result.data as unknown as GetProductsResponse;
+    const products = (response as { products?: unknown }).products;
+    if (!Array.isArray(products) || products.length === 0) return result;
+
+    const kept: unknown[] = [];
+    const rejected: Array<{ index: number; product_id?: string }> = [];
+    products.forEach((product, index) => {
+      if (productHasPricingOptions(product)) {
+        kept.push(product);
+        return;
+      }
+      const productId = productIdForPricingDiagnostics(product);
+      rejected.push({ index, ...(productId ? { product_id: productId } : {}) });
+    });
+
+    if (rejected.length === 0) return result;
+
+    const message = `Rejected ${rejected.length} product${rejected.length === 1 ? '' : 's'} without pricing_options`;
+
+    // Mutate in place (like the property-policy filter path) so the
+    // non-enumerable `match` accessor and result identity survive.
+    result.data = { ...(response as unknown as Record<string, unknown>), products: kept } as T;
+    result.metadata = {
+      ...result.metadata,
+      productPricingPolicy: {
+        ok: true,
+        accepted_count: kept.length,
+        rejected_count: rejected.length,
+        rejected_products: rejected,
+      },
+    };
+    result.debug_logs = [
+      ...(result.debug_logs ?? []),
+      {
+        type: 'warning',
+        message,
+        timestamp: new Date().toISOString(),
+        details: {
+          code: 'product_missing_pricing_options',
+          task: taskType,
+          agent_id: this.agent.id,
+          rejected_count: rejected.length,
+          rejected_products: rejected,
+        },
+      },
+    ];
+    return result;
+  }
+
   private async applyProductPropertyPolicy<T>(
     result: TaskResult<T>,
     taskType: string,
     requestParams: Record<string, unknown>
   ): Promise<TaskResult<T>> {
+    // Reject non-transactable products (no pricing_options) before any
+    // property-policy evaluation, regardless of whether a property policy is
+    // configured. This runs on the same completion chokepoint so it covers the
+    // sync, polling, track, and webhook paths uniformly.
+    result = this.enforceProductPricingOptions(result, taskType);
+
     const policyConfig = this.config.validation?.productPropertyPolicy;
     if (policyConfig === false || taskType !== 'get_products') return result;
     if (!result.success || result.status !== 'completed' || !result.data) return result;
@@ -2037,6 +2197,9 @@ export class SingleAgentClient {
       ...(policyResult.metadata.productPropertyPolicy
         ? { productPropertyPolicy: policyResult.metadata.productPropertyPolicy }
         : {}),
+      ...(policyResult.metadata.productPricingPolicy
+        ? { productPricingPolicy: policyResult.metadata.productPricingPolicy }
+        : {}),
     };
 
     return {
@@ -2047,17 +2210,25 @@ export class SingleAgentClient {
   }
 
   /**
-   * Adapt request parameters for the detected server version
+   * Adapt a request for the detected server wire version and the seller's
+   * AdCP protocol version. Applies wire-format adapters (v2.5) when talking
+   * to a v2 server, then applies protocol-version adapters (e.g. stripping
+   * 3.1-only fields for a 3.0 seller). Returns the adapted params and any
+   * drift log entries describing what was changed.
    *
-   * Converts v3-style requests to v2 format when talking to v2 servers.
+   * Runs after `detectServerVersion` so `cachedCapabilities` is populated
+   * and the protocol-version adapters see the seller's declared caps.
    */
-  private async adaptRequestForServerVersion(taskType: string, params: any): Promise<any> {
-    // Get server version (cached after first call)
-    const version = await this.detectServerVersion();
-
+  private adaptRequest(
+    taskType: string,
+    params: any,
+    serverVersion: string,
+    debugLogs?: any[]
+  ): { params: any; driftLogs: Record<string, unknown>[] } {
+    const driftLogs: Record<string, unknown>[] = [];
     let adapted = params;
 
-    if (version !== 'v3') {
+    if (serverVersion !== 'v3') {
       // Dispatch through the legacy v2.5 adapter registry. Per-tool pairs
       // live in `src/lib/adapters/legacy/v2-5/<tool>.ts`. Tools without a
       // registered pair (or pairs whose request side is pass-through)
@@ -2065,7 +2236,7 @@ export class SingleAgentClient {
       // adding a sibling `legacy/<version>/` directory, not editing
       // this dispatch.
       const pair = getV25Adapter(taskType);
-      if (pair) adapted = pair.adaptRequest(params);
+      if (pair) adapted = pair.adaptRequest(adapted);
     }
 
     // Strip any top-level fields not declared in the agent's tool schema.
@@ -2090,57 +2261,120 @@ export class SingleAgentClient {
     // (e.g. `applyBrandInvariant` in the storyboard runner — see #940),
     // not to lean on this strip path as a backstop.
     const toolSchema = this.cachedToolSchemas?.get(taskType);
-    if (!toolSchema || Object.keys(toolSchema).length === 0) return adapted;
+    if (toolSchema && Object.keys(toolSchema).length > 0) {
+      const declaredFields = new Set(Object.keys(toolSchema));
 
-    const declaredFields = new Set(Object.keys(toolSchema));
+      // The v2 adapter may rename fields (e.g. brand → brand_manifest) that a
+      // v3 server — misdetected as v2 — doesn't declare. Reconcile known
+      // adapter mappings so the value isn't silently dropped.
+      //
+      // CRITICAL: only alias when the JS type of the moved value is
+      // compatible with the destination field's declared shape. v2.5 sellers
+      // (e.g. Wonderstruck) declare `brand` in their tool schema as a
+      // BrandReference object — v2 adapter produces a `brand_manifest` URL
+      // string, and blindly aliasing the string into the object slot causes
+      // the seller to reject with `Input should be a valid dictionary or
+      // instance of BrandReference`. Skip the alias when shapes don't match
+      // and let the field-stripping path drop the v2-shaped value cleanly.
+      const adapterAliases: [string, string][] = [['brand_manifest', 'brand']];
+      for (const [adapterField, schemaField] of adapterAliases) {
+        if (
+          adapted[adapterField] !== undefined &&
+          !declaredFields.has(adapterField) &&
+          declaredFields.has(schemaField) &&
+          adapted[schemaField] === undefined &&
+          valueMatchesSchemaType(adapted[adapterField], (toolSchema as Record<string, unknown>)[schemaField])
+        ) {
+          adapted[schemaField] = adapted[adapterField];
+          delete adapted[adapterField];
+        }
+      }
 
-    // The v2 adapter may rename fields (e.g. brand → brand_manifest) that a
-    // v3 server — misdetected as v2 — doesn't declare. Reconcile known
-    // adapter mappings so the value isn't silently dropped.
-    //
-    // CRITICAL: only alias when the JS type of the moved value is
-    // compatible with the destination field's declared shape. v2.5 sellers
-    // (e.g. Wonderstruck) declare `brand` in their tool schema as a
-    // BrandReference object — v2 adapter produces a `brand_manifest` URL
-    // string, and blindly aliasing the string into the object slot causes
-    // the seller to reject with `Input should be a valid dictionary or
-    // instance of BrandReference`. Skip the alias when shapes don't match
-    // and let the field-stripping path drop the v2-shaped value cleanly.
-    const adapterAliases: [string, string][] = [['brand_manifest', 'brand']];
-    for (const [adapterField, schemaField] of adapterAliases) {
-      if (
-        adapted[adapterField] !== undefined &&
-        !declaredFields.has(adapterField) &&
-        declaredFields.has(schemaField) &&
-        adapted[schemaField] === undefined &&
-        valueMatchesSchemaType(adapted[adapterField], (toolSchema as Record<string, unknown>)[schemaField])
-      ) {
-        adapted[schemaField] = adapted[adapterField];
-        delete adapted[adapterField];
+      // Protocol envelope fields are always preserved — they live at the
+      // protocol layer, not in individual tool schemas.
+      const envelopeFields = ADCP_ENVELOPE_FIELDS;
+      const filtered: Record<string, unknown> = {};
+      const schemaStripped: string[] = [];
+
+      // A field is preserved when it's declared by the agent's (possibly
+      // partial) tool schema, OR it's a protocol envelope field, OR it's a
+      // CANONICAL top-level field for this task in the resolved AdCP version.
+      //
+      // The canonical-schema union is the fix for partial-schema sellers
+      // (e.g. "Open Ads", https://api.openads.ai/mcp): such agents
+      // under-declare their `tools/list` inputSchema, so intersecting only
+      // their self-declared fields silently dropped canonical — sometimes
+      // REQUIRED — AdCP request fields (`media_buy_id` on update_media_buy,
+      // `media_buy_ids` on get_media_buy_delivery, `creative_ids` on
+      // sync_creatives) before the request left the client, breaking
+      // media-buy updates and delivery polling. Only fields unknown to BOTH
+      // the agent schema AND the canonical request schema are genuine junk
+      // and get stripped.
+      //
+      // `taskType` is the snake_case tool name (e.g. `update_media_buy`),
+      // which is exactly the `toolName` key `schemaAllowsTopLevelField` looks
+      // up as `${toolName}::request` in the loader's fileIndex. The version
+      // arg is the raw resolved pin (`this.resolvedAdcpVersion`); the loader
+      // resolves the bundle key internally via `ensureInit`/`resolveBundleKey`
+      // (same contract as `TaskExecutor.validateRequest`). The helper FAILS
+      // OPEN (returns true) when no canonical schema is indexed for the tool,
+      // which preserves the field rather than dropping something we can't
+      // authoritatively rule out.
+      for (const [key, value] of Object.entries(adapted)) {
+        if (
+          declaredFields.has(key) ||
+          envelopeFields.has(key) ||
+          schemaAllowsTopLevelField(taskType, key, this.resolvedAdcpVersion)
+        ) {
+          filtered[key] = value;
+        } else {
+          schemaStripped.push(key);
+        }
+      }
+
+      if (schemaStripped.length > 0) {
+        console.warn(
+          `[AdCP] Stripping fields not declared in agent "${this.agent.id}" schema for ${taskType}: ${schemaStripped.join(', ')}`
+        );
+        debugLogs?.push({
+          type: 'warning',
+          message: `Stripped fields not declared in agent tool input schema for ${taskType}: ${schemaStripped.join(', ')}`,
+          timestamp: new Date().toISOString(),
+          details: {
+            code: 'input_schema_field_stripped',
+            task: taskType,
+            fields: schemaStripped,
+            agent_id: this.agent.id,
+          },
+        });
+      }
+
+      adapted = filtered;
+    }
+
+    // Protocol version adaptation: strip fields not accepted by the target
+    // AdCP version. `resolveAdapterKey` returns the effective target version
+    // based on the client pin and the seller's advertised caps; adapters live
+    // in `src/lib/adapters/version/<target>/`.
+    const adapterKey = resolveAdapterKey(this.resolvedAdcpVersion, this.cachedCapabilities);
+    if (adapterKey) {
+      const versionAdapter = getVersionAdapter(adapterKey, taskType);
+      if (versionAdapter) {
+        const result = versionAdapter.adaptRequest(adapted);
+        adapted = result.params;
+        if (result.drift) {
+          driftLogs.push({
+            ...result.drift,
+            taskName: taskType,
+            clientVersion: this.resolvedAdcpVersion,
+            targetVersion: adapterKey,
+            timestamp: new Date().toISOString(),
+          });
+        }
       }
     }
 
-    // Protocol envelope fields are always preserved — they live at the
-    // protocol layer, not in individual tool schemas.
-    const envelopeFields = ADCP_ENVELOPE_FIELDS;
-    const filtered: Record<string, unknown> = {};
-    const stripped: string[] = [];
-
-    for (const [key, value] of Object.entries(adapted)) {
-      if (declaredFields.has(key) || envelopeFields.has(key)) {
-        filtered[key] = value;
-      } else {
-        stripped.push(key);
-      }
-    }
-
-    if (stripped.length > 0) {
-      console.warn(
-        `[AdCP] Stripping fields not declared in agent "${this.agent.id}" schema for ${taskType}: ${stripped.join(', ')}`
-      );
-    }
-
-    return filtered;
+    return { params: adapted, driftLogs };
   }
 
   /**
@@ -2166,14 +2400,18 @@ export class SingleAgentClient {
    *
    * @returns TaskResult with empty data if v3 features are unsupported, null to proceed normally
    */
-  private async getEarlyResultForUnsupportedFeatures<T>(taskType: string, params: any): Promise<TaskResult<T> | null> {
+  private async getEarlyResultForUnsupportedFeatures<T>(
+    taskType: string,
+    params: any,
+    options?: ReadRequestOptions
+  ): Promise<TaskResult<T> | null> {
     // Only check for tasks that have v3-specific features
     if (taskType !== 'get_products') {
       return null;
     }
 
     // Get capabilities to check what the server supports
-    const capabilities = await this.getCapabilities();
+    const capabilities = await this.getCapabilities(options);
 
     // If server is v3, all features are supported - proceed normally
     if (capabilities.version === 'v3') {
@@ -2633,7 +2871,7 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: TaskOptions
   ): Promise<TaskResult<GetAdCPCapabilitiesResponse>> {
-    const agent = await this.ensureEndpointDiscovered();
+    const agent = await this.ensureEndpointDiscovered(options);
     this.executor.validateRequest('get_adcp_capabilities', params);
     return this.executor.executeTask<GetAdCPCapabilitiesResponse>(
       agent,
@@ -2966,6 +3204,7 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: TaskOptions
   ): Promise<TaskResult<T>> {
+    throwIfAborted(options?.signal);
     const startTime = Date.now();
     try {
       const normalizedParams = normalizeRequestParams(taskName, params, {
@@ -2973,11 +3212,20 @@ export class SingleAgentClient {
         skipAccountValidation: options?.skipAccountValidation,
       });
       this.assertRequestSupportedByConfiguredVersion(taskName, normalizedParams, options);
-      await this.validateTaskFeatures(taskName);
+
+      // Degrade an auto-injected discovery webhook to polling for pre-3.1 pins
+      // (get_products / get_signals). `effectiveOptions` carries disableWebhook
+      // so no push_notification_config reaches a seller that can't accept it.
+      const { options: effectiveOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
+        taskName,
+        options
+      );
+
+      await this.validateTaskFeatures(taskName, options);
       if (this.config.requireV3ForMutations && isMutatingTask(taskName)) {
-        await this.requireSupportedMajor(taskName);
+        await this.requireSupportedMajor(taskName, options);
       }
-      const agent = await this.ensureEndpointDiscovered();
+      const agent = await this.ensureEndpointDiscovered(options);
 
       // Schema-driven pre-send validation runs on the unadapted v3 shape so
       // wire-format adapters (e.g. adaptGetProductsRequestForV2) don't strip
@@ -2988,15 +3236,21 @@ export class SingleAgentClient {
         this.executor.validateRequest(taskName, normalizedParams);
       }
 
-      // Adapt request for the server's protocol version (e.g. strip v3-only
-      // fields like buying_mode when talking to v2 agents).
-      const serverVersion = await this.detectServerVersion();
-      const adaptedParams = await this.adaptRequestForServerVersion(taskName, normalizedParams);
+      // Adapt request for the detected server and AdCP protocol versions.
+      const serverVersion = await this.detectServerVersion(options);
+      const inputSchemaStripLogs: any[] = [];
+      const { params: adaptedParams, driftLogs: adaptDriftLogs } = this.adaptRequest(
+        taskName,
+        normalizedParams,
+        serverVersion,
+        inputSchemaStripLogs
+      );
 
       // Symmetric warn-only post-adapter pass against the v2.5 schema bundle.
       // Drift gets surfaced via result.metadata.debug_logs so adapter
       // regressions in production aren't silently swallowed.
-      const v25DriftLogs: any[] = [];
+      const v25DriftLogs: any[] = [...adaptDriftLogs];
+      if (webhookDriftLog) v25DriftLogs.push(webhookDriftLog);
       if (serverVersion === 'v2') {
         this.executor.validateAdaptedRequestAgainstV2(taskName, adaptedParams, v25DriftLogs);
       }
@@ -3006,12 +3260,13 @@ export class SingleAgentClient {
         taskName,
         adaptedParams,
         inputHandler,
-        options,
+        effectiveOptions,
         serverVersion
       );
 
-      if (v25DriftLogs.length > 0) {
-        result.debug_logs = [...(result.debug_logs ?? []), ...v25DriftLogs];
+      const postAdapterLogs = [...inputSchemaStripLogs, ...v25DriftLogs];
+      if (postAdapterLogs.length > 0) {
+        result.debug_logs = [...(result.debug_logs ?? []), ...postAdapterLogs];
       }
 
       // Normalize response to v3 format for consistent API surface
@@ -3033,7 +3288,8 @@ export class SingleAgentClient {
         error instanceof AuthenticationRequiredError ||
         error instanceof TaskTimeoutError ||
         error instanceof VersionUnsupportedError ||
-        error instanceof FeatureUnsupportedError
+        error instanceof FeatureUnsupportedError ||
+        isAbortOrTimeoutError(error)
       ) {
         throw error;
       }
@@ -3427,7 +3683,7 @@ export class SingleAgentClient {
    * });
    * ```
    */
-  async getAgentInfo(): Promise<{
+  async getAgentInfo(options?: ReadRequestOptions): Promise<{
     name: string;
     description?: string;
     protocol: 'mcp' | 'a2a';
@@ -3443,12 +3699,22 @@ export class SingleAgentClient {
     // `transport.maxResponseBytes` extends to discovery / tools-list bodies.
     // `withResponseSizeLimit` is a no-op when no cap is configured.
     const { withResponseSizeLimit } = await import('../protocols/responseSizeLimit');
-    const maxResponseBytes = this.config.transport?.maxResponseBytes;
+    throwIfAborted(options?.signal);
+    const transport = options?.transport ?? this.config.transport;
+    const maxResponseBytes = transport?.maxResponseBytes;
+    const requestTimeoutMs = resolveRequestTimeoutMs(transport?.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
+    const clientRequestTimeoutMs = resolveClientRequestTimeoutMs(transport?.requestTimeoutMs);
+    const mcpRequestOptions = {
+      ...(options?.signal && { signal: options.signal }),
+      ...(clientRequestTimeoutMs !== undefined && { timeout: clientRequestTimeoutMs }),
+    };
     if (this.normalizedAgent.protocol === 'mcp') {
       // In-process: use the pre-connected client instead of opening a new HTTP connection
       if (this.normalizedAgent._inProcessMcpClient) {
         const mcpClient = this.normalizedAgent._inProcessMcpClient;
-        const toolsList = await withResponseSizeLimit(maxResponseBytes, () => mcpClient.listTools());
+        const toolsList = await withResponseSizeLimit(maxResponseBytes, () =>
+          mcpClient.listTools(undefined, mcpRequestOptions)
+        );
         const tools = toolsList.tools.map(tool => ({
           name: tool.name,
           description: tool.description,
@@ -3465,7 +3731,7 @@ export class SingleAgentClient {
       }
 
       // Discover endpoint if needed
-      const agent = await this.ensureEndpointDiscovered();
+      const agent = await this.ensureEndpointDiscovered(options);
 
       // Use the shared connectMCP path so both static bearer AND saved OAuth
       // tokens work. OAuth takes the refresh-capable authProvider branch.
@@ -3475,6 +3741,12 @@ export class SingleAgentClient {
       // SDK doesn't emit a competing `Authorization: Bearer …`.
       const { connectMCP } = await import('../protocols/mcp');
       const connectOptions: Parameters<typeof connectMCP>[0] = { agentUrl: agent.agent_uri };
+      if (options?.signal) {
+        connectOptions.signal = options.signal;
+      }
+      if (transport?.requestTimeoutMs !== undefined) {
+        connectOptions.requestTimeoutMs = transport.requestTimeoutMs;
+      }
       if (this.normalizedAgent.headers && Object.keys(this.normalizedAgent.headers).length > 0) {
         connectOptions.customHeaders = this.normalizedAgent.headers;
       }
@@ -3489,7 +3761,9 @@ export class SingleAgentClient {
 
       const { client: mcpClient } = await connectMCP(connectOptions);
       try {
-        const toolsList = await withResponseSizeLimit(maxResponseBytes, () => mcpClient.listTools());
+        const toolsList = await withResponseSizeLimit(maxResponseBytes, () =>
+          mcpClient.listTools(undefined, mcpRequestOptions)
+        );
 
         const tools = toolsList.tools.map(tool => ({
           name: tool.name,
@@ -3523,17 +3797,38 @@ export class SingleAgentClient {
       // calls native `fetch` directly and ignores `transport.maxResponseBytes`.
       const { wrapFetchWithSizeLimit } = await import('../protocols/responseSizeLimit');
       const authToken = this.normalizedAgent.auth_token;
+      const agentHeaders = this.normalizedAgent.headers ?? {};
       const sizeLimitedFetch = wrapFetchWithSizeLimit((input, init) => fetch(input as RequestInfo | URL, init));
-      const fetchImpl = authToken
-        ? async (url: string | URL | Request, options?: RequestInit) => {
-            const headers = {
-              ...(options?.headers as Record<string, string>),
-              Authorization: `Bearer ${authToken}`,
-              'x-adcp-auth': authToken,
-            };
-            return sizeLimitedFetch(url as RequestInfo | URL, { ...options, headers });
+      const normalizeHeaders = (headers?: HeadersInit): Record<string, string> => {
+        const normalized: Record<string, string> = {};
+        if (!headers) return normalized;
+        if (headers instanceof Headers) {
+          headers.forEach((value, key) => {
+            normalized[key] = value;
+          });
+        } else if (Array.isArray(headers)) {
+          for (const [key, value] of headers) {
+            normalized[key] = value;
           }
-        : (url: string | URL | Request, options?: RequestInit) => sizeLimitedFetch(url as RequestInfo | URL, options);
+        } else {
+          Object.assign(normalized, headers);
+        }
+        return normalized;
+      };
+      const buildHeaders = (requestInit?: RequestInit): Record<string, string> => ({
+        ...normalizeHeaders(requestInit?.headers),
+        ...agentHeaders,
+        ...(authToken && {
+          Authorization: `Bearer ${authToken}`,
+          'x-adcp-auth': authToken,
+        }),
+      });
+      const fetchImpl = async (url: string | URL | Request, requestInit?: RequestInit) => {
+        const headers = buildHeaders(requestInit);
+        return withAbortSignal<Response>([options?.signal, requestInit?.signal], requestTimeoutMs, signal =>
+          sizeLimitedFetch(url as RequestInfo | URL, { ...requestInit, headers, signal })
+        );
+      };
 
       const cardUrls = buildCardUrls(this.normalizedAgent.agent_uri);
 
@@ -3606,7 +3901,8 @@ export class SingleAgentClient {
    * }
    * ```
    */
-  async getCapabilities(): Promise<AdcpCapabilities> {
+  async getCapabilities(options?: ReadRequestOptions): Promise<AdcpCapabilities> {
+    throwIfAborted(options?.signal);
     // Return cached if available
     if (this.cachedCapabilities) {
       this.maybeWarnV2Sunset(this.cachedCapabilities);
@@ -3614,7 +3910,7 @@ export class SingleAgentClient {
     }
 
     // First get tool list to support both detection methods
-    const agentInfo = await this.getAgentInfo();
+    const agentInfo = await this.getAgentInfo(options);
     const tools: ToolInfo[] = agentInfo.tools.map(t => ({
       name: t.name,
       description: t.description,
@@ -3622,7 +3918,7 @@ export class SingleAgentClient {
 
     // Cache raw tool schemas for field-level compatibility checks (e.g. buying_mode on get_products).
     // INVARIANT: must be assigned before cachedCapabilities below so that any code path
-    // reaching adaptRequestForServerVersion always finds the schemas populated.
+    // reaching adaptRequest always finds the schemas populated.
     this.cachedToolSchemas = new Map(
       agentInfo.tools
         .filter(t => t.inputSchema?.properties)
@@ -3638,8 +3934,19 @@ export class SingleAgentClient {
         // because normalizeAgentConfig returns early when _inProcessMcpClient is set). The
         // executor then hits ProtocolClient.callTool which reads _inProcessMcpClient directly,
         // so the sentinel adcp-in-process:// URI never reaches validateAgentUrl.
-        const agent = await this.ensureEndpointDiscovered();
-        const result = await this.executor.executeTask<any>(agent, 'get_adcp_capabilities', {}, undefined);
+        const agent = await this.ensureEndpointDiscovered(options);
+        const result = await this.executor.executeTask<any>(agent, 'get_adcp_capabilities', {}, undefined, options);
+        throwIfAborted(options?.signal);
+        const requestTimeoutMs = resolveRequestTimeoutMs(
+          options?.transport?.requestTimeoutMs ?? this.config.transport?.requestTimeoutMs
+        );
+        if (
+          !result.success &&
+          requestTimeoutMs !== undefined &&
+          /\b(requesttimeout|timeout|timed out)\b/i.test(result.error ?? '')
+        ) {
+          throw createTimeoutError(requestTimeoutMs);
+        }
 
         if (result.success && result.data) {
           this.cachedCapabilities = augmentCapabilitiesFromTools(parseCapabilitiesResponse(result.data), tools);
@@ -3699,7 +4006,7 @@ export class SingleAgentClient {
             `since the agent has the v3-only discovery tool. ` +
             `This client routes to v3 adapters, but calls reading capability details ` +
             `(idempotency TTL, supported_versions, feature flags) will fail until the agent ` +
-            `operator fixes the capabilities endpoint at ${this.agent.agent_uri}.`,
+            `operator fixes the capabilities endpoint.`,
           {
             success: result.success,
             hasError: !!result.error,
@@ -3710,7 +4017,11 @@ export class SingleAgentClient {
         // Re-throw errors that indicate real infrastructure problems —
         // only fall through for tool-execution failures (the agent
         // advertises get_adcp_capabilities but can't actually serve it).
-        if (error instanceof AuthenticationRequiredError || error instanceof TaskTimeoutError) {
+        if (
+          error instanceof AuthenticationRequiredError ||
+          error instanceof TaskTimeoutError ||
+          isAbortOrTimeoutError(error)
+        ) {
           throw error;
         }
         console.warn(
@@ -3718,8 +4029,7 @@ export class SingleAgentClient {
             `threw — treating as v3 (synthetic) since the agent has the v3-only discovery tool. ` +
             `This client routes to v3 adapters, but calls reading capability details ` +
             `(idempotency TTL, supported_versions, feature flags) will fail until the agent ` +
-            `operator fixes the capabilities endpoint at ${this.agent.agent_uri}. ` +
-            `Error: ${error instanceof Error ? error.message : String(error)}`
+            `operator fixes the capabilities endpoint.`
         );
       }
 
@@ -3820,8 +4130,8 @@ export class SingleAgentClient {
    *
    * @returns 'v2' or 'v3' based on server capabilities
    */
-  async detectServerVersion(): Promise<'v2' | 'v3'> {
-    const capabilities = await this.getCapabilities();
+  async detectServerVersion(options?: ReadRequestOptions): Promise<'v2' | 'v3'> {
+    const capabilities = await this.getCapabilities(options);
     return capabilities.version;
   }
 
@@ -3926,13 +4236,17 @@ export class SingleAgentClient {
    *
    * Skipped when validateFeatures is false or the task has no feature requirements.
    */
-  private async validateTaskFeatures(taskName: string): Promise<void> {
+  private async validateTaskFeatures(taskName: string, options?: ReadRequestOptions): Promise<void> {
     if (this.config.validateFeatures === false) return;
 
     const requiredFeatures = TASK_FEATURE_MAP[taskName];
     if (!requiredFeatures || requiredFeatures.length === 0) return;
 
-    await this.require(...requiredFeatures);
+    const capabilities = await this.getCapabilities(options);
+    const missing = requiredFeatures.filter(f => !resolveFeature(capabilities, f));
+    if (missing.length > 0) {
+      throw new FeatureUnsupportedError(missing, listDeclaredFeatures(capabilities), this.agent.agent_uri);
+    }
   }
 
   /**
@@ -3942,12 +4256,10 @@ export class SingleAgentClient {
    * result set. A pre-3.1 client pin should not silently drop those controls
    * or let a generic schema error hide the recovery path.
    */
-  private assertRequestSupportedByConfiguredVersion(taskName: string, params: unknown, options?: TaskOptions): void {
+  private assertRequestSupportedByConfiguredVersion(taskName: string, params: unknown, _options?: TaskOptions): void {
     if (!isPre31AdcpVersion(this.resolvedAdcpVersion)) return;
     const request =
       params && typeof params === 'object' && !Array.isArray(params) ? (params as Record<string, unknown>) : {};
-    const willInjectDiscoveryWebhook =
-      !options?.disableWebhook && selectWebhookTemplate(this.config.webhookUrlTemplate, taskName) !== undefined;
 
     if (taskName === 'get_signals' && request.discovery_mode === 'wholesale') {
       this.throwPre31UnsupportedFeature(taskName, 'discovery_mode', 'get_signals.discovery_mode=wholesale', {
@@ -3956,10 +4268,12 @@ export class SingleAgentClient {
       });
     }
 
-    if (
-      (taskName === 'get_products' || taskName === 'get_signals') &&
-      (request.push_notification_config !== undefined || willInjectDiscoveryWebhook)
-    ) {
+    // An EXPLICIT push_notification_config on a discovery task is caller misuse
+    // while hard-pinned <3.1: surface it rather than silently dropping the
+    // caller's webhook. An AUTO-injected discovery webhook (from
+    // `webhookUrlTemplate`) is degraded to polling instead; see
+    // `suppressPre31DiscoveryWebhook`.
+    if ((taskName === 'get_products' || taskName === 'get_signals') && request.push_notification_config !== undefined) {
       this.throwPre31UnsupportedFeature(taskName, 'push_notification_config', `${taskName}.push_notification_config`, {
         capabilityPath: 'adcp.supported_versions',
         suffix: 'Probe get_adcp_capabilities at adcp.supported_versions before relying on discovery task webhooks.',
@@ -3970,6 +4284,45 @@ export class SingleAgentClient {
     // `if_pricing_version`: 3.1 defines them as optimistic conditional
     // probes, and pre-3.1 sellers may safely ignore them and return the full
     // payload.
+  }
+
+  /**
+   * Degrade the auto-injected get_products / get_signals discovery webhook to
+   * polling when the client is pinned below 3.1. Discovery-task
+   * `push_notification_config` is an AdCP 3.1 feature; a pre-3.1 seller would
+   * reject it. Rather than throwing on the library's own auto-injected webhook
+   * (which the caller never asked for), suppress it via `disableWebhook` and
+   * record a `pre31_webhook_degraded` drift entry so the loss of push is
+   * visible in `debug_logs`.
+   *
+   * Returns the effective options (a `disableWebhook` copy when suppressing,
+   * otherwise the caller's unchanged) and an optional drift log to merge into
+   * the result. Explicit caller-supplied `push_notification_config` is handled
+   * by `assertRequestSupportedByConfiguredVersion` (it throws) and never
+   * reaches here.
+   */
+  private suppressPre31DiscoveryWebhook(
+    taskName: string,
+    options?: TaskOptions
+  ): { options: TaskOptions | undefined; driftLog?: Record<string, unknown> } {
+    if (!isPre31AdcpVersion(this.resolvedAdcpVersion)) return { options };
+    if (taskName !== 'get_products' && taskName !== 'get_signals') return { options };
+    if (options?.disableWebhook) return { options };
+    if (selectWebhookTemplate(this.config.webhookUrlTemplate, taskName) === undefined) return { options };
+
+    return {
+      options: { ...options, disableWebhook: true },
+      driftLog: {
+        type: 'pre31_webhook_degraded',
+        message:
+          `${taskName} discovery webhook degraded to polling: discovery-task push_notification_config ` +
+          `requires AdCP 3.1, but this client is pinned to ${this.resolvedAdcpVersion}. ` +
+          'The seller will not receive a push webhook; poll for the result instead.',
+        timestamp: new Date().toISOString(),
+        taskName,
+        clientVersion: this.resolvedAdcpVersion,
+      },
+    };
   }
 
   private throwPre31UnsupportedFeature(
@@ -4021,9 +4374,9 @@ export class SingleAgentClient {
    *
    * Throws `VersionUnsupportedError` with the specific reason on failure.
    */
-  async requireSupportedMajor(taskType: string = 'request'): Promise<void> {
+  async requireSupportedMajor(taskType: string = 'request', options?: ReadRequestOptions): Promise<void> {
     if (this.isV2Allowed()) return;
-    const capabilities = await this.getCapabilities();
+    const capabilities = await this.getCapabilities(options);
 
     // Synthetic capabilities — no authoritative `get_adcp_capabilities`
     // response, so the version + idempotency-TTL fields couldn't be read.
@@ -4142,7 +4495,7 @@ export class SingleAgentClient {
    * but unknown top-level keys pass through. This matters because callers —
    * including the storyboard runner's `applyBrandInvariant` — inject
    * scoping fields (`brand`, `account`) onto every outgoing request, and
-   * `adaptRequestForServerVersion` strips those fields downstream for tools
+   * `adaptRequest` strips those fields downstream for tools
    * whose schema doesn't declare them. A strict parse here rejects the
    * injected fields before the adapter gets a chance to clean them up, so
    * the two passes have to agree on "extra keys are fine."

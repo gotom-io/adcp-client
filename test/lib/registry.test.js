@@ -20,6 +20,36 @@ const BRAND = {
   source: 'brand_json',
 };
 
+const BRAND_HIERARCHY = {
+  chain: [
+    {
+      canonical_id: 'wpp-spain.com',
+      canonical_domain: 'wpp-spain.com',
+      brand_name: 'WPP Spain',
+      keller_type: 'sub_brand',
+      parent_brand: 'brand_wpp',
+      house_domain: 'omnicom.com',
+      source: 'brand_json',
+    },
+    {
+      canonical_id: 'wpp.com',
+      canonical_domain: 'wpp.com',
+      brand_name: 'WPP',
+      keller_type: 'sub_brand',
+      parent_brand: 'brand_omnicom',
+      house_domain: 'omnicom.com',
+      source: 'brand_json',
+    },
+    {
+      canonical_id: 'omnicom.com',
+      canonical_domain: 'omnicom.com',
+      brand_name: 'Omnicom',
+      keller_type: 'master',
+      source: 'brand_json',
+    },
+  ],
+};
+
 const PROPERTY = {
   publisher_domain: 'nytimes.com',
   source: 'adagents_json',
@@ -27,9 +57,10 @@ const PROPERTY = {
   properties: [
     {
       id: 'prop_1',
-      type: 'website',
+      property_type: 'website',
       name: 'NYTimes',
       identifiers: [{ type: 'domain', value: 'nytimes.com' }],
+      tags: ['news', 'premium'],
     },
   ],
   verified: true,
@@ -182,6 +213,265 @@ describe('RegistryClient', () => {
     });
   });
 
+  // ============ resolveBrandHierarchy ============
+
+  describe('resolveBrandHierarchy', () => {
+    test('resolves a domain to an ordered brand chain', async () => {
+      let capturedUrl;
+      restore = mockFetch(async url => {
+        capturedUrl = url;
+        return new Response(JSON.stringify(BRAND_HIERARCHY), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      const result = await client.resolveBrandHierarchy('wpp-spain.com');
+
+      assert.ok(capturedUrl.includes('/api/brands/hierarchy?'));
+      assert.ok(capturedUrl.includes('domain=wpp-spain.com'));
+      assert.deepStrictEqual(
+        result.chain.map(brand => brand.canonical_domain),
+        ['wpp-spain.com', 'wpp.com', 'omnicom.com']
+      );
+    });
+
+    test('returns null on 404', async () => {
+      restore = mockFetch(async () => {
+        return new Response(JSON.stringify({ error: 'Brand not found' }), { status: 404 });
+      });
+
+      const client = new RegistryClient();
+      const result = await client.resolveBrandHierarchy('unknown.com');
+
+      assert.strictEqual(result, null);
+    });
+
+    test('uses client-side ttl cache when requested', async () => {
+      let fetchCount = 0;
+      restore = mockFetch(async () => {
+        fetchCount++;
+        return new Response(JSON.stringify(BRAND_HIERARCHY), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      await client.resolveBrandHierarchy('WPP-Spain.com', { ttlMs: 60_000 });
+      await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+
+      assert.strictEqual(fetchCount, 1);
+    });
+
+    test('cached hierarchy entries cannot be mutated by callers', async () => {
+      restore = mockFetch(async () => {
+        return new Response(JSON.stringify(BRAND_HIERARCHY), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      const first = await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+      first.chain[0].brand_name = 'Mutated';
+      const second = await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+      second.chain[0].brand_name = 'Also Mutated';
+      const third = await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+
+      assert.strictEqual(third.chain[0].brand_name, 'WPP Spain');
+    });
+
+    test('fresh bypasses and refreshes ttl cache', async () => {
+      let fetchCount = 0;
+      restore = mockFetch(async url => {
+        fetchCount++;
+        if (fetchCount === 2) assert.ok(url.includes('fresh=true'));
+        return new Response(JSON.stringify(BRAND_HIERARCHY), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+      await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000, fresh: true });
+
+      assert.strictEqual(fetchCount, 2);
+    });
+
+    test('fresh without ttl clears an existing cache entry', async () => {
+      let fetchCount = 0;
+      restore = mockFetch(async () => {
+        fetchCount++;
+        return new Response(
+          JSON.stringify({
+            chain: [{ ...BRAND_HIERARCHY.chain[0], brand_name: `WPP Spain v${fetchCount}` }],
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient();
+      await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+      const fresh = await client.resolveBrandHierarchy('wpp-spain.com', { fresh: true });
+      const next = await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+
+      assert.strictEqual(fresh.chain[0].brand_name, 'WPP Spain v2');
+      assert.strictEqual(next.chain[0].brand_name, 'WPP Spain v3');
+      assert.strictEqual(fetchCount, 3);
+    });
+
+    test('rejects invalid ttl values', async () => {
+      const client = new RegistryClient();
+      await assert.rejects(() => client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: Infinity }), {
+        message: /ttlMs/,
+      });
+      await assert.rejects(() => client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: -1 }), {
+        message: /ttlMs/,
+      });
+    });
+
+    test('rejects empty domain', async () => {
+      const client = new RegistryClient();
+      await assert.rejects(() => client.resolveBrandHierarchy(''), { message: /domain is required/ });
+    });
+  });
+
+  // ============ resolveBrandHierarchies ============
+
+  describe('resolveBrandHierarchies', () => {
+    test('bulk resolves ordered brand chains', async () => {
+      restore = mockFetch(async (url, opts) => {
+        assert.ok(url.includes('/api/brands/hierarchy/bulk'));
+        assert.strictEqual(opts.method, 'POST');
+        const body = JSON.parse(opts.body);
+        assert.deepStrictEqual(body.domains, ['wpp-spain.com', 'unknown.com']);
+        return new Response(
+          JSON.stringify({
+            results: {
+              'wpp-spain.com': BRAND_HIERARCHY,
+              'unknown.com': null,
+            },
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient();
+      const result = await client.resolveBrandHierarchies(['wpp-spain.com', 'unknown.com']);
+
+      assert.strictEqual(result['wpp-spain.com'].chain[0].canonical_domain, 'wpp-spain.com');
+      assert.strictEqual(result['unknown.com'], null);
+    });
+
+    test('returns empty object for empty array', async () => {
+      const client = new RegistryClient();
+      const result = await client.resolveBrandHierarchies([]);
+
+      assert.deepStrictEqual(result, {});
+    });
+
+    test('rejects more than 100 domains', async () => {
+      const client = new RegistryClient();
+      const domains = Array.from({ length: 101 }, (_, i) => `domain${i}.com`);
+
+      await assert.rejects(
+        () => client.resolveBrandHierarchies(domains),
+        err => {
+          assert.ok(err.message.includes('100'));
+          return true;
+        }
+      );
+    });
+
+    test('uses cached entries and fetches only missing domains', async () => {
+      const posts = [];
+      restore = mockFetch(async (url, opts) => {
+        if (url.includes('/api/brands/hierarchy?')) {
+          return new Response(JSON.stringify(BRAND_HIERARCHY), { status: 200 });
+        }
+        posts.push(JSON.parse(opts.body));
+        return new Response(
+          JSON.stringify({
+            results: {
+              'operator.com': {
+                chain: [
+                  {
+                    canonical_id: 'operator.com',
+                    canonical_domain: 'operator.com',
+                    brand_name: 'Operator',
+                    source: 'brand_json',
+                  },
+                ],
+              },
+            },
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient();
+      await client.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
+      const result = await client.resolveBrandHierarchies(['wpp-spain.com', 'operator.com'], { ttlMs: 60_000 });
+
+      assert.deepStrictEqual(posts[0].domains, ['operator.com']);
+      assert.strictEqual(result['wpp-spain.com'].chain[0].canonical_domain, 'wpp-spain.com');
+      assert.strictEqual(result['operator.com'].chain[0].canonical_domain, 'operator.com');
+    });
+
+    test('deduplicates bulk cache misses while preserving caller keys', async () => {
+      const posts = [];
+      restore = mockFetch(async (_url, opts) => {
+        posts.push(JSON.parse(opts.body));
+        return new Response(
+          JSON.stringify({
+            results: {
+              'WPP-Spain.com': BRAND_HIERARCHY,
+            },
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient();
+      const result = await client.resolveBrandHierarchies(['WPP-Spain.com', 'wpp-spain.com']);
+
+      assert.deepStrictEqual(posts[0].domains, ['WPP-Spain.com']);
+      assert.strictEqual(result['WPP-Spain.com'].chain[0].canonical_domain, 'wpp-spain.com');
+      assert.strictEqual(result['wpp-spain.com'].chain[0].canonical_domain, 'wpp-spain.com');
+    });
+
+    test('throws when bulk response is missing results', async () => {
+      restore = mockFetch(async () => {
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      await assert.rejects(() => client.resolveBrandHierarchies(['wpp-spain.com']), { message: /missing results/ });
+    });
+
+    test('throws when bulk response omits a requested domain', async () => {
+      restore = mockFetch(async () => {
+        return new Response(JSON.stringify({ results: {} }), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      await assert.rejects(() => client.resolveBrandHierarchies(['wpp-spain.com']), {
+        message: /missing result for wpp-spain\.com/,
+      });
+    });
+
+    test('ignores unmatched bulk response keys', async () => {
+      restore = mockFetch(async () => {
+        return new Response(
+          JSON.stringify({
+            results: {
+              'wpp-spain.com': BRAND_HIERARCHY,
+              'unrequested.com': BRAND_HIERARCHY,
+            },
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient();
+      const result = await client.resolveBrandHierarchies(['wpp-spain.com']);
+
+      assert.strictEqual(result['wpp-spain.com'].chain[0].canonical_domain, 'wpp-spain.com');
+      assert.strictEqual(result['unrequested.com'], undefined);
+    });
+  });
+
   // ============ findCompany ============
 
   describe('findCompany', () => {
@@ -325,6 +615,207 @@ describe('RegistryClient', () => {
     });
   });
 
+  // ============ brand logo assets ============
+
+  describe('brand logo assets', () => {
+    const LOGO_ASSET = {
+      id: 'logo_123',
+      content_type: 'image/svg+xml',
+      source: 'community',
+      review_status: 'approved',
+      tags: ['primary', 'light'],
+      url: 'https://agenticadvertising.org/assets/brands/acme.com/logo_123.svg',
+      legacy_url: '/logos/brands/acme.com/logo_123',
+      width: 512,
+      height: 128,
+    };
+
+    test('lists logo assets and serializes tags as a comma-separated query param', async () => {
+      let capturedUrl;
+      restore = mockFetch(async url => {
+        capturedUrl = url;
+        return new Response(JSON.stringify({ domain: 'acme.com', assets: [LOGO_ASSET] }), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      const result = await client.listBrandLogos('acme.com', ['primary', 'light-bg']);
+
+      const parsed = new URL(capturedUrl);
+      assert.strictEqual(parsed.pathname, '/api/brands/acme.com/logos');
+      assert.strictEqual(parsed.searchParams.get('tags'), 'primary,light-bg');
+      assert.strictEqual(result.domain, 'acme.com');
+      assert.strictEqual(result.assets[0].id, 'logo_123');
+      assert.strictEqual(result.logos, result.assets);
+    });
+
+    test('accepts options object for logo tag filters and preserves legacy logos responses', async () => {
+      let capturedUrl;
+      restore = mockFetch(async url => {
+        capturedUrl = url;
+        return new Response(JSON.stringify({ domain: 'acme.com', logos: [LOGO_ASSET] }), { status: 200 });
+      });
+
+      const client = new RegistryClient();
+      const result = await client.listBrandLogos('acme.com', { tags: ['dark-bg'] });
+
+      const parsed = new URL(capturedUrl);
+      assert.strictEqual(parsed.searchParams.get('tags'), 'dark-bg');
+      assert.strictEqual(result.assets[0].id, 'logo_123');
+      assert.strictEqual(result.logos[0].id, 'logo_123');
+    });
+
+    test('saves logo assets as multipart form data', async () => {
+      restore = mockFetch(async (url, opts) => {
+        assert.ok(url.includes('/api/brands/acme.com/logos'));
+        assert.strictEqual(opts.method, 'POST');
+        assert.strictEqual(opts.headers.Authorization, 'Bearer sk_test');
+        assert.strictEqual(opts.headers['Content-Type'], undefined);
+        assert.ok(opts.body instanceof FormData);
+
+        const file = opts.body.get('file');
+        assert.strictEqual(file.name, 'logo.png');
+        assert.strictEqual(file.type, 'image/png');
+        assert.strictEqual(await file.text(), 'logo-bytes');
+        assert.strictEqual(opts.body.get('tags'), 'primary,dark-bg');
+        assert.strictEqual(opts.body.get('note'), 'Use for dark backgrounds');
+
+        return new Response(
+          JSON.stringify({
+            success: true,
+            domain: 'acme.com',
+            logo_id: 'logo_pending',
+            review_status: 'pending',
+            message: 'Logo submitted for review',
+            review_sla_hours: 24,
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.saveBrandLogo({
+        domain: 'acme.com',
+        data: Buffer.from('logo-bytes'),
+        filename: 'logo.png',
+        mimeType: 'image/png',
+        tags: ['primary', 'dark-bg'],
+        note: 'Use for dark backgrounds',
+      });
+
+      assert.strictEqual(result.logo_id, 'logo_pending');
+      assert.strictEqual(result.review_status, 'pending');
+      assert.strictEqual(result.review_sla_hours, 24);
+    });
+
+    test('keeps uploadBrandLogo as a deprecated alias', async () => {
+      restore = mockFetch(async () => {
+        return new Response(
+          JSON.stringify({
+            success: true,
+            domain: 'acme.com',
+            logo_id: 'logo_alias',
+            review_status: 'pending',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.uploadBrandLogo({
+        domain: 'acme.com',
+        data: Buffer.from('logo-bytes'),
+        filename: 'logo.png',
+        mimeType: 'image/png',
+        tags: ['primary'],
+      });
+
+      assert.strictEqual(result.logo_id, 'logo_alias');
+    });
+
+    test('accepts Blob and ArrayBuffer logo data', async () => {
+      const seen = [];
+      restore = mockFetch(async (_url, opts) => {
+        const file = opts.body.get('file');
+        seen.push({ name: file.name, type: file.type, text: await file.text() });
+        return new Response(
+          JSON.stringify({
+            success: true,
+            domain: 'acme.com',
+            logo_id: `logo_${seen.length}`,
+            review_status: 'pending',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      await client.saveBrandLogo({
+        domain: 'acme.com',
+        data: new Blob(['blob-logo'], { type: 'text/plain' }),
+        filename: 'blob.txt',
+        mimeType: 'image/svg+xml',
+        tags: ['primary'],
+      });
+      await client.saveBrandLogo({
+        domain: 'acme.com',
+        data: new TextEncoder().encode('array-buffer-logo').buffer,
+        filename: 'array-buffer.svg',
+        mimeType: 'image/svg+xml',
+        tags: ['primary'],
+      });
+
+      assert.deepStrictEqual(seen, [
+        { name: 'blob.txt', type: 'image/svg+xml', text: 'blob-logo' },
+        { name: 'array-buffer.svg', type: 'image/svg+xml', text: 'array-buffer-logo' },
+      ]);
+    });
+
+    test('throws without apiKey when uploading a logo', async () => {
+      const client = new RegistryClient();
+      await assert.rejects(
+        () =>
+          client.saveBrandLogo({
+            domain: 'acme.com',
+            data: Buffer.from('logo'),
+            filename: 'logo.png',
+            mimeType: 'image/png',
+            tags: ['primary'],
+          }),
+        err => {
+          assert.ok(err.message.includes('apiKey is required'));
+          return true;
+        }
+      );
+    });
+
+    test('rejects empty brand logo inputs', async () => {
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      await assert.rejects(() => client.listBrandLogos(''), { message: /domain is required/ });
+      await assert.rejects(
+        () =>
+          client.saveBrandLogo({
+            domain: 'acme.com',
+            data: Buffer.from('logo'),
+            filename: '',
+            mimeType: 'image/png',
+            tags: ['primary'],
+          }),
+        { message: /filename is required/ }
+      );
+      await assert.rejects(
+        () =>
+          client.saveBrandLogo({
+            domain: 'acme.com',
+            data: Buffer.from('logo'),
+            filename: 'logo.png',
+            mimeType: 'image/png',
+            tags: [],
+          }),
+        { message: /tags are required/ }
+      );
+    });
+  });
+
   // ============ lookupProperty ============
 
   describe('lookupProperty', () => {
@@ -340,6 +831,8 @@ describe('RegistryClient', () => {
       assert.strictEqual(result.publisher_domain, 'nytimes.com');
       assert.strictEqual(result.verified, true);
       assert.strictEqual(result.properties.length, 1);
+      assert.deepStrictEqual(result.properties[0].identifiers, [{ type: 'domain', value: 'nytimes.com' }]);
+      assert.deepStrictEqual(result.properties[0].tags, ['news', 'premium']);
     });
 
     test('returns null on 404', async () => {
@@ -1017,6 +1510,7 @@ describe('RegistryClient', () => {
       assert.strictEqual(capturedOpts.headers['Authorization'], 'Bearer sk_test');
       const body = JSON.parse(capturedOpts.body);
       assert.strictEqual(body.publisher_domain, 'example.com');
+      assert.deepStrictEqual(body.authorized_agents, []);
       assert.strictEqual(result.success, true);
       assert.strictEqual(result.id, 'pr_456');
     });
@@ -1057,18 +1551,108 @@ describe('RegistryClient', () => {
       );
     });
 
-    test('throws without authorized_agents', async () => {
-      const client = new RegistryClient({ apiKey: 'sk_test' });
-      await assert.rejects(
-        () =>
-          client.saveProperty({
-            publisher_domain: 'example.com',
+    test('defaults omitted authorized_agents to an empty array', async () => {
+      let capturedOpts;
+      restore = mockFetch(async (_url, opts) => {
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: 'Property saved',
+            id: 'pr_456',
           }),
-        err => {
-          assert.ok(err.message.includes('authorized_agents is required'));
-          return true;
-        }
-      );
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.saveProperty({
+        publisher_domain: 'example.com',
+      });
+
+      const body = JSON.parse(capturedOpts.body);
+      assert.strictEqual(body.publisher_domain, 'example.com');
+      assert.deepStrictEqual(body.authorized_agents, []);
+      assert.strictEqual(result.success, true);
+    });
+
+    test('forwards property identity identifiers and tags', async () => {
+      let capturedOpts;
+      restore = mockFetch(async (_url, opts) => {
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: 'Property saved',
+            id: 'pr_identity',
+            revision_number: 7,
+          }),
+          { status: 200 }
+        );
+      });
+
+      const propertyIdentity = {
+        property_type: 'website',
+        name: 'Example Publisher',
+        identifiers: [
+          { type: 'domain', value: 'example.com' },
+          { type: 'ios_bundle', value: 'com.example.news' },
+        ],
+        tags: ['news', 'premium'],
+      };
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.saveProperty({
+        publisher_domain: 'example.com',
+        properties: [propertyIdentity],
+        authorized_agents: [],
+      });
+
+      const body = JSON.parse(capturedOpts.body);
+      assert.deepStrictEqual(body.authorized_agents, []);
+      assert.deepStrictEqual(body.properties, [{ ...propertyIdentity, type: 'website' }]);
+      assert.strictEqual(result.id, 'pr_identity');
+      assert.strictEqual(result.revision_number, 7);
+    });
+
+    test('normalizes legacy property type alias before sending', async () => {
+      let capturedOpts;
+      restore = mockFetch(async (_url, opts) => {
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: 'Property saved',
+            id: 'pr_legacy',
+            revision_number: 8,
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      await client.saveProperty({
+        publisher_domain: 'legacy.example',
+        properties: [
+          {
+            type: 'mobile_app',
+            name: 'Legacy App',
+            identifiers: [{ type: 'android_package', value: 'com.example.legacy' }],
+            tags: ['app'],
+          },
+        ],
+      });
+
+      const body = JSON.parse(capturedOpts.body);
+      assert.deepStrictEqual(body.properties, [
+        {
+          type: 'mobile_app',
+          property_type: 'mobile_app',
+          name: 'Legacy App',
+          identifiers: [{ type: 'android_package', value: 'com.example.legacy' }],
+          tags: ['app'],
+        },
+      ]);
     });
 
     test('throws on 401 unauthorized', async () => {
@@ -1088,6 +1672,306 @@ describe('RegistryClient', () => {
           return true;
         }
       );
+    });
+
+    test('preserves authoritative-property 409 errors', async () => {
+      restore = mockFetch(async () => {
+        return new Response(JSON.stringify({ error: 'Cannot edit authoritative property' }), { status: 409 });
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      await assert.rejects(
+        () =>
+          client.saveProperty({
+            publisher_domain: 'example.com',
+            properties: [{ property_type: 'website', name: 'Example Publisher' }],
+            authorized_agents: [],
+          }),
+        err => {
+          assert.ok(err.message.includes('409'));
+          assert.ok(err.message.includes('Cannot edit authoritative property'));
+          return true;
+        }
+      );
+    });
+  });
+
+  describe('saveProperties', () => {
+    test('fans out property identity payloads with canonical property_type', async () => {
+      const capturedBodies = [];
+      restore = mockFetch(async (_url, opts) => {
+        capturedBodies.push(JSON.parse(opts.body));
+        const body = capturedBodies[capturedBodies.length - 1];
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: 'Property saved',
+            id: `pr_${body.publisher_domain}`,
+            revision_number: capturedBodies.length,
+          }),
+          { status: 200 }
+        );
+      });
+
+      const requests = [
+        {
+          publisher_domain: 'example.com',
+          authorized_agents: [],
+          properties: [
+            {
+              property_type: 'website',
+              name: 'Example Publisher',
+              identifiers: [{ type: 'domain', value: 'example.com' }],
+              tags: ['news'],
+            },
+          ],
+        },
+        {
+          publisher_domain: 'legacy.example',
+          authorized_agents: [],
+          properties: [
+            {
+              type: 'mobile_app',
+              name: 'Legacy App',
+              identifiers: [{ type: 'android_package', value: 'com.example.legacy' }],
+              tags: ['app'],
+            },
+          ],
+        },
+      ];
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const results = await client.saveProperties(requests, { concurrency: 1 });
+
+      assert.deepStrictEqual(capturedBodies, [
+        {
+          publisher_domain: 'example.com',
+          authorized_agents: [],
+          properties: [
+            {
+              type: 'website',
+              property_type: 'website',
+              name: 'Example Publisher',
+              identifiers: [{ type: 'domain', value: 'example.com' }],
+              tags: ['news'],
+            },
+          ],
+        },
+        {
+          publisher_domain: 'legacy.example',
+          authorized_agents: [],
+          properties: [
+            {
+              type: 'mobile_app',
+              property_type: 'mobile_app',
+              name: 'Legacy App',
+              identifiers: [{ type: 'android_package', value: 'com.example.legacy' }],
+              tags: ['app'],
+            },
+          ],
+        },
+      ]);
+      assert.strictEqual(results['example.com'].revision_number, 1);
+      assert.strictEqual(results['legacy.example'].revision_number, 2);
+    });
+  });
+
+  describe('property catalog fact APIs', () => {
+    test('resolves identifiers with provenance and auth', async () => {
+      let capturedUrl, capturedOpts;
+      restore = mockFetch(async (url, opts) => {
+        capturedUrl = url;
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            resolved: [
+              {
+                identifier: { type: 'domain', value: 'example.com' },
+                property_rid: 'rid_example',
+                classification: 'property',
+                status: 'existing',
+                source: 'member_assertion',
+              },
+            ],
+            summary: { total: 1, resolved: 1, created: 0, excluded: 0, not_found: 0 },
+            server_timestamp: '2026-07-01T00:00:00Z',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.resolveIdentifiers({
+        identifiers: [{ type: 'domain', value: 'example.com' }],
+        provenance: { type: 'member_assertion' },
+      });
+
+      assert.ok(capturedUrl.includes('/api/registry/resolve'));
+      assert.strictEqual(capturedOpts.method, 'POST');
+      assert.strictEqual(capturedOpts.headers['Authorization'], 'Bearer sk_test');
+      assert.deepStrictEqual(JSON.parse(capturedOpts.body), {
+        identifiers: [{ type: 'domain', value: 'example.com' }],
+        provenance: { type: 'member_assertion' },
+      });
+      assert.strictEqual(result.resolved[0].property_rid, 'rid_example');
+    });
+
+    test('allows identifier lookup mode without an apiKey', async () => {
+      let capturedOpts;
+      restore = mockFetch(async (_url, opts) => {
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            resolved: [],
+            summary: { total: 1, resolved: 0, created: 0, excluded: 0, not_found: 1 },
+            server_timestamp: '2026-07-01T00:00:00Z',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient();
+      await client.resolveIdentifiers({
+        identifiers: [{ type: 'domain', value: 'missing.example' }],
+        provenance: { type: 'member_assertion' },
+        mode: 'lookup',
+      });
+
+      assert.strictEqual(capturedOpts.headers.Authorization, undefined);
+    });
+
+    test('requires an apiKey for identifier resolve mode', async () => {
+      const savedEnv = process.env.ADCP_REGISTRY_API_KEY;
+      delete process.env.ADCP_REGISTRY_API_KEY;
+      try {
+        const client = new RegistryClient();
+        await assert.rejects(
+          () =>
+            client.resolveIdentifiers({
+              identifiers: [{ type: 'domain', value: 'example.com' }],
+              provenance: { type: 'member_assertion' },
+            }),
+          /apiKey is required/
+        );
+      } finally {
+        if (savedEnv !== undefined) process.env.ADCP_REGISTRY_API_KEY = savedEnv;
+      }
+    });
+
+    test('files and fetches catalog disputes', async () => {
+      const calls = [];
+      restore = mockFetch(async (url, opts) => {
+        calls.push({ url, opts });
+        if (opts?.method === 'POST') {
+          return new Response(
+            JSON.stringify({
+              dispute_id: 'disp_123',
+              action_taken: 'queued_for_review',
+              reason: 'queued',
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            id: 'disp_123',
+            dispute_type: 'identifier_link',
+            subject_type: 'identifier',
+            subject_value: 'example.com',
+            claim: 'This identifier is incorrectly linked.',
+            status: 'queued_for_review',
+            created_at: '2026-07-01T00:00:00Z',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const filed = await client.fileCatalogDispute({
+        dispute_type: 'identifier_link',
+        subject_type: 'identifier',
+        subject_value: 'example.com',
+        claim: 'This identifier is incorrectly linked.',
+      });
+      const fetched = await client.getCatalogDispute('disp_123');
+
+      assert.ok(calls[0].url.includes('/api/registry/catalog/disputes'));
+      assert.strictEqual(calls[0].opts.headers['Authorization'], 'Bearer sk_test');
+      assert.strictEqual(filed.dispute_id, 'disp_123');
+      assert.ok(calls[1].url.endsWith('/api/registry/catalog/disputes/disp_123'));
+      assert.strictEqual(fetched.id, 'disp_123');
+    });
+  });
+
+  // ============ hosted property ownership ============
+
+  describe('hosted property ownership', () => {
+    test('claims a hosted property domain with auth header', async () => {
+      let capturedUrl, capturedOpts;
+      restore = mockFetch(async (url, opts) => {
+        capturedUrl = url;
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            success: true,
+            domain: 'example.com',
+            authoritative_location: 'https://registry.example/adagents.json?adcp_claim=tok',
+            instructions: 'Publish the pointer at your origin.',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.claimHostedPropertyDomain('example.com');
+
+      assert.ok(capturedUrl.includes('/api/properties/hosted/example.com/claim'));
+      assert.strictEqual(capturedOpts.method, 'POST');
+      assert.strictEqual(capturedOpts.headers['Authorization'], 'Bearer sk_test');
+      assert.strictEqual(result.success, true);
+      assert.strictEqual(result.domain, 'example.com');
+    });
+
+    test('verifies a hosted property origin with auth header', async () => {
+      let capturedUrl, capturedOpts;
+      restore = mockFetch(async (url, opts) => {
+        capturedUrl = url;
+        capturedOpts = opts;
+        return new Response(
+          JSON.stringify({
+            verified: true,
+            reason: 'authoritative_location_pointer',
+            checked_at: '2026-07-01T00:00:00.000Z',
+            bound_org_id: 'org_123',
+          }),
+          { status: 200 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'sk_test' });
+      const result = await client.verifyHostedPropertyOrigin('example.com');
+
+      assert.ok(capturedUrl.includes('/api/properties/hosted/example.com/verify-origin'));
+      assert.strictEqual(capturedOpts.method, 'POST');
+      assert.strictEqual(capturedOpts.headers['Authorization'], 'Bearer sk_test');
+      assert.strictEqual(result.verified, true);
+      assert.strictEqual(result.bound_org_id, 'org_123');
+    });
+
+    test('hosted property claim and verification require apiKey', async () => {
+      const savedEnv = process.env.ADCP_REGISTRY_API_KEY;
+      delete process.env.ADCP_REGISTRY_API_KEY;
+      try {
+        const client = new RegistryClient();
+        await assert.rejects(() => client.claimHostedPropertyDomain('example.com'), {
+          message: /apiKey is required/,
+        });
+        await assert.rejects(() => client.verifyHostedPropertyOrigin('example.com'), {
+          message: /apiKey is required/,
+        });
+      } finally {
+        if (savedEnv !== undefined) process.env.ADCP_REGISTRY_API_KEY = savedEnv;
+      }
     });
   });
 
@@ -1264,7 +2148,19 @@ describe('RegistryClient', () => {
 
   describe('listProperties', () => {
     test('lists properties without options', async () => {
-      const responseData = { properties: [PROPERTY], stats: { total: 1 } };
+      const responseData = {
+        properties: [
+          {
+            domain: 'nytimes.com',
+            source: 'hosted',
+            property_count: 1,
+            agent_count: 0,
+            verified: true,
+            properties: PROPERTY.properties,
+          },
+        ],
+        stats: { total: 1 },
+      };
       let capturedUrl;
       restore = mockFetch(async url => {
         capturedUrl = url;
@@ -1277,6 +2173,10 @@ describe('RegistryClient', () => {
       assert.ok(capturedUrl.includes('/api/properties/registry'));
       assert.ok(!capturedUrl.includes('?'));
       assert.strictEqual(result.properties.length, 1);
+      assert.deepStrictEqual(result.properties[0].properties[0].identifiers, [
+        { type: 'domain', value: 'nytimes.com' },
+      ]);
+      assert.deepStrictEqual(result.properties[0].properties[0].tags, ['news', 'premium']);
     });
 
     test('passes search, limit, and offset params', async () => {
@@ -2807,14 +3707,23 @@ describe('RegistryClient', () => {
     });
 
     test('throws without apiKey', async () => {
-      const client = new RegistryClient();
-      await assert.rejects(
-        () => client.requestCrawl('publisher.example.com'),
-        err => {
-          assert.ok(err.message.includes('apiKey is required'));
-          return true;
-        }
-      );
+      const savedApiKey = process.env.ADCP_REGISTRY_API_KEY;
+      delete process.env.ADCP_REGISTRY_API_KEY;
+      restore = mockFetch(async () => {
+        throw new Error('unexpected network call');
+      });
+      try {
+        const client = new RegistryClient();
+        await assert.rejects(
+          () => client.requestCrawl('publisher.example.com'),
+          err => {
+            assert.ok(err.message.includes('apiKey is required'));
+            return true;
+          }
+        );
+      } finally {
+        if (savedApiKey !== undefined) process.env.ADCP_REGISTRY_API_KEY = savedApiKey;
+      }
     });
 
     test('throws on empty domain', async () => {
@@ -2845,6 +3754,66 @@ describe('RegistryClient', () => {
         () => client.requestCrawl('publisher.example.com'),
         err => {
           assert.ok(err.message.includes('429'));
+          return true;
+        }
+      );
+    });
+  });
+
+  // ============ requestManagerRevalidation ============
+
+  describe('requestManagerRevalidation', () => {
+    test('requests manager fan-out revalidation', async () => {
+      restore = mockFetch(async (url, opts) => {
+        assert.ok(url.includes('/api/registry/manager-revalidation-request'));
+        assert.strictEqual(opts.method, 'POST');
+        const body = JSON.parse(opts.body);
+        assert.strictEqual(body.manager_domain, 'raptive.com');
+        assert.strictEqual(opts.headers.Authorization, 'Bearer test-key');
+        return new Response(
+          JSON.stringify({
+            message: 'Manager re-validation enqueued',
+            manager_domain: 'raptive.com',
+            publishers_enqueued: 42,
+          }),
+          { status: 202 }
+        );
+      });
+
+      const client = new RegistryClient({ apiKey: 'test-key' });
+      const result = await client.requestManagerRevalidation('raptive.com');
+
+      assert.strictEqual(result.message, 'Manager re-validation enqueued');
+      assert.strictEqual(result.manager_domain, 'raptive.com');
+      assert.strictEqual(result.publishers_enqueued, 42);
+    });
+
+    test('throws without apiKey', async () => {
+      const savedApiKey = process.env.ADCP_REGISTRY_API_KEY;
+      delete process.env.ADCP_REGISTRY_API_KEY;
+      restore = mockFetch(async () => {
+        throw new Error('unexpected network call');
+      });
+      try {
+        const client = new RegistryClient();
+        await assert.rejects(
+          () => client.requestManagerRevalidation('raptive.com'),
+          err => {
+            assert.ok(err.message.includes('apiKey is required'));
+            return true;
+          }
+        );
+      } finally {
+        if (savedApiKey !== undefined) process.env.ADCP_REGISTRY_API_KEY = savedApiKey;
+      }
+    });
+
+    test('throws on empty managerDomain', async () => {
+      const client = new RegistryClient({ apiKey: 'test-key' });
+      await assert.rejects(
+        () => client.requestManagerRevalidation(''),
+        err => {
+          assert.ok(err.message.includes('managerDomain is required'));
           return true;
         }
       );

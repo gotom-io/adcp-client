@@ -1,6 +1,6 @@
 {
   "name": "@adcp/sdk",
-  "version": "9.0.0-beta.28",
+  "version": "11.2.0",
   "description": "AdCP SDK — client, server, and compliance harnesses for the AdContext Protocol (MCP + A2A)",
   "workspaces": [
     ".",
@@ -34,6 +34,11 @@
       "import": "./dist/lib/types/index.js",
       "require": "./dist/lib/types/index.js",
       "types": "./dist/lib/types/index.d.ts"
+    },
+    "./enums": {
+      "import": "./dist/lib/enums.js",
+      "require": "./dist/lib/enums.js",
+      "types": "./dist/lib/enums.d.ts"
     },
     "./types/v2-5": {
       "import": "./dist/lib/types/v2-5/index.js",
@@ -299,10 +304,11 @@
     "test:lib:slow": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test test/lib/cli-auth-scheme.test.js test/lib/cli-webhook-receiver-flag.test.js test/lib/conformance-cli.test.js",
     "pretest:examples": "npm run build",
     "test:examples": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test-concurrency=1 --test test/examples/*.test.js",
-    "test:e2e": "node test/e2e/adcp-e2e.test.js",
+    "test:e2e": "node --test test/e2e/registry-live.test.js",
+    "test:e2e:local-app": "node test/e2e/adcp-e2e.test.js",
     "test:protocols": "node test/run-protocol-tests.js",
     "changeset": "changeset",
-    "version": "changeset version && npm run sync-version",
+    "version": "changeset version && npm install --package-lock-only --ignore-scripts && npm run sync-version",
     "release": "tsx scripts/publish-adcp-release.ts",
     "test:protocol-compliance": "node test/run-protocol-tests.js --only compliance",
     "test:protocol-schema": "node test/run-protocol-tests.js --only schema",
@@ -398,8 +404,8 @@
     "secure-json-parse": "^4.1.0",
     "structured-headers": "^2.0.2",
     "tldts": "^7.0.29",
-    "undici": "^6.25.0",
-    "ws": "^8.20.0",
+    "undici": "^6.27.0",
+    "ws": "^8.21.0",
     "yaml": "^2.7.1"
   },
   "peerDependencies": {
@@ -461,5 +467,5 @@
     },
     "minimatch": "^10.2.1"
   },
-  "adcp_version": "3.1.0-rc.10"
+  "adcp_version": "3.1.2"
 }

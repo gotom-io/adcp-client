@@ -4,12 +4,12 @@
 /**
  * AdCP SDK library version
  */
-export const LIBRARY_VERSION = '9.0.0-beta.28';
+export const LIBRARY_VERSION = '11.2.0';
 
 /**
  * AdCP specification version this library is built for
  */
-export const ADCP_VERSION = '3.1.0-rc.10';
+export const ADCP_VERSION = '3.1.2';
 
 /**
  * AdCP major version sent with every request (adcp_major_version field).
@@ -21,9 +21,9 @@ export const ADCP_MAJOR_VERSION = 3;
 /**
  * AdCP versions this library maintains backward compatibility with.
  *
- * Auto-derived from `ADCP_VERSION` by scripts/sync-version.ts — every
- * `3.0.0` through the current pin is enumerated. Do not edit this list
- * by hand; bumping the AdCP pin via `npm run sync-version` extends it.
+ * Auto-derived from `ADCP_VERSION` by scripts/sync-version.ts. Do not edit
+ * this list by hand; bumping the AdCP pin via `npm run sync-version`
+ * extends it.
  */
 export const COMPATIBLE_ADCP_VERSIONS = [
   'v2.5',
@@ -34,37 +34,8 @@ export const COMPATIBLE_ADCP_VERSIONS = [
   '3.0-beta',
   '3.0.0-beta.3',
   '3.0-beta.3',
-  '3.1.0-beta.1',
-  '3.1-beta.1',
-  '3.1-beta',
-  '3.1.0-beta.2',
-  '3.1-beta.2',
-  '3.1.0-beta.3',
-  '3.1-beta.3',
-  '3.1.0-beta.5',
-  '3.1-beta.5',
-  '3.1.0-beta.7',
-  '3.1-beta.7',
-  '3.1.0-rc.1',
-  '3.1-rc.1',
-  '3.1-rc',
-  '3.1.0-rc.2',
-  '3.1-rc.2',
-  '3.1.0-rc.3',
-  '3.1-rc.3',
-  '3.1.0-rc.4',
-  '3.1-rc.4',
-  '3.1.0-rc.6',
-  '3.1-rc.6',
-  '3.1.0-rc.7',
-  '3.1-rc.7',
-  '3.1.0-rc.8',
-  '3.1-rc.8',
-  '3.1.0-rc.9',
-  '3.1-rc.9',
-  '3.1.0-rc.10',
-  '3.1-rc.10',
   '3.0.0',
+  '3.0',
   '3.0.1',
   '3.0.2',
   '3.0.3',
@@ -77,6 +48,10 @@ export const COMPATIBLE_ADCP_VERSIONS = [
   '3.0.10',
   '3.0.11',
   '3.0.12',
+  '3.1.0',
+  '3.1',
+  '3.1.1',
+  '3.1.2',
 ] as const;
 
 /**
@@ -93,10 +68,10 @@ export type AdcpVersion = (typeof COMPATIBLE_ADCP_VERSIONS)[number];
  * Full version information
  */
 export const VERSION_INFO = {
-  library: '9.0.0-beta.28',
-  adcp: '3.1.0-rc.10',
+  library: '11.2.0',
+  adcp: '3.1.2',
   compatibleVersions: COMPATIBLE_ADCP_VERSIONS,
-  generatedAt: '2026-06-10T18:40:37.777Z',
+  generatedAt: '2026-07-09T20:01:29.494Z',
 } as const;
 
 /**

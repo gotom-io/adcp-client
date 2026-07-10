@@ -18,11 +18,15 @@ const assert = require('node:assert');
 const http = require('node:http');
 
 const { validateAdAgents, parseManagerDomain } = require('../../dist/lib/discovery/validate-adagents.js');
+const {
+  validateSameRegistrableDomainRedirect,
+  AdAgentsRedirectRefusedError,
+} = require('../../dist/lib/discovery/adagents-redirects.js');
 
 /**
  * Start a loopback HTTP server with a per-path response map.
  *
- * @param {Record<string, { status?: number, body?: string, contentType?: string }>} routes
+ * @param {Record<string, { status?: number, body?: string, contentType?: string, headers?: Record<string, string> }>} routes
  *   Map from request path to response config. Unmapped paths → 404.
  */
 function startRoutedServer(routes) {
@@ -36,6 +40,7 @@ function startRoutedServer(routes) {
       }
       res.writeHead(route.status ?? 200, {
         'Content-Type': route.contentType ?? 'application/json',
+        ...(route.headers ?? {}),
       });
       res.end(route.body ?? '');
     });
@@ -48,6 +53,43 @@ function startRoutedServer(routes) {
       });
     });
   });
+}
+
+function startChunkedServer(path, chunks, contentType = 'application/json') {
+  return new Promise(resolve => {
+    const server = http.createServer(async (req, res) => {
+      if (req.url !== path) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': contentType });
+      for (const chunk of chunks) {
+        res.write(chunk);
+        await new Promise(r => setImmediate(r));
+      }
+      res.end();
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolve({
+        host: `127.0.0.1:${port}`,
+        url: `http://127.0.0.1:${port}`,
+        close: () => new Promise(r => server.close(() => r())),
+      });
+    });
+  });
+}
+
+function assertRedirectAllowed(originUrl, currentUrl, nextUrl) {
+  assert.doesNotThrow(() => validateSameRegistrableDomainRedirect(originUrl, currentUrl, nextUrl));
+}
+
+function assertRedirectRefused(originUrl, currentUrl, nextUrl, code) {
+  assert.throws(
+    () => validateSameRegistrableDomainRedirect(originUrl, currentUrl, nextUrl),
+    err => err instanceof AdAgentsRedirectRefusedError && err.code === code
+  );
 }
 
 function adAgentsJson(agentUrl = 'https://agent.example.com/mcp') {
@@ -110,6 +152,17 @@ describe('parseManagerDomain', () => {
 });
 
 describe('validateAdAgents — discovery_method', () => {
+  test('rejects invalid maxBodyBytes values before fetching', async () => {
+    await assert.rejects(
+      () => validateAdAgents('example.com', { maxBodyBytes: Infinity }),
+      /maxBodyBytes must be an integer between 1 and 10485760/
+    );
+    await assert.rejects(
+      () => validateAdAgents('example.com', { maxBodyBytes: 10 * 1024 * 1024 + 1 }),
+      /maxBodyBytes must be an integer between 1 and 10485760/
+    );
+  });
+
   test("direct path: publisher hosts its own adagents.json → discovery_method 'direct'", async () => {
     const server = await startRoutedServer({
       '/.well-known/adagents.json': { body: adAgentsJson() },
@@ -176,6 +229,121 @@ describe('validateAdAgents — discovery_method', () => {
     }
   });
 
+  test('managerdomain fallback honors 10 MiB opt-in for large network adagents.json', async () => {
+    const largeAdagents = JSON.stringify({
+      $schema: 'https://adcontextprotocol.org/schemas/v1/adagents.json',
+      authorized_agents: [{ url: 'https://agent.example.com/mcp', authorized_for: 'Programmatic sales' }],
+      properties: [
+        {
+          property_type: 'website',
+          name: 'example.com',
+          identifiers: [{ type: 'domain', value: 'example.com' }],
+        },
+      ],
+      padding: 'x'.repeat(3 * 1024 * 1024 + 512 * 1024),
+    });
+    assert.ok(largeAdagents.length > 3.5 * 1024 * 1024, `fixture too small: ${largeAdagents.length}`);
+
+    const manager = await startRoutedServer({
+      '/.well-known/adagents.json': { body: largeAdagents },
+    });
+    const publisher = await startRoutedServer({
+      '/ads.txt': {
+        body: `MANAGERDOMAIN=${manager.host}\n`,
+        contentType: 'text/plain',
+      },
+    });
+    try {
+      const defaultResult = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(defaultResult.valid, false);
+      assert.strictEqual(defaultResult.discovery_method, 'ads_txt_managerdomain');
+      assert.ok(
+        defaultResult.errors.some(e => e.includes('Response body exceeded 262144 bytes')),
+        `expected default body cap failure, got: ${JSON.stringify(defaultResult.errors)}`
+      );
+
+      const raisedCapResult = await validateAdAgents(publisher.host, {
+        maxBodyBytes: 10 * 1024 * 1024,
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(
+        raisedCapResult.valid,
+        true,
+        `expected raised maxBodyBytes to pass, got errors=${JSON.stringify(raisedCapResult.errors)}`
+      );
+      assert.strictEqual(raisedCapResult.discovery_method, 'ads_txt_managerdomain');
+      assert.strictEqual(raisedCapResult.manager_domain, manager.host);
+      assert.ok(raisedCapResult.adagents?.authorized_agents?.length);
+    } finally {
+      await Promise.all([publisher.close(), manager.close()]);
+    }
+  });
+
+  test('direct path keeps the 256 KiB default but accepts a valid 3.5 MiB adagents.json with explicit opt-in', async () => {
+    const largeAdagents = JSON.stringify({
+      $schema: 'https://adcontextprotocol.org/schemas/v1/adagents.json',
+      authorized_agents: [{ url: 'https://agent.example.com/mcp', authorized_for: 'Programmatic sales' }],
+      properties: [
+        {
+          property_type: 'website',
+          name: 'example.com',
+          identifiers: [{ type: 'domain', value: 'example.com' }],
+        },
+      ],
+      padding: 'x'.repeat(3 * 1024 * 1024 + 512 * 1024),
+    });
+    assert.ok(largeAdagents.length > 3.5 * 1024 * 1024, `fixture too small: ${largeAdagents.length}`);
+
+    const publisher = await startRoutedServer({
+      '/.well-known/adagents.json': { body: largeAdagents },
+    });
+    try {
+      const defaultResult = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(defaultResult.valid, false);
+      assert.strictEqual(defaultResult.discovery_method, 'direct');
+      assert.ok(
+        defaultResult.errors.some(e => e.includes('Response body exceeded 262144 bytes')),
+        `expected default body cap failure, got: ${JSON.stringify(defaultResult.errors)}`
+      );
+
+      const optedInResult = await validateAdAgents(publisher.host, {
+        maxBodyBytes: 10 * 1024 * 1024,
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(
+        optedInResult.valid,
+        true,
+        `expected 10 MiB maxBodyBytes to pass, got errors=${JSON.stringify(optedInResult.errors)}`
+      );
+      assert.strictEqual(optedInResult.discovery_method, 'direct');
+      assert.ok(optedInResult.adagents?.authorized_agents?.length);
+    } finally {
+      await publisher.close();
+    }
+  });
+
+  test('direct path rejects chunked responses over the configured maxBodyBytes while streaming', async () => {
+    const publisher = await startChunkedServer('/.well-known/adagents.json', ['{"padding":"', 'x'.repeat(2048), '"}']);
+    try {
+      const result = await validateAdAgents(publisher.host, {
+        maxBodyBytes: 1024,
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(result.valid, false);
+      assert.strictEqual(result.discovery_method, 'direct');
+      assert.ok(
+        result.errors.some(e => e.includes('Response body exceeded 1024 bytes')),
+        `expected streaming body cap failure, got: ${JSON.stringify(result.errors)}`
+      );
+    } finally {
+      await publisher.close();
+    }
+  });
+
   test('manager domain 404 → terminal validation failure (not silent pass)', async () => {
     // Manager 404s on adagents.json. Publisher 404s + has ads.txt
     // pointing at it. Validator must surface failure, NOT treat as
@@ -222,6 +390,36 @@ describe('validateAdAgents — discovery_method', () => {
       assert.strictEqual(result.manager_domain, undefined);
     } finally {
       await Promise.all([publisher.close(), manager.close()]);
+    }
+  });
+
+  test('redirected ads.txt reports an HTTP status, not an adagents redirect refusal', async () => {
+    const publisher = await startRoutedServer({
+      '/ads.txt': {
+        status: 301,
+        headers: { Location: '/ads2.txt' },
+        contentType: 'text/plain',
+      },
+      '/ads2.txt': {
+        body: 'MANAGERDOMAIN=manager.example\n',
+        contentType: 'text/plain',
+      },
+    });
+    try {
+      const result = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(result.valid, false);
+      assert.ok(
+        result.errors.some(e => e.includes('ads.txt unavailable: HTTP 301')),
+        `expected ads.txt HTTP 301 error, got: ${JSON.stringify(result.errors)}`
+      );
+      assert.ok(
+        result.errors.every(e => !e.includes('authoritative adagents.json')),
+        `ads.txt error should not use adagents redirect wording: ${JSON.stringify(result.errors)}`
+      );
+    } finally {
+      await publisher.close();
     }
   });
 
@@ -407,6 +605,166 @@ describe('validateAdAgents — discovery_method', () => {
       // Even if input was 127.0.0.1:PORT (numeric — no case to lose),
       // the result MUST carry the lowercased form.
       assert.strictEqual(result.publisher_domain, publisher.host);
+    } finally {
+      await publisher.close();
+    }
+  });
+});
+
+describe('validateAdAgents — adagents.json HTTP redirect policy', () => {
+  test('well-known redirect policy matches cross-SDK registrable-domain vectors', () => {
+    assertRedirectAllowed(
+      'https://ladepeche.fr/.well-known/adagents.json',
+      'https://ladepeche.fr/.well-known/adagents.json',
+      'https://www.ladepeche.fr/.well-known/adagents.json'
+    );
+    assertRedirectAllowed(
+      'https://www.example.com/.well-known/adagents.json',
+      'https://www.example.com/.well-known/adagents.json',
+      'https://example.com/.well-known/adagents.json'
+    );
+    assertRedirectAllowed(
+      'https://pub.example/.well-known/adagents.json',
+      'https://pub.example/.well-known/adagents.json',
+      'https://cdn.pub.example/.well-known/adagents.json'
+    );
+    assertRedirectAllowed(
+      'https://example.co.uk/.well-known/adagents.json',
+      'https://example.co.uk/.well-known/adagents.json',
+      'https://www.example.co.uk/.well-known/adagents.json'
+    );
+    assertRedirectAllowed(
+      'https://victim.github.io/.well-known/adagents.json',
+      'https://victim.github.io/.well-known/adagents.json',
+      'https://www.victim.github.io/.well-known/adagents.json'
+    );
+
+    assertRedirectRefused(
+      'https://ladepeche.fr/.well-known/adagents.json',
+      'https://ladepeche.fr/.well-known/adagents.json',
+      'https://claire.pub/.well-known/adagents.json',
+      'redirect_cross_registrable_domain'
+    );
+    assertRedirectRefused(
+      'https://example.co.uk/.well-known/adagents.json',
+      'https://example.co.uk/.well-known/adagents.json',
+      'https://example.com/.well-known/adagents.json',
+      'redirect_cross_registrable_domain'
+    );
+    assertRedirectRefused(
+      'https://victim.github.io/.well-known/adagents.json',
+      'https://victim.github.io/.well-known/adagents.json',
+      'https://attacker.github.io/.well-known/adagents.json',
+      'redirect_cross_registrable_domain'
+    );
+    assertRedirectRefused(
+      'https://pub.example/.well-known/adagents.json',
+      'https://www.pub.example/.well-known/adagents.json',
+      'https://attacker.example/.well-known/adagents.json',
+      'redirect_cross_registrable_domain'
+    );
+    assertRedirectRefused(
+      'https://pub.example/.well-known/adagents.json',
+      'https://pub.example/.well-known/adagents.json',
+      'http://pub.example/.well-known/adagents.json',
+      'redirect_scheme_changed'
+    );
+  });
+
+  test('initial .well-known fetch follows same-site HTTP redirects', async () => {
+    const publisher = await startRoutedServer({
+      '/.well-known/adagents.json': {
+        status: 301,
+        headers: { Location: '/v2/adagents.json' },
+      },
+      '/v2/adagents.json': { body: adAgentsJson('https://redirected.example/mcp') },
+    });
+    try {
+      const result = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(result.valid, true, `expected valid, got errors=${JSON.stringify(result.errors)}`);
+      assert.strictEqual(result.discovery_method, 'direct');
+      assert.ok(result.resolved_url.endsWith('/v2/adagents.json'), `unexpected resolved_url=${result.resolved_url}`);
+      assert.strictEqual(result.adagents?.authorized_agents?.[0]?.url, 'https://redirected.example/mcp');
+    } finally {
+      await publisher.close();
+    }
+  });
+
+  test('initial .well-known fetch enforces three redirect hop cap', async () => {
+    const publisher = await startRoutedServer({
+      '/.well-known/adagents.json': { status: 301, headers: { Location: '/r1' } },
+      '/r1': { status: 301, headers: { Location: '/r2' } },
+      '/r2': { status: 301, headers: { Location: '/r3' } },
+      '/r3': { status: 301, headers: { Location: '/r4' } },
+      '/r4': { body: adAgentsJson('https://too-late.example/mcp') },
+    });
+    try {
+      const result = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(result.valid, false);
+      assert.ok(
+        result.errors.some(e => e.includes('Too many adagents.json redirects')),
+        `expected hop-cap error, got: ${JSON.stringify(result.errors)}`
+      );
+    } finally {
+      await publisher.close();
+    }
+  });
+
+  test('authoritative_location dereference refuses any HTTP redirect', async () => {
+    const authoritative = await startRoutedServer({
+      '/authoritative/adagents.json': {
+        status: 301,
+        headers: { Location: '/canonical/adagents.json' },
+      },
+      '/canonical/adagents.json': { body: adAgentsJson('https://must-not-fetch.example/mcp') },
+    });
+    const publisher = await startRoutedServer({
+      '/.well-known/adagents.json': {
+        body: JSON.stringify({
+          authoritative_location: `${authoritative.url}/authoritative/adagents.json`,
+        }),
+      },
+    });
+    try {
+      const result = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(result.valid, false);
+      assert.strictEqual(result.discovery_method, 'authoritative_location');
+      assert.ok(
+        result.errors.some(e => e.includes('Redirect refused while fetching authoritative adagents.json')),
+        `expected authoritative redirect refusal, got: ${JSON.stringify(result.errors)}`
+      );
+    } finally {
+      await Promise.all([publisher.close(), authoritative.close()]);
+    }
+  });
+
+  test('redirect errors reject userinfo and do not echo credentials or query strings', async () => {
+    const publisher = await startRoutedServer({
+      '/.well-known/adagents.json': {
+        status: 301,
+        headers: { Location: `http://user:pass@placeholder.invalid/v2/adagents.json?sig=secret123#frag` },
+      },
+    });
+    try {
+      const target = `http://user:pass@${publisher.host}/v2/adagents.json?sig=secret123#frag`;
+      const result = await validateAdAgents(publisher.host, {
+        urlForDomain: (domain, path) => `http://${domain}${path}`,
+      });
+      assert.strictEqual(result.valid, false);
+      assert.ok(
+        result.errors.some(e => e.includes('adagents.json redirect must not include userinfo')),
+        `expected userinfo refusal, got: ${JSON.stringify(result.errors)}`
+      );
+      assert.ok(
+        result.errors.every(e => !e.includes('user:pass') && !e.includes('sig=secret123')),
+        `redirect error leaked sensitive URL parts from ${target}: ${JSON.stringify(result.errors)}`
+      );
     } finally {
       await publisher.close();
     }

@@ -44,6 +44,7 @@ import { enrichRequest, hasRequestEnricher } from './request-builder';
 import { resolveAccount, resolveBrand } from '../client';
 import { isMutatingTask, generateIdempotencyKey } from '../../utils/idempotency';
 import {
+  getSchemaDefaultByPath,
   getSchemaValidatorByRef,
   resolveBundleKey,
   schemaAllowsTopLevelField,
@@ -97,6 +98,7 @@ import type {
   RequirementName,
   RunnerSkipReason,
   RunnerNotice,
+  RequiresCapabilityPredicate,
   ResponseNotApplicableGate,
   StepAuthDirective,
   Storyboard,
@@ -122,7 +124,7 @@ import {
   RoutingError,
   type AgentRoutingContext,
 } from './agent-routing';
-import { DETAILED_SKIP_TO_CANONICAL } from './types';
+import { DETAILED_SKIP_TO_CANONICAL, KNOWN_REQUIREMENTS } from './types';
 import type { AgentProfile, TaskResult, TestStepResult } from '../types';
 import {
   type AssertionContext,
@@ -252,9 +254,7 @@ function selectionForProbeSkip(reason: RunnerDetailedSkipReason, detail: string)
 /**
  * Walk a dotted key path (e.g. `"adcp.idempotency.supported"`) through a
  * nested object. Returns `undefined` when any segment is missing or the
- * intermediate value is not an object — the caller treats `undefined` as
- * "path absent" and does NOT skip the storyboard (absence means the agent
- * hasn't explicitly opted out, so failing the storyboard surfaces the gap).
+ * intermediate value is not an object.
  *
  * Exported for direct testing. Inline copies of this logic in test code
  * silently drift from the runtime when edge cases (null prototypes,
@@ -266,22 +266,57 @@ export function resolveCapabilityPath(raw: unknown, dottedPath: string): unknown
   let current: unknown = raw;
   for (const key of keys) {
     if (current === null || typeof current !== 'object') return undefined;
+    if (!Object.prototype.hasOwnProperty.call(current, key)) return undefined;
     current = (current as Record<string, unknown>)[key];
   }
   return current;
 }
 
+const GET_ADCP_CAPABILITIES_RESPONSE_SCHEMA_REF = 'protocol/get-adcp-capabilities-response.json';
+
+function resolveCapabilityPathForGate(
+  raw: unknown,
+  predicate: RequiresCapabilityPredicate,
+  adcpVersion?: string
+): unknown {
+  const actual = resolveCapabilityPath(raw, predicate.path);
+  if (actual !== undefined) return actual;
+  // `present:` is an absence-detection matcher — an absent field IS the
+  // load-bearing signal. Materializing a schema default would make a defaulted
+  // field never read as absent, silently flipping the gate (e.g. a signals
+  // seller that omits `signals.discovery_modes`, default `["brief"]`, would run
+  // a `present: true`-gated scenario that should skip). Defaults are resolved
+  // only for the value matchers (`equals` / `contains`), where the default's
+  // VALUE is what the gate tests.
+  if ('present' in predicate) return undefined;
+  if (!schemaDefaultShouldApply(raw, predicate.path)) return undefined;
+  return getSchemaDefaultByPath(GET_ADCP_CAPABILITIES_RESPONSE_SCHEMA_REF, predicate.path, adcpVersion);
+}
+
+function schemaDefaultShouldApply(raw: unknown, dottedPath: string): boolean {
+  const keys = dottedPath.split('.');
+  if (keys.length <= 1) return raw !== null && typeof raw === 'object';
+
+  let current: unknown = raw;
+  for (const key of keys.slice(0, -1)) {
+    if (current === null || typeof current !== 'object') return false;
+    if (!Object.prototype.hasOwnProperty.call(current, key)) return false;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current !== null && typeof current === 'object';
+}
+
 /**
  * Evaluate a `requires_capability` predicate against the value already
  * resolved from the agent's raw capabilities. Returns `null` when the
- * predicate is satisfied (or unresolvable, per `equals` absence semantics)
- * and a human-readable detail string when the storyboard should be skipped.
+ * predicate is satisfied and a human-readable detail string when the
+ * storyboard should be skipped.
  *
  * Three matcher forms — see `Storyboard.requires_capability` for full semantics:
  *
- * - `equals: V` — skip only when `actual` is declared AND disagrees with `V`.
- *   Absent fields (`undefined`) RUN the storyboard so the failure surfaces
- *   an under-declared agent.
+ * - `equals: V` — scalar equality. `actual` must be declared and must equal
+ *   `V`. Absent fields (`undefined`) skip unless the capabilities schema
+ *   declares a default that the gate materialized before predicate evaluation.
  *
  * - `present: B` — presence is the load-bearing signal. `present: true`
  *   skips when the field is absent (treats `undefined` and `null` as absent).
@@ -291,23 +326,20 @@ export function resolveCapabilityPath(raw: unknown, dottedPath: string): unknown
  *   non-conformant for object-typed capabilities (`"type": "object"` rejects
  *   null in JSON Schema), but is coalesced with absent here in the spirit of
  *   Postel — agents that misdeclare a not-supported capability as `null`
- *   get the same not_applicable skip as agents that omit the field.
+ *   get the same not_applicable skip as agents that omit the field. Schema
+ *   defaults are deliberately NOT materialized for this matcher: presence is
+ *   the signal, so a default would defeat the gate (see
+ *   `resolveCapabilityPathForGate`).
  *
  * - `contains: V` — array-membership. `actual` must be an array that
  *   includes `V` (strict equality, no coercion). Empty arrays, non-arrays,
- *   and absent fields all skip — absence means the agent hasn't opted into
- *   the array variant this storyboard tests.
+ *   and absent fields all skip unless the capabilities schema declares a
+ *   default that the gate materialized before predicate evaluation.
  *
  * Exported for direct testing so the predicate semantics are pinned without
  * needing a full runStoryboard() roundtrip.
  */
-export function evaluateCapabilityPredicate(
-  predicate:
-    | { path: string; equals: boolean | string | number | null }
-    | { path: string; present: boolean }
-    | { path: string; contains: boolean | string | number },
-  actual: unknown
-): string | null {
+export function evaluateCapabilityPredicate(predicate: RequiresCapabilityPredicate, actual: unknown): string | null {
   if ('present' in predicate) {
     const isPresent = actual !== undefined && actual !== null;
     if (predicate.present && !isPresent) {
@@ -335,20 +367,13 @@ export function evaluateCapabilityPredicate(
     }
     return null;
   }
-  // `equals` form — absence semantics are load-bearing. `actual === undefined`
-  // means the agent didn't declare the capability at all (field missing from
-  // `get_adcp_capabilities` response). We deliberately RUN the storyboard in
-  // that case rather than skip it: an agent that pre-dates the capability
-  // field hasn't explicitly opted out, so the storyboard's failures surface
-  // a real spec-coverage gap (under-declared agent) rather than a behavior
-  // the agent affirmatively refused. Skip ONLY when the agent declared a
-  // value AND that value disagrees with the predicate.
-  //
-  // Exception: media_buy.features.inline_creative_management is an optional
-  // feature flag whose rc.9 storyboard states that non-advertising sellers
-  // grade not_applicable. Treat absence as unsupported only for that feature.
-  if (actual === undefined && isInlineCreativeManagementGate(predicate)) {
-    return `Capability predicate \`${predicate.path} === true\` not satisfied: ` + `agent did not declare the feature.`;
+  // `equals` form: absence means the agent did not declare the capability or
+  // capability variant this storyboard tests, so skip as unsupported.
+  if (actual === undefined) {
+    return (
+      `Capability predicate \`${predicate.path} === ${JSON.stringify(predicate.equals)}\` not satisfied: ` +
+      `agent did not declare support.`
+    );
   }
   if (actual !== undefined && actual !== predicate.equals) {
     return (
@@ -359,17 +384,47 @@ export function evaluateCapabilityPredicate(
   return null;
 }
 
-function isInlineCreativeManagementGate(
-  predicate:
-    | { path: string; equals: boolean | string | number | null }
-    | { path: string; present: boolean }
-    | { path: string; contains: boolean | string | number }
-): predicate is { path: 'media_buy.features.inline_creative_management'; equals: true } {
-  return (
-    'equals' in predicate &&
-    predicate.path === 'media_buy.features.inline_creative_management' &&
-    predicate.equals === true
-  );
+function evaluateRequiresCapabilityGate(
+  predicate: RequiresCapabilityPredicate,
+  profile: AgentProfile | undefined,
+  agentTools?: readonly string[],
+  adcpVersion?: string
+): string | null {
+  const rawCaps = profile?.raw_capabilities;
+  if (rawCaps !== undefined) {
+    const actual = resolveCapabilityPathForGate(rawCaps, predicate, adcpVersion);
+    return evaluateCapabilityPredicate(predicate, actual);
+  }
+  const tools = agentTools ?? profile?.tools;
+  if ('equals' in predicate && tools !== undefined && !tools.includes('get_adcp_capabilities')) {
+    return evaluateCapabilityPredicate(predicate, undefined);
+  }
+  return null;
+}
+
+function collectPhaseCapabilitySkipDetails(
+  storyboard: Storyboard,
+  profile: AgentProfile | undefined,
+  agentTools?: readonly string[],
+  adcpVersion?: string
+): Map<string, string> {
+  const skipDetails = new Map<string, string>();
+  for (const phase of storyboard.phases) {
+    if (!phase.requires_capability) continue;
+    const unmetDetail = evaluateRequiresCapabilityGate(phase.requires_capability, profile, agentTools, adcpVersion);
+    if (unmetDetail !== null) {
+      skipDetails.set(phase.id, unmetDetail);
+    }
+  }
+  return skipDetails;
+}
+
+function allExecutablePhasesCapabilitySkipped(
+  storyboard: Storyboard,
+  phaseCapabilitySkipDetails: ReadonlyMap<string, string>
+): boolean {
+  const executablePhases = storyboard.phases.filter(phase => phase.steps.length > 0);
+  return executablePhases.length > 0 && executablePhases.every(phase => phaseCapabilitySkipDetails.has(phase.id));
 }
 
 function buildSkip(reason: RunnerSkipReason, detail?: string): { reason: RunnerSkipReason; detail: string } {
@@ -1017,6 +1072,7 @@ async function runStoryboardBody(
   if (!options.agents && agentUrls.length === 0) {
     throw new Error('runStoryboard: at least one agent URL required');
   }
+
   const isMultiInstance = agentUrls.length > 1;
   if (isMultiInstance && options._client) {
     throw new Error(
@@ -1042,6 +1098,19 @@ async function runStoryboardBody(
     }
     return runMultiPass(agentUrls, storyboard, options);
   }
+
+  const allRequires = resolveStoryboardRequires(storyboard, options);
+  if (allRequires.length) {
+    const unmet = checkRequires(allRequires, storyboard, options, options._profile);
+    if (unmet) {
+      const resultAgentUrls = options.agents ? Object.values(options.agents).map(e => e.url) : agentUrls;
+      return {
+        ...buildRequirementUnmetResult(resultAgentUrls, storyboard, unmet.requirement, unmet.detail),
+        notices: collectCapabilityNotices(storyboard, options._profile?.raw_capabilities),
+      };
+    }
+  }
+
   if (options.agents) {
     // Project the agents map's URLs into the legacy `agentUrls` array so
     // downstream signatures (per-step `agent_url:` records, etc.) keep
@@ -1220,6 +1289,30 @@ function buildCapabilityUnsupportedResult(
   };
 }
 
+function buildPhaseCapabilitySkippedSteps(
+  storyboard: Storyboard,
+  phase: StoryboardPhase,
+  detail: string,
+  context: StoryboardContext
+): StoryboardStepResult[] {
+  return phase.steps.map(step => ({
+    storyboard_id: storyboard.id,
+    step_id: step.id,
+    phase_id: phase.id,
+    title: step.title,
+    task: step.task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'not_applicable',
+    skip: { reason: 'not_applicable', detail },
+    duration_ms: 0,
+    validations: [],
+    context,
+    error: detail,
+    extraction: { path: 'none' },
+  }));
+}
+
 /**
  * Map a `requires:` requirement onto the canonical `RunnerSkipReason` to
  * emit when that requirement is unmet. `controller` reuses the existing
@@ -1239,7 +1332,12 @@ const REQUIREMENT_TO_SKIP_REASON: Record<RequirementName, RunnerSkipReason> = {
   real_wire: 'requirement_unmet',
   webhook_receiver: 'requirement_unmet',
   request_signer: 'not_applicable',
+  multi_agent: 'requirement_unmet',
 };
+
+function isKnownRequirement(requirement: string): requirement is RequirementName {
+  return KNOWN_REQUIREMENTS.has(requirement as RequirementName);
+}
 
 /**
  * Build a minimal StoryboardResult for a storyboard skipped because a
@@ -1253,10 +1351,10 @@ const REQUIREMENT_TO_SKIP_REASON: Record<RequirementName, RunnerSkipReason> = {
 function buildRequirementUnmetResult(
   agentUrls: string[],
   storyboard: Storyboard,
-  requirement: RequirementName,
+  requirement: string,
   detail: string
 ): StoryboardResult {
-  const reason = REQUIREMENT_TO_SKIP_REASON[requirement];
+  const reason = isKnownRequirement(requirement) ? REQUIREMENT_TO_SKIP_REASON[requirement] : 'requirement_unmet';
   const syntheticStep: StoryboardStepResult = {
     storyboard_id: storyboard.id,
     step_id: `requirement_unmet:${requirement}`,
@@ -1405,13 +1503,29 @@ function normalizeAgentToolNames(tools: unknown): string[] | undefined {
  *     threaded through), the gate is a no-op — the caller accepted
  *     responsibility for capability compatibility by reusing an external
  *     client. Spec: adcp-client#1702.
+ *   - `multi_agent` — `options.agents` is set and the storyboard's
+ *     declared route keys (`default_agent` and step-level `agent:` overrides)
+ *     resolve to at least two distinct entries in that map. Raw
+ *     `options.agents` cardinality is not enough; the requirement describes
+ *     the topology this storyboard actually routes through.
+ *     Spec: adcp-client#2281.
  */
 function checkRequires(
-  requires: readonly RequirementName[],
+  requires: readonly string[],
+  storyboard: Storyboard,
   options: StoryboardRunOptions,
   profile?: AgentProfile
-): { requirement: RequirementName; detail: string } | null {
+): { requirement: string; detail: string } | null {
   for (const requirement of requires) {
+    if (!isKnownRequirement(requirement)) {
+      return {
+        requirement,
+        detail:
+          `Storyboard requires unknown runtime requirement '${requirement}'. ` +
+          `This SDK does not know how to satisfy it, so the requirement is treated as unmet ` +
+          `for forward compatibility.`,
+      };
+    }
     switch (requirement) {
       case 'controller': {
         if (!options.agentTools) continue;
@@ -1478,9 +1592,47 @@ function checkRequires(
             'register the test keypair before the 4.0 cut to avoid a hard compliance failure then.',
         };
       }
+      case 'multi_agent': {
+        const routeKeys = collectMultiAgentRequirementRouteKeys(storyboard, options);
+        if (routeKeys.length >= 2) break;
+        const availableKeys = options.agents ? Object.keys(options.agents) : [];
+        const routed = routeKeys.length ? routeKeys.join(', ') : '(none)';
+        const available = availableKeys.length ? availableKeys.join(', ') : '(none)';
+        return {
+          requirement,
+          detail:
+            "Storyboard requires 'multi_agent'; configure `agents` and route this storyboard " +
+            'to at least two distinct agent keys via `default_agent` and/or step-level `agent:` overrides. ' +
+            `Resolved route keys: [${routed}]. Available agents: [${available}].`,
+        };
+      }
     }
   }
   return null;
+}
+
+function collectMultiAgentRequirementRouteKeys(storyboard: Storyboard, options: StoryboardRunOptions): string[] {
+  const agents = options.agents;
+  if (!agents) return [];
+
+  const routeKeys = new Set<string>();
+  if (options.default_agent !== undefined && options.default_agent in agents) {
+    routeKeys.add(options.default_agent);
+  }
+  for (const phase of storyboard.phases ?? []) {
+    for (const step of phase.steps ?? []) {
+      if (step.agent !== undefined && step.agent in agents) {
+        routeKeys.add(step.agent);
+      }
+    }
+  }
+  return [...routeKeys];
+}
+
+function resolveStoryboardRequires(storyboard: Storyboard, options: StoryboardRunOptions): string[] {
+  const declared = storyboard.requires ?? [];
+  const implicit = detectImplicitRequires(storyboard, options);
+  return [...declared, ...implicit.filter(r => !declared.includes(r))];
 }
 
 /**
@@ -1518,10 +1670,12 @@ function valueContainsWebhookToken(value: unknown): boolean {
  * structure (not its declared `requires:` list). Today:
  *   - `'webhook_receiver'`, autodetected from `{{runner.webhook_url:…}}`
  *     / `{{runner.webhook_base}}` token presence inside any step's
- *     `sample_request`. Token presence is the authoring contract — a
- *     storyboard that names the runner's webhook receiver cannot run
- *     without one — so authors don't need to remember to add
- *     `requires: [webhook_receiver]` separately. Spec: adcp-client#1678.
+ *     `sample_request` or in-scope `rate_limit_trip.trip_target_sample_request`.
+ *     Token presence is the authoring contract — a storyboard that names
+ *     the runner's webhook receiver cannot run without one — so authors
+ *     don't need to remember to add `requires: [webhook_receiver]`
+ *     separately. Contract-gated synthetic steps only count when their
+ *     `requires_contract` is configured for this run. Spec: adcp-client#1678.
  *   - `'request_signer'`, autodetected from `storyboard.id ===
  *     'signed_requests'` or any step using the synthesized
  *     `request_signing_probe` task. The signed-requests universal
@@ -1531,13 +1685,24 @@ function valueContainsWebhookToken(value: unknown): boolean {
  *     failures on bearer-only agents that never claimed signing.
  *     Spec: adcp-client#1702.
  */
-function detectImplicitRequires(storyboard: Storyboard): RequirementName[] {
+function detectImplicitRequires(
+  storyboard: Storyboard,
+  options: Pick<StoryboardRunOptions, 'contracts'> = {}
+): RequirementName[] {
   const requires: RequirementName[] = [];
   let needsWebhook = false;
   let needsSigner = storyboard.id === 'signed_requests';
+  const contractsInScope = new Set(options.contracts ?? []);
   for (const phase of storyboard.phases) {
     for (const step of phase.steps) {
-      if (!needsWebhook && step.sample_request && valueContainsWebhookToken(step.sample_request)) {
+      const rateLimitTripInScope = !step.requires_contract || contractsInScope.has(step.requires_contract);
+      if (
+        !needsWebhook &&
+        ((step.sample_request && valueContainsWebhookToken(step.sample_request)) ||
+          (step.rate_limit_trip?.trip_target_sample_request &&
+            rateLimitTripInScope &&
+            valueContainsWebhookToken(step.rate_limit_trip.trip_target_sample_request)))
+      ) {
         needsWebhook = true;
       }
       if (!needsSigner && step.task === 'request_signing_probe') {
@@ -1783,6 +1948,56 @@ function collectCapabilityNotices(storyboard: Storyboard, rawCaps: unknown): Run
   return notices;
 }
 
+function collectInputSchemaFieldStripNotices(debugLogs: unknown, storyboardId: string): RunnerNotice[] {
+  if (!Array.isArray(debugLogs)) return [];
+  const notices: RunnerNotice[] = [];
+  const seen = new Set<string>();
+  for (const entry of debugLogs) {
+    if (!entry || typeof entry !== 'object') continue;
+    const details = (entry as { details?: unknown }).details;
+    if (!details || typeof details !== 'object') continue;
+    const record = details as Record<string, unknown>;
+    if (record.code !== 'input_schema_field_stripped') continue;
+    const task = typeof record.task === 'string' ? record.task : 'unknown_task';
+    const fields = Array.isArray(record.fields)
+      ? record.fields.filter((field): field is string => typeof field === 'string')
+      : [];
+    if (fields.length === 0) continue;
+    const key = `${task}\u0000${fields.join('\u0000')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    notices.push({
+      severity: 'info',
+      code: 'input_schema_field_stripped',
+      message:
+        `Runner stripped fields not declared in the agent's tool input schema for ${task}: ` +
+        `${fields.join(', ')}. Fix the tool schema declaration or avoid sending unsupported fields.`,
+      docs_url: 'https://github.com/adcontextprotocol/adcp/issues/5495',
+      storyboard_ids: [storyboardId],
+    });
+  }
+  return notices;
+}
+
+function mergeRunnerNotices(notices: RunnerNotice[]): RunnerNotice[] {
+  const byCode = new Map<string, RunnerNotice>();
+  for (const notice of notices) {
+    const existing = byCode.get(notice.code);
+    if (existing) {
+      for (const sid of notice.storyboard_ids) {
+        if (!existing.storyboard_ids.includes(sid)) existing.storyboard_ids.push(sid);
+      }
+    } else {
+      byCode.set(notice.code, { ...notice, storyboard_ids: [...notice.storyboard_ids] });
+    }
+  }
+  return [...byCode.values()];
+}
+
+function collectStepNotices(phases: StoryboardPhaseResult[]): RunnerNotice[] {
+  return phases.flatMap(phase => phase.steps.flatMap(step => step.notices ?? []));
+}
+
 /**
  * Execute a single pass of the storyboard against the supplied replica URLs
  * using round-robin dispatch starting at `dispatchOffset`. Called directly
@@ -1939,11 +2154,9 @@ async function executeStoryboardPass(
   // collected again from the fully-fetched profile at result-build time.
   const preflightNotices = collectCapabilityNotices(storyboard, options._profile?.raw_capabilities);
 
-  const declared = storyboard.requires ?? [];
-  const implicit = detectImplicitRequires(storyboard);
-  const allRequires = [...declared, ...implicit.filter(r => !declared.includes(r))];
+  const allRequires = resolveStoryboardRequires(storyboard, options);
   if (allRequires.length) {
-    const unmet = checkRequires(allRequires, options, profile);
+    const unmet = checkRequires(allRequires, storyboard, options, profile);
     if (unmet) {
       if (!callerOwnsClients) await closeConnections(options.protocol);
       return {
@@ -1973,31 +2186,18 @@ async function executeStoryboardPass(
   // tests (e.g. `adcp.idempotency.supported: false`), skip the whole storyboard
   // rather than producing a cascade of misleading per-phase failures.
   if (storyboard.requires_capability) {
-    const rawCaps = profile?.raw_capabilities;
-    if (rawCaps !== undefined) {
-      const cap = storyboard.requires_capability;
-      const actual = resolveCapabilityPath(rawCaps, cap.path);
-      const unmetDetail = evaluateCapabilityPredicate(cap, actual);
-      if (unmetDetail !== null) {
-        if (!callerOwnsClients) await closeConnections(options.protocol);
-        return {
-          ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
-          notices: preflightNotices,
-        };
-      }
-    } else if (
-      isInlineCreativeManagementGate(storyboard.requires_capability) &&
-      profile !== undefined &&
-      !profile.tools.includes('get_adcp_capabilities')
-    ) {
-      const unmetDetail = evaluateCapabilityPredicate(storyboard.requires_capability, undefined);
-      if (unmetDetail !== null) {
-        if (!callerOwnsClients) await closeConnections(options.protocol);
-        return {
-          ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
-          notices: preflightNotices,
-        };
-      }
+    const unmetDetail = evaluateRequiresCapabilityGate(
+      storyboard.requires_capability,
+      profile,
+      options.agentTools,
+      options.adcpVersion
+    );
+    if (unmetDetail !== null) {
+      if (!callerOwnsClients) await closeConnections(options.protocol);
+      return {
+        ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
+        notices: preflightNotices,
+      };
     }
   }
 
@@ -2046,6 +2246,7 @@ async function executeStoryboardPass(
   let passedCount = 0;
   let failedCount = 0;
   let skippedCount = 0;
+  const phaseCapabilitySkippedIds = new Set<string>();
   // Per-phase stateful-cascade tracking (#1161).
   //
   // Map entry exists iff the phase tripped its stateful cascade — i.e.,
@@ -2081,6 +2282,11 @@ async function executeStoryboardPass(
   // the storyboard. Phases push their own id at end-of-phase.
   const priorPhaseIds: string[] = [];
 
+  // Phase → branch-set membership, resolved once up front so the stateful
+  // cascade (and the post-loop branch-set re-grade) can consult it. Phases
+  // outside any branch set are absent from the map.
+  const branchSetsByPhaseId = resolveBranchSets(storyboard);
+
   // Helpers for per-phase cascade state.
   const effectiveDependsOn = (phase: { depends_on?: string[] }, prior: readonly string[]): readonly string[] =>
     phase.depends_on ?? prior;
@@ -2093,7 +2299,26 @@ async function executeStoryboardPass(
     if (phaseStatefulCascades.has(phase.id)) {
       return { tripped: true, trigger: phaseStatefulCascades.get(phase.id) ?? null };
     }
+    // Branch-set peers under `any_of` are mutually-exclusive ALTERNATIVES, not
+    // a stateful dependency chain: a conformant seller satisfies exactly one
+    // peer, so the non-taken peer(s) fail by design (storyboard-schema.yaml,
+    // "Per-step grading in any_of branch patterns"). A peer's expected
+    // failure must NOT cascade-skip a sibling peer — doing so suppresses the
+    // only viable contribution and fails the any_of gate even though the
+    // seller behaved conformantly. Exclude same-branch-set peers from this
+    // phase's cascade dependencies. (adcontextprotocol/adcp-client#2305)
+    //
+    // Scoped to `any_of` deliberately: `BranchSetSpec.semantics` is typed
+    // `string` to leave room for future semantics (e.g. `all_of`/`one_of`)
+    // where peers legitimately DO depend on each other and must keep
+    // cascading. `all_of` is rejected at load time today, so this is
+    // forward-compat hardening rather than live behavior.
+    const ownSpec = branchSetsByPhaseId.get(phase.id);
+    const ownAnyOfBranchSet = ownSpec?.semantics === 'any_of' ? ownSpec.id : undefined;
     for (const depId of effectiveDependsOn(phase, prior)) {
+      if (ownAnyOfBranchSet !== undefined && branchSetsByPhaseId.get(depId)?.id === ownAnyOfBranchSet) {
+        continue;
+      }
       if (phaseStatefulCascades.has(depId)) {
         return { tripped: true, trigger: phaseStatefulCascades.get(depId) ?? null };
       }
@@ -2170,6 +2395,16 @@ async function executeStoryboardPass(
   // an implementor reading the report can't tell "nothing tested" from
   // "everything passed".
   const hasExecutableSteps = storyboard.phases.some(p => p.steps.length > 0);
+  const phaseCapabilitySkipDetails = collectPhaseCapabilitySkipDetails(
+    storyboard,
+    profile,
+    options.agentTools,
+    options.adcpVersion
+  );
+  const skipControllerSeedingForPhaseGates = allExecutablePhasesCapabilitySkipped(
+    storyboard,
+    phaseCapabilitySkipDetails
+  );
   if (!hasExecutableSteps) {
     const isScenarioComposed = (storyboard.requires_scenarios?.length ?? 0) > 0;
     const detail = isScenarioComposed
@@ -2234,8 +2469,9 @@ async function executeStoryboardPass(
   let seedingMissingController = false;
   let seedingUnsupported = false;
   {
-    const seeding =
-      preSeeded !== undefined
+    const seeding = skipControllerSeedingForPhaseGates
+      ? null
+      : preSeeded !== undefined
         ? preSeeded.result
         : await runControllerSeeding(clients[0]!, storyboard, options, context);
     if (seeding) {
@@ -2262,6 +2498,21 @@ async function executeStoryboardPass(
     // to completion regardless of the outer budget.
     options.signal?.throwIfAborted();
     const phaseStart = Date.now();
+    const phaseCapabilitySkipDetail = phaseCapabilitySkipDetails.get(phase.id);
+    if (phaseCapabilitySkipDetail !== undefined) {
+      const skippedSteps = buildPhaseCapabilitySkippedSteps(storyboard, phase, phaseCapabilitySkipDetail, context);
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: skippedSteps,
+        duration_ms: Date.now() - phaseStart,
+      });
+      skippedCount += skippedSteps.length;
+      phaseCapabilitySkippedIds.add(phase.id);
+      priorPhaseIds.push(phase.id);
+      continue;
+    }
     const stepResults: StoryboardStepResult[] = [];
     let phasePassed = true;
     // `statefulFailed` and `statefulSkipTrigger` live at storyboard
@@ -2553,19 +2804,28 @@ async function executeStoryboardPass(
         phasePassed = false;
         continue;
       }
-      const rawResult = await executeStep(assignment.client, step, phase.id, context, allSteps, options, {
-        contributions,
-        priorStepResults,
-        priorProbes,
-        agentUrl: assignment.agentUrl,
-        webhookReceiver,
-        runnerVars,
-        contextProvenance,
-        priorA2aEnvelopes,
-        stepRequestStarts,
-        responseDerivedNotApplicableContextKeys,
-        agentLibraryVersion: profile?.library_version,
-      });
+      const rawResult = await executeStep(
+        assignment.client,
+        step,
+        storyboard.id,
+        phase.id,
+        context,
+        allSteps,
+        options,
+        {
+          contributions,
+          priorStepResults,
+          priorProbes,
+          agentUrl: assignment.agentUrl,
+          webhookReceiver,
+          runnerVars,
+          contextProvenance,
+          priorA2aEnvelopes,
+          stepRequestStarts,
+          responseDerivedNotApplicableContextKeys,
+          agentLibraryVersion: profile?.library_version,
+        }
+      );
       const result: StoryboardStepResult = { ...rawResult, storyboard_id: storyboard.id };
       if (isMultiInstance || useRouting) {
         // Echo per-step routing on the result so JUnit/CI consumers and
@@ -2934,8 +3194,9 @@ async function executeStoryboardPass(
   // contribution status isn't knowable inside the per-phase loop. Runs
   // before storyboard-scoped assertions so `onEnd` hooks see the finalized
   // per-step grades (a moot peer's "failure" should not trip a cross-step
-  // invariant).
-  const branchSetsByPhaseId = resolveBranchSets(storyboard);
+  // invariant). `branchSetsByPhaseId` was resolved before the phase loop so
+  // the stateful cascade could consult it (branch-set peers don't cascade
+  // onto each other); reuse it here.
   const branchSetDelta = applyBranchSetGrading(
     storyboard.phases,
     phaseResults,
@@ -2972,13 +3233,24 @@ async function executeStoryboardPass(
   // false, flipping overall_passed to false. Short-circuit to true so the
   // no-phases sentinel produces overall_passed: true (consistent with how
   // buildNotApplicableStoryboardResult shapes its result in comply.ts).
+  const requiredPhaseHasExecutedPass = phaseResults.some((p, idx) => {
+    const phaseDef = storyboard.phases[idx];
+    if (!phaseDef || phaseDef.optional || !p.passed) return false;
+    return p.steps.some(s => !s.skipped && s.passed);
+  });
+  const requiredPhaseDefs = storyboard.phases.filter(phaseDef => !phaseDef.optional);
+  const requiredPhasesCoveredByCapabilityGates =
+    phaseCapabilitySkippedIds.size > 0 &&
+    requiredPhaseDefs.length > 0 &&
+    requiredPhaseDefs.every(phaseDef => {
+      if (phaseCapabilitySkippedIds.has(phaseDef.id)) return true;
+      const phaseResult = phaseResults.find(p => p.phase_id === phaseDef.id);
+      return !!phaseResult && phaseResult.passed && phaseResult.steps.some(s => !s.skipped && s.passed);
+    });
   const requiredPhasesPassed =
     !hasExecutableSteps ||
-    phaseResults.some((p, idx) => {
-      const phaseDef = storyboard.phases[idx];
-      if (!phaseDef || phaseDef.optional || !p.passed) return false;
-      return p.steps.some(s => !s.skipped && s.passed);
-    });
+    requiredPhaseHasExecutedPass ||
+    (failedCount === 0 && requiredPhasesCoveredByCapabilityGates);
   const storyboardWideFixtureSeedUnsupported =
     seedingUnsupported &&
     failedCount === 0 &&
@@ -2994,7 +3266,10 @@ async function executeStoryboardPass(
   // Use the fully-fetched profile for notice detection; fall back to pre-flight
   // notices (which used options._profile) when profile was not re-fetched in
   // this pass (standalone runner with options._profile pre-set skips the fetch).
-  const notices = collectCapabilityNotices(storyboard, profile?.raw_capabilities ?? options._profile?.raw_capabilities);
+  const notices = mergeRunnerNotices([
+    ...collectCapabilityNotices(storyboard, profile?.raw_capabilities ?? options._profile?.raw_capabilities),
+    ...collectStepNotices(phaseResults),
+  ]);
   const result: StoryboardResult = {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
@@ -3086,7 +3361,31 @@ async function runMultiPass(
   const preSeedContext: StoryboardContext = { ...storyboard.context, ...options.context };
   if (storyboard.context) forwardAliasCache(storyboard.context, preSeedContext);
   if (options.context) forwardAliasCache(options.context, preSeedContext);
-  const preSeededResult = await runControllerSeeding(preSeedClients[0]!, storyboard, options, preSeedContext);
+  let preSeedProfile = options._profile;
+  if (!preSeedProfile) {
+    const discovered = await getOrDiscoverProfile(preSeedClients[0]!, options);
+    if (discovered.step.passed === false) {
+      await closeConnections(options.protocol);
+      return buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step);
+    }
+    preSeedProfile = discovered.profile;
+  }
+  if (preSeedProfile && (!options._profile || !options.agentTools)) {
+    options = {
+      ...options,
+      _profile: preSeedProfile,
+      ...(options.agentTools ? {} : { agentTools: normalizeAgentToolNames(preSeedProfile.tools) }),
+    };
+  }
+  const phaseCapabilitySkipDetails = collectPhaseCapabilitySkipDetails(
+    storyboard,
+    preSeedProfile,
+    options.agentTools,
+    options.adcpVersion
+  );
+  const preSeededResult = allExecutablePhasesCapabilitySkipped(storyboard, phaseCapabilitySkipDetails)
+    ? null
+    : await runControllerSeeding(preSeedClients[0]!, storyboard, options, preSeedContext);
 
   const passes: StoryboardPassResult[] = [];
   const passResults: StoryboardResult[] = [];
@@ -3376,8 +3675,9 @@ async function runStoryboardStepBody(
   const responseDerivedNotApplicableContextKeys = new Map<string, string>(
     Object.entries(options.response_derived_not_applicable_context_keys ?? {})
   );
-  const result = await executeStep(client, found.step, found.phaseId, context, allSteps, options, {
-    contributions: new Set(),
+  const contributions = new Set(options.contributions ?? []);
+  const result = await executeStep(client, found.step, storyboard.id, found.phaseId, context, allSteps, options, {
+    contributions,
     priorStepResults: new Map(),
     priorProbes: new Map(),
     agentUrl,
@@ -3390,13 +3690,19 @@ async function runStoryboardStepBody(
     agentLibraryVersion: profile?.library_version,
   });
 
+  if (!result.skipped && result.passed && found.step.contributes_to) {
+    if (evalContributesIf(found.step.contributes_if, new Map())) {
+      contributions.add(found.step.contributes_to);
+    }
+  }
+
   if (!clientResolution.reusedShared) {
     await closeConnections(options.protocol);
   }
 
   if (ownsWebhookReceiver && webhookReceiver) await webhookReceiver.close();
 
-  return result;
+  return { ...result, contributions: Array.from(contributions) };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -3461,6 +3767,7 @@ async function executeStep(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- client type varies (TestClient)
   client: any,
   step: StoryboardStep,
+  storyboardId: string,
   phaseId: string,
   context: StoryboardContext,
   allSteps: FlatStep[],
@@ -3541,12 +3848,14 @@ async function executeStep(
     };
   }
 
-  // Account-mode capability gate: sync_accounts is exclusive to implicit mode
-  // (require_operator_auth: false). When the seller declared explicit mode
-  // (require_operator_auth: true), sync_accounts does not apply — grade
-  // not_applicable rather than missing_tool so adopters can distinguish
-  // "your capability declaration says this path isn't yours" from "you forgot
-  // to implement a required tool."
+  // Account-mode capability gate: when the seller declared explicit mode
+  // (require_operator_auth: true) and does not advertise sync_accounts,
+  // sync_accounts does not apply — grade not_applicable rather than
+  // missing_tool so adopters can distinguish "your capability declaration
+  // says this path isn't yours" from "you forgot to implement a required
+  // tool." If the seller explicitly advertises sync_accounts, run it: account
+  // discovery mode and account-level write surfaces such as notification
+  // config registration are orthogonal.
   //
   // list_accounts is NOT gated here: it appears in audience_sync and other
   // storyboard flows regardless of account mode, so it is always applicable.
@@ -3557,7 +3866,8 @@ async function executeStep(
     const rawCaps = options._profile?.raw_capabilities;
     if (rawCaps !== undefined) {
       const requireOperatorAuth = resolveCapabilityPath(rawCaps, 'account.require_operator_auth');
-      if (requireOperatorAuth === true) {
+      const syncAccountsAdvertised = options.agentTools?.includes('sync_accounts') === true;
+      if (requireOperatorAuth === true && !syncAccountsAdvertised) {
         const detail =
           `Agent declared explicit account mode (require_operator_auth: true); ` +
           `sync_accounts is not applicable — list_accounts is the correct tool for this account shape.`;
@@ -3975,6 +4285,7 @@ async function executeStep(
         executeStoryboardTask(client, effectiveStep.task, request, {
           skipIdempotencyAutoInject: testsMissingIdempotencyKey,
           skipAccountValidation: testsMissingAccount,
+          signal: options.signal,
         });
       const run = await runStep(step.title, effectiveStep.task, async () => {
         if (!captureA2a) return dispatch();
@@ -3996,6 +4307,9 @@ async function executeStep(
       taskResult = run.result;
       stepResult = run.step;
       caughtError = run.caughtError;
+      if (caughtError !== undefined && options.signal?.aborted) {
+        throw caughtError;
+      }
       if (captureA2a && a2aCaptures) {
         a2aEnvelope = parseLastA2aMessageSendCapture(a2aCaptures);
       }
@@ -4020,6 +4334,10 @@ async function executeStep(
     payload: redactSecrets(request),
     ...(runState.agentUrl ? { url: runState.agentUrl } : {}),
   };
+  const inputSchemaStripNotices = collectInputSchemaFieldStripNotices(
+    (taskResult as { debug_logs?: unknown } | undefined)?.debug_logs,
+    storyboardId
+  );
 
   // AdCP 3.0.12 runner-output-contract `force_scenario_unsupported`: when a
   // comply_test_controller step calls a force_* scenario that the agent
@@ -4066,6 +4384,7 @@ async function executeStep(
         context,
         next,
         extraction: extractionFromTaskResult(taskResult),
+        ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
       };
     }
   }
@@ -4094,6 +4413,7 @@ async function executeStep(
       error: stepResult.error,
       next,
       extraction: { path: 'none' },
+      ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
     };
   }
 
@@ -4133,6 +4453,7 @@ async function executeStep(
       request: requestRecord,
       ...(responseRecord && { response_record: responseRecord }),
       extraction: extractionFromTaskResult(taskResult),
+      ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
     };
   }
 
@@ -4528,6 +4849,7 @@ async function executeStep(
     request: requestRecord,
     ...(responseRecord && { response_record: responseRecord }),
     extraction: extractionFromTaskResult(taskResult),
+    ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
     ...(hints.length > 0 && { hints }),
   };
 }
@@ -4593,7 +4915,12 @@ async function executeProbeStep(
   } else if (step.task === 'fetch_brand_jwks') {
     httpResult = await probeBrandJwks(options._profile?.raw_capabilities, probeOpts);
   } else if (step.task === 'assert_jwks_purpose') {
-    httpResult = assertJwksPurpose(runState.priorProbes.get('fetch_brand_jwks'), 'webhook-signing');
+    // Webhook delivery is signed with the agent's request-signing key; the
+    // deprecated webhook-signing purpose is still accepted (adcontextprotocol/adcp#5555).
+    httpResult = assertJwksPurpose(runState.priorProbes.get('fetch_brand_jwks'), [
+      'request-signing',
+      'webhook-signing',
+    ]);
   } else if (step.task === 'expect_rate_limit_not_replayed') {
     const specError = validateRateLimitTripSpec(step.rate_limit_trip);
     if (specError) {
@@ -5436,7 +5763,8 @@ async function probeBrandJwks(
   return jwks;
 }
 
-function assertJwksPurpose(prior: HttpProbeResult | undefined, purpose: string): HttpProbeResult {
+function assertJwksPurpose(prior: HttpProbeResult | undefined, purposes: string | readonly string[]): HttpProbeResult {
+  const accepted = typeof purposes === 'string' ? [purposes] : purposes;
   if (!prior || prior.error) {
     return {
       url: prior?.url ?? '',
@@ -5459,7 +5787,12 @@ function assertJwksPurpose(prior: HttpProbeResult | undefined, purpose: string):
   const matching = keys.filter(key => {
     if (!key || typeof key !== 'object') return false;
     const rec = key as { adcp_use?: unknown; status?: unknown; revoked?: unknown };
-    return rec.adcp_use === purpose && rec.status !== 'revoked' && rec.revoked !== true;
+    return (
+      typeof rec.adcp_use === 'string' &&
+      accepted.includes(rec.adcp_use) &&
+      rec.status !== 'revoked' &&
+      rec.revoked !== true
+    );
   });
   if (matching.length === 0) {
     return {
@@ -5467,14 +5800,14 @@ function assertJwksPurpose(prior: HttpProbeResult | undefined, purpose: string):
       status: 0,
       headers: {},
       body: prior.body,
-      error: `JWKS contains no active key with adcp_use="${purpose}"`,
+      error: `JWKS contains no active key with adcp_use in {${accepted.join(', ')}}`,
     };
   }
   return {
     url: prior.url,
     status: 200,
     headers: prior.headers,
-    body: { purpose, matching_key_count: matching.length },
+    body: { accepted_purposes: accepted, matching_key_count: matching.length },
   };
 }
 

@@ -5,67 +5,18 @@
 
 import type { InputRequest } from './ConversationTypes';
 import { getLatestA2ADataPartFromTask } from '../utils/a2a-artifacts';
+import {
+  ADCP_STATUS,
+  type ADCPStatus,
+  TASK_ENVELOPE_FIELDS,
+  extractAdcpStatusFromA2aTaskResult,
+  extractAdcpTaskStatusFromPayload,
+  isAdcpStatus,
+} from './task-status';
 
-/**
- * ADCP standardized status values as per spec PR #78
- * Clear semantics for async task management:
- * - submitted: Long-running tasks (hours to days) - webhook required
- * - working: Processing tasks (<120 seconds) - keep connection open
- * - input-required: Tasks needing user interaction via handler
- * - completed: Successful task completion
- */
-export const ADCP_STATUS = {
-  SUBMITTED: 'submitted', // Long-running (hours/days) - webhook required
-  WORKING: 'working', // Processing (<120s) - keep connection open
-  INPUT_REQUIRED: 'input-required', // Needs user input via handler
-  COMPLETED: 'completed', // Task completed successfully
-  FAILED: 'failed', // Task failed
-  CANCELED: 'canceled', // Task was canceled
-  REJECTED: 'rejected', // Task was rejected
-  AUTH_REQUIRED: 'auth-required', // Authentication required
-  UNKNOWN: 'unknown', // Unknown status
-} as const;
+export { ADCP_STATUS, type ADCPStatus } from './task-status';
 
-export type ADCPStatus = (typeof ADCP_STATUS)[keyof typeof ADCP_STATUS];
-
-/**
- * Fields that belong to the task envelope, not to a domain payload. Derived
- * from `ProtocolEnvelope` (core/protocol-envelope.json) plus the optional
- * `errors` / `context` / `ext` fields that AdCP task-response schemas place at
- * envelope level. Used to disambiguate `structuredContent.status` from AdCP v3
- * domain status enums (MediaBuyStatus, CreativeStatus, etc.) that share
- * literals like `completed` / `canceled` / `failed` / `rejected` — see #646
- * and #2009.
- */
-const TASK_ENVELOPE_FIELDS: ReadonlySet<string> = new Set([
-  'status',
-  'message',
-  'timestamp',
-  'context_id',
-  'task_id',
-  'replayed',
-  'push_notification_config',
-  'governance_context',
-  'adcp_version',
-  'errors',
-  'context',
-  'ext',
-]);
 const NESTED_TASK_ENVELOPE_FIELDS: ReadonlySet<string> = new Set([...TASK_ENVELOPE_FIELDS, 'taskId', 'adcp_error']);
-
-/**
- * ADCP task-lifecycle statuses that never overlap with AdCP domain status
- * enums and can be trusted from `structuredContent.status` or A2A DataPart
- * `status` unconditionally.
- * The other literals (`completed` / `canceled` / `failed` / `rejected`) share
- * values with `MediaBuyStatus` et al and require envelope-shape disambiguation.
- */
-const EXCLUSIVE_TASK_STATUSES: ReadonlySet<string> = new Set([
-  ADCP_STATUS.SUBMITTED,
-  ADCP_STATUS.WORKING,
-  ADCP_STATUS.INPUT_REQUIRED,
-  ADCP_STATUS.AUTH_REQUIRED,
-]);
 
 /**
  * Max length for a server-issued session id (`contextId` / `taskId`) we
@@ -92,64 +43,47 @@ function isSafeSessionId(v: unknown): v is string {
 }
 
 /**
- * Extract the AdCP work-layer status from an A2A wrapped Task result,
- * if present. Exclusive AdCP task statuses (`submitted` / `working` /
- * `input-required` / `auth-required`) live on the latest structured DataPart
- * `status` (per adcp-client#899's two-lifecycle contract); the transport-layer
- * `result.status.state` tracks the HTTP-call lifecycle and is `'completed'`
- * for AdCP submitted arms.
- *
- * Shared literals (`completed` / `canceled` / `failed` / `rejected`) are
- * ambiguous in A2A artifact data because domain payloads also have a
- * `status` field. A completed `update_media_buy` task can return
- * `{ media_buy_id, status: "canceled" }`; that means the media buy was
- * canceled, not the A2A task. Use the same envelope-shape guard as MCP
- * structuredContent. See issue #2009.
- *
- * Returns `undefined` for non-AdCP A2A responses (no artifact, no
- * DataPart, or `data.status` not in the AdCP enum) so callers can
- * fall back to the transport-layer status.
- */
-function extractAdcpStatusFromA2aTaskResult(result: any): ADCPStatus | undefined {
-  if (result == null || typeof result !== 'object' || Array.isArray(result)) return undefined;
-  if (result.kind !== 'task') return undefined;
-  const extracted = getLatestA2ADataPartFromTask(result);
-  if (!extracted) return undefined;
-  const data = extracted.data;
-  const status = data.status;
-  if (typeof status === 'string' && (Object.values(ADCP_STATUS) as string[]).includes(status)) {
-    if (EXCLUSIVE_TASK_STATUSES.has(status)) {
-      return status as ADCPStatus;
-    }
-    const hasDomainPayload = Object.keys(data).some(k => !TASK_ENVELOPE_FIELDS.has(k));
-    if (hasDomainPayload) {
-      return undefined;
-    }
-    return status as ADCPStatus;
-  }
-  return undefined;
-}
-
-/**
  * Extract the AdCP task handle from an A2A wrapped Task result. The
- * handle lives on artifact `metadata.adcp_task_id` (per adcp-client#899).
+ * handle lives on artifact metadata (`adcp_task_id` per adcp-client#899,
+ * with `serverTaskId` accepted as a compatibility alias).
  * Walk artifacts backward so trailing text-only artifacts with metadata still
- * win, while responses with metadata only on the latest DataPart-bearing
- * artifact continue to work.
+ * work when the DataPart does not carry a task id. If both metadata and the
+ * typed DataPart carry task ids and they disagree, prefer the DataPart.
  */
 function extractAdcpTaskIdFromA2aTaskResult(result: any): string | undefined {
   if (result == null || typeof result !== 'object' || Array.isArray(result)) return undefined;
   if (result.kind !== 'task') return undefined;
+
+  const latestDataPart = getLatestA2ADataPartFromTask(result);
+  const taskIdFromDataPart = firstSafeSessionId(latestDataPart?.data?.task_id, latestDataPart?.data?.taskId);
+
+  const resolveMetadataTaskId = (taskId: string | undefined): string | undefined => {
+    if (!taskId) return undefined;
+    return taskIdFromDataPart && taskIdFromDataPart !== taskId ? taskIdFromDataPart : taskId;
+  };
+
   const artifacts = result.artifacts;
-  if (!Array.isArray(artifacts)) return undefined;
-  for (let i = artifacts.length - 1; i >= 0; i -= 1) {
-    const artifact = artifacts[i];
-    if (artifact == null || typeof artifact !== 'object' || Array.isArray(artifact)) continue;
-    const metadata = (artifact as { metadata?: unknown }).metadata;
-    if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
-    const taskId = firstSafeSessionId((metadata as Record<string, unknown>).adcp_task_id);
+  if (Array.isArray(artifacts)) {
+    for (let i = artifacts.length - 1; i >= 0; i -= 1) {
+      const artifact = artifacts[i];
+      if (artifact == null || typeof artifact !== 'object' || Array.isArray(artifact)) continue;
+      const metadata = (artifact as { metadata?: unknown }).metadata;
+      if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
+      const m = metadata as Record<string, unknown>;
+      const taskId = resolveMetadataTaskId(firstSafeSessionId(m.adcp_task_id, m.serverTaskId));
+      if (taskId) return taskId;
+    }
+  }
+
+  if (taskIdFromDataPart) return taskIdFromDataPart;
+
+  const resultMetadata = result.metadata;
+  if (resultMetadata != null && typeof resultMetadata === 'object' && !Array.isArray(resultMetadata)) {
+    const m = resultMetadata as Record<string, unknown>;
+    const taskId = resolveMetadataTaskId(firstSafeSessionId(m.adcp_task_id, m.serverTaskId));
     if (taskId) return taskId;
   }
+
   return undefined;
 }
 
@@ -297,12 +231,26 @@ export class ProtocolResponseParser {
     // when the artifact didn't surface an AdCP status (non-AdCP A2A
     // responses, or sync-completed responses where transport state is
     // authoritative).
-    if (response?.result?.status?.state && Object.values(ADCP_STATUS).includes(response.result.status.state)) {
+    if (isAdcpStatus(response?.result?.status?.state)) {
       return response.result.status.state as ADCPStatus;
     }
 
+    // Raw/in-process MCP wrappers may have a wrapper-level status plus the
+    // actual AdCP task envelope under `data`. The nested task status wins
+    // over the wrapper when it is a real task envelope; domain-status
+    // collisions still fall through because `extractAdcpTaskStatusFromPayload`
+    // rejects domain payloads with non-envelope fields.
+    const hasOfficialPayload =
+      response?.structuredContent !== undefined || response?.content !== undefined || response?.result !== undefined;
+    const data = hasOfficialPayload ? undefined : response?.data;
+    const dataTaskStatus =
+      data != null && typeof data === 'object' && !Array.isArray(data)
+        ? extractAdcpTaskStatusFromPayload(data)
+        : undefined;
+    if (dataTaskStatus) return dataTaskStatus;
+
     // Check top-level status first (A2A and direct responses)
-    if (response?.status && Object.values(ADCP_STATUS).includes(response.status)) {
+    if (isAdcpStatus(response?.status)) {
       return response.status as ADCPStatus;
     }
 
@@ -315,14 +263,9 @@ export class ProtocolResponseParser {
     // Otherwise we fall through to the structuredContent fallback below, so Zod
     // validators parse the domain payload. See issue #646.
     const sc = response?.structuredContent;
-    if (sc?.status && Object.values(ADCP_STATUS).includes(sc.status)) {
-      if (EXCLUSIVE_TASK_STATUSES.has(sc.status)) {
-        return sc.status as ADCPStatus;
-      }
-      const hasDomainPayload = Object.keys(sc).some(k => !TASK_ENVELOPE_FIELDS.has(k));
-      if (!hasDomainPayload) {
-        return sc.status as ADCPStatus;
-      }
+    if (sc?.status && isAdcpStatus(sc.status)) {
+      const taskStatus = extractAdcpTaskStatusFromPayload(sc);
+      if (taskStatus) return taskStatus;
       // Domain payload present alongside a shared-literal status — fall through.
     }
 
@@ -481,7 +424,17 @@ export class ProtocolResponseParser {
       const fromSc = firstSafeSessionId(sc.task_id);
       if (fromSc) return fromSc;
     }
-    return firstSafeSessionId(response.task_id);
+    const fromFlat = firstSafeSessionId(response.task_id);
+    if (fromFlat) return fromFlat;
+
+    const hasOfficialPayload =
+      response.structuredContent !== undefined || response.content !== undefined || response.result !== undefined;
+    const data = hasOfficialPayload ? undefined : response.data;
+    if (data != null && typeof data === 'object' && !Array.isArray(data)) {
+      const fromData = firstSafeSessionId(data.task_id, data.taskId);
+      if (fromData) return fromData;
+    }
+    return undefined;
   }
 
   private parseExpectedType(rawType: unknown): 'string' | 'number' | 'boolean' | 'object' | 'array' | undefined {

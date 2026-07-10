@@ -430,17 +430,11 @@ describe('CLI registry command', () => {
       });
       output = captureOutput();
 
-      const code = await handleRegistryCommand([
-        'save-property',
-        'example.com',
-        'https://agent.example.com',
-        '--auth',
-        'sk_test',
-      ]);
+      const code = await handleRegistryCommand(['save-property', 'example.com', '--auth', 'sk_test']);
 
       assert.strictEqual(code, 0);
       assert.strictEqual(capturedBody.publisher_domain, 'example.com');
-      assert.deepStrictEqual(capturedBody.authorized_agents, [{ url: 'https://agent.example.com' }]);
+      assert.deepStrictEqual(capturedBody.authorized_agents, []);
       assert.ok(output.stdout.includes('Saved successfully'));
       assert.ok(output.stdout.includes('prop_456'));
     });
@@ -456,7 +450,6 @@ describe('CLI registry command', () => {
       const code = await handleRegistryCommand([
         'save-property',
         'example.com',
-        'https://agent.example.com',
         '{"contact":{"email":"admin@example.com"}}',
         '--auth',
         'sk_test',
@@ -467,8 +460,85 @@ describe('CLI registry command', () => {
       assert.strictEqual(capturedBody.contact.email, 'admin@example.com');
     });
 
+    test('saves a property with identity facts payload JSON', async () => {
+      let capturedBody;
+      restoreFetch = mockFetch(async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return new Response(JSON.stringify(SAVE_RESULT), { status: 200 });
+      });
+      output = captureOutput();
+
+      const code = await handleRegistryCommand([
+        'save-property',
+        'example.com',
+        '{"properties":[{"property_type":"website","name":"Example","identifiers":[{"type":"domain","value":"example.com"}],"tags":["news"]}]}',
+        '--auth',
+        'sk_test',
+      ]);
+
+      assert.strictEqual(code, 0);
+      assert.strictEqual(capturedBody.publisher_domain, 'example.com');
+      assert.deepStrictEqual(capturedBody.authorized_agents, []);
+      assert.deepStrictEqual(capturedBody.properties, [
+        {
+          type: 'website',
+          property_type: 'website',
+          name: 'Example',
+          identifiers: [{ type: 'domain', value: 'example.com' }],
+          tags: ['news'],
+        },
+      ]);
+    });
+
+    test('saves a property without an authorized agent URL', async () => {
+      let capturedBody;
+      restoreFetch = mockFetch(async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return new Response(JSON.stringify(SAVE_RESULT), { status: 200 });
+      });
+      output = captureOutput();
+
+      const code = await handleRegistryCommand(['save-property', 'example.com', '--auth', 'sk_test']);
+
+      assert.strictEqual(code, 0);
+      assert.strictEqual(capturedBody.publisher_domain, 'example.com');
+      assert.deepStrictEqual(capturedBody.authorized_agents, []);
+    });
+
+    test('saves a property with payload JSON and no authorized agent URL', async () => {
+      let capturedBody;
+      restoreFetch = mockFetch(async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return new Response(JSON.stringify(SAVE_RESULT), { status: 200 });
+      });
+      output = captureOutput();
+
+      const code = await handleRegistryCommand([
+        'save-property',
+        'example.com',
+        '{"contact":{"email":"admin@example.com"}}',
+        '--auth',
+        'sk_test',
+      ]);
+
+      assert.strictEqual(code, 0);
+      assert.strictEqual(capturedBody.publisher_domain, 'example.com');
+      assert.deepStrictEqual(capturedBody.authorized_agents, []);
+      assert.strictEqual(capturedBody.contact.email, 'admin@example.com');
+    });
+
     test('outputs JSON with --json flag', async () => {
       restoreFetch = mockFetch(async () => new Response(JSON.stringify(SAVE_RESULT), { status: 200 }));
+      output = captureOutput();
+
+      const code = await handleRegistryCommand(['save-property', 'example.com', '--auth', 'sk_test', '--json']);
+
+      assert.strictEqual(code, 0);
+      const parsed = JSON.parse(output.stdout);
+      assert.strictEqual(parsed.id, 'prop_456');
+    });
+
+    test('returns exit code 2 for legacy authorized agent URL positional', async () => {
       output = captureOutput();
 
       const code = await handleRegistryCommand([
@@ -477,19 +547,60 @@ describe('CLI registry command', () => {
         'https://agent.example.com',
         '--auth',
         'sk_test',
-        '--json',
+      ]);
+
+      assert.strictEqual(code, 2);
+      assert.ok(output.stderr.includes('no longer accepts an agent URL'));
+      assert.ok(output.stderr.includes('Authorization is managed at the publisher origin adagents.json'));
+      assert.ok(output.stderr.includes('Example: adcp registry save-property'));
+    });
+
+    test('accepts payload JSON with leading whitespace', async () => {
+      let capturedBody;
+      restoreFetch = mockFetch(async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return new Response(JSON.stringify(SAVE_RESULT), { status: 200 });
+      });
+      output = captureOutput();
+
+      const code = await handleRegistryCommand([
+        'save-property',
+        'example.com',
+        '  {"properties":[{"property_type":"website","name":"Example"}]}',
+        '--auth',
+        'sk_test',
       ]);
 
       assert.strictEqual(code, 0);
-      const parsed = JSON.parse(output.stdout);
-      assert.strictEqual(parsed.id, 'prop_456');
+      assert.deepStrictEqual(capturedBody.properties, [
+        {
+          type: 'website',
+          property_type: 'website',
+          name: 'Example',
+        },
+      ]);
     });
 
-    test('returns exit code 2 when domain or agent URL is missing', async () => {
+    test('returns exit code 2 for non-object payload JSON', async () => {
       output = captureOutput();
-      const code = await handleRegistryCommand(['save-property', 'example.com', '--auth', 'sk_test']);
+
+      const code = await handleRegistryCommand([
+        'save-property',
+        'example.com',
+        '[{"name":"Example"}]',
+        '--auth',
+        'sk_test',
+      ]);
+
       assert.strictEqual(code, 2);
-      assert.ok(output.stderr.includes('domain and agent URL are required'));
+      assert.ok(output.stderr.includes('expected payload JSON object or @file'));
+    });
+
+    test('returns exit code 2 when domain is missing', async () => {
+      output = captureOutput();
+      const code = await handleRegistryCommand(['save-property', '--auth', 'sk_test']);
+      assert.strictEqual(code, 2);
+      assert.ok(output.stderr.includes('domain is required'));
     });
 
     test('returns exit code 1 when no API key is provided', async () => {
@@ -498,7 +609,7 @@ describe('CLI registry command', () => {
       output = captureOutput();
 
       try {
-        const code = await handleRegistryCommand(['save-property', 'example.com', 'https://agent.example.com']);
+        const code = await handleRegistryCommand(['save-property', 'example.com']);
         assert.strictEqual(code, 1);
         assert.ok(output.stderr.includes('apiKey is required'));
       } finally {

@@ -1080,11 +1080,26 @@ export interface AdcpCapabilitiesOverrides {
  * mounts it as the transport-layer `preTransport` hook, so every inbound MCP
  * request passes the verifier before reaching the JSON-RPC router.
  *
- * A seller that declares the `signed-requests` specialism in
- * `capabilities.specialisms` MUST provide this config, and vice-versa — both
- * together or neither. `createAdcpServer` throws at construction time when
- * only one is set, closing the footgun where claiming the specialism
- * accepts unsigned mutating traffic.
+ * A seller wiring this config MUST also publish a buyer-visible discovery
+ * surface in `capabilities`, one of:
+ *
+ * - **3.1+ canonical (recommended):** set
+ *   `capabilities.request_signing.supported: true`. Buyers learn the agent
+ *   verifies signatures from `get_adcp_capabilities`; no deprecated specialism
+ *   claim required. The universal `signed_requests` storyboard grades on this
+ *   signal alone.
+ * - **Back-compat:** add `'signed-requests'` to `capabilities.specialisms`.
+ *   The 3.0-era enum value is preserved through the AdCP 4.0 deprecation cycle
+ *   (adcp#3075); when this path is taken the runner emits
+ *   `signed_requests_specialism_deprecated` (adcp-client#2082, adcp#4796).
+ *
+ * `createAdcpServer` throws at construction time when `signedRequests` is set
+ * but neither discovery surface is declared, closing the footgun where the
+ * verifier silently rejects every signed request from buyers who never learned
+ * to sign. The inverse (specialism or capability declared without a
+ * `signedRequests` config) is logged loudly but not thrown — legacy servers
+ * that hand-build the middleware via `serve({ preTransport })` stay
+ * conformant.
  *
  * `jwks`, `replayStore`, and `revocationStore` should be hoisted outside
  * the agent factory so a single verifier instance serves every request —
@@ -1341,6 +1356,18 @@ export type WebhooksConfig = Pick<
 export interface AdcpServerConfig<TAccount = unknown> {
   name: string;
   version: string;
+
+  /**
+   * Expose generated top-level AdCP request shapes in MCP `tools/list`.
+   *
+   * Defaults to `false`, preserving the long-standing passthrough schema so
+   * the framework AJV validator remains the only validation gate shared by
+   * MCP and A2A. Set to `true` when generic MCP clients need argument hints
+   * from `tools/list`; known AdCP tools use shallow key hints derived from
+   * `TOOL_INPUT_SHAPES` and unknown/custom framework surfaces fall back to
+   * passthrough.
+   */
+  exposeToolSchemas?: boolean;
 
   /**
    * AdCP protocol version this server speaks. Defaults to {@link ADCP_VERSION}
@@ -2418,14 +2445,36 @@ const MUT: ToolAnnotation = { readOnlyHint: false, destructiveHint: false };
 const DEST: ToolAnnotation = { readOnlyHint: false, destructiveHint: true };
 const IDEMP: ToolAnnotation = { readOnlyHint: false, idempotentHint: true };
 
-// Passthrough schema for every framework-registered tool (#909). See
-// the comment at the registerTool call sites for rationale — short
-// version: makes our AJV validator authoritative on both transports
-// without destroying args on MCP when the SDK's tool dispatcher would
-// otherwise coerce `undefined` into the handler for schemaless tools.
-// This also keeps `tools/list` payloads small for LLM consumers (full
-// schemas live in `docs/llms.txt`, SKILL.md files, and `schemas/cache/`).
+// Passthrough schema for framework-registered tools by default (#909). See
+// the comment at the registerTool call sites for rationale — short version:
+// makes our AJV validator authoritative on both transports without destroying
+// args on MCP when the SDK's tool dispatcher would otherwise coerce
+// `undefined` into the handler for schemaless tools. Servers can opt into
+// shallow MCP discovery hints derived from `TOOL_INPUT_SHAPES` with
+// config.exposeToolSchemas.
 const PASSTHROUGH_INPUT_SCHEMA = z.object({}).passthrough();
+type ToolInputShapeMap = Readonly<Record<string, ZodRawShapeCompat | undefined>>;
+let cachedToolInputShapes: ToolInputShapeMap | undefined;
+const SHALLOW_HINT_FIELD_SCHEMA = z.unknown().optional();
+const SHALLOW_HINT_SCHEMAS = new Map<string, AnySchema>();
+
+function getToolInputShapes(): ToolInputShapeMap {
+  cachedToolInputShapes ??= require('../schemas').TOOL_INPUT_SHAPES as ToolInputShapeMap;
+  return cachedToolInputShapes;
+}
+
+function shallowToolInputHintSchema(toolName: string): AnySchema | undefined {
+  const inputShape = getToolInputShapes()[toolName];
+  if (inputShape === undefined) return undefined;
+
+  const cached = SHALLOW_HINT_SCHEMAS.get(toolName);
+  if (cached !== undefined) return cached;
+
+  const hintShape = Object.fromEntries(Object.keys(inputShape).map(key => [key, SHALLOW_HINT_FIELD_SCHEMA]));
+  const schema = z.object(hintShape).passthrough();
+  SHALLOW_HINT_SCHEMAS.set(toolName, schema);
+  return schema;
+}
 
 const TOOL_META: Record<string, ToolMeta> = {
   // Media Buy
@@ -3454,6 +3503,10 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     responseEnhancer,
     toolSchemas,
   } = config;
+  const frameworkInputSchemaFor = (toolName: string) =>
+    config.exposeToolSchemas === true
+      ? (shallowToolInputHintSchema(toolName) ?? PASSTHROUGH_INPUT_SCHEMA)
+      : PASSTHROUGH_INPUT_SCHEMA;
 
   // One-shot construction-time warn when `testController` is wired without
   // any account resolver. The dispatch-time sandbox gate admits requests
@@ -3517,7 +3570,12 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     protocolBundleKey === '3.1-rc.9' ||
     protocolBundleKey === '3.1.0-rc.10' ||
     protocolBundleKey === '3.1-rc.10' ||
-    protocolBundleKey === '3.1-rc';
+    protocolBundleKey === '3.1.0-rc.13' ||
+    protocolBundleKey === '3.1-rc.13' ||
+    protocolBundleKey === '3.1.0-rc.14' ||
+    protocolBundleKey === '3.1-rc.14' ||
+    protocolBundleKey === '3.1-rc' ||
+    protocolBundleKey === '3.1';
 
   // Tool-name set for two-layer error emission. Computed once at server
   // build from the bundled response schemas: any tool whose top-level
@@ -3630,26 +3688,39 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     }
   }
 
-  // Enforce lock-step between the `signed-requests` specialism claim and the
-  // verifier config for the auto-wiring path. When `signedRequests` is set
-  // but the specialism isn't declared, buyers can't discover the signing
-  // requirement from `get_adcp_capabilities` — they won't sign, the
-  // verifier rejects every mutating call, and the agent is dead on arrival.
-  // That's unambiguously wrong, so we throw.
+  // Enforce that the verifier config has a buyer-visible discovery surface.
+  // When `signedRequests` is set but neither the deprecated `signed-requests`
+  // specialism claim NOR `capabilities.request_signing.supported: true` is
+  // declared, buyers can't discover the signing requirement from
+  // `get_adcp_capabilities` — they won't sign, the verifier rejects every
+  // mutating call, and the agent is dead on arrival. Two discovery surfaces
+  // are accepted:
   //
-  // The opposite direction — claiming the specialism without a
-  // `signedRequests` config — is only wrong when the agent also doesn't
-  // wire a verifier via `serve({ preTransport })`. Legacy servers that
-  // hand-build the middleware fall into this case and are still conformant.
-  // We log a loud error so operators notice (matching the idempotency
-  // guardrail precedent) but don't throw, leaving the manual path working.
+  // - **3.1+ canonical (recommended):** `capabilities.request_signing.supported: true`.
+  //   The universal signed_requests storyboard runs on this signal alone and
+  //   the runner emits `request_signing.required` notices for buyers.
+  // - **Back-compat:** `specialisms: ['signed-requests']`. The 3.0-era enum
+  //   is preserved through the AdCP 4.0 deprecation cycle (adcp#3075). The
+  //   runner emits `signed_requests_specialism_deprecated` notice when this
+  //   path is taken (adcp-client#2082, adcp#4796).
+  //
+  // The opposite direction — advertising signing without a `signedRequests`
+  // config — is only wrong when the agent also doesn't wire a verifier via
+  // `serve({ preTransport })`. Legacy servers that hand-build the middleware
+  // fall into this case and are still conformant. We log a loud error so
+  // operators notice (matching the idempotency guardrail precedent) but
+  // don't throw, leaving the manual path working.
   const specialismsClaimed = capConfig?.specialisms ?? [];
   const claimsSignedRequests = specialismsClaimed.includes('signed-requests');
-  if (signedRequests && !claimsSignedRequests) {
+  const declaresRequestSigningCapability = capConfig?.request_signing?.supported === true;
+  if (signedRequests && !claimsSignedRequests && !declaresRequestSigningCapability) {
     throw new Error(
-      'createAdcpServer: `signedRequests` is configured but `capabilities.specialisms` does not include "signed-requests". ' +
-        'Add "signed-requests" to the specialisms list — buyers discover the signing requirement from get_adcp_capabilities, ' +
-        "and omitting the claim means they won't sign their requests."
+      'createAdcpServer: `signedRequests` is configured but neither ' +
+        '`capabilities.request_signing.supported: true` nor `capabilities.specialisms: ["signed-requests"]` is declared. ' +
+        'Buyers discover the signing requirement from get_adcp_capabilities — ' +
+        'set `capabilities.request_signing = { supported: true, ... }` (canonical 3.1+ form, recommended) ' +
+        'or claim the deprecated `signed-requests` specialism (back-compat). ' +
+        "Omitting both surfaces means buyers won't sign their requests."
     );
   }
   if (claimsSignedRequests && !signedRequests) {
@@ -5766,15 +5837,15 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         }
       };
 
-      // Register a PASSTHROUGH input schema (#909). The MCP SDK's Zod
-      // validator only fires on the MCP transport — A2A calls the
-      // handler via AdcpServer.invoke(), bypassing it. Registering the
+      // Register a PASSTHROUGH input schema by default (#909). The MCP
+      // SDK's Zod validator only fires on the MCP transport — A2A calls
+      // the handler via AdcpServer.invoke(), bypassing it. Registering the
       // real per-tool Zod schema meant MCP and A2A produced different
-      // verdicts and different error shapes for the same malformed
-      // request. Our framework request validator (AJV, loaded from
-      // schemas/cache/<version>/) runs inside the handler closure on
-      // BOTH transports and produces a structured adcp_error envelope;
-      // make it authoritative.
+      // verdicts and different error shapes for the same malformed request.
+      // Our framework request validator (AJV, loaded from
+      // schemas/cache/<version>/) runs inside the handler closure on BOTH
+      // transports and produces a structured adcp_error envelope; make it
+      // authoritative unless the adopter opts into MCP discovery schemas.
       //
       // Passthrough (not omit): the SDK's `validateToolInput` returns
       // `undefined` when `inputSchema` is absent (see @modelcontextprotocol/sdk
@@ -5782,17 +5853,21 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       // handler — destroying the actual arguments. `z.object({}).passthrough()`
       // keeps every key intact, so args still reach the closure.
       //
-      // Trade-off: MCP `tools/list` publishes `{ type: 'object' }` for
-      // every tool (no per-tool parameter schema). This is intentional,
-      // not a wiring gap — inlining ~50 full request schemas in
-      // `tools/list` would balloon the context window for LLM consumers,
-      // who are the primary readers of MCP discovery. Tool shapes live
-      // in `docs/llms.txt`, the SKILL.md files, and `schemas/cache/`,
+      // Trade-off: default MCP `tools/list` publishes `{ type: 'object' }`
+      // for every tool (no per-tool parameter schema). This is intentional,
+      // not a wiring gap — inlining full request schemas in `tools/list`
+      // would balloon the context window for LLM consumers. Tool shapes
+      // live in `docs/llms.txt`, the SKILL.md files, and `schemas/cache/`,
       // which curated agents read on demand instead of paying the cost
       // every connection. AdCP-native discovery via `get_adcp_capabilities`
       // already works over both transports; upstream #3057 proposes a
       // `get_schema` capability tool for programmatic per-tool shape
-      // discovery.
+      // discovery. For generic MCP clients that need hints directly in
+      // `tools/list`, set `exposeToolSchemas: true` to publish shallow
+      // top-level key hints derived from `TOOL_INPUT_SHAPES`. Those hint
+      // schemas use optional `unknown` fields plus passthrough so MCP keeps
+      // all args intact and leaves substantive validation under the
+      // framework validator.
       //
       // Adopters can opt specific tools into schema hints via
       // `toolSchemas` on {@link AdcpServerConfig}. All other tools
@@ -5802,13 +5877,12 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       // (cross-version field-stripping, gating, validation), read raw
       // JSON from `schemas/cache/{version}/` via `schema-loader.ts` —
       // see `schemaAllowsTopLevelField` for the canonical pattern (#940).
-      // Don't try to recover the shape from `tools/list`; it's empty by
-      // design and will fail open.
+      // Don't try to recover the canonical shape from `tools/list` when
+      // `exposeToolSchemas` is off; it's empty by design and will fail open.
       const adopterSchemas = toolSchemas ?? {};
       const inputSchema =
         adopterSchemas[toolName] ??
-        PASSTHROUGH_INPUT_SCHEMA;
-
+        frameworkInputSchemaFor(toolName);
       server.registerTool(
         toolName,
         {
@@ -5826,7 +5900,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     server.registerTool(
       'get_task_status',
       {
-        inputSchema: PASSTHROUGH_INPUT_SCHEMA,
+        inputSchema: frameworkInputSchemaFor('get_task_status'),
         annotations: RO,
       },
       (async (params: any, extra: any) => {
@@ -5904,7 +5978,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     server.registerTool(
       'list_tasks',
       {
-        inputSchema: PASSTHROUGH_INPUT_SCHEMA,
+        inputSchema: frameworkInputSchemaFor('list_tasks'),
         annotations: RO,
       },
       (async (params: any, extra: any) => {
@@ -6131,6 +6205,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     status: 'completed',
     adcp: {
       major_versions: capConfig?.major_versions ?? [3],
+      ...(capConfig?.supported_versions?.length && { supported_versions: [...capConfig.supported_versions] }),
       idempotency: idempotencyCapability,
     },
     supported_protocols: protocols as GetAdCPCapabilitiesResponse['supported_protocols'],
@@ -6211,7 +6286,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   server.registerTool(
     'get_adcp_capabilities',
     {
-      inputSchema: PASSTHROUGH_INPUT_SCHEMA,
+      inputSchema: frameworkInputSchemaFor('get_adcp_capabilities'),
       annotations: { readOnlyHint: true },
     },
     (async (params: any, extra: { authInfo?: ResolvedAuthInfo } = {}) => {
@@ -6249,7 +6324,9 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       if (ctx !== null && typeof ctx === 'object' && !Array.isArray(ctx)) {
         (data as any).context = ctx;
       }
-      return applyResponseEnhancer(capabilitiesResponse(data));
+      const response = capabilitiesResponse(data);
+      injectVersionIntoResponse(response, servedAdcpVersion);
+      return applyResponseEnhancer(response);
     }) as Parameters<typeof server.registerTool>[2]
   );
   registeredToolNames.add('get_adcp_capabilities');

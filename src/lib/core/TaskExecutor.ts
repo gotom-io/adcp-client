@@ -24,6 +24,7 @@ import { normalizeGetProductsResponse } from '../utils/pricing-adapter';
 import { normalizeLegacyMediaBuyStatusForReturn } from '../utils/envelope-status-compat';
 import { getLatestA2ADataPartFromResponse } from '../utils/a2a-artifacts';
 import { cancelA2ATask } from '../protocols/a2a';
+import { isAbortOrTimeoutError } from '../protocols/abort';
 import type {
   Message,
   InputRequest,
@@ -168,13 +169,13 @@ function stringField(value: unknown): string | undefined {
  */
 const TASKS_GET_UNWRAP_MAX_DEPTH = 8;
 
-function unwrapTasksGetEnvelope(obj: Record<string, unknown>, depth = 0): Record<string, unknown> {
+function unwrapTasksGetEnvelope(obj: Record<string, unknown>, depth = 0, allowRawData = true): Record<string, unknown> {
   if (depth >= TASKS_GET_UNWRAP_MAX_DEPTH) return obj;
   // MCP: `tools/call` response carries the typed payload at
   // `structuredContent`.
   const sc = obj.structuredContent;
   if (sc != null && typeof sc === 'object' && !Array.isArray(sc)) {
-    return unwrapTasksGetEnvelope(sc as Record<string, unknown>, depth + 1);
+    return unwrapTasksGetEnvelope(sc as Record<string, unknown>, depth + 1, false);
   }
   // A2A: `message/send` response is a JSON-RPC envelope wrapping a
   // Task; the AdCP payload sits on the latest structured DataPart.
@@ -184,7 +185,7 @@ function unwrapTasksGetEnvelope(obj: Record<string, unknown>, depth = 0): Record
     if (r.kind === 'task') {
       const extracted = getLatestA2ADataPartFromResponse(obj);
       if (extracted) {
-        return unwrapTasksGetEnvelope(extracted.data, depth + 1);
+        return unwrapTasksGetEnvelope(extracted.data, depth + 1, false);
       }
       // adcp-client#1612: When the A2A Task has no DataPart artifacts (e.g. the
       // seller returns an A2A transport-level state without an AdCP DataPart
@@ -201,6 +202,17 @@ function unwrapTasksGetEnvelope(obj: Record<string, unknown>, depth = 0): Record
       if (typeof transportStatus === 'string') {
         return { status: transportStatus, task_id: typeof r.id === 'string' ? r.id : undefined };
       }
+    }
+  }
+  // Raw/in-process MCP wrappers sometimes carry the AdCP payload under
+  // `data` rather than the official CallToolResult `structuredContent`.
+  // Unwrap only when it looks like a task envelope and no official payload
+  // has already been selected.
+  const data = obj.data;
+  if (allowRawData && data != null && typeof data === 'object' && !Array.isArray(data)) {
+    const d = data as Record<string, unknown>;
+    if ('status' in d || 'task_id' in d || 'taskId' in d) {
+      return unwrapTasksGetEnvelope(d, depth + 1, true);
     }
   }
   // Legacy nested wrapper from pre-3.0 sellers and existing mocks.
@@ -311,6 +323,8 @@ export class TaskExecutor {
       filterInvalidProducts?: boolean;
       /** Global activity callback for observability */
       onActivity?: (activity: Activity) => void | Promise<void>;
+      /** Transport-level diagnostics callback for outbound HTTP requests. */
+      onTransportActivity?: import('../protocols').TransportActivityHandler;
       /** Governance configuration for buyer-side campaign governance */
       governance?: GovernanceConfig;
       /**
@@ -342,7 +356,8 @@ export class TaskExecutor {
         config.governance,
         config.onActivity,
         config.adcpVersion,
-        config.versionEnvelope
+        config.versionEnvelope,
+        config.onTransportActivity
       );
     }
     const modes = resolveValidationModes(config.validation);
@@ -602,6 +617,14 @@ export class TaskExecutor {
         ...(this.config.wireAdcpVersion !== undefined && { wireAdcpVersion: this.config.wireAdcpVersion }),
         ...(this.config.versionEnvelope !== undefined && { versionEnvelope: this.config.versionEnvelope }),
         transport: options.transport ?? this.config.transport,
+        signal: options.signal,
+        onTransportActivity: this.config.onTransportActivity,
+        transportActivityContext: {
+          operationId: taskId,
+          taskId: options.taskId ?? taskId,
+          contextId: options.contextId,
+          idempotencyKey,
+        },
       });
 
       // Emit protocol_response activity
@@ -686,6 +709,14 @@ export class TaskExecutor {
 
       return attachMatch(result);
     } catch (error) {
+      if (isAbortOrTimeoutError(error)) {
+        if (idempotencyKey && error && typeof error === 'object') {
+          (error as Error & { idempotency_key?: string; idempotencyKey?: string }).idempotency_key = idempotencyKey;
+          (error as Error & { idempotency_key?: string; idempotencyKey?: string }).idempotencyKey = idempotencyKey;
+        }
+        throw error;
+      }
+
       // Report failed outcome on error
       if (governanceCheckId && this.governanceMiddleware && governanceResult?.governanceContext) {
         await this.governanceMiddleware.reportOutcome(
@@ -1128,9 +1159,11 @@ export class TaskExecutor {
     // SERVER-assigned task handle, not the runner's local UUID. The local
     // UUID is the `activeTasks` map key and the `{operation_id}` webhook
     // macro value — it never reaches the seller. The server handle comes
-    // from `response.task_id` (AdCP submitted-arm wire field) or, for A2A
-    // responses, the same handle surfaced via `result.id` / `taskId`.
-    // `responseParser.getTaskId` walks both shapes.
+    // from `response.task_id` / `response.data.task_id` (AdCP submitted-arm
+    // wire fields) or, for A2A responses, the same handle surfaced via
+    // metadata (`adcp_task_id` / `serverTaskId`) before falling back to the
+    // transport `result.id` / `taskId`. `responseParser.getTaskId` walks these
+    // shapes.
     //
     // When the seller violated the spec and didn't include a task handle
     // we fall back to the local UUID so the buyer at least gets a
@@ -1145,7 +1178,8 @@ export class TaskExecutor {
         message:
           'Submitted-arm response omitted task_id (spec violation). Polling will use the runner-side ' +
           'correlation id as a fallback; the seller will not recognize it. ' +
-          'Expected: response.task_id (AdCP) or result.id with kind === "task" (A2A wrapped).',
+          'Expected: response.task_id / response.data.task_id (AdCP), A2A metadata.serverTaskId, ' +
+          'A2A metadata.adcp_task_id, or result.id with kind === "task" (A2A wrapped).',
         timestamp: new Date().toISOString(),
         taskName,
         runnerTaskId: taskId,
@@ -1340,7 +1374,13 @@ export class TaskExecutor {
     if (agent.protocol === 'mcp') {
       const authToken = getAuthToken(agent);
       try {
-        return await listMCPTasks(agent.agent_uri, authToken);
+        return await listMCPTasks(agent.agent_uri, authToken, undefined, {
+          transport: transport ?? this.config.transport,
+          onTransportActivity: this.config.onTransportActivity,
+          transportActivityContext: {
+            agentId: agent.id,
+          },
+        });
       } catch (err) {
         if (is401Error(err)) throw err;
         // Fall through to tool call if protocol method is not supported
@@ -1356,6 +1396,7 @@ export class TaskExecutor {
         ...(this.config.wireAdcpVersion !== undefined && { wireAdcpVersion: this.config.wireAdcpVersion }),
         ...(this.config.versionEnvelope !== undefined && { versionEnvelope: this.config.versionEnvelope }),
         transport: transport ?? this.config.transport,
+        onTransportActivity: this.config.onTransportActivity,
       }
     )) as Record<string, unknown>;
     return (response.tasks as TaskInfo[]) || [];
@@ -1380,7 +1421,8 @@ export class TaskExecutor {
   private async getTaskStatusWithRawResponse(
     agent: AgentConfig,
     taskId: string,
-    transport?: import('../protocols').TransportOptions
+    transport?: import('../protocols').TransportOptions,
+    signal?: AbortSignal
   ): Promise<TaskStatusPollResult> {
     // AdCP `tasks/get` is the cross-protocol work-status interface
     // (`schemas/cache/<v>/bundled/core/tasks-get-{request,response}.json`).
@@ -1419,6 +1461,11 @@ export class TaskExecutor {
         ...(this.config.wireAdcpVersion !== undefined && { wireAdcpVersion: this.config.wireAdcpVersion }),
         ...(this.config.versionEnvelope !== undefined && { versionEnvelope: this.config.versionEnvelope }),
         transport: transport ?? this.config.transport,
+        signal,
+        onTransportActivity: this.config.onTransportActivity,
+        transportActivityContext: {
+          taskId,
+        },
       }
     )) as Record<string, unknown>;
     // We don't run `extractResponseData` here: that helper's
@@ -1439,9 +1486,10 @@ export class TaskExecutor {
   async getTaskStatus(
     agent: AgentConfig,
     taskId: string,
-    transport?: import('../protocols').TransportOptions
+    transport?: import('../protocols').TransportOptions,
+    signal?: AbortSignal
   ): Promise<TaskInfo> {
-    return (await this.getTaskStatusWithRawResponse(agent, taskId, transport)).task;
+    return (await this.getTaskStatusWithRawResponse(agent, taskId, transport, signal)).task;
   }
 
   async pollTaskCompletion<T>(
@@ -1511,7 +1559,7 @@ export class TaskExecutor {
       let status: TaskInfo;
       let rawResponse: Record<string, unknown> | undefined;
       try {
-        const pollResult = await this.getTaskStatusWithRawResponse(agent, taskId, transport);
+        const pollResult = await this.getTaskStatusWithRawResponse(agent, taskId, transport, signal);
         status = pollResult.task;
         rawResponse = pollResult.rawResponse;
       } catch (err) {
@@ -1725,6 +1773,13 @@ export class TaskExecutor {
         ...(this.config.wireAdcpVersion !== undefined && { wireAdcpVersion: this.config.wireAdcpVersion }),
         ...(this.config.versionEnvelope !== undefined && { versionEnvelope: this.config.versionEnvelope }),
         transport: options.transport ?? this.config.transport,
+        signal: options.signal,
+        onTransportActivity: this.config.onTransportActivity,
+        transportActivityContext: {
+          operationId: taskId,
+          taskId,
+          contextId,
+        },
       }
     );
 

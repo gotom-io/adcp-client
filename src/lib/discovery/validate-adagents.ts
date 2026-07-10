@@ -33,6 +33,7 @@ import { validateUserAgent } from '../utils/validate-user-agent';
 import { ssrfSafeFetch, SsrfRefusedError, decodeBodyAsJsonOrText } from '../net/ssrf-fetch';
 import { isInternalProbesAllowed } from '../utils/probe-policy';
 import type { AdAgentsJson } from './types';
+import { AdAgentsRedirectRefusedError, ssrfSafeFetchAdAgents, type AdAgentsRedirectPolicy } from './adagents-redirects';
 
 /** How the validator located the authoritative `adagents.json` for a publisher. */
 export type DiscoveryMethod = 'direct' | 'authoritative_location' | 'ads_txt_managerdomain';
@@ -84,6 +85,8 @@ export interface AdAgentsValidationResult {
 export interface ValidateAdAgentsOptions {
   /** Per-request timeout in ms (default 10_000). */
   timeoutMs?: number;
+  /** Maximum response body bytes for adagents.json and ads.txt fetches (default 256 KiB). */
+  maxBodyBytes?: number;
   /** Optional User-Agent suffix (validated via `validateUserAgent`). */
   userAgent?: string;
   /** Logger level (default `'warn'`). */
@@ -98,8 +101,8 @@ export interface ValidateAdAgentsOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
-const MAX_ADAGENTS_BYTES = 256 * 1024;
-const MAX_ADS_TXT_BYTES = 256 * 1024;
+const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
+const MAX_CONFIGURABLE_BODY_BYTES = 10 * 1024 * 1024;
 
 const FETCH_HEADERS = {
   Accept: 'application/json, text/plain, */*',
@@ -122,6 +125,7 @@ export async function validateAdAgents(
     validateUserAgent(options.userAgent);
   }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxBodyBytes = resolveMaxBodyBytes(options.maxBodyBytes);
   const logger = createLogger({ level: options.logLevel ?? 'warn' }).child('validateAdAgents');
   const userAgentHeader = `adcp-validate-adagents/${LIBRARY_VERSION} (+https://adcontextprotocol.org)`;
   const fromHeader = options.userAgent
@@ -135,9 +139,10 @@ export async function validateAdAgents(
   // Step 1: try the publisher's canonical location.
   const direct = await fetchJsonOrStatus(publisherUrl, {
     timeoutMs,
-    maxBodyBytes: MAX_ADAGENTS_BYTES,
+    maxBodyBytes,
     userAgentHeader,
     fromHeader,
+    redirectPolicy: { mode: 'same-registrable-domain', originUrl: publisherUrl },
   });
 
   if (direct.kind === 'ok') {
@@ -147,7 +152,7 @@ export async function validateAdAgents(
         valid: false,
         publisher_domain: publisher,
         discovery_method: 'direct',
-        resolved_url: publisherUrl,
+        resolved_url: direct.url,
         errors: ['adagents.json fetch failed: invalid JSON: response is not a JSON object'],
       };
     }
@@ -166,7 +171,7 @@ export async function validateAdAgents(
           valid: false,
           publisher_domain: publisher,
           discovery_method: 'authoritative_location',
-          resolved_url: publisherUrl,
+          resolved_url: direct.url,
           errors: [`authoritative_location must use https://, got: ${target}`],
         };
       }
@@ -176,20 +181,21 @@ export async function validateAdAgents(
       // wasted RTT against the publisher's own server, not SSRF
       // (still routed through `ssrfSafeFetch`), but the right check
       // is on origin+pathname.
-      if (sameOriginAndPath(target, publisherUrl)) {
+      if (sameOriginAndPath(target, direct.url)) {
         return {
           valid: false,
           publisher_domain: publisher,
           discovery_method: 'authoritative_location',
-          resolved_url: publisherUrl,
+          resolved_url: direct.url,
           errors: ['authoritative_location points back to the publisher (cycle)'],
         };
       }
       const followed = await fetchJsonOrStatus(target, {
         timeoutMs,
-        maxBodyBytes: MAX_ADAGENTS_BYTES,
+        maxBodyBytes,
         userAgentHeader,
         fromHeader,
+        redirectPolicy: { mode: 'none' },
       });
       if (followed.kind !== 'ok') {
         return {
@@ -214,7 +220,7 @@ export async function validateAdAgents(
         valid: true,
         publisher_domain: publisher,
         discovery_method: 'authoritative_location',
-        resolved_url: target,
+        resolved_url: followed.url,
         adagents: followedAdAgents,
         errors: [],
       };
@@ -224,7 +230,7 @@ export async function validateAdAgents(
       valid: true,
       publisher_domain: publisher,
       discovery_method: 'direct',
-      resolved_url: publisherUrl,
+      resolved_url: direct.url,
       adagents: data,
       errors: [],
     };
@@ -246,7 +252,7 @@ export async function validateAdAgents(
   const adsTxtUrl = buildUrl(publisher, '/ads.txt');
   const adsTxt = await fetchTextOrStatus(adsTxtUrl, {
     timeoutMs,
-    maxBodyBytes: MAX_ADS_TXT_BYTES,
+    maxBodyBytes,
     userAgentHeader,
     fromHeader,
   });
@@ -283,9 +289,10 @@ export async function validateAdAgents(
   const managerUrl = buildUrl(managerDomain, '/.well-known/adagents.json');
   const manager = await fetchJsonOrStatus(managerUrl, {
     timeoutMs,
-    maxBodyBytes: MAX_ADAGENTS_BYTES,
+    maxBodyBytes,
     userAgentHeader,
     fromHeader,
+    redirectPolicy: { mode: 'same-registrable-domain', originUrl: managerUrl },
   });
   if (manager.kind !== 'ok') {
     logger.debug(`Manager domain ${managerDomain} adagents.json fetch failed: ${describeOutcome(manager)}`);
@@ -314,7 +321,7 @@ export async function validateAdAgents(
     publisher_domain: publisher,
     discovery_method: 'ads_txt_managerdomain',
     manager_domain: managerDomain,
-    resolved_url: managerUrl,
+    resolved_url: manager.url,
     adagents: managerAdAgents,
     errors: [],
   };
@@ -329,6 +336,14 @@ export async function validateAdAgents(
 function coerceAdAgentsObject(value: unknown): AdAgentsJson | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as AdAgentsJson;
+}
+
+function resolveMaxBodyBytes(maxBodyBytes: number | undefined): number {
+  const value = maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_CONFIGURABLE_BODY_BYTES) {
+    throw new Error(`maxBodyBytes must be an integer between 1 and ${MAX_CONFIGURABLE_BODY_BYTES}`);
+  }
+  return value;
 }
 
 /**
@@ -421,26 +436,28 @@ type FetchFailure =
   | { kind: 'http_error'; status: number }
   | { kind: 'transport_error'; message: string }
   | { kind: 'parse_error'; message: string }
-  | { kind: 'ssrf_refused'; message: string };
+  | { kind: 'ssrf_refused'; message: string }
+  | { kind: 'redirect_refused'; message: string };
 
-type RawFetchOutcome = { kind: 'ok-text'; text: string } | FetchFailure;
+type RawFetchOutcome = { kind: 'ok-text'; text: string; url: string } | FetchFailure;
 
-type JsonFetchOutcome = { kind: 'ok'; data: unknown } | FetchFailure;
+type JsonFetchOutcome = { kind: 'ok'; data: unknown; url: string } | FetchFailure;
 
-type TextFetchOutcome = { kind: 'ok'; text: string } | FetchFailure;
+type TextFetchOutcome = { kind: 'ok'; text: string; url: string } | FetchFailure;
 
 interface InternalFetchOptions {
   timeoutMs: number;
   maxBodyBytes: number;
   userAgentHeader: string;
   fromHeader: string;
+  redirectPolicy?: AdAgentsRedirectPolicy;
 }
 
 async function fetchJsonOrStatus(url: string, opts: InternalFetchOptions): Promise<JsonFetchOutcome> {
   const raw = await rawFetch(url, opts);
   if (raw.kind !== 'ok-text') return raw;
   try {
-    return { kind: 'ok', data: JSON.parse(raw.text) };
+    return { kind: 'ok', data: JSON.parse(raw.text), url: raw.url };
   } catch (err) {
     return { kind: 'parse_error', message: err instanceof Error ? err.message : 'invalid JSON' };
   }
@@ -448,13 +465,13 @@ async function fetchJsonOrStatus(url: string, opts: InternalFetchOptions): Promi
 
 async function fetchTextOrStatus(url: string, opts: InternalFetchOptions): Promise<TextFetchOutcome> {
   const raw = await rawFetch(url, opts);
-  if (raw.kind === 'ok-text') return { kind: 'ok', text: raw.text };
+  if (raw.kind === 'ok-text') return { kind: 'ok', text: raw.text, url: raw.url };
   return raw;
 }
 
 async function rawFetch(url: string, opts: InternalFetchOptions): Promise<RawFetchOutcome> {
   try {
-    const result = await ssrfSafeFetch(url, {
+    const fetchOptions = {
       timeoutMs: opts.timeoutMs,
       allowPrivateIp: isInternalProbesAllowed(),
       maxBodyBytes: opts.maxBodyBytes,
@@ -463,7 +480,10 @@ async function rawFetch(url: string, opts: InternalFetchOptions): Promise<RawFet
         'User-Agent': opts.userAgentHeader,
         From: opts.fromHeader,
       },
-    });
+    };
+    const result = opts.redirectPolicy
+      ? await ssrfSafeFetchAdAgents(url, fetchOptions, opts.redirectPolicy)
+      : await ssrfSafeFetch(url, fetchOptions);
     if (result.status === 404) return { kind: 'not_found' };
     if (result.status < 200 || result.status >= 300) {
       return { kind: 'http_error', status: result.status };
@@ -472,8 +492,11 @@ async function rawFetch(url: string, opts: InternalFetchOptions): Promise<RawFet
     // lets ads.txt and adagents.json share the same fetch primitive.
     const decoded = decodeBodyAsJsonOrText(result.body, 'text/plain');
     const text = typeof decoded === 'string' ? decoded : JSON.stringify(decoded);
-    return { kind: 'ok-text', text };
+    return { kind: 'ok-text', text, url: result.url };
   } catch (err) {
+    if (err instanceof AdAgentsRedirectRefusedError) {
+      return { kind: 'redirect_refused', message: err.message };
+    }
     if (err instanceof SsrfRefusedError) {
       return { kind: 'ssrf_refused', message: err.message };
     }
@@ -498,5 +521,7 @@ function describeOutcome(outcome: FetchFailure): string {
       return `invalid JSON: ${outcome.message}`;
     case 'ssrf_refused':
       return `[SSRF refused] ${outcome.message}`;
+    case 'redirect_refused':
+      return outcome.message;
   }
 }

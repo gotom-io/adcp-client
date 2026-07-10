@@ -136,6 +136,74 @@ describe('Storyboard.requires gate (#1626)', () => {
     assert.ok(!phaseIds.includes('requirement_unmet'), 'real_wire never blocks');
   });
 
+  test('requires: [multi_agent] skips without options.agents', async () => {
+    const sb = buildStoryboard({ requires: ['multi_agent'] });
+    const result = await runStoryboard('http://fake-local-99999', sb, {
+      _profile: profileWithoutController,
+      agentTools: profileWithoutController.tools,
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'requirement_unmet');
+    assert.equal(step.skip.reason, 'requirement_unmet');
+    assert.equal(step.skip.requirement, 'multi_agent');
+    assert.match(step.skip.detail, /at least two distinct agent keys/);
+    assert.match(step.skip.detail, /Available agents: \[\(none\)\]/);
+  });
+
+  test('requires: [multi_agent] passes with two distinct declared route keys', async () => {
+    const sb = buildStoryboard({
+      requires: ['multi_agent'],
+      phases: [
+        {
+          id: 'p1',
+          title: 'Phase 1',
+          steps: [{ id: 'step1', title: 'A routed read', task: 'get_products', agent: 'signals' }],
+        },
+      ],
+    });
+    const result = await runStoryboard('', sb, {
+      allow_http: true,
+      agents: {
+        sales: { url: 'http://127.0.0.1:1/sales/mcp' },
+        signals: { url: 'http://127.0.0.1:1/signals/mcp' },
+      },
+      default_agent: 'sales',
+    });
+
+    const phaseIds = result.phases.map(p => p.phase_id);
+    assert.ok(!phaseIds.includes('requirement_unmet'), 'two distinct route keys satisfy multi_agent');
+  });
+
+  test('requires: [multi_agent] stays unmet when routes resolve to one distinct key', async () => {
+    const sb = buildStoryboard({
+      requires: ['multi_agent'],
+      phases: [
+        {
+          id: 'p1',
+          title: 'Phase 1',
+          steps: [{ id: 'step1', title: 'A routed read', task: 'get_products', agent: 'sales' }],
+        },
+      ],
+    });
+    const result = await runStoryboard('', sb, {
+      allow_http: true,
+      agents: {
+        sales: { url: 'http://127.0.0.1:1/sales/mcp' },
+        signals: { url: 'http://127.0.0.1:1/signals/mcp' },
+      },
+      default_agent: 'sales',
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'requirement_unmet');
+    assert.equal(step.skip.requirement, 'multi_agent');
+    assert.match(step.skip.detail, /Resolved route keys: \[sales\]/);
+    assert.match(step.skip.detail, /Available agents: \[sales, signals\]/);
+  });
+
   test('multiple requires: first unmet wins', async () => {
     // Both controller and seeded_state are unmet; the gate reports the
     // first one in the array order, not a synthesized aggregate.
@@ -147,6 +215,51 @@ describe('Storyboard.requires gate (#1626)', () => {
 
     const step = result.phases[0].steps[0];
     assert.equal(step.skip.requirement, 'controller', 'first unmet requirement is reported');
+  });
+
+  test('mixed requires: multi_agent passes through to controller gate', async () => {
+    const sb = buildStoryboard({
+      requires: ['multi_agent', 'controller'],
+      phases: [
+        {
+          id: 'p1',
+          title: 'Phase 1',
+          steps: [{ id: 'step1', title: 'A routed read', task: 'get_products', agent: 'signals' }],
+        },
+      ],
+    });
+    const result = await runStoryboard('', sb, {
+      allow_http: true,
+      agentTools: profileWithoutController.tools,
+      agents: {
+        sales: { url: 'http://127.0.0.1:1/sales/mcp' },
+        signals: { url: 'http://127.0.0.1:1/signals/mcp' },
+      },
+      default_agent: 'sales',
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skip_reason, 'missing_test_controller');
+    assert.equal(step.skip.requirement, 'controller');
+  });
+
+  test('unknown requires values load and skip with requirement_unmet at runtime', async () => {
+    const sb = buildStoryboard({ requires: ['future_runtime'] });
+    const result = await runStoryboard('http://fake-local-99999', sb, {
+      _profile: profileWithoutController,
+      agentTools: profileWithoutController.tools,
+    });
+
+    assert.equal(result.overall_passed, true, 'unknown requires-unmet is not a failure');
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.failed_count, 0);
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'requirement_unmet');
+    assert.equal(step.skip.reason, 'requirement_unmet');
+    assert.equal(step.skip.requirement, 'future_runtime');
+    assert.match(step.skip.detail, /unknown runtime requirement 'future_runtime'/);
   });
 });
 
@@ -312,15 +425,15 @@ phases:
     assert.throws(() => parseStoryboard(yaml), /requires: \[\] is not allowed/);
   });
 
-  test('rejects unknown requirement names', () => {
+  test('accepts unknown requirement names for forward-compatible runtime gating', () => {
     const yaml = `
-id: bad_unknown
+id: ok_unknown
 version: "1.0.0"
-title: bad name
+title: future gate
 category: test
 summary: ""
 narrative: ""
-requires: [contoller]
+requires: [multi_agent]
 agent:
   interaction_model: sync
   capabilities: []
@@ -331,7 +444,8 @@ phases:
     title: P
     steps: []
 `;
-    assert.throws(() => parseStoryboard(yaml), /unknown requirement 'contoller'/);
+    const parsed = parseStoryboard(yaml);
+    assert.deepEqual(parsed.requires, ['multi_agent']);
   });
 
   test('rejects non-array requires', () => {
@@ -348,6 +462,17 @@ phases:
       phases: [{ id: 'p1', title: 'P', steps: [] }],
     };
     assert.throws(() => validateStoryboardShape(sb), /requires: must be an array/);
+  });
+
+  test('rejects malformed requires entries', () => {
+    assert.throws(
+      () => validateStoryboardShape(buildStoryboard({ requires: [''] })),
+      /requires\[0\]: entries must be non-empty strings/
+    );
+    assert.throws(
+      () => validateStoryboardShape(buildStoryboard({ requires: ['controller', 42] })),
+      /requires\[1\]: entries must be non-empty strings/
+    );
   });
 
   test('accepts known requirement names', () => {
@@ -525,6 +650,110 @@ describe('Storyboard.requires gate (#1678): implicit webhook_receiver', () => {
 
     const step = result.phases[0].steps[0];
     assert.equal(step.skip.requirement, 'webhook_receiver', 'recursive scan finds nested tokens');
+  });
+
+  test('webhook tokens in rate_limit_trip target requests also trigger the gate', async () => {
+    const sb = buildStoryboard({
+      phases: [
+        {
+          id: 'p1',
+          title: 'Rate-limit target with webhook callback',
+          steps: [
+            {
+              id: 'trip',
+              title: 'Rate-limit trip target request needs a receiver',
+              task: 'expect_rate_limit_not_replayed',
+              rate_limit_trip: {
+                trip_target_task: 'create_media_buy',
+                trip_target_sample_request: {
+                  buyer_ref: 'buyer-rate-limit-test',
+                  packages: [{ product_id: 'prod_1', budget: 1000 }],
+                  push_notification_config: {
+                    url: '{{runner.webhook_url:trip}}',
+                  },
+                },
+                max_attempts: 50,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await runStoryboard('http://fake-local-99999', sb, {
+      _profile: profileWithoutController,
+      agentTools: profileWithoutController.tools,
+      contracts: ['rate_limit_trip_runner'],
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'requirement_unmet');
+    assert.equal(step.skip.requirement, 'webhook_receiver');
+  });
+
+  test('out-of-scope rate_limit_trip webhook tokens do not skip unrelated phases', async () => {
+    const sb = buildStoryboard({
+      phases: [
+        {
+          id: 'normal',
+          title: 'Normal phase',
+          steps: [
+            {
+              id: 'normal_read',
+              title: 'Normal read still runs',
+              task: 'get_products',
+              sample_request: { buying_mode: 'brief', brief: 'show products' },
+            },
+          ],
+        },
+        {
+          id: 'rate_limit',
+          title: 'Out-of-scope rate-limit phase',
+          steps: [
+            {
+              id: 'trip',
+              title: 'Rate-limit trip target request needs a receiver only when the contract is in scope',
+              task: 'expect_rate_limit_not_replayed',
+              requires_contract: 'rate_limit_trip_runner',
+              rate_limit_trip: {
+                trip_target_task: 'create_media_buy',
+                trip_target_sample_request: {
+                  buyer_ref: 'buyer-rate-limit-test',
+                  packages: [{ product_id: 'prod_1', budget: 1000 }],
+                  push_notification_config: {
+                    url: '{{runner.webhook_url:trip}}',
+                  },
+                },
+                max_attempts: 50,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await runStoryboard('http://fake-local-99999', sb, {
+      _profile: {
+        ...profileWithoutController,
+        tools: [...profileWithoutController.tools, 'create_media_buy'],
+      },
+      agentTools: [...profileWithoutController.tools, 'create_media_buy'],
+    });
+
+    assert.ok(
+      !result.phases.some(phase => phase.phase_id === 'requirement_unmet'),
+      'out-of-scope contract-gated webhook token must not trigger storyboard-level requirement_unmet'
+    );
+    assert.ok(
+      result.phases.some(phase => phase.phase_id === 'normal'),
+      'unrelated phase still runs'
+    );
+    const trip = result.phases
+      .find(phase => phase.phase_id === 'rate_limit')
+      ?.steps.find(step => step.step_id === 'trip');
+    assert.equal(trip?.skipped, true);
+    assert.equal(trip?.skip_reason, 'missing_test_kit_contract');
   });
 
   test('declared requires: [webhook_receiver] resolves the same way (loader allows the name)', () => {

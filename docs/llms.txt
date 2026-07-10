@@ -1,7 +1,7 @@
 # Ad Context Protocol (AdCP)
 
-> Generated at: 2026-06-07
-> Library: @adcp/sdk v9.0.0-beta.26
+> Generated at: 2026-07-08
+> Library: @adcp/sdk v11.0.0
 > AdCP major version: 3
 > Canonical URL: https://adcontextprotocol.github.io/adcp-client/llms.txt
 > Note: the `Library` stamp reflects the package.json version at doc-generation time. The narrative below describes the surface that lands on the next-published minor — including any 6.7 helpers documented here ahead of the release tag.
@@ -630,7 +630,7 @@ Request parameters for activating a signal on a specific platform/account.
 
 **Request:**
 - Required: `signal_agent_segment_id: string`, `destinations: object[]`, `idempotency_key: string`
-- Optional: `action: 'activate' | 'deactivate'`, `pricing_option_id: string`, `account: Account Ref`, `context: Context`
+- Optional: `action: 'activate' | 'deactivate'`, `pricing_option_id: string`, `governance_context: string`, `account: Account Ref`, `context: Context`
 
 **Response (success branch):**
 - Required: `deployments: object[]`
@@ -915,7 +915,7 @@ Get offering details, availability, and optionally matching products before sess
 
 **Response (success branch):**
 - Required: `available: boolean`
-- Optional: `offering_token: string`, `ttl_seconds: integer`, `checked_at: string`, `offering: object`, `matching_products: object[]`, `total_matching: integer`, `unavailable_reason: string`, `alternative_offering_ids: string[]`, +2 more
+- Optional: `offering_token: string`, `ttl_seconds: integer`, `checked_at: string`, `offering: object`, `matching_products: object[]`, `sponsored_context: Si Sponsored Context`, `total_matching: integer`, `unavailable_reason: string`, +3 more
 
 #### `si_initiate_session`
 
@@ -923,11 +923,11 @@ Host initiates SI session with brand agent - includes context, identity, and cap
 
 **Request:**
 - Required: `intent: string`, `identity: Si Identity`, `idempotency_key: string`
-- Optional: `context: Context`, `media_buy_id: string`, `placement: string`, `offering_id: string`, `supported_capabilities: Si Capabilities`, `offering_token: string`
+- Optional: `context: Context`, `media_buy_id: string`, `placement: string`, `offering_id: string`, `supported_capabilities: Si Capabilities`, `offering_token: string`, `sponsored_context_receipt: Si Sponsored Context Receipt`
 
 **Response (success branch):**
 - Required: `session_id: string`, `session_status: Si Session Status`
-- Optional: `response: object`, `negotiated_capabilities: Si Capabilities`, `session_ttl_seconds: integer`, `errors: object[]`, `context: Context`
+- Optional: `response: object`, `negotiated_capabilities: Si Capabilities`, `sponsored_context: Si Sponsored Context`, `session_ttl_seconds: integer`, `errors: object[]`, `context: Context`
 
 #### `si_send_message`
 
@@ -935,11 +935,11 @@ Send a message within an active SI session.
 
 **Request:**
 - Required: `idempotency_key: string`, `session_id: string`
-- Optional: `message: string`, `action_response: object`, `context: Context`
+- Optional: `message: string`, `action_response: object`, `sponsored_context_receipt: Si Sponsored Context Receipt`, `context: Context`
 
 **Response (success branch):**
 - Required: `session_id: string`, `session_status: Si Session Status`
-- Optional: `response: object`, `mcp_resource_uri: string`, `handoff: object`, `errors: object[]`, `context: Context`
+- Optional: `response: object`, `mcp_resource_uri: string`, `sponsored_context: Si Sponsored Context`, `handoff: object`, `errors: object[]`, `context: Context`
 
 #### `si_terminate_session`
 
@@ -1065,10 +1065,10 @@ Flow: `comply_test_controller → create_media_buy`
 Flow: `get_products → create_media_buy → sync_creatives → list_creatives → update_media_buy → list_creatives → create_media_buy → sync_creatives`
 
 **Dependency impairment end-to-end — resource transition propagates to media buy health** — Forces a creative from approved → rejected on a non-terminal media buy, verifies the buy reflects health: impaired with a matching impairments[] entry, and recovers via assignment swap to a different creative (canonical recovery vector — re-approval of the same creative_id is uncommon in production).
-Flow: `get_products → create_media_buy → sync_creatives → update_media_buy → comply_test_controller → get_media_buys → comply_test_controller → get_media_buys → sync_creatives → comply_test_controller → update_media_buy → get_media_buys`
+Flow: `get_products → create_media_buy → sync_creatives → update_media_buy → comply_test_controller → get_media_buys → comply_test_controller → list_creatives → get_media_buys → sync_creatives → comply_test_controller → update_media_buy → get_media_buys`
 
 **Dependency impairment cardinality — impairments[] tracks each offline resource independently** — Two creatives on two packages of the same buy. Rejects them sequentially and verifies impairments[] grows 0 → 1 → 2; recovers them sequentially via swap-assignment and verifies impairments[] shrinks 2 → 1 → 0. Pressure-tests the inverse rule under cardinality — a seller emitting any impairment entry rather than the right one fails.
-Flow: `get_products → create_media_buy → sync_creatives → update_media_buy → comply_test_controller → get_media_buys → comply_test_controller → get_media_buys → comply_test_controller → get_media_buys → sync_creatives → comply_test_controller → update_media_buy → get_media_buys → sync_creatives → comply_test_controller → update_media_buy → get_media_buys`
+Flow: `get_products → create_media_buy → sync_creatives → update_media_buy → comply_test_controller → get_media_buys → comply_test_controller → list_creatives → get_media_buys → comply_test_controller → list_creatives → get_media_buys → sync_creatives → comply_test_controller → update_media_buy → get_media_buys → sync_creatives → comply_test_controller → update_media_buy → get_media_buys`
 
 **Seller deduplicates the same event across multiple registered event sources** — Verifies that a seller advertising conversion_tracking.multi_source_event_dedup can register multiple event sources for the same buy and deduplicate inbound events by event_id so the same conversion from a pixel and a CAPI source counts once, not twice. Sibling to media_buy_seller/performance_buy_flow gated on the dedup sub-capability bit: sellers that don't advertise multi-source dedup grade not_applicable.
 Flow: `sync_accounts → get_products → sync_event_sources → create_media_buy → log_event → comply_test_controller → get_media_buy_delivery`
@@ -1178,6 +1178,9 @@ Flow: `get_adcp_capabilities → get_products → sync_governance → create_med
 **Media buy via proposal acceptance** — Seller agent that generates curated media plan proposals the buyer can review, refine, and accept.
 Flow: `get_adcp_capabilities → sync_accounts → get_products → create_media_buy → list_creative_formats → sync_creatives → get_media_buy_delivery`
 
+**get_products wholesale pagination cursor integrity** — Validates get_products wholesale-mode pagination by walking a seeded product feed from continuation to terminal, while documenting that brief/refine pagination caps returned products in curated results.
+Flow: `get_adcp_capabilities → get_products`
+
 **Wholesale product feed webhook registration** — Validates account-level notification_configs[] registration for agents that advertise product wholesale feed webhook events.
 Flow: `sync_accounts`
 
@@ -1214,8 +1217,8 @@ Flow: `comply_test_controller → get_signals → list_tasks → comply_test_con
 **Marketplace signal agent** — Signal agent that resells third-party data provider signals with verifiable provider-published provenance.
 Flow: `get_adcp_capabilities → get_signals → activate_signal`
 
-**Signal agent rejects activation when governance denies** — Verifies that a signal agent propagates GOVERNANCE_DENIED when the buyer's governance plan denies activation.
-Flow: `sync_plans → sync_accounts → sync_governance → get_signals → activate_signal`
+**Signal agent rejects activation without governance approval** — Verifies that a signal agent requires a governance approval context before activating signals on governed accounts.
+Flow: `sync_accounts → sync_governance → get_signals → activate_signal`
 
 **Owned signal agent** — Signal agent serving first-party or proprietary audience data for discovery without external catalog verification.
 Flow: `get_adcp_capabilities → get_signals`
@@ -1233,6 +1236,9 @@ Flow: `get_signals`
 
 **Sponsored intelligence baseline** — Baseline domain storyboard — every SI agent must discover offerings, initiate a session, exchange messages, and terminate cleanly.
 Flow: `get_adcp_capabilities → si_get_offering → si_initiate_session → si_send_message → si_terminate_session`
+
+**Sponsored context accountability** — Validates that a brand-side SI agent claiming sponsored_context_accountability conformance emits sponsored_context on each response, accepts well-formed sponsored_context_receipt envelopes, and rejects receipts that silently downgrade declared context_use.
+Flow: `si_initiate_session → si_send_message`
 
 **Sponsored intelligence** — Specialism claim for agents that expose conversational sponsored experiences via the SI session lifecycle. Preview while the underlying SI tools remain `x-status: experimental`; SDK dispatch parity with other specialism IDs.
 
@@ -1265,7 +1271,7 @@ Flow: `get_adcp_capabilities → comply_test_controller → sync_accounts → li
 Flow: `get_adcp_capabilities → get_media_buys`
 
 **Idempotency enforcement** — Validates that mutating requests enforce idempotency_key — replays return cached responses, key reuse with a different payload returns IDEMPOTENCY_CONFLICT, fresh keys create new resources, and concurrent retries with the same key produce exactly one resource (first-insert-wins under rule 9).
-Flow: `get_adcp_capabilities → create_media_buy → expect_webhook → create_media_buy → get_media_buys → expect_rate_limit_not_replayed`
+Flow: `get_adcp_capabilities → create_media_buy → get_media_buys → expect_rate_limit_not_replayed`
 
 **Notification config event-scope rejection** — Validates that sync_accounts.accounts[].notification_configs[] rejects media-buy-anchored notification types even though they are valid notification-type enum values.
 Flow: `sync_accounts`
@@ -1303,7 +1309,7 @@ Flow: `get_adcp_capabilities`
 **Release-precision version negotiation** — Sellers advertise supported releases on capabilities and echo the served release on every response.
 Flow: `get_adcp_capabilities`
 
-**Webhook emission — outbound webhook conformance (operation ID + signing + idempotency + sync silence)** — Any agent that emits webhooks MUST echo the caller-supplied operation_id in every payload, carry a stable idempotency_key across retries, and — when the buyer has not opted into the deprecated HMAC fallback — MUST sign deliveries under the RFC 9421 webhook profile. Sellers MUST NOT emit task webhooks for inline terminal responses; any future sync-completion notification mode would be explicit and capability-advertised. Graded by a runner hosting a webhook receiver during storyboard execution.
+**Webhook emission — outbound webhook conformance (operation ID + signing + idempotency + sync silence)** — Any agent that emits webhooks MUST echo the caller-supplied operation_id in every payload, carry a stable idempotency_key across retries, avoid duplicate webhook side effects on request replay, and — when the buyer has not opted into the deprecated HMAC fallback — MUST sign deliveries under the RFC 9421 webhook profile. Sellers MUST NOT emit task webhooks for inline terminal responses; any future sync-completion notification mode would be explicit and capability-advertised. Graded by a runner hosting a webhook receiver during storyboard execution.
 Flow: `get_adcp_capabilities → expect_webhook → get_products → expect_webhook_retry_keys_stable → fetch_brand_jwks → assert_jwks_purpose → expect_webhook_signature_valid`
 
 **Webhook receiver envelope: inbound POST conformance** — Buyer webhook receivers MUST accept full MCP webhook envelopes, reject bare delivery-result payloads, preserve raw-body signature verification, and dedupe retries by a stable idempotency_key.

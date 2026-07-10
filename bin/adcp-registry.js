@@ -218,9 +218,9 @@ SAVE COMMANDS (requires --auth):
                                 Save or update a community brand
   save-brand <domain> <name> @manifest.json
                                 Save brand with manifest from file
-  save-property <domain> <agent-url> [payload-json]
+  save-property <domain> [payload-json]
                                 Save or update a hosted property
-  save-property <domain> <agent-url> @property.json
+  save-property <domain> @property.json
                                 Save property with full payload from file
 
 LIST & SEARCH:
@@ -295,7 +295,8 @@ EXAMPLES:
   adcp registry save-brand acmeoutdoor.example "Acme Outdoor" --sandbox --auth sk_your_key
 
   # Save a property
-  adcp registry save-property example.com https://agent.example.com --auth sk_your_key`);
+  adcp registry save-property example.com --auth sk_your_key
+  adcp registry save-property example.com '{"properties":[{"property_type":"website","name":"Example","identifiers":[{"type":"domain","value":"example.com"}],"tags":["news"]}]}' --auth sk_your_key`);
 }
 
 /**
@@ -455,27 +456,36 @@ async function handleRegistryCommand(args) {
 
       case 'save-property': {
         const domain = positional[1];
-        const agentUrl = positional[2];
-        if (!domain || !agentUrl) {
-          console.error('Error: domain and agent URL are required\n');
-          console.error('Usage: adcp registry save-property <domain> <agent-url> [payload-json]\n');
+        if (!domain) {
+          console.error('Error: domain is required\n');
+          console.error('Usage: adcp registry save-property <domain> [payload-json]\n');
           return 2;
         }
-        const extraArg = positional[3];
-        let payload;
-        if (extraArg) {
-          const extra = parsePayload(extraArg);
-          payload = {
-            publisher_domain: domain,
-            authorized_agents: [{ url: agentUrl }],
-            ...extra,
-          };
-        } else {
-          payload = {
-            publisher_domain: domain,
-            authorized_agents: [{ url: agentUrl }],
-          };
+        const extraArg = positional[2];
+        const payloadArg = extraArg?.trim();
+        if (payloadArg && !payloadArg.startsWith('{') && !payloadArg.startsWith('@')) {
+          if (/^https?:\/\//i.test(payloadArg)) {
+            console.error(
+              'Error: save-property no longer accepts an agent URL. Authorization is managed at the publisher origin adagents.json; pass property identity facts as payload JSON when needed.\n'
+            );
+          } else {
+            console.error('Error: expected payload JSON object or @file for save-property\n');
+          }
+          console.error(
+            'Example: adcp registry save-property example.com \'{"properties":[{"property_type":"website","name":"Example","identifiers":[{"type":"domain","value":"example.com"}],"tags":["news"]}]}\' --auth sk_your_key'
+          );
+          console.error('Usage: adcp registry save-property <domain> [payload-json]\n');
+          return 2;
         }
+        const extraPayload = payloadArg ? parsePayload(payloadArg) : {};
+        if (extraPayload == null || typeof extraPayload !== 'object' || Array.isArray(extraPayload)) {
+          console.error('Error: save-property payload must be a JSON object or @file containing a JSON object\n');
+          return 2;
+        }
+        const payload = {
+          publisher_domain: domain,
+          ...extraPayload,
+        };
         const result = await client.saveProperty(payload);
         if (flags.json) {
           console.log(JSON.stringify(result, null, 2));

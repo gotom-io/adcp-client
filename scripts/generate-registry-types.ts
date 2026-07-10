@@ -154,6 +154,17 @@ export type PropertyActivity = components['schemas']['PropertyActivity'];
 export type PolicySummary = components['schemas']['PolicySummary'];
 export type Policy = components['schemas']['Policy'];
 export type PolicyHistory = components['schemas']['PolicyHistory'];
+export type RegistryFeedEvent = components['schemas']['RegistryFeedEvent'];
+export type AgentEventPayload = components['schemas']['AgentEventPayload'];
+export type PropertyEventPayload = components['schemas']['PropertyEventPayload'];
+export type CollectionEventPayload = components['schemas']['CollectionEventPayload'];
+export type AuthorizationEventPayload = components['schemas']['AuthorizationEventPayload'];
+export type PublisherEventPayload = components['schemas']['PublisherEventPayload'];
+export type BrandEventPayload = components['schemas']['BrandEventPayload'];
+export type CatalogBrowseResponse = components['schemas']['CatalogBrowseResponse'];
+export type CatalogBrowseEntry = components['schemas']['CatalogBrowseEntry'];
+export type CatalogSyncResponse = components['schemas']['CatalogSyncResponse'];
+export type CatalogSyncEntry = components['schemas']['CatalogSyncEntry'];
 export type AgentCompliance = components['schemas']['AgentCompliance'];
 export type AgentComplianceDetail = components['schemas']['AgentComplianceDetail'];
 export type StoryboardStatus = components['schemas']['StoryboardStatus'];
@@ -175,17 +186,36 @@ export type CommunityMirrorDeleteResponse = components['schemas']['CommunityMirr
 /** A single event from the registry feed (inline in getRegistryFeed 200 response). */
 export type CatalogEvent = operations['getRegistryFeed']['responses']['200']['content']['application/json']['events'][number];
 
-/** Full response from GET /api/registry/feed. Includes optional cursor_expired for 410 handling. */
-export type FeedResponse = operations['getRegistryFeed']['responses']['200']['content']['application/json'] & {
+/** Feed freshness metadata for lag monitoring (adcp#5733). Reported on every real feed page. */
+export type FeedFreshness = NonNullable<
+  operations['getRegistryFeed']['responses']['200']['content']['application/json']['freshness']
+>;
+
+/**
+ * Full response from GET /api/registry/feed.
+ *
+ * \`cursor_expired\` is set by the client when the server returns 410; that
+ * synthetic marker carries no \`freshness\`, so \`freshness\` is widened to
+ * optional here even though the spec requires it on real pages. The SDK never
+ * fabricates freshness — it is present iff the server sent it.
+ */
+export type FeedResponse = Omit<
+  operations['getRegistryFeed']['responses']['200']['content']['application/json'],
+  'freshness'
+> & {
   /** Set to true by the client when the server returns 410 (cursor expired). */
   cursor_expired?: boolean;
+  /** Feed lag metadata. Present on every real feed page; absent on the cursor_expired marker. */
+  freshness?: FeedFreshness;
 };
 
 /** Raw search result from the searchAgentProfiles operation. */
-export type AgentProfileSearchResult = operations['searchAgentProfiles']['responses']['200']['content']['application/json']['results'][number];
+export type AgentProfileSearchResult =
+  operations['searchAgentProfiles']['responses']['200']['content']['application/json']['results'][number];
 
 /** Full response from GET /api/registry/agents/search (raw operation type). */
-export type AgentProfileSearchResponse = operations['searchAgentProfiles']['responses']['200']['content']['application/json'];
+export type AgentProfileSearchResponse =
+  operations['searchAgentProfiles']['responses']['200']['content']['application/json'];
 
 /** Response from POST /api/registry/crawl-request (202). */
 export type CrawlRequestResponse = operations['requestCrawl']['responses']['202']['content']['application/json'];
@@ -203,7 +233,7 @@ export type AgentInventoryProfile = {
   category_taxonomy: string | null;
   tags: string[];
   delivery_types: string[];
-  format_ids?: unknown[];
+  format_ids?: string[];
   property_count: number;
   publisher_count: number;
   has_tmp: boolean;
@@ -226,13 +256,9 @@ export type AgentSearchResponse = {
   has_more: boolean;
 };
 
-/** An authorization entry used by the sync module. Derived from authorization.granted event payloads. */
-export type AuthorizationEntry = {
-  agent_url: string;
-  publisher_domain: string;
-  authorization_type: string;
-  property_ids?: string[];
-  effective_from?: string;
+/** An authorization entry used by the sync module. Mirrors authorization.* event payloads. */
+export type AuthorizationEntry = components['schemas']['AuthorizationEventPayload'] & {
+  /** Legacy alias still returned by some registry deployments. */
   effective_to?: string;
 };
 `;
