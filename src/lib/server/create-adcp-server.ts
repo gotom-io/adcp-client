@@ -3452,6 +3452,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     credentialPolicy,
     testController: testControllerBridge,
     responseEnhancer,
+    toolSchemas,
   } = config;
 
   // One-shot construction-time warn when `testController` is wired without
@@ -5802,7 +5803,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       server.registerTool(
         toolName,
         {
-          inputSchema: PASSTHROUGH_INPUT_SCHEMA,
+          inputSchema: toolSchemas?.[toolName] ?? PASSTHROUGH_INPUT_SCHEMA,
           ...(meta?.annotations != null && { annotations: meta.annotations }),
         },
         toolHandler as Parameters<typeof server.registerTool>[2]
