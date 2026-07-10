@@ -588,3 +588,6 @@ export {
   type ConformanceClientOptions,
   type ConformanceStatus,
 } from './socket-mode';
+
+export { createAdcpServerFromPlatform } from './decisioning/runtime/from-platform';
+export { createInMemoryTaskRegistry } from './decisioning/runtime/task-registry';

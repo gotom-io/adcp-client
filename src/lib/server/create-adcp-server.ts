@@ -1646,7 +1646,7 @@ export interface AdcpServerConfig<TAccount = unknown> {
     * });
     * ```
     */
-   toolSchemas?: Record<string, z.AnyZodObject>;
+   toolSchemas?: Record<string, z.ZodObject<any>>;
 
    /**
    * Schema-driven validation of requests and responses against the bundled
