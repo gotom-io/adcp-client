@@ -85,6 +85,10 @@ import type {
   CreateMediaBuyResponse,
 } from '../types/core.generated';
 import type { Task as A2ATask, TaskStatusUpdateEvent } from '@a2a-js/sdk';
+import { A2AClient as A2AClientImpl } from '@a2a-js/sdk/client';
+// A2A SDK client used untyped — wire shapes are validated at runtime, matching
+// the prior CommonJS `require('@a2a-js/sdk/client')` behaviour.
+const A2AClient: any = A2AClientImpl;
 
 import { TaskExecutor, DeferredTaskError } from './TaskExecutor';
 import { attachMatch } from './match';
@@ -679,6 +683,8 @@ export class SingleAgentClient {
   private normalizedAgent: InternalAgentConfig;
   private discoveredEndpoint?: string; // Cache discovered MCP endpoint
   private discoveredAgent?: AgentConfig; // Stable post-discovery config for protocol/provider caches
+  private discoveredMcpEra?: 'legacy' | 'modern';
+  private discoveredMcpEraAt = 0;
   private canonicalBaseUrl?: string; // Cache canonical base URL (from agent card or stripped /mcp)
   private cachedCapabilities?: AdcpCapabilities; // Cache detected server capabilities
   private cachedToolSchemas?: Map<string, Record<string, unknown>>; // inputSchema.properties per tool name
@@ -832,9 +838,6 @@ export class SingleAgentClient {
    * - Check for OAuth metadata to provide helpful guidance
    */
   private async fetchA2ACanonicalUrl(agentUri: string, readOptions?: ReadRequestOptions): Promise<string> {
-    const clientModule = require('@a2a-js/sdk/client');
-    const A2AClient = clientModule.A2AClient;
-
     // adcp-client#1804 — wrap A2A card discovery in withResponseSizeLimit so
     // `transport.maxResponseBytes` applies to every agent-card fetch. The
     // auth-stamping fetchImpl composes through wrapFetchWithSizeLimit so the
@@ -962,10 +965,16 @@ export class SingleAgentClient {
   private async discoverMCPEndpoint(providedUri: string, options?: ReadRequestOptions): Promise<string> {
     throwIfAborted(options?.signal);
     const { connectMCPWithFallback } = await import('../protocols/mcp');
+    const { probeModernMCPConnection } = await import('../protocols/mcp-modern');
 
     const authToken = this.agent.auth_token;
     const agentHeaders = this.agent.headers;
     const authHeaders = { ...agentHeaders, ...createMCPAuthHeaders(authToken) };
+    const authProvider = this.normalizedAgent.oauth_tokens
+      ? (await import('../auth/oauth')).createNonInteractiveOAuthProvider(this.normalizedAgent, {
+          agentHint: this.normalizedAgent.id,
+        })
+      : undefined;
 
     type EndpointTestResult = {
       success: boolean;
@@ -975,11 +984,26 @@ export class SingleAgentClient {
 
     const testEndpoint = async (url: string): Promise<EndpointTestResult> => {
       try {
+        const modern = await probeModernMCPConnection(url, authToken, agentHeaders, {
+          authProvider,
+          signal: options?.signal,
+          requestTimeoutMs: options?.transport?.requestTimeoutMs ?? this.config.transport?.requestTimeoutMs,
+        });
+        if (modern.connected) {
+          this.discoveredMcpEra = modern.era;
+          this.discoveredMcpEraAt = Date.now();
+          return { success: true };
+        }
+
+        // The v2 Streamable HTTP probe could not connect. Preserve the
+        // established v1 Streamable→SSE fallback for old SSE-only agents.
         const client = await connectMCPWithFallback(new URL(url), authHeaders, [], 'endpoint discovery', undefined, {
           signal: options?.signal,
           requestTimeoutMs: options?.transport?.requestTimeoutMs ?? this.config.transport?.requestTimeoutMs,
         });
         await client.close();
+        this.discoveredMcpEra = 'legacy';
+        this.discoveredMcpEraAt = Date.now();
         return { success: true };
       } catch (error: unknown) {
         if (isAbortOrTimeoutError(error)) {
@@ -3740,6 +3764,7 @@ export class SingleAgentClient {
       // basic auth in particular suppresses `auth_token` on purpose so the
       // SDK doesn't emit a competing `Authorization: Bearer …`.
       const { connectMCP } = await import('../protocols/mcp');
+      const { tryListModernMCPTools } = await import('../protocols/mcp-modern');
       const connectOptions: Parameters<typeof connectMCP>[0] = { agentUrl: agent.agent_uri };
       if (options?.signal) {
         connectOptions.signal = options.signal;
@@ -3750,13 +3775,41 @@ export class SingleAgentClient {
       if (this.normalizedAgent.headers && Object.keys(this.normalizedAgent.headers).length > 0) {
         connectOptions.customHeaders = this.normalizedAgent.headers;
       }
+      let authProvider: Parameters<typeof connectMCP>[0]['authProvider'];
       if (this.normalizedAgent.oauth_tokens) {
         const { createNonInteractiveOAuthProvider } = await import('../auth/oauth');
-        connectOptions.authProvider = createNonInteractiveOAuthProvider(this.normalizedAgent, {
+        authProvider = createNonInteractiveOAuthProvider(this.normalizedAgent, {
           agentHint: this.normalizedAgent.id,
         });
+        connectOptions.authProvider = authProvider;
       } else if (this.normalizedAgent.auth_token) {
         connectOptions.authToken = this.normalizedAgent.auth_token;
+      }
+
+      const modernTools =
+        this.discoveredMcpEra === 'legacy' && Date.now() - this.discoveredMcpEraAt < 5 * 60 * 1000
+          ? ({ handled: false } as const)
+          : await withResponseSizeLimit(maxResponseBytes, () =>
+              tryListModernMCPTools(agent.agent_uri, this.normalizedAgent.auth_token, this.normalizedAgent.headers, {
+                authProvider,
+                signal: options?.signal,
+                requestTimeoutMs: transport?.requestTimeoutMs,
+              })
+            );
+      if (modernTools.handled) {
+        const tools = modernTools.tools.map(tool => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          parameters: tool.inputSchema?.properties ? Object.keys(tool.inputSchema.properties) : [],
+        }));
+        return {
+          name: this.normalizedAgent.name,
+          description: undefined,
+          protocol: this.normalizedAgent.protocol,
+          url: agent.agent_uri,
+          tools,
+        };
       }
 
       const { client: mcpClient } = await connectMCP(connectOptions);
@@ -3788,8 +3841,6 @@ export class SingleAgentClient {
       }
     } else if (this.normalizedAgent.protocol === 'a2a') {
       // Use A2A SDK to get agent card
-      const clientModule = require('@a2a-js/sdk/client');
-      const A2AClient = clientModule.A2AClient;
 
       // adcp-client#1799 — route the custom fetchImpl through
       // `wrapFetchWithSizeLimit` so the active ALS slot enforces the cap on

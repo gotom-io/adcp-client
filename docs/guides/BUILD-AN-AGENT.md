@@ -8,7 +8,7 @@ We'll build a **signals agent** that serves audience segments via the `get_signa
 
 ## Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - `@adcp/sdk` installed from the AdCP 3.1 line while validating AdCP 3.1 (`npm install @adcp/sdk@adcp-3.1`)
 - `@modelcontextprotocol/sdk` (installed as a dependency of `@adcp/sdk`)
 
@@ -562,6 +562,76 @@ createAdcpServerFromPlatform(platform, {
 
 See [SIGNING-GUIDE.md](./SIGNING-GUIDE.md) for the full walkthrough: key generation, JWKS publication, brand.json, conformance testing, and KMS-backed production deployment.
 
+### Portable MCP Apps for custom tools
+
+Use `resources` with custom-tool `_meta.ui` to attach one host-neutral MCP
+App to a tool. The framework registers the `ui://` resource on both legacy
+MCP connections and every modern per-request server reconstruction; the same
+configuration therefore works in compliant Claude, ChatGPT, and future hosts.
+
+```typescript
+import {
+  createAdcpServerFromPlatform,
+  MCP_APP_RESOURCE_MIME_TYPE,
+} from '@adcp/sdk/server';
+
+const server = createAdcpServerFromPlatform(platform, {
+  name: 'My Publisher',
+  version: '1.0.0',
+  resources: [
+    {
+      name: 'creative_upload',
+      uri: 'ui://creative/upload',
+      mimeType: MCP_APP_RESOURCE_MIME_TYPE,
+      _meta: {
+        ui: {
+          csp: {
+            connectDomains: ['https://uploads.example.com'],
+            resourceDomains: ['https://assets.example.com'],
+          },
+          prefersBorder: true,
+        },
+      },
+      handler: async () => renderUploadApp(),
+    },
+  ],
+  customTools: {
+    upload_creative_asset: {
+      description: 'Open the creative upload flow.',
+      _meta: { ui: { resourceUri: 'ui://creative/upload' } },
+      handler: async () => ({
+        // Required text-only fallback for hosts without MCP Apps support.
+        content: [{ type: 'text', text: 'Upload a creative asset.' }],
+      }),
+    },
+    prepare_creative_upload: {
+      _meta: { ui: { visibility: ['app'] } },
+      handler: prepareCreativeUpload,
+    },
+    finalize_creative_upload: {
+      _meta: { ui: { visibility: ['app'] } },
+      handler: finalizeCreativeUpload,
+    },
+  },
+});
+```
+
+MCP App resources always use a `ui://` URI and
+`text/html;profile=mcp-app`; the public types and construction-time checks
+reject other shapes. The resource `_meta.ui` object carries CSP domains,
+permissions, a dedicated host domain, and border preference, and is emitted
+consistently by both `resources/list` and `resources/read`.
+
+`ui.visibility` is host routing metadata, not an authorization boundary.
+App-only handlers must still authenticate and authorize every request, and
+tools should always return meaningful text content so clients that do not
+negotiate `io.modelcontextprotocol/ui` degrade gracefully. A startup warning
+identifies any tool `resourceUri` that does not match a configured resource.
+Resource handlers intentionally receive no authentication material: the HTML
+bundle must be principal-independent and cache-safe. Fetch tenant data or mint
+short-lived upload URLs through authenticated app-only tools after the app has
+loaded.
+
 ### createTaskCapableServer (Low-Level)
 
 For advanced cases where you need direct control over MCP tool registration, schema wiring, and response formatting. `createAdcpServerFromPlatform` calls into this internally.
@@ -713,7 +783,21 @@ serve(() => createAdcpServerFromPlatform(platform, { /* ... */ }), { path: '/v1/
 
 `serve()` returns the underlying `http.Server` for lifecycle control (e.g., graceful shutdown).
 
-When using `createTaskCapableServer` directly, `serve()` passes a `{ taskStore }` to your factory so MCP Tasks work correctly across stateless HTTP requests.
+**Breaking transport requirement:** Host/Origin validation runs before MCP era
+classification, so it applies to both legacy and MCP 2026-07-28 requests served
+by an `AdcpServer`. Public deployments that previously omitted these settings
+must set `publicUrl` so `serve()` derives the public hostname, or pass explicit
+`allowedHosts` and `allowedOrigins` lists. Without either, requests are
+localhost-only to prevent DNS rebinding. If a reverse proxy rewrites `Host`,
+include both the public hostname and the upstream hostname in `allowedHosts`;
+keep browser-facing origins in `allowedOrigins`. Entries are hostnames without
+ports. Era classification buffers JSON bodies up to 2 MiB by default; use
+`maxRequestBytes` when a documented extension needs a larger payload.
+
+When using the v1 `createTaskCapableServer` directly, `serve()` passes a
+`{ taskStore }` to your factory so legacy MCP Tasks work correctly across
+stateless HTTP requests. Raw v1 `McpServer` instances remain legacy-only;
+return an `AdcpServer` from `createAdcpServerFromPlatform` for MCP 2026-07-28.
 
 For custom routing or middleware, you can wire the transport manually:
 

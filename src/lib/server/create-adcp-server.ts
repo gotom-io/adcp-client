@@ -40,6 +40,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { parseAdcpMajorVersion, toReleasePrecisionVersion, type AdcpVersion } from '../version';
 import { resolveAdcpVersion } from '../utils/adcp-version-config';
 import { resolveBundleKey } from '../validation/schema-loader';
+import { TOOL_INPUT_SHAPES } from '../schemas';
 import { bundleSupportsAdcpVersionField } from '../protocols';
 import { getToolsWithErrorArm, type ErrorArmDescriptor } from './error-arm-tools';
 import type { ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -50,10 +51,17 @@ import {
   ADCP_STATE_STORE,
   wrapMcpServer,
   setSdkServerInstructions,
+  setMcpAppResources,
   wrapInitializeHandler,
   type AdcpServer,
   type AdcpServerInternal,
 } from './adcp-server';
+import {
+  mcpAppResourceMetadata,
+  normalizeMcpAppResources,
+  readMcpAppResource,
+  type AdcpMcpResourceDefinition,
+} from './mcp-app';
 import { createTaskCapableServer, InMemoryTaskStore } from './tasks';
 import type { TaskStore, TaskMessageQueue } from './tasks';
 import { adcpError, applyAdcpErrorAllowlist, sanitizeStructuredAdcpError } from './errors';
@@ -1185,6 +1193,13 @@ export const ADCP_SIGNED_REQUESTS_STATE: unique symbol = Symbol.for('@adcp/clien
 export const ADCP_INSTRUCTIONS_FN: unique symbol = Symbol.for('@adcp/client.instructionsFn');
 
 /**
+ * Resolve function-form instructions for transports without a legacy
+ * `initialize` handshake (notably MCP 2026-07-28). Internal contract between
+ * `createAdcpServer` and transport adapters.
+ */
+export const ADCP_INSTRUCTIONS_RESOLVER: unique symbol = Symbol.for('@adcp/client.instructionsResolver');
+
+/**
  * Pre-resolution session context passed to a function-form `instructions`.
  * Slim by design — no `account` (resolution hasn't run yet at MCP `initialize`
  * time, which is the natural eval moment for per-session instructions).
@@ -1264,6 +1279,19 @@ export type AdcpPreTransport = (
 // Custom tool config
 // ---------------------------------------------------------------------------
 
+/** UI hints for a custom tool backed by an MCP App. */
+export interface McpAppUiMeta {
+  /** URI of the MCP App resource rendered when the tool is invoked. */
+  resourceUri?: string;
+  /** Audiences a compliant host exposes the tool to. Routing metadata, not authorization. */
+  visibility?: Array<'model' | 'app'>;
+}
+
+/** Typed MCP App metadata forwarded unchanged in `tools/list`. */
+export interface McpAppMeta {
+  ui?: McpAppUiMeta;
+}
+
 /**
  * Declarative registration for a tool outside {@link AdcpToolMap} — seller
  * extensions (e.g. collection-list helpers), test-harness endpoints
@@ -1310,6 +1338,8 @@ export interface AdcpCustomToolConfig<
   outputSchema?: OutputArgs;
   /** Tool annotations (readOnlyHint / destructiveHint / idempotentHint / openWorldHint). */
   annotations?: ToolAnnotations;
+  /** Portable MCP App metadata surfaced unchanged in `tools/list`. */
+  _meta?: McpAppMeta;
   /**
    * Tool handler. Gets SDK-validated `args` based on `inputSchema` and
    * must return a `CallToolResult`. Use `capabilitiesResponse`,
@@ -1779,6 +1809,17 @@ export interface AdcpServerConfig<TAccount = unknown> {
    * construction time — the spec handler wins by convention.
    */
   customTools?: Record<string, AdcpCustomToolConfig<any, any>>;
+
+  /**
+   * Portable HTML MCP Apps served through standard MCP resources.
+   *
+   * Each definition is registered on both the legacy MCP server and every
+   * modern per-request server reconstruction. A custom tool links to a
+   * resource with `_meta.ui.resourceUri`; a startup warning identifies any
+   * link whose URI is absent here. Hosts without MCP Apps support can ignore
+   * the metadata and consume the tool's normal text result.
+   */
+  resources?: readonly AdcpMcpResourceDefinition[];
 
   /**
    * Opt-in bridge between the `comply_test_controller` seed store and the
@@ -2459,7 +2500,7 @@ const SHALLOW_HINT_FIELD_SCHEMA = z.unknown().optional();
 const SHALLOW_HINT_SCHEMAS = new Map<string, AnySchema>();
 
 function getToolInputShapes(): ToolInputShapeMap {
-  cachedToolInputShapes ??= require('../schemas').TOOL_INPUT_SHAPES as ToolInputShapeMap;
+  cachedToolInputShapes ??= TOOL_INPUT_SHAPES as unknown as ToolInputShapeMap;
   return cachedToolInputShapes;
 }
 
@@ -3275,10 +3316,16 @@ function buildSignedRequestsPreTransport(
       const raw = (req as { rawBody?: string }).rawBody;
       if (!raw) return undefined;
       try {
-        const parsed = JSON.parse(raw) as { method?: string; params?: { name?: string } };
-        if (parsed.method === 'tools/call' && typeof parsed.params?.name === 'string') {
-          return parsed.params.name;
-        }
+        const parsed = JSON.parse(raw) as unknown;
+        const messages = Array.isArray(parsed) ? parsed : [parsed];
+        const operations = messages.flatMap(message => {
+          if (message == null || typeof message !== 'object') return [];
+          const candidate = message as { method?: unknown; params?: { name?: unknown } };
+          return candidate.method === 'tools/call' && typeof candidate.params?.name === 'string'
+            ? [candidate.params.name]
+            : [];
+        });
+        return operations.find(operation => requiredFor.includes(operation)) ?? operations[0];
       } catch {
         // Non-JSON or malformed body — let transport handle rejection.
       }
@@ -3507,6 +3554,17 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     config.exposeToolSchemas === true
       ? (shallowToolInputHintSchema(toolName) ?? PASSTHROUGH_INPUT_SCHEMA)
       : PASSTHROUGH_INPUT_SCHEMA;
+  const mcpAppResources = normalizeMcpAppResources(config.resources);
+  const mcpAppResourceUris = new Set<string>(mcpAppResources.map(resource => resource.uri));
+  for (const [toolName, tool] of Object.entries(config.customTools ?? {})) {
+    const resourceUri = tool?._meta?.ui?.resourceUri;
+    if (resourceUri === undefined || mcpAppResourceUris.has(resourceUri)) continue;
+    const message =
+      `[adcp/createAdcpServer] customTools["${toolName}"]._meta.ui.resourceUri references ` +
+      `"${resourceUri}", but no matching MCP App resource is configured in resources[].`;
+    process.emitWarning(message, { type: 'AdcpServerConfigWarning', code: 'ADCP_MCP_APP_RESOURCE_MISSING' });
+    logger.warn(message);
+  }
 
   // One-shot construction-time warn when `testController` is wired without
   // any account resolver. The dispatch-time sandbox gate admits requests
@@ -3840,6 +3898,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   const instructionsIsFn = typeof instructionsOption === 'function';
   let resolvedInstructions: string | undefined;
   let pendingInstructions: Promise<string | undefined> | undefined;
+  let resolveInstructionsForTransport: (() => Promise<string | undefined>) | undefined;
   if (typeof instructionsOption === 'string') {
     resolvedInstructions = instructionsOption;
   } else if (instructionsIsFn) {
@@ -3856,6 +3915,12 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         // Async return: store the running Promise; resolution happens in the
         // wrapInitializeHandler block below, just before the MCP response.
         pendingInstructions = Promise.resolve(result as Promise<string | undefined>);
+        // Mark eager rejection as observed immediately. The original promise
+        // remains rejected and is awaited by the transport resolver later,
+        // where onInstructionsError decides fail vs skip. Without this
+        // observer, stateless modern tool requests that never run discovery
+        // could surface an unhandled rejection from an async instructions fn.
+        void pendingInstructions.catch(() => {});
       } else {
         // Reject non-string non-undefined sync returns instead of silently coercing
         // (`String({})` → "[object Object]" would ship as instructions otherwise).
@@ -3890,28 +3955,52 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     instructions: resolvedInstructions,
   });
 
+  // The v1 SDK server remains the canonical legacy path. The modern adapter
+  // separately mirrors these validated definitions onto every per-request
+  // MCP v2 server reconstruction.
+  for (const resource of mcpAppResources) {
+    server.registerResource(
+      resource.name,
+      resource.uri,
+      mcpAppResourceMetadata(resource) as Parameters<typeof server.registerResource>[2],
+      async (uri, extra) =>
+        readMcpAppResource(resource, uri, {
+          signal: extra.signal,
+        })
+    );
+  }
+
   // Wire async instructions resolution into the MCP `initialize` handler.
   // The function returned a Promise at construction time; await it here
   // (just before the initialize response) so the resolved string is included
   // in the MCP handshake without making createAdcpServer itself async.
   if (pendingInstructions !== undefined) {
     const pending = pendingInstructions;
-    wrapInitializeHandler(server, async (origHandler, req, extra) => {
-      try {
-        const resolved = await pending;
-        if (resolved !== undefined && typeof resolved !== 'string') {
-          throw new Error(
-            `function-form \`instructions\` resolved to ${typeof resolved}, expected string | undefined. ` +
-              `Return a string for the prose, or undefined for "no instructions on this session."`
-          );
+    let resolvedOnce: Promise<string | undefined> | undefined;
+    resolveInstructionsForTransport = () => {
+      resolvedOnce ??= (async () => {
+        try {
+          const resolved = await pending;
+          if (resolved !== undefined && typeof resolved !== 'string') {
+            throw new Error(
+              `function-form \`instructions\` resolved to ${typeof resolved}, expected string | undefined. ` +
+                `Return a string for the prose, or undefined for "no instructions on this session."`
+            );
+          }
+          setSdkServerInstructions(server, resolved);
+          return resolved;
+        } catch (err) {
+          if (onInstructionsError === 'fail') throw err;
+          logger.warn('[adcp/createAdcpServer] async instructions threw; skipping (onInstructionsError: "skip")', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return undefined;
         }
-        setSdkServerInstructions(server, resolved);
-      } catch (err) {
-        if (onInstructionsError === 'fail') throw err;
-        logger.warn('[adcp/createAdcpServer] async instructions threw; skipping (onInstructionsError: "skip")', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      })();
+      return resolvedOnce;
+    };
+    wrapInitializeHandler(server, async (origHandler, req, extra) => {
+      await resolveInstructionsForTransport?.();
       return origHandler(req, extra);
     });
   }
@@ -6102,7 +6191,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       }
       const custom = config.customTools[customName];
       if (!custom) continue;
-      const { description, title, inputSchema, outputSchema, annotations, handler } = custom;
+      const { description, title, inputSchema, outputSchema, annotations, _meta, handler } = custom;
       // Wrap the adopter-supplied handler so `throw new AdcpError(...)` and
       // `throw adcpError(...)` from inside it project to the typed envelope —
       // matching the behavior framework-registered tools get from the catch
@@ -6127,6 +6216,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           ...(inputSchema != null && { inputSchema }),
           ...(outputSchema != null && { outputSchema }),
           ...(annotations != null && { annotations }),
+          ...(_meta != null && { _meta }),
         } as Parameters<typeof server.registerTool>[1],
         wrappedHandler
       );
@@ -6396,6 +6486,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     },
   };
   const wrapped: AdcpServerInternal = wrapMcpServer(server, compliance, adcpVersion);
+  setMcpAppResources(wrapped, mcpAppResources);
 
   // Attach the auto-wired preTransport so `serve()` mounts the verifier
   // on the HTTP transport. Stashed under a non-enumerable symbol property
@@ -6439,6 +6530,14 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       configurable: true,
       writable: false,
     });
+    if (resolveInstructionsForTransport) {
+      Object.defineProperty(wrapped, ADCP_INSTRUCTIONS_RESOLVER, {
+        value: resolveInstructionsForTransport,
+        enumerable: false,
+        configurable: true,
+        writable: false,
+      });
+    }
   }
   // Expose the capabilitiesData object so post-registration helpers
   // (registerTestController) can add spec-defined capability blocks
