@@ -1677,35 +1677,35 @@ export interface AdcpServerConfig<TAccount = unknown> {
    * that wire the verifier manually via `serve({ preTransport })` are
    * unaffected — auto-wiring only kicks in through this field.
    */
-   signedRequests?: SignedRequestsConfig;
+  signedRequests?: SignedRequestsConfig;
 
-   /**
-    * Per-tool input schemas for MCP tool hints (tools/list).
-    *
-    * Keys are tool names (e.g. `'get_products'`), values are Zod objects.
-    * The SDK uses these instead of the passthrough schema so MCP clients
-    * (Claude, Cursor, etc.) surface meaningful parameter hints to LLM
-    * consumers. The framework's AJV validator remains the authoritative
-    * schema — this is purely for discovery.
-    *
-    * @example
-    * ```ts
-    * createAdcpServer({
-    *   toolSchemas: {
-    *     get_products: z.object({
-    *       buying_mode: z.enum(['brief', 'wholesale', 'refine']).describe(
-    *         'How the buyer wants products.'
-    *       ),
-    *       brief: z.string().optional().describe('Free-text brief.'),
-    *       account: z.any().optional().describe('Account context.'),
-    *     }),
-    *   },
-    * });
-    * ```
-    */
-   toolSchemas?: Record<string, z.ZodObject<any>>;
+  /**
+   * Per-tool input schemas for MCP tool hints (tools/list).
+   *
+   * Keys are tool names (e.g. `'get_products'`), values are Zod objects.
+   * The SDK uses these instead of the passthrough schema so MCP clients
+   * (Claude, Cursor, etc.) surface meaningful parameter hints to LLM
+   * consumers. The framework's AJV validator remains the authoritative
+   * schema — this is purely for discovery.
+   *
+   * @example
+   * ```ts
+   * createAdcpServer({
+   *   toolSchemas: {
+   *     get_products: z.object({
+   *       buying_mode: z.enum(['brief', 'wholesale', 'refine']).describe(
+   *         'How the buyer wants products.'
+   *       ),
+   *       brief: z.string().optional().describe('Free-text brief.'),
+   *       account: z.any().optional().describe('Account context.'),
+   *     }),
+   *   },
+   * });
+   * ```
+   */
+  toolSchemas?: Record<string, z.ZodObject<any>>;
 
-   /**
+  /**
    * Schema-driven validation of requests and responses against the bundled
    * AdCP JSON schemas. When enabled, the dispatcher rejects bad requests
    * with `VALIDATION_ERROR` before the handler runs and catches drift in
@@ -1917,8 +1917,8 @@ interface ToolAnnotation {
 }
 
 interface ToolMeta {
-   wrap: ((data: any, summary?: string) => McpToolResponse) | null;
-   annotations?: ToolAnnotation;
+  wrap: ((data: any, summary?: string) => McpToolResponse) | null;
+  annotations?: ToolAnnotation;
 }
 
 /**
@@ -5969,9 +5969,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       // Don't try to recover the canonical shape from `tools/list` when
       // `exposeToolSchemas` is off; it's empty by design and will fail open.
       const adopterSchemas = toolSchemas ?? {};
-      const inputSchema =
-        adopterSchemas[toolName] ??
-        frameworkInputSchemaFor(toolName);
+      const inputSchema = adopterSchemas[toolName] ?? frameworkInputSchemaFor(toolName);
       server.registerTool(
         toolName,
         {
