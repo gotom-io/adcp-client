@@ -16,16 +16,6 @@
     "declarationMap": true,
     "sourceMap": true,
     "moduleResolution": "node",
-    // FORK-LOCAL: consumed as a git submodule inside an npm-workspace root, so deps hoist to
-    // ../../node_modules. The first candidate keeps a standalone checkout working (upstream's
-    // path); the second resolves under workspace hoisting. This is the ONLY intended divergence
-    // from the upstream tsconfig — do not add others.
-    "paths": {
-      "structured-headers": [
-        "./node_modules/structured-headers/cjs/index.d.cts",
-        "../../node_modules/structured-headers/cjs/index.d.cts"
-      ]
-    },
     "allowSyntheticDefaultImports": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true
