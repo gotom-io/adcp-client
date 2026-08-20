@@ -8,15 +8,17 @@
  * store interface — not reimplemented protocol logic.
  *
  * Wire contract:
- *   - PRM (RFC 9728) is consulted first; `prm.resource` is the source of
- *     truth for the RFC 8707 `resource` indicator. We fall back to
+ *   - An operator `resourceOverride` takes precedence for legacy or
+ *     non-conformant integrations. Otherwise PRM (RFC 9728) is consulted;
+ *     `prm.resource` is the source of truth for the RFC 8707 `resource`
+ *     indicator. We fall back to
  *     `resourceUrlFromServerUrl(agent.agent_uri)` only when the resource
  *     server does not implement PRM (404). Connection / parse / 5xx
  *     errors throw `ProtectedResourceMetadataError` — never silently
  *     downgrade to local guessing.
- *   - `prm.resource` must share an origin with the agent URL; the MCP
- *     SDK's `checkResourceAllowed` guards against a poisoned PRM
- *     pointing the audience at a third party.
+ *   - Without a trusted override, `prm.resource` must share an origin with
+ *     the agent URL; the MCP SDK's `checkResourceAllowed` guards against a
+ *     poisoned PRM pointing the audience at a third party.
  *   - AS URL = `prm.authorization_servers[0]` when PRM is present, else
  *     the agent origin.
  *   - Scope priority: caller-supplied `scopeHint` (e.g. from a 401
@@ -49,6 +51,8 @@ import type {
 
 import type { AgentConfig, OAuthConfigStorage } from './types';
 import { DEFAULT_CLIENT_METADATA, fromMCPClientInfo, fromMCPTokens, OAuthError, toMCPClientInfo } from './types';
+import { validateOAuthResourceUrl } from './resource-url';
+import { ssrfSafeFetch } from '../../net/ssrf-fetch';
 
 /**
  * Default TTL for a pending web flow row. RFC 6749 §10.12 recommends
@@ -76,6 +80,12 @@ export interface PendingWebFlow {
   codeVerifier: string;
   redirectUri: string;
   resource?: string;
+  /** Explicit operator override, persisted separately so refresh can retain it. */
+  resourceOverride?: string;
+  /** Mutation requested by this flow. Absent on legacy rows and preserve-only flows. */
+  resourceOverrideAction?: 'set' | 'clear';
+  /** Value observed at flow start; used to reject concurrent operator edits. */
+  resourceOverrideSnapshot?: string | null;
   scope?: string;
   authorizationServerUrl: string;
   /** Persist as JSON (e.g. Postgres `jsonb`); contents are MCP SDK-typed. */
@@ -188,6 +198,17 @@ export class AgentVanishedDuringFlowError extends OAuthError {
   }
 }
 
+export class AgentChangedDuringFlowError extends OAuthError {
+  constructor(agentId: string) {
+    super(
+      `Agent ${agentId} changed while OAuth authorization was pending; tokens were not saved`,
+      'agent_changed_during_flow',
+      agentId
+    );
+    this.name = 'AgentChangedDuringFlowError';
+  }
+}
+
 export class ConfidentialClientNotAllowedError extends OAuthError {
   constructor(agentId: string | undefined) {
     super(
@@ -197,6 +218,17 @@ export class ConfidentialClientNotAllowedError extends OAuthError {
       agentId
     );
     this.name = 'ConfidentialClientNotAllowedError';
+  }
+}
+
+export class BrowserBindingRequiredError extends OAuthError {
+  constructor() {
+    super(
+      'completeWebOAuthFlow requires expectedState by default — pass the state value from the session cookie ' +
+        'set at /oauth/start, or set allowUnboundState:true only for a trusted non-browser flow',
+      'browser_binding_required'
+    );
+    this.name = 'BrowserBindingRequiredError';
   }
 }
 
@@ -221,11 +253,30 @@ export interface StartWebFlowOptions {
    * value from a prior 401 `WWW-Authenticate` challenge if you have one.
    */
   scopeHint?: string;
+  /**
+   * Operator-supplied RFC 8707 resource override. Takes precedence over
+   * `prm.resource` and the agent-URL-derived fallback, and is sent during
+   * both authorization and code exchange. Pass `null` to explicitly clear a
+   * persisted override and return to metadata/agent-URL discovery.
+   */
+  resourceOverride?: string | null;
+  /**
+   * Non-standard Auth0-compatible audience parameter. Sent only to the
+   * authorization endpoint. Prefer `resourceOverride` for RFC 8707 servers.
+   */
+  audience?: string;
+  /** Permit an HTTP resource override for local development. Default false. */
+  allowHttp?: boolean;
   /** Override flow TTL. Default: {@link DEFAULT_WEB_FLOW_TTL_MS}. */
   ttlMs?: number;
   /** Override the random-state generator (defaults to 32 bytes base64url). */
   generateState?: () => string;
-  /** Override `fetch` (timeouts, signing, mocks). */
+  /**
+   * Override with a fetch that performs its own connect-time DNS pinning.
+   * Intended for controlled tests or a hardened egress proxy.
+   */
+  trustedFetchFn?: typeof fetch;
+  /** @deprecated Rename to `trustedFetchFn`; the custom transport must pin DNS. */
   fetch?: typeof fetch;
   /**
    * Override base client metadata. `redirect_uris` is always replaced
@@ -254,14 +305,26 @@ export interface CompleteWebFlowOptions {
   pendingFlowStore: PendingWebFlowStore;
   /** When provided, the issued tokens are persisted to `agent.oauth_tokens`. */
   agentStorage?: OAuthConfigStorage;
+  /** Caller-owned fetch that performs its own connect-time DNS pinning. */
+  trustedFetchFn?: typeof fetch;
+  /** @deprecated Rename to `trustedFetchFn`; the custom transport must pin DNS. */
   fetch?: typeof fetch;
+  /** Permit HTTP/private OAuth endpoints for local development. Default false. */
+  allowHttp?: boolean;
   /**
    * The caller-bound expected state (e.g. from a session cookie set at
-   * `/oauth/start`). When provided, must equal `state`; mismatch throws
-   * {@link StateMismatchError}. Without this, `state` is replay-protected
-   * but not browser-bound — see WEB-OAUTH.md.
+   * `/oauth/start`). Must equal `state`; mismatch throws
+   * {@link StateMismatchError}. Omission fails closed unless the caller
+   * explicitly sets `allowUnboundState`.
    */
   expectedState?: string;
+  /**
+   * Explicit compatibility escape hatch for non-browser flows that cannot
+   * bind state to a session. Default false. Do not enable for browser callbacks.
+   */
+  allowUnboundState?: boolean;
+  /** @deprecated Browser binding is now required by default. */
+  requireBrowserBinding?: boolean;
 }
 
 export interface CompleteWebFlowResult {
@@ -286,30 +349,48 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
     agentStorage,
     carry,
     scopeHint,
+    resourceOverride: requestedResourceOverride,
+    audience,
+    allowHttp = false,
     ttlMs = DEFAULT_WEB_FLOW_TTL_MS,
     generateState,
-    fetch: fetchFn,
+    trustedFetchFn,
+    fetch: legacyFetchFn,
     clientMetadata: clientMetadataOverrides,
     allowConfidentialClient = false,
   } = opts;
+  const fetchFn = resolveTrustedOAuthFetch(trustedFetchFn, legacyFetchFn);
 
   if (!agent.agent_uri) {
     throw new OAuthError('Agent missing agent_uri', 'invalid_agent', agent.id);
   }
 
-  const prm = await tryDiscoverPRM(agent.agent_uri, fetchFn);
-  if (prm?.resource) {
+  const resourceOverrideAction =
+    requestedResourceOverride === null ? 'clear' : requestedResourceOverride !== undefined ? 'set' : undefined;
+  const rawResourceOverride =
+    requestedResourceOverride === null ? undefined : (requestedResourceOverride ?? agent.oauth_resource);
+  const resourceOverride = rawResourceOverride
+    ? validateOAuthResourceUrl(rawResourceOverride, { allowHttp }).href
+    : undefined;
+
+  const guardedFetch = createSsrfSafeOAuthFetch(fetchFn, allowHttp);
+  const prm = await tryDiscoverPRM(agent.agent_uri, guardedFetch);
+  if (!resourceOverride && prm?.resource) {
     assertPrmResourceMatchesAgentOrigin(agent.agent_uri, prm.resource);
   }
 
-  const asUrl = resolveAuthorizationServerUrl(agent.agent_uri, prm);
+  const asUrl = resolveAuthorizationServerUrl(agent.agent_uri, prm, allowHttp);
 
-  const asMetadata = await discoverAuthorizationServerMetadata(asUrl.toString(), { fetchFn });
+  const asMetadata = await discoverAuthorizationServerMetadata(asUrl.toString(), { fetchFn: guardedFetch });
   if (!asMetadata) {
     throw new OAuthError(`No OAuth metadata at ${asUrl.toString()}`, 'no_authorization_server_metadata', agent.id);
   }
 
-  const resource = prm?.resource ? new URL(prm.resource) : resourceUrlFromServerUrl(new URL(agent.agent_uri));
+  const resource = resourceOverride
+    ? new URL(resourceOverride)
+    : prm?.resource
+      ? new URL(prm.resource)
+      : resourceUrlFromServerUrl(new URL(agent.agent_uri));
 
   const baseClientMetadata: OAuthClientMetadata = {
     ...DEFAULT_CLIENT_METADATA,
@@ -325,7 +406,7 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
     asUrl,
     asMetadata,
     clientMetadata: baseClientMetadata,
-    fetchFn,
+    fetchFn: guardedFetch,
     allowConfidentialClient,
   });
 
@@ -338,6 +419,9 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
     state,
     resource,
   });
+  if (audience) {
+    authorizationUrl.searchParams.set('audience', audience);
+  }
 
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ttlMs);
@@ -348,6 +432,9 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
     codeVerifier,
     redirectUri,
     resource: resource.href,
+    resourceOverride,
+    resourceOverrideAction,
+    resourceOverrideSnapshot: agent.oauth_resource ?? null,
     scope,
     authorizationServerUrl: asUrl.toString(),
     clientInformation,
@@ -376,9 +463,23 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
  * for the full tradeoff discussion.
  */
 export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promise<CompleteWebFlowResult> {
-  const { state, code, pendingFlowStore, agentStorage, fetch: fetchFn, expectedState } = opts;
+  const {
+    state,
+    code,
+    pendingFlowStore,
+    agentStorage,
+    trustedFetchFn,
+    fetch: legacyFetchFn,
+    allowHttp = false,
+    expectedState,
+    allowUnboundState = false,
+    requireBrowserBinding = false,
+  } = opts;
+  const fetchFn = resolveTrustedOAuthFetch(trustedFetchFn, legacyFetchFn);
 
-  if (expectedState !== undefined && expectedState !== state) {
+  if (expectedState === undefined) {
+    if (!allowUnboundState || requireBrowserBinding) throw new BrowserBindingRequiredError();
+  } else if (expectedState !== state) {
     throw new StateMismatchError();
   }
 
@@ -387,8 +488,16 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
     throw new InvalidOrExpiredFlowError(state);
   }
 
+  const guardedFetch = createSsrfSafeOAuthFetch(fetchFn, allowHttp);
+
+  let agentForPersistence: AgentConfig | undefined;
+  if (agentStorage) {
+    agentForPersistence = await agentStorage.loadAgent(flow.agentId);
+    assertAgentUnchangedForFlow(agentForPersistence, flow);
+  }
+
   const asMetadata = await discoverAuthorizationServerMetadata(flow.authorizationServerUrl, {
-    fetchFn,
+    fetchFn: guardedFetch,
   });
 
   let tokens: OAuthTokens;
@@ -400,7 +509,7 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
       codeVerifier: flow.codeVerifier,
       redirectUri: flow.redirectUri,
       resource: flow.resource ? new URL(flow.resource) : undefined,
-      fetchFn,
+      fetchFn: guardedFetch,
     });
   } catch (err) {
     throw wrapTokenExchangeError(err);
@@ -408,13 +517,20 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
 
   let persisted = false;
   if (agentStorage) {
-    const agent = await agentStorage.loadAgent(flow.agentId);
-    if (!agent) {
-      throw new AgentVanishedDuringFlowError(flow.agentId);
+    // Re-read after the network round trips so we do not save the stale object
+    // loaded before token exchange or overwrite an edit made while the AS was
+    // responding. Storage implementations that need a hard same-ID/same-URI
+    // tenant guarantee should additionally make saveAgent revision-aware.
+    agentForPersistence = await agentStorage.loadAgent(flow.agentId);
+    assertAgentUnchangedForFlow(agentForPersistence, flow);
+    agentForPersistence.oauth_tokens = fromMCPTokens(tokens);
+    if (flow.resourceOverrideAction === 'set' && flow.resourceOverride) {
+      agentForPersistence.oauth_resource = flow.resourceOverride;
+    } else if (flow.resourceOverrideAction === 'clear') {
+      delete agentForPersistence.oauth_resource;
     }
-    agent.oauth_tokens = fromMCPTokens(tokens);
-    delete agent.oauth_code_verifier;
-    await agentStorage.saveAgent(agent);
+    delete agentForPersistence.oauth_code_verifier;
+    await agentStorage.saveAgent(agentForPersistence);
     persisted = true;
   }
 
@@ -425,6 +541,24 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
     carry: flow.carry,
     persisted,
   };
+}
+
+function assertAgentUnchangedForFlow(
+  agent: AgentConfig | undefined,
+  flow: PendingWebFlow
+): asserts agent is AgentConfig {
+  if (!agent) {
+    throw new AgentVanishedDuringFlowError(flow.agentId);
+  }
+  if (agent.agent_uri !== flow.agentUrl) {
+    throw new AgentChangedDuringFlowError(flow.agentId);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(flow, 'resourceOverrideSnapshot') &&
+    (agent.oauth_resource ?? null) !== flow.resourceOverrideSnapshot
+  ) {
+    throw new AgentChangedDuringFlowError(flow.agentId);
+  }
 }
 
 /**
@@ -550,12 +684,91 @@ function assertPrmResourceMatchesAgentOrigin(agentUrl: string, prmResource: stri
   }
 }
 
-function resolveAuthorizationServerUrl(agentUrl: string, prm: OAuthProtectedResourceMetadata | undefined): URL {
+function resolveAuthorizationServerUrl(
+  agentUrl: string,
+  prm: OAuthProtectedResourceMetadata | undefined,
+  allowHttp: boolean
+): URL {
   const first = prm?.authorization_servers?.[0];
-  if (first) {
-    return new URL(first);
+  let url: URL;
+  try {
+    url = first ? new URL(first) : new URL(new URL(agentUrl).origin);
+  } catch {
+    throw new ProtectedResourceMetadataError('Authorization server metadata contains an invalid URL');
   }
-  return new URL(new URL(agentUrl).origin);
+  if (url.username || url.password || url.hash) {
+    throw new ProtectedResourceMetadataError('Authorization server URL must not contain userinfo or a fragment');
+  }
+  if (url.protocol !== 'https:' && !(allowHttp && url.protocol === 'http:')) {
+    throw new ProtectedResourceMetadataError('Authorization server URL must use HTTPS');
+  }
+  return url;
+}
+
+let warnedLegacyOAuthFetch = false;
+
+function resolveTrustedOAuthFetch(
+  trustedFetchFn: typeof fetch | undefined,
+  legacyFetchFn: typeof fetch | undefined
+): typeof fetch | undefined {
+  if (trustedFetchFn && legacyFetchFn && trustedFetchFn !== legacyFetchFn) {
+    throw new TypeError('OAuth flow options cannot set different fetch and trustedFetchFn implementations');
+  }
+  if (legacyFetchFn && !warnedLegacyOAuthFetch) {
+    warnedLegacyOAuthFetch = true;
+    console.warn(
+      '[adcp] OAuth flow option fetch is deprecated; rename it to trustedFetchFn. ' +
+        'Custom fetch implementations must provide connect-time DNS pinning.'
+    );
+  }
+  return trustedFetchFn ?? legacyFetchFn;
+}
+
+/**
+ * Adapt the buffered DNS-pinning SSRF primitive to the Fetch API expected by
+ * the MCP OAuth helpers. Redirects remain manual, so every endpoint is bound
+ * to the validated URL and credentials are never forwarded to a second hop.
+ */
+function createSsrfSafeOAuthFetch(trustedFetchFn: typeof fetch | undefined, allowHttp: boolean): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const inputRequest = typeof Request !== 'undefined' && input instanceof Request ? input : undefined;
+    const url = inputRequest?.url ?? input.toString();
+    const method = init?.method ?? inputRequest?.method ?? 'GET';
+    const headers = new Headers(inputRequest?.headers);
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+
+    let body: string | Uint8Array | undefined;
+    const rawBody = init?.body;
+    if (typeof rawBody === 'string') body = rawBody;
+    else if (rawBody instanceof URLSearchParams) body = rawBody.toString();
+    else if (rawBody instanceof Uint8Array) body = rawBody;
+    else if (rawBody instanceof ArrayBuffer) body = new Uint8Array(rawBody);
+    else if (rawBody !== undefined && rawBody !== null) {
+      throw new OAuthError('Unsupported OAuth request body type', 'oauth_fetch_body_unsupported');
+    } else if (inputRequest && inputRequest.body) {
+      body = new Uint8Array(await inputRequest.arrayBuffer());
+    }
+
+    const headerRecord: Record<string, string> = {};
+    headers.forEach((value, key) => {
+      headerRecord[key] = value;
+    });
+
+    const result = await ssrfSafeFetch(url, {
+      method,
+      headers: headerRecord,
+      body,
+      allowPrivateIp: allowHttp,
+      maxBodyBytes: 1024 * 1024,
+      signal: init?.signal ?? inputRequest?.signal,
+      ...(trustedFetchFn ? { trustedFetchFn } : {}),
+    });
+
+    return new Response(Buffer.from(result.body), {
+      status: result.status,
+      headers: result.headers,
+    });
+  }) as typeof fetch;
 }
 
 async function resolveClientInformation(args: {

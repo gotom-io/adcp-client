@@ -6,7 +6,7 @@
  * SingleAgentClient method and includes validations.
  */
 
-import type { TestOptions } from '../types';
+import type { AgentProfile, TestOptions } from '../types';
 import type { BuyerAgent, BuyerAgentBillingMode, BuyerAgentStatus } from '../../server/decisioning/buyer-agent';
 import type { WebhookConformanceSigningOptions } from '../../conformance/types';
 
@@ -14,10 +14,19 @@ import type { WebhookConformanceSigningOptions } from '../../conformance/types';
 // Parsed storyboard structure (mirrors YAML schema)
 // ────────────────────────────────────────────────────────────
 
+export type CapabilityPredicateValue =
+  | boolean
+  | string
+  | number
+  | null
+  | CapabilityPredicateValue[]
+  | { [key: string]: CapabilityPredicateValue };
+
 export type RequiresCapabilityPredicate =
   | { path: string; equals: boolean | string | number | null }
   | { path: string; present: boolean }
-  | { path: string; contains: boolean | string | number };
+  | { path: string; contains: CapabilityPredicateValue }
+  | { path: string; not_contains: CapabilityPredicateValue };
 
 export interface Storyboard {
   id: string;
@@ -28,6 +37,12 @@ export interface Storyboard {
    * authored in storyboard YAML.
    */
   adcp_version?: string;
+  /**
+   * Compliance cache root this storyboard was loaded from. Injected by the
+   * cache loader so synthesized vectors and runtime probes use the same
+   * bundle even when process-level cache environment variables differ.
+   */
+  compliance_dir?: string;
   title: string;
   category: string;
   summary: string;
@@ -50,7 +65,7 @@ export interface Storyboard {
    * the whole storyboard with `requirement_unmet` and a
    * `missing_required_tool_family:` detail prefix. The standard `comply()`
    * path populates `agentTools` before this gate runs; direct callers that
-   * reuse a client should provide `agentTools` or `_profile.tools` so the
+   * reuse a profile should provide `agentTools` or `profile.tools` so the
    * runner can enforce it without discovery ambiguity.
    */
   required_any_of_tools?: RequiredToolFamily[];
@@ -63,7 +78,7 @@ export interface Storyboard {
    *
    * Recognised names:
    *   - `controller` — the agent must advertise `comply_test_controller`.
-   *     Detected from `options.agentTools`, `_profile.tools`, or discovery
+   *     Detected from `options.agentTools`, `profile.tools`, or discovery
    *     on reused clients. Direct callers that deliberately provide none of
    *     those surfaces bypass this check; their storyboard runs into the
    *     per-step `missing_test_controller` cascade instead.
@@ -84,6 +99,21 @@ export interface Storyboard {
    *     declares this requirement implicitly. Authors do not need to
    *     write `requires: [webhook_receiver]` — the tokens are
    *     self-describing.
+   *   - `webhook_replay_receiver` — the runner must be configured with an
+   *     inbound buyer/orchestrator receiver URL
+   *     (`StoryboardRunOptions.webhook_replay_receiver.url`). Autodetected
+   *     from any `replay_webhook_vector` step and graded not applicable when
+   *     absent. Spec: adcp-client#2356.
+   *   - `trusted_match_context_router_runner` — the runner must be configured
+   *     with a raw Context Match router URL and operator registration seam.
+   *     Autodetected from `replay_trusted_match_context_vector`; absent
+   *     harnesses grade not_applicable. Spec: adcp-client#2479.
+   *   - `trusted_match_publisher_auth_runner` — the operator supplies exact
+   *     publisher-facing Context/Identity URLs and declarative absent/invalid
+   *     credential configuration. The SDK owns the guarded raw HTTPS probes.
+   *     Capability applicability is evaluated before this requirement, so a
+   *     non-TMP agent grades not_applicable rather than requirement_unmet.
+   *     Spec: adcp-client#2526.
    *   - `request_signer` — the agent under test MUST advertise
    *     `request_signing.supported: true` in `get_adcp_capabilities`.
    *     Autodetected: any storyboard whose `id === 'signed_requests'`
@@ -125,7 +155,7 @@ export interface Storyboard {
    * `path` is a dotted key path into the raw `get_adcp_capabilities` response
    * (e.g. `"adcp.idempotency.supported"`).
    *
-   * Two matcher forms — mutually exclusive on a single gate:
+   * Four matcher forms — mutually exclusive on a single gate:
    *
    * - `equals: V` — scalar equality. The path's resolved value must be
    *   declared and must equal `V` for the storyboard to run. When the path
@@ -151,20 +181,46 @@ export interface Storyboard {
    *   declaration shape is an array of allowed values (e.g.
    *   `media_buy.conversion_tracking.supported_targets: ["cost_per",
    *   "per_ad_spend"]`). The value at `path` MUST be an array and MUST include
-   *   `V` (strict equality, no coercion). Empty arrays fail; paths resolving
+   *   `V` (structural JSON equality, no coercion). Empty arrays fail; paths resolving
    *   to undefined or non-array values fail unless the `get_adcp_capabilities`
    *   response schema declares a default for that exact path and the parent
    *   capability object is present. Like `present:`, absence is otherwise the
    *   load-bearing signal — a seller that doesn't advertise the array hasn't
    *   opted into the variant this storyboard tests.
    *
+   * - `not_contains: V` — negative array-membership matcher. The value at
+   *   `path` MUST be an array and MUST NOT include `V` (structural JSON equality, no
+   *   coercion). This is useful for rejection scenarios that apply only when
+   *   an advertised allowlist omits a value. Missing and non-array values do
+   *   not satisfy the predicate; a separate discovery validation should grade
+   *   a required capability declaration. Schema defaults are materialized on
+   *   the same terms as `contains`.
+   *
    * When `raw_capabilities` is not available and the discovered profile does
    * not expose `get_adcp_capabilities`, `equals` gates are treated as
    * unsupported because there is no declaration proving the agent opted into
-   * the behavior. Other matcher forms remain a no-op without raw
-   * capabilities because their authored paths cannot be inspected.
+   * the behavior. Other matcher forms remain a no-op without raw capabilities
+   * unless the storyboard contract explicitly requires a raw opt-in (currently
+   * `experimental_features contains trusted_match.core`).
    */
   requires_capability?: RequiresCapabilityPredicate;
+  /**
+   * Two or more capability predicates evaluated as one AND-composed
+   * applicability gate. When this field and `requires_capability` are both
+   * present, every predicate across both declarations must pass. A failed
+   * predicate skips the entire storyboard before runtime or tool gates.
+   *
+   * The loader rejects empty and single-entry arrays; use
+   * `requires_capability` for a singular gate.
+   *
+   * Compound gates fail closed when the raw capabilities payload is
+   * unavailable: advertised or auto-registered tools are not capability
+   * declarations. This is intentionally stricter than the compatibility
+   * fallback retained for legacy singular gates.
+   *
+   * Supported by @adcp/sdk starting in 14.0.0-beta.4.
+   */
+  requires_all_capabilities?: RequiresCapabilityPredicate[];
   /** Scenario IDs that must pass alongside this storyboard (loaded from storyboards/scenarios/) */
   requires_scenarios?: string[];
   agent: {
@@ -198,6 +254,13 @@ export interface Storyboard {
    * field(s) into `params.fixture` verbatim.
    */
   fixtures?: StoryboardFixtures;
+  /**
+   * AdCP 3.2 fixture-handle resolution policy. Fixture ids remain authored in
+   * `fixtures:` and in step payloads, but declarations here may allow the
+   * runner to bind those run-scoped handles to real seller catalog ids.
+   * Omitted handles retain the compatibility strategy `["seed"]`.
+   */
+  fixture_resolution?: StoryboardFixtureResolution;
   /**
    * Initial context values declared by the storyboard YAML. Runner callers may
    * override these defaults with `StoryboardRunOptions.context`.
@@ -322,6 +385,92 @@ export interface StoryboardFixtures {
   plans?: Array<Record<string, unknown> & { plan_id?: string }>;
   media_buys?: Array<Record<string, unknown> & { media_buy_id?: string }>;
   buyer_agents?: StoryboardBuyerAgentFixture[];
+}
+
+/** Ordered setup strategies supported by the first AdCP 3.2 runner slice. */
+export type FixtureResolutionStrategy = 'seed' | 'discover';
+
+/** Operators supported by the closed AdCP 3.2 fixture predicate DSL. */
+export type FixtureMatchOperator = 'equals' | 'present' | 'contains_all' | 'any_match' | 'canonical_format_satisfies';
+
+export interface FixtureCanonicalFormatSelector extends Record<string, unknown> {
+  format_kind: string;
+  params?: Record<string, unknown>;
+}
+
+/**
+ * One fixture-discovery predicate. `path` is an RFC 6901 JSON Pointer
+ * relative to the candidate entity. `any_match` uses `where` recursively,
+ * `present` is valueless, and the remaining operators use `value`.
+ */
+export type FixtureMatchClause =
+  | { path: string; operator: 'equals'; value: unknown; where?: never }
+  | { path: string; operator: 'present'; value?: never; where?: never }
+  | { path: string; operator: 'contains_all'; value: unknown[]; where?: never }
+  | { path: string; operator: 'canonical_format_satisfies'; value: FixtureCanonicalFormatSelector; where?: never }
+  | { path: string; operator: 'any_match'; where: FixtureMatchClause[]; value?: never };
+
+export interface FixtureResolutionDeclaration {
+  /** Authored run-scoped fixture handle. */
+  handle: string;
+  /** Ordered strategy ladder. Omission means `["seed"]`. */
+  strategies?: FixtureResolutionStrategy[];
+  /** Requirements a discovered seller entity must satisfy. */
+  match?: FixtureMatchClause[];
+  /** Default false: one seller entity cannot satisfy two handles. */
+  allow_reuse?: boolean;
+}
+
+export type ProductFixtureResolutionDeclaration = FixtureResolutionDeclaration;
+
+export interface PricingOptionFixtureResolutionDeclaration extends FixtureResolutionDeclaration {
+  /** Parent authored product handle for root-level pricing-option declarations. */
+  product_handle: string;
+}
+
+export interface StoryboardFixtureResolution {
+  products?: ProductFixtureResolutionDeclaration[];
+  pricing_options?: PricingOptionFixtureResolutionDeclaration[];
+}
+
+export type FixtureResolutionStatus = 'resolved' | 'unsatisfied' | 'failed';
+
+export interface FixtureResolutionAttempt {
+  strategy: FixtureResolutionStrategy;
+  disposition: 'resolved' | 'unavailable' | 'failed';
+  detail: string;
+  request?: Record<string, unknown>;
+  response?: unknown;
+}
+
+/** @deprecated Use FixtureResolutionAttempt. */
+export type FixtureResolutionEvidence = FixtureResolutionAttempt;
+
+/** Machine-readable record emitted exactly once for every fixture handle. */
+export interface FixtureResolutionRecord {
+  fixture_type: 'product' | 'pricing_option';
+  handle: string;
+  product_handle?: string;
+  requirements: FixtureMatchClause[];
+  strategies_attempted: FixtureResolutionAttempt[];
+  status: FixtureResolutionStatus;
+  strategy?: FixtureResolutionStrategy;
+  seller_ids?: {
+    product_id: string;
+    pricing_option_id?: string;
+  };
+}
+
+/** One storyboard-scoped coverage gap produced by fixture resolution. */
+export interface FixtureResolutionCoverageGap {
+  reason: 'fixture_unsatisfied';
+  detail: string;
+  fixtures: Array<{
+    fixture_type: FixtureResolutionRecord['fixture_type'];
+    handle: string;
+    product_handle?: string;
+    requirements: FixtureMatchClause[];
+  }>;
 }
 
 export interface StoryboardBuyerAgentFixture {
@@ -533,6 +682,12 @@ export interface StoryboardStep {
   doc_ref?: string;
   /** Maps to existing @adcp/sdk test scenario (legacy, partial coverage) */
   comply_scenario?: string;
+  /**
+   * Select the SDK response projection used for this step. `raw` is reserved
+   * for compatibility storyboards that must grade both legacy and canonical
+   * fields from the same seller response without changing the request wire.
+   */
+  response_projection?: 'raw';
   /** Whether this step depends on state from a previous step */
   stateful?: boolean;
   /**
@@ -667,7 +822,8 @@ export interface StoryboardStep {
   contributes_if?: string;
   // ──────────────────────────────────────────────────────────
   // Webhook-assertion step fields (only used when task is one
-  // of `expect_webhook`, `expect_webhook_retry_keys_stable`,
+  // of `expect_webhook`, `expect_no_webhook`,
+  // `expect_webhook_retry_keys_stable`, or
   // `expect_webhook_signature_valid`). The runner interprets
   // these pseudo-tasks as receiver observations, not agent calls.
   // ──────────────────────────────────────────────────────────
@@ -679,7 +835,7 @@ export interface StoryboardStep {
   triggered_by?: string;
   /** Match predicate scoped to the per-step URL and/or body fields. */
   filter?: WebhookFilterSpec;
-  /** Seconds to wait for the first matching delivery. Default 30. */
+  /** Seconds to observe for a matching delivery. Default 5 for `expect_no_webhook`, otherwise 30. */
   timeout_seconds?: number;
   /** When true (default) assert `idempotency_key` is present and pattern-valid. */
   expect_idempotency_key?: boolean;
@@ -810,6 +966,7 @@ export type StoryboardValidationCheck =
   | 'on_401_require_header'
   // Cross-cutting
   | 'resource_equals_agent_url'
+  | 'oauth_metadata_graph'
   | 'any_of'
   // A2A wire-shape checks (transport-specific; skipped on non-A2A runs)
   | 'a2a_submitted_artifact'
@@ -866,6 +1023,19 @@ export type StoryboardValidationCheck =
    * Added for adcp#2642 cross-step comparison primitives.
    */
   | 'field_equals_context'
+  /**
+   * Assert a field in the current response is a member of an array captured
+   * from an earlier step via `context_key`. Missing context keeps the same
+   * branch-safe `context_key_absent` behavior as other cross-step checks;
+   * a present non-array context value fails the check.
+   */
+  | 'field_in_context_array'
+  /**
+   * Resolve every terminal value at a wildcard-aware response path and require
+   * each value to deep-equal a member of a context-captured array. An empty
+   * terminal set passes vacuously; missing context is branch-safe.
+   */
+  | 'all_fields_in_context_array'
   /**
    * Asserts upstream side-effects against the adopter's
    * `comply_test_controller`'s `query_upstream_traffic` scenario. The
@@ -1113,7 +1283,17 @@ export interface RefsResolveScope {
 export interface StoryboardValidation {
   /** Stable authored validation identifier echoed into runner results when present. */
   id?: string;
-  check: StoryboardValidationCheck;
+  /** Known validation kind, or a future string graded not_applicable by older runners. */
+  check: StoryboardValidationCheck | (string & {});
+  /** Whether a failed validation gates the step. Defaults to `required`. */
+  severity?: 'required' | 'advisory';
+  /**
+   * Runner capability version at which an advisory is promoted to required.
+   * Compared using semver.gte against the runner's self-declared capability.
+   */
+  expires_after_version?: string;
+  /** Structured marker for an advisory that deliberately never auto-promotes. */
+  permanent_advisory?: { reason: string };
   /** JSON path for field checks, e.g. "accounts[0].account_id" */
   path?: string;
   /** Expected value for exact-match checks. */
@@ -1139,11 +1319,12 @@ export interface StoryboardValidation {
    *  - `fail` — treat as missing
    */
   on_out_of_scope?: 'warn' | 'ignore' | 'fail';
-  // ─── field_less_than / field_equals_context fields ────────
+  // ─── Cross-step comparison fields ──────────────────────
   /**
    * Key to look up in the accumulated `storyboardContext` for cross-step
    * comparison checks (`field_less_than`, `field_greater_than`,
-   * `field_at_most`, `field_at_least`, `field_equals_context`).
+   * `field_at_most`, `field_at_least`, `field_equals_context`,
+   * `field_in_context_array`, `all_fields_in_context_array`).
    * Only consumed by those check types — ignored on all others.
    * When set and the key is absent from context, the check passes with a
    * `context_key_absent` observation rather than failing — the prior step
@@ -1230,7 +1411,7 @@ export interface StoryboardValidation {
 // ────────────────────────────────────────────────────────────
 // Webhook-assertion step types
 //
-// The three `expect_webhook*` tasks are pseudo-tasks: they do not drive the
+// The four `expect_webhook*` tasks are pseudo-tasks: they do not drive the
 // agent over MCP. Instead the runner uses them to observe / assert on the
 // webhook deliveries a prior step triggered. Graded only when the storyboard
 // declares the `webhook_receiver_runner` contract and the runner hosts a
@@ -1270,6 +1451,8 @@ export type WebhookAssertionErrorCode =
   | 'missing_idempotency_key'
   | 'invalid_idempotency_key_format'
   | 'duplicate_webhook_on_replay'
+  // expect_no_webhook
+  | 'unexpected_webhook_received'
   // expect_webhook_retry_keys_stable
   | 'insufficient_retries'
   | 'idempotency_key_rotated'
@@ -1356,7 +1539,108 @@ export interface AgentEntry {
   transport?: 'mcp' | 'a2a';
 }
 
+/** One runner-hosted Context Match provider fixture exposed to the router under test. */
+export interface TrustedMatchContextProviderEndpoint {
+  /** Publisher-controlled registration id from the packaged conformance vector. */
+  provider_id: string;
+  /** Absolute URL serving this provider's vector response at `POST /context`. */
+  context_url: string;
+}
+
+/** Input to the operator-owned router registration seam. */
+export interface TrustedMatchContextRegistrationContext {
+  /** Vector profile, currently `adcp/trusted-match/context-targeting-merge/v1`. */
+  profile: string;
+  /** Fixed provider ids paired with the runner-hosted fixture URLs. */
+  providers: TrustedMatchContextProviderEndpoint[];
+  /** Exact Context Match request the runner will send after registration completes. */
+  request: Record<string, unknown>;
+}
+
+export interface TrustedMatchContextRouterRunnerOptions {
+  /** Router base URL. The runner posts the vector request to `<router_url>/context`. */
+  router_url: string;
+  /**
+   * Operator-owned seam that installs the supplied provider registrations in
+   * the router under test. It may return a cleanup callback, which the runner
+   * invokes after the replay even when the router request fails.
+   */
+  registerProviders(
+    context: TrustedMatchContextRegistrationContext
+  ): void | (() => void | Promise<void>) | Promise<void | (() => void | Promise<void>)>;
+  /** Extra headers sent to the router's `/context` endpoint. */
+  headers?: Record<string, string>;
+  /** Router request timeout in milliseconds. Defaults to 10000. */
+  timeoutMs?: number;
+  /** Optional root directory for resolving the packaged vector file. */
+  vectorsRoot?: string;
+  /** Override fetch for tests or custom runtimes. */
+  fetchImpl?: typeof fetch;
+  /** Configuration for the ephemeral provider fixture server. */
+  provider_server?: {
+    /** Loopback by default; proxy mode advertises `public_url` to remote routers. */
+    mode?: 'loopback_mock' | 'proxy_url';
+    /** Bind host for the local fixture listener. Defaults to `127.0.0.1`. */
+    host?: string;
+    /** Bind port. `0` (default) lets the kernel assign one. */
+    port?: number;
+    /** Public base URL routed to the local listener; required in proxy mode. */
+    public_url?: string;
+  };
+}
+
+export type TrustedMatchPublisherAuthOperation = 'context' | 'identity';
+export type TrustedMatchPublisherCredentialState = 'absent' | 'invalid';
+
+/** Declarative TLS material for one runner-owned publisher-auth probe. */
+export interface TrustedMatchPublisherAuthTls {
+  clientCertificatePem?: string;
+  privateKeyPem?: string;
+  privateKeyPassphrase?: string;
+  caCertificatePem?: string;
+}
+
+/** The only values an operator adapter may contribute to a publisher-auth probe. */
+export interface TrustedMatchPublisherAuthProbeConfiguration {
+  credentialHeaders?: Record<string, string>;
+  tls?: TrustedMatchPublisherAuthTls;
+}
+
+/**
+ * Operator seam for credential-profile-neutral Trusted Match publisher-auth
+ * conformance. The SDK, not this adapter, owns endpoint validation, routing,
+ * HTTP construction, redirect policy, timeouts, response limits, and output.
+ */
+export interface TrustedMatchPublisherAuthRunner {
+  /** Exact publisher-facing Context Match URL. No path is inferred. */
+  contextEndpoint: string;
+  /** Exact publisher-facing Identity Match URL. No path is inferred. */
+  identityEndpoint: string;
+  preparePublisherAuthProbe(input: {
+    operation: TrustedMatchPublisherAuthOperation;
+    credentialState: TrustedMatchPublisherCredentialState;
+  }): Promise<TrustedMatchPublisherAuthProbeConfiguration>;
+}
+
 export interface StoryboardRunOptions extends TestOptions {
+  /** Compliance cache root for bundle-scoped fixtures and test vectors. */
+  complianceDir?: string;
+  /**
+   * Pre-discovered agent profile to reuse instead of repeating capability
+   * discovery. When `agentTools` is omitted, the runner derives it from
+   * `profile.tools` so storyboard-level `required_tools` and step-level
+   * `requires_tool` gates remain enforced.
+   *
+   * Reuse a profile only for the same agent URL, authentication, AdCP version,
+   * and route that produced it. Route-specific profiles are not interchangeable.
+   * In an `agents` run this value supplies only the run-level/default-agent
+   * gating context; each routed agent is still discovered independently.
+   * Profile reuse does not retain or reuse a client or transport connection.
+   *
+   * `AgentProfile` does not carry the server's exact wire version. Pass
+   * `adcpVersion` separately when version-skew validation depends on it.
+   */
+  profile?: AgentProfile;
   /** Initial context (e.g., from a previous step invocation) */
   context?: StoryboardContext;
   /**
@@ -1389,10 +1673,12 @@ export interface StoryboardRunOptions extends TestOptions {
   /** Agent's available tools for storyboard/step-level tool gates. */
   agentTools?: string[];
   /**
-   * Allow plain-http agent URLs during compliance runs. Normally rejected
-   * because production agents MUST terminate TLS. Intended for local dev
-   * loops (docker compose, localhost harnesses). Emits an advisory banner
-   * in the report when used.
+   * Allow plain-http agent URLs during compliance runs and permit guarded
+   * raw-HTTP probes to reach private/loopback endpoints. Production agents
+   * MUST terminate TLS; dedicated probes that require HTTPS (including TMP
+   * publisher authentication) keep that requirement even when this flag is
+   * enabled. Intended for local dev loops and private staging harnesses.
+   * Emits an advisory banner in the report when used.
    */
   allow_http?: boolean;
   /**
@@ -1429,17 +1715,19 @@ export interface StoryboardRunOptions extends TestOptions {
     /**
      * Opt in to running vectors that produce live agent-side effects
      * (016 replay, 020 rate-abuse). Required unless the test-kit declares
-     * `endpoint_scope: sandbox`.
+     * `endpoint_scope: sandbox`. This flag controls request-signing vectors
+     * only; use the top-level `allowLiveSideEffects` option separately for
+     * `expect_rate_limit_not_replayed`.
      */
     allowLiveSideEffects?: boolean;
     /**
      * How the grader dispatches each vector to the agent.
      *
-     *   - `raw` (default) — POSTs each vector body directly to a per-
+     *   - `raw` — POSTs each vector body directly to a per-
      *     operation AdCP endpoint (e.g. `<baseUrl>/create_media_buy`).
      *     Works for agents that expose AdCP tools as discrete HTTP
      *     operations.
-     *   - `mcp` — wraps each vector body in a JSON-RPC `tools/call`
+     *   - `mcp` (default) — wraps each vector body in a JSON-RPC `tools/call`
      *     envelope and POSTs to the agent's single `/mcp` mount. Required
      *     for MCP-only agents that don't expose per-operation endpoints.
      *     The operation name is derived from the last path segment of the
@@ -1450,6 +1738,23 @@ export interface StoryboardRunOptions extends TestOptions {
      * `mcp` to let the runner round-trip every vector through `tools/call`.
      */
     transport?: 'raw' | 'mcp';
+    /**
+     * Pre-provisioned MCP session ID to attach as `Mcp-Session-Id` on every
+     * vector probe after signing. When `transport` is `'mcp'` and this is
+     * omitted, the runner auto-initializes a session via the MCP
+     * `initialize` handshake before each vector call. Pass a pre-acquired ID
+     * (from `initializeMcpSession`) to reuse one session across the whole
+     * storyboard run and avoid the per-vector round-trip overhead.
+     *
+     * Pass `''` (empty string) to disable auto-initialization for stateless
+     * streamable-HTTP agents that do not issue session IDs.
+     */
+    mcpSessionId?: string;
+    /**
+     * Negotiated MCP protocol version for a pre-provisioned session. When the
+     * runner auto-initializes, it uses the version returned by the server.
+     */
+    mcpProtocolVersion?: string;
   };
   /**
    * Distribution strategy across agent URLs in multi-instance mode.
@@ -1589,12 +1894,35 @@ export interface StoryboardRunOptions extends TestOptions {
     fetchImpl?: typeof fetch;
   };
   /**
+   * Raw-HTTP Trusted Match Context router harness used by
+   * `replay_trusted_match_context_vector`. The runner hosts the packaged
+   * provider fixtures, calls `registerProviders`, then posts the vector
+   * request to `<router_url>/context`. Without this option the storyboard
+   * grades `not_applicable`; it never falls back to MCP or A2A.
+   */
+  trusted_match_context_router_runner?: TrustedMatchContextRouterRunnerOptions;
+  /**
+   * Guarded raw-HTTP harness for the four Trusted Match publisher-auth
+   * pseudo-tasks. Only credential headers and declarative PEM TLS material
+   * cross the adapter boundary; the SDK owns every transport decision.
+   */
+  trusted_match_publisher_auth_runner?: TrustedMatchPublisherAuthRunner;
+  /**
    * Test-kit contract ids that are in scope for this run. A step with
    * `requires_contract: <id>` grades `not_applicable` when the id is not
    * listed here. Storyboards that assert webhook behavior typically declare
    * `webhook_receiver_runner`.
    */
   contracts?: string[];
+  /**
+   * Explicitly authorize the `expect_rate_limit_not_replayed` storyboard
+   * probe, which may send hundreds of mutating requests. The probe requires
+   * this opt-in in addition to its `rate_limit_trip_runner` contract;
+   * contract presence alone is not runtime authorization. This does not
+   * authorize request-signing vectors, which use
+   * `request_signing.allowLiveSideEffects`. Default false.
+   */
+  allowLiveSideEffects?: boolean;
   /**
    * Opt out of the runner's pre-flight `comply_test_controller` seeding
    * (adcp-client#778). When true, the runner skips the seed_* loop even if
@@ -1705,6 +2033,15 @@ export type RunnerSkipReason =
   | 'prerequisite_failed'
   | 'missing_tool'
   | 'missing_test_controller'
+  /**
+   * The runner selected the pathway but its test kit cannot synthesize a
+   * valid input for the seller-declared contract. This is a runner-owned
+   * coverage gap: it never fails validations or cascades prerequisites.
+   * Spec: AdCP runner-output-contract v2.8.0,
+   * `skip_result.reasons.fixture_unavailable` (adcp#6276). Early preflight
+   * and whole-storyboard termination semantics: adcp#6278.
+   */
+  | 'fixture_unavailable'
   | 'unsatisfied_contract'
   /**
    * A storyboard-level `requires:` tag named a requirement that is not
@@ -1712,7 +2049,8 @@ export type RunnerSkipReason =
    * advertise `comply_test_controller`, or `seeded_state` when the operator
    * didn't pass `--asserts-seeded-state`). Distinct from `missing_tool` /
    * `missing_test_controller` (per-step tool gates) and `unsatisfied_contract`
-   * (capability predicate). The `RunnerSkipResult.requirement` field carries
+   * (a declared runner contract is unavailable). The
+   * `RunnerSkipResult.requirement` field carries
    * the unmet requirement name, including unknown forward-compatible strings.
    * Spec: adcp-client#1626.
    */
@@ -1738,7 +2076,7 @@ export type RunnerSkipReason =
   | 'peer_substituted';
 
 /**
- * Grader-specific skip reasons. These are narrower than the six canonical
+ * Grader-specific skip reasons. These are narrower than the canonical
  * `RunnerSkipReason` values — they carry runner-local context (which probe,
  * which operator opt-out) that the contract neither requires nor forbids.
  * The runner records them on `skip_reason` for legacy consumers, and also
@@ -1780,14 +2118,15 @@ export type RunnerDetailedSkipReason =
    * setup, so the storyboard is out of scope rather than failed.
    */
   | 'fixture_seed_unsupported'
+  /** A valid fixture strategy ladder exhausted without finding a binding. */
+  | 'fixture_unsatisfied'
   /**
-   * A `requires_capability` predicate on the storyboard evaluated to false —
+   * A root capability predicate on the storyboard evaluated to false —
    * the agent explicitly declared it does not support the capability this
    * storyboard tests (e.g. `adcp.idempotency.supported: false`). The whole
    * storyboard is skipped before any phase runs. Maps to canonical
-   * `unsatisfied_contract`: the agent's self-declared capability profile
-   * does not satisfy the storyboard's preconditions — consistent with peer
-   * skip reasons `rate_abuse_opt_out` and `missing_test_kit_contract`.
+   * `not_applicable`: this storyboard does not target the agent's
+   * self-declared capability profile.
    */
   | 'capability_unsupported'
   /**
@@ -1804,7 +2143,7 @@ export type RunnerDetailedSkipReason =
   | 'force_scenario_unsupported';
 
 /**
- * Map detailed grader skip reasons onto the six canonical spec values so
+ * Map detailed grader skip reasons onto the canonical spec values so
  * consumers reading `skip.reason` get a stable enum regardless of which
  * subsystem produced the skip.
  */
@@ -1819,7 +2158,8 @@ export const DETAILED_SKIP_TO_CANONICAL: Record<RunnerDetailedSkipReason, Runner
   rate_limit_not_triggered: 'not_applicable',
   force_scenario_unsupported: 'not_applicable',
   fixture_seed_unsupported: 'not_applicable',
-  capability_unsupported: 'unsatisfied_contract',
+  fixture_unsatisfied: 'not_applicable',
+  capability_unsupported: 'not_applicable',
   rate_abuse_opt_out: 'unsatisfied_contract',
   missing_test_kit_contract: 'unsatisfied_contract',
   live_side_effect_opt_in_required: 'unsatisfied_contract',
@@ -1860,13 +2200,16 @@ export interface RunnerSelectionResult {
  * surface change; coordinate with the upstream spec proposal before
  * extending.
  *
- * Spec: adcp-client#1626, adcp-client#2281.
+ * Spec: adcp-client#1626, adcp-client#2281, adcp-client#2356.
  */
 export type RequirementName =
   | 'controller'
   | 'seeded_state'
   | 'real_wire'
   | 'webhook_receiver'
+  | 'webhook_replay_receiver'
+  | 'trusted_match_context_router_runner'
+  | 'trusted_match_publisher_auth_runner'
   | 'request_signer'
   | 'multi_agent';
 
@@ -1882,6 +2225,9 @@ export const KNOWN_REQUIREMENTS: ReadonlySet<RequirementName> = new Set([
   'seeded_state',
   'real_wire',
   'webhook_receiver',
+  'webhook_replay_receiver',
+  'trusted_match_context_router_runner',
+  'trusted_match_publisher_auth_runner',
   'request_signer',
   'multi_agent',
 ] as const satisfies readonly RequirementName[]);
@@ -1934,7 +2280,9 @@ export type NoticeCode =
    *  AdCP 4.0 per `effective_version`. */
   | 'webhook_signing.legacy_hmac_fallback.removed'
   /** Runner stripped request fields missing from the agent's advertised tool input schema. */
-  | 'input_schema_field_stripped';
+  | 'input_schema_field_stripped'
+  /** The preflight get_adcp_capabilities response failed schema validation. */
+  | 'capabilities_response_schema_invalid';
 
 /**
  * Severity of a runner notice. Deliberately separate from `ObservationSeverity`
@@ -1942,7 +2290,7 @@ export type NoticeCode =
  * compliance trajectory_ — a different axis: something is fine today but the
  * spec already signals a future state change.
  *
- * - `info` — purely informational; no action required now.
+ * - `info` — non-grading context; it may still identify an actionable defect.
  * - `deprecation` — SHOULD migrate; the field/claim is deprecated in the current
  *   spec version.
  * - `future_required` — behavior is optional today but will be mandatory in a
@@ -1958,7 +2306,8 @@ export type NoticeSeverity = 'info' | 'deprecation' | 'future_required';
  * like "DEPRECATION" or "FUTURE-REQUIRED" without parsing prose strings.
  *
  * `ComplianceResult.notices` aggregates these across all storyboard runs,
- * deduplicated by `code`.
+ * deduplicated by `code`, or by (`code`, `capability_pointer`) when a pointer
+ * is present. This preserves one schema-invalid notice per response location.
  *
  * Spec: adcp-client#1704.
  */
@@ -1982,6 +2331,12 @@ export interface RunnerNotice {
    */
   capability_path?: string;
   /**
+   * RFC 6901 pointer into the agent's `get_adcp_capabilities` response.
+   * Distinct from `capability_path`, which is a human-readable dotted flag
+   * path. Notices may carry both when they identify the same location.
+   */
+  capability_pointer?: string;
+  /**
    * Click-through URL for adopters to read the underlying spec section,
    * migration guide, or AdCP issue. Optional; consumers that surface
    * notices in dashboards or CI output use this to deep-link the
@@ -1992,10 +2347,10 @@ export interface RunnerNotice {
    * Storyboard ids that triggered this notice. On `StoryboardResult.notices`
    * this is always a single-element array (the storyboard the notice came
    * from). On `ComplianceResult.notices` (the deduplicated cross-storyboard
-   * rollup) this aggregates every storyboard that emitted the same `code`,
-   * so auditors can see "how widespread" a deprecation or future-required
-   * signal is without re-walking the per-storyboard arrays. Order is stable
-   * across runs (insertion order across the storyboard execution order).
+   * rollup) this aggregates every storyboard that emitted the same dedupe key
+   * (`code`, or `code` + `capability_pointer` when present), so auditors can
+   * see "how widespread" a signal is without re-walking the per-storyboard
+   * arrays. Order is stable across runs (storyboard execution order).
    */
   storyboard_ids: string[];
 }
@@ -2010,6 +2365,13 @@ export interface ValidationResult {
   check: string;
   passed: boolean;
   description: string;
+  /** Effective severity after any capability-version promotion. Defaults to `required`. */
+  severity?: 'required' | 'advisory';
+  /**
+   * Present only for expiry-gated advisories that were graded: true when
+   * promoted to required, false while the runner capability remains older.
+   */
+  severity_promoted_from_advisory?: boolean;
   /** Dot/bracket JSON path (legacy). See `json_pointer` for the RFC 6901 form. */
   path?: string;
   /** Human-readable failure detail. */
@@ -2031,13 +2393,11 @@ export interface ValidationResult {
   /** Optional remediation hint. */
   remediation?: string;
   /**
-   * Forward-compat marker: set when the runner did not implement the
-   * authored check kind and graded it as `not_applicable` (passed: true)
-   * to preserve forward compatibility with future spec additions. The
-   * companion `note` describes the coverage gap. Per
-   * runner-output-contract.yaml v2.0.0 these contribute to the run
-   * summary's `validations_not_applicable` counter so consumers can
-   * distinguish "runner is older than the storyboard" from clean passes.
+   * Marker for an implemented check whose declared applicability conditions
+   * were not met. Unknown authored check kinds fail closed; they never set
+   * this flag or contribute a false green result. Entries carrying this flag
+   * contribute to `validations_not_applicable` so consumers can distinguish
+   * inapplicable coverage from clean passes.
    */
   not_applicable?: boolean;
   /**
@@ -2065,25 +2425,31 @@ export interface ValidationResult {
   /**
    * Issue #820 follow-up — strict JSON-schema (AJV) verdict for
    * `response_schema` checks. `passed` remains the lenient Zod outcome
-   * (runner's historical pass/fail semantics); `strict` carries the
-   * AJV-with-formats-and-additionalProperties verdict separately so
-   * agent developers can see the strict/lenient delta without the
-   * runner failing a step that the Zod path accepts. Absent on non-
-   * response_schema checks or when no AJV schema is available.
+   * (runner's historical packaged-cache semantics); `strict` carries the
+   * AJV-with-formats-and-additionalProperties verdict separately so agent
+   * developers can see the strict/lenient delta. When the run supplies an
+   * external `schemaRoot`, its AJV verdict is authoritative and may drive
+   * `passed`. Absent on non-response_schema checks or when no AJV schema is
+   * available.
    */
   strict?: StrictValidationVerdict;
 }
 
 /**
  * Strict (AJV JSON-schema) verdict attached to a response_schema
- * validation result. Informational — the step's pass/fail is driven by
- * the lenient Zod path. `valid: false` with `valid_lenient: true`
- * indicates the strict/lenient delta: the agent's response passes the
- * generated Zod shape but fails strict JSON-schema (typically a
- * `format` violation or an `additionalProperties: false` breach).
+ * validation result. Informational for packaged-cache runs, where step
+ * pass/fail remains driven by the lenient Zod path. Authoritative for runs
+ * with an external `schemaRoot`, so current protocol source is not gated by
+ * the SDK's generated Zod snapshot.
  */
 export interface StrictValidationVerdict {
   valid: boolean;
+  /**
+   * Outcome from the SDK's packaged Zod snapshot, captured only as a
+   * comparison signal. `null` means that snapshot has no schema for the tool.
+   * External-schema runs never use this field to decide pass/fail.
+   */
+  lenient_valid?: boolean | null;
   /** Response variant AJV ultimately validated against. After fallback: `"sync"`. */
   variant: string;
   /** Concrete AJV issues (RFC 6901 pointers) when `valid: false`. Absent when valid. */
@@ -2122,14 +2488,18 @@ export interface StoryboardStepResult {
   /** True when the step was not executed */
   skipped?: boolean;
   /**
-   * Skip reason. Accepts either a canonical `RunnerSkipReason` (the six
-   * spec-required values) or one of the grader-specific variants introduced
+   * Skip reason. Accepts either a canonical `RunnerSkipReason` or one of the
+   * grader-specific variants introduced
    * by the RFC 9421 request-signing grader (#585, #617). The structured
    * `skip` field below always carries the canonical spec reason so consumers
    * of the runner-output contract don't need to know the grader vocabulary.
+   * In particular, `rate_limit_not_triggered` is a passing skipped result
+   * with `skip.reason === 'not_applicable'`,
+   * `skip.detail === 'rate_limit_not_triggered'`, and no validations. Its
+   * human-readable diagnostic remains on the legacy `response.error` field.
    */
   skip_reason?: RunnerSkipReason | RunnerDetailedSkipReason;
-  /** Structured skip result with canonical spec reason + human-readable detail. */
+  /** Structured skip result with canonical spec reason + contract-defined detail. */
   skip?: RunnerSkipResult;
   /**
    * Structured selection result for steps that were outside the caller's
@@ -2663,6 +3033,10 @@ export interface StoryboardResult {
    */
   agent_map?: Record<string, string>;
   overall_passed: boolean;
+  /** AdCP 3.2 fixture-handle setup/discovery evidence, one row per handle. */
+  fixture_resolutions?: FixtureResolutionRecord[];
+  /** Storyboard-level fixture coverage gaps, emitted once per cause. */
+  coverage_gaps?: FixtureResolutionCoverageGap[];
   /**
    * Phases from the first pass. In `multi-pass` mode see `passes` for the full
    * per-pass detail; `passed_count`/`failed_count`/`skipped_count` and
@@ -2683,6 +3057,8 @@ export interface StoryboardResult {
   passed_count: number;
   failed_count: number;
   skipped_count: number;
+  /** Failed advisory validations, counted separately from failed steps. */
+  validations_advisory_failed?: number;
   /**
    * Validation results graded `not_applicable` because the runner did not
    * implement the authored `check` kind (forward-compat default). Surfaces
@@ -2690,6 +3066,8 @@ export interface StoryboardResult {
    * passes. Per runner-output-contract.yaml v2.0.0 run_summary.
    */
   validations_not_applicable?: number;
+  /** Semver capability used to evaluate advisory validation expiry gates. */
+  runner_capability_version?: string;
   tested_at: string;
   /**
    * Schemas applied during this run. Per the runner-output contract, runners
@@ -2717,11 +3095,13 @@ export interface StoryboardResult {
   /**
    * Structured protocol-compliance advisories produced for this storyboard
    * run. Each notice carries a stable `code` (machine-readable, suitable for
-   * CI badge routing) and a `severity` (`deprecation` | `future_required`).
+   * CI badge routing) and a non-grading `severity` (`info` | `deprecation` |
+   * `future_required`).
    * Always present; empty array when no notices were triggered.
    *
    * `ComplianceResult.notices` aggregates across all storyboard runs,
-   * deduplicated by `code`. Spec: adcp-client#1704.
+   * deduplicated by `code`, or by (`code`, `capability_pointer`) when a
+   * capability pointer is present. Spec: adcp-client#1704 and adcp#6256.
    */
   notices: RunnerNotice[];
   /**
@@ -2780,11 +3160,17 @@ export interface StrictValidationSummary {
   /**
    * Count of validations where BOTH lenient Zod AND strict AJV rejected —
    * the step already failed under today's semantics, so strict rejection
-   * isn't new signal. Equals `failed - strict_only_failures`. Useful for
-   * dashboards that want to distinguish "already-failing" from
-   * "silently-failing" in the same run.
+   * isn't new signal. Useful for dashboards that want to distinguish
+   * "already-failing" from "silently-failing" in the same run. Strict
+   * failures without a packaged Zod comparator are reported separately as
+   * `lenient_unobserved`.
    */
   lenient_also_failed: number;
+  /**
+   * Strict AJV failures for tools with no packaged Zod schema to compare.
+   * Present only when non-zero so older serialized summaries remain stable.
+   */
+  lenient_unobserved?: number;
 }
 
 /**
@@ -2803,6 +3189,8 @@ export interface AssertionResult {
   scope: 'step' | 'storyboard';
   /** Step that produced the observation, when `scope === "step"`. */
   step_id?: string;
+  /** 1-based pass index when aggregated from a multi-pass run. */
+  pass_index?: number;
   /** Failure detail. Absent on pass. */
   error?: string;
   /**
@@ -2874,6 +3262,8 @@ export interface StoryboardPassResult {
   passed_count: number;
   failed_count: number;
   skipped_count: number;
+  /** Failed advisory validations, counted separately from failed steps. */
+  validations_advisory_failed?: number;
   /** Validations graded `not_applicable` (forward-compat default). */
   validations_not_applicable?: number;
   duration_ms: number;

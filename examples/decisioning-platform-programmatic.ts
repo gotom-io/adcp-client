@@ -28,18 +28,20 @@ import {
   type SalesCorePlatform,
   type SalesIngestionPlatform,
   type AccountStore,
-  type GetProductsPayload,
+  type GetProductsHandlerResult,
   type SyncCreativesRow,
 } from '@adcp/sdk/server';
 import type {
-  GetProductsRequest,
+  CanonicalSyncCreativeAsset,
   CreateMediaBuyRequest,
-  CreateMediaBuySuccess,
+  GetProductsRequest,
   UpdateMediaBuyRequest,
+} from '@adcp/sdk';
+import type {
+  CreateMediaBuySuccess,
   UpdateMediaBuySuccess,
   GetMediaBuyDeliveryRequest,
   GetMediaBuyDeliveryResponse,
-  CreativeAsset,
   AccountReference,
 } from '@adcp/sdk/types';
 
@@ -97,14 +99,20 @@ export class ProgrammaticSeller implements DecisioningPlatform<ProgrammaticConfi
 
   sales: SalesCorePlatform<ProgrammaticMeta> & SalesIngestionPlatform<ProgrammaticMeta> = {
     /** Sync discovery: catalog read; no async ceremony. */
-    getProducts: async (_req: GetProductsRequest): Promise<GetProductsPayload> => ({
+    getProducts: async (_req: GetProductsRequest): Promise<GetProductsHandlerResult> => ({
       cache_scope: 'account' as const,
       products: [
         {
           product_id: 'prod_run_of_network_display',
           name: 'RON Display',
           description: 'Run-of-network display, 300x250 + 728x90',
-          format_ids: [{ id: 'display_300x250', agent_url: 'https://example.com/programmatic-creative-agent/mcp' }],
+          format_options: [
+            {
+              format_option_id: 'display_300x250',
+              format_kind: 'image',
+              params: { width: 300, height: 250 },
+            },
+          ],
           delivery_type: 'non_guaranteed',
           publisher_properties: [{ publisher_domain: 'programmatic.example.com', selection_type: 'all' }],
           reporting_capabilities: { ...DEFAULT_REPORTING_CAPABILITIES, expected_delay_minutes: 60 },
@@ -121,7 +129,13 @@ export class ProgrammaticSeller implements DecisioningPlatform<ProgrammaticConfi
           product_id: 'prod_premium_video_15s',
           name: 'Premium Video 15s',
           description: 'In-stream video on premium publishers',
-          format_ids: [{ id: 'video_15s', agent_url: 'https://example.com/programmatic-creative-agent/mcp' }],
+          format_options: [
+            {
+              format_option_id: 'video_15s',
+              format_kind: 'video_hosted',
+              params: { duration_ms_exact: 15_000 },
+            },
+          ],
           delivery_type: 'non_guaranteed',
           publisher_properties: [{ publisher_domain: 'programmatic.example.com', selection_type: 'all' }],
           reporting_capabilities: { ...DEFAULT_REPORTING_CAPABILITIES, expected_delay_minutes: 60 },
@@ -158,7 +172,7 @@ export class ProgrammaticSeller implements DecisioningPlatform<ProgrammaticConfi
       const buyId = `mb_${this.capabilities.config.networkId}_${Date.now()}`;
       const buy: ProgrammaticBuy = {
         media_buy_id: buyId,
-        status: 'pending_creatives',
+        media_buy_status: 'pending_creatives',
         confirmed_at: new Date().toISOString(),
         revision: 1,
         packages: [],
@@ -172,7 +186,7 @@ export class ProgrammaticSeller implements DecisioningPlatform<ProgrammaticConfi
       const account = (req as { account?: { account_id?: string } }).account;
       const accountId = account?.account_id ?? 'prog_acc_1';
       setTimeout(() => {
-        buy.status = 'active';
+        buy.media_buy_status = 'active';
         publishStatusChange({
           account_id: accountId,
           resource_type: 'media_buy',
@@ -193,9 +207,13 @@ export class ProgrammaticSeller implements DecisioningPlatform<ProgrammaticConfi
           field: 'media_buy_id',
         });
       }
-      if (patch.paused === true) existing.status = 'paused';
-      if (patch.paused === false && existing.status === 'paused') existing.status = 'active';
-      return { media_buy_id: existing.media_buy_id, status: existing.status, revision: existing.revision };
+      if (patch.paused === true) existing.media_buy_status = 'paused';
+      if (patch.paused === false && existing.media_buy_status === 'paused') existing.media_buy_status = 'active';
+      return {
+        media_buy_id: existing.media_buy_id,
+        media_buy_status: existing.media_buy_status,
+        revision: existing.revision,
+      };
     },
 
     /**
@@ -203,11 +221,10 @@ export class ProgrammaticSeller implements DecisioningPlatform<ProgrammaticConfi
      * continues async — the seller's review pipeline pushes status changes
      * via publishStatusChange when each creative reaches terminal state.
      */
-    syncCreatives: async (creatives: CreativeAsset[]): Promise<SyncCreativesRow[]> => {
+    syncCreatives: async (creatives: CanonicalSyncCreativeAsset[]): Promise<SyncCreativesRow[]> => {
       return creatives.map(c => {
-        const id = (c as { creative_id?: string }).creative_id ?? `cr_${Math.random()}`;
-        const formatId = (c as { format_id?: { id?: string } }).format_id?.id ?? '';
-        const needsReview = formatId.startsWith('video_');
+        const id = c.creative_id;
+        const needsReview = c.format_kind === 'video_hosted' || c.format_kind === 'video_vast';
         if (needsReview) {
           // Schedule the pending → approved transition for the demo
           setTimeout(() => {

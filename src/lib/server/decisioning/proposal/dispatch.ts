@@ -36,7 +36,8 @@
  */
 
 import { AdcpError, isTaskHandoff, type TaskHandoff } from '../async-outcome';
-import type { GetProductsRequest, Product, Proposal } from '../../../types/tools.generated';
+import type { Product, Proposal } from '../../../types/tools.generated';
+import type { CanonicalGetProductsRequest } from '../../../v2/projection/creative-delivery';
 import {
   detectFinalizeAction,
   enforceProposalExpiry,
@@ -127,15 +128,15 @@ export type FinalizeInterceptResult<TRecipe extends Recipe = Recipe> =
  * @public
  */
 export async function maybeInterceptFinalize<TRecipe extends Recipe, TCtxMeta>(args: {
-  request: GetProductsRequest;
+  request: CanonicalGetProductsRequest;
   manager: ProposalManager<TRecipe, TCtxMeta> | undefined;
   store: ProposalStore<TRecipe> | undefined;
   ctx: { account: { id: string } } & Record<string, unknown>;
 }): Promise<FinalizeInterceptResult<TRecipe>> {
   const { request, manager, store, ctx } = args;
+  if (!hasFinalizeCapability(manager) || !store) return { kind: 'pass' };
   const finalizeEntry = detectFinalizeAction(request);
   if (!finalizeEntry) return { kind: 'pass' };
-  if (!hasFinalizeCapability(manager) || !store) return { kind: 'pass' };
 
   const fieldPath = `refine[${finalizeEntry.index}].proposal_id`;
   const accountId = ctx.account.id;
@@ -216,7 +217,7 @@ function isFinalizeSuccess<TRecipe extends Recipe>(v: unknown): v is FinalizePro
 }
 
 function projectFinalizeResponse(args: {
-  request: GetProductsRequest;
+  request: CanonicalGetProductsRequest;
   committedProposal: Record<string, unknown>;
   finalizeProposalId: string;
 }): ProposalGetProductsPayload {

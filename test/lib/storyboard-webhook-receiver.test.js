@@ -6,7 +6,7 @@
  *      retry-replay policy (5xx→2xx), filter matching.
  *   2. Runner variables — `{{runner.*}}` and `{{prior_step.*.operation_id}}`
  *      substitution against a `RunnerVariables` bag.
- *   3. runStoryboard integration — `expect_webhook`,
+ *   3. runStoryboard integration — `expect_webhook`, `expect_no_webhook`,
  *      `expect_webhook_retry_keys_stable`, and `expect_webhook_signature_valid`
  *      pseudo-tasks against a fake publisher.
  */
@@ -17,6 +17,8 @@ const http = require('http');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const { createWebhookReceiver } = require('../../dist/lib/testing/storyboard/webhook-receiver.js');
+const webhookAssertions = require('../../dist/lib/testing/storyboard/webhook-assertions.js');
+const { executeWebhookAssertionStep } = webhookAssertions;
 const { injectContext, createRunnerVariables } = require('../../dist/lib/testing/storyboard/context.js');
 const { runStoryboard } = require('../../dist/lib/testing/storyboard/runner.js');
 const { ADCP_VERSION } = require('../../dist/lib/version.js');
@@ -780,6 +782,275 @@ describe('runStoryboard: expect_webhook step task', () => {
   });
 });
 
+describe('runStoryboard: expect_no_webhook step task', () => {
+  let publisher;
+  afterEach(async () => {
+    if (publisher) await stopPublisher(publisher);
+    publisher = undefined;
+  });
+
+  test('passes after the observation window when no matching webhook arrives', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Complete synchronously without a webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, true, JSON.stringify(assertStep.validations));
+    assert.strictEqual(assertStep.validations[0].check, 'expect_no_webhook');
+    assert.strictEqual(assertStep.validations[0].json_pointer, null);
+  });
+
+  test('fails immediately with safe correlation metadata when a matching webhook arrives', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Emit an unexpected webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: { push_notification_config: { url: '{{runner.webhook_url:trigger}}' } },
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 2,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    const validation = assertStep.validations[0];
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(validation.actual.code, 'unexpected_webhook_received');
+    assert.strictEqual(validation.json_pointer, null);
+    assert.strictEqual(validation.actual.actual.count, 1);
+    assert.strictEqual(validation.actual.actual.first_delivery.step_id, 'trigger');
+    assert.ok(validation.actual.actual.first_delivery.operation_id);
+    assert.ok(assertStep.duration_ms < 1000, `expected immediate failure, got ${assertStep.duration_ms}ms`);
+  });
+
+  test('fails when a matching webhook arrives while the observation waiter is active', async () => {
+    let signalWaitStarted;
+    const waitStarted = new Promise(resolve => {
+      signalWaitStarted = resolve;
+    });
+    let resolveWait;
+    const captured = [];
+    const receiver = {
+      base_url: 'http://127.0.0.1:1',
+      mode: 'loopback_mock',
+      all: () => [...captured],
+      matching: () => [...captured],
+      set_retry_replay: () => {},
+      wait: () => {
+        signalWaitStarted();
+        return new Promise(resolve => {
+          resolveWait = resolve;
+        });
+      },
+      wait_all: async () => [],
+      close: async () => {},
+    };
+    const runState = {
+      contributions: new Set(),
+      priorStepResults: new Map([['trigger', { passed: true }]]),
+      priorProbes: new Map(),
+      agentUrl: '',
+      webhookReceiver: receiver,
+      runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+    };
+    const step = {
+      id: 'assert_silence',
+      title: 'Assert no completion webhook',
+      task: 'expect_no_webhook',
+      triggered_by: 'trigger',
+      timeout_seconds: 1,
+    };
+
+    const resultPromise = executeWebhookAssertionStep(step, 'p', {}, [], {}, runState);
+    await waitStarted;
+    const webhook = {
+      id: 'delivery-1',
+      step_id: 'trigger',
+      operation_id: 'operation-1',
+      delivery_index: 1,
+      received_at: new Date().toISOString(),
+      body: { idempotency_key: 'evt_delayed_0123456789abcdef' },
+    };
+    captured.push(webhook);
+    resolveWait({ timed_out: false, webhook });
+
+    const assertStep = await resultPromise;
+    assert.strictEqual(assertStep.passed, false);
+    assert.strictEqual(assertStep.validations[0].actual.code, 'unexpected_webhook_received');
+    assert.strictEqual(assertStep.validations[0].actual.actual.first_delivery.id, 'delivery-1');
+  });
+
+  test('ignores deliveries that do not match the authored body filter', async () => {
+    publisher = await startFakePublisher({ mode: 'ok' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Emit an unrelated webhook',
+        task: '__test_fire_webhook',
+        auth: 'none',
+        sample_request: {
+          task_id: 'mb-1',
+          push_notification_config: { url: '{{runner.webhook_url:trigger}}' },
+        },
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no matching webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        filter: { body: { 'task.task_id': 'different-task' } },
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[1];
+    assert.strictEqual(assertStep.passed, true, JSON.stringify(assertStep.validations));
+  });
+
+  test('skips when the triggering step was skipped', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'trigger',
+        title: 'Unavailable trigger',
+        task: '__test_fire_webhook',
+        requires_tool: '__missing_webhook_tool',
+        sample_request: {},
+      },
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const [triggerStep, assertStep] = result.phases[0].steps;
+    assert.strictEqual(triggerStep.skipped, true);
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'prerequisite_failed');
+  });
+
+  test('does not false-pass when triggered_by has no prior result', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'assert_silence',
+        title: 'Assert no completion webhook',
+        task: 'expect_no_webhook',
+        triggered_by: 'missing_trigger',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, {
+      ...RUN_OPTIONS_BASE,
+      webhook_receiver: {},
+    });
+    const assertStep = result.phases[0].steps[0];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'prerequisite_failed');
+    assert.match(assertStep.skip.detail, /no prior result/);
+  });
+
+  test('grades not_applicable when webhook_receiver is not enabled', async () => {
+    publisher = await startFakePublisher({ mode: 'quiet' });
+    const storyboard = storyboardWith([
+      {
+        id: 'assert_silence',
+        title: 'No receiver',
+        task: 'expect_no_webhook',
+        timeout_seconds: 0.05,
+      },
+    ]);
+
+    const result = await runStoryboard(publisher.url, storyboard, RUN_OPTIONS_BASE);
+    const assertStep = result.phases[0].steps[0];
+    assert.strictEqual(assertStep.skipped, true);
+    assert.strictEqual(assertStep.skip.reason, 'unsatisfied_contract');
+  });
+
+  test('uses a five-second default and clamps authored timeouts to five minutes', async () => {
+    const observedTimeouts = [];
+    const receiver = {
+      base_url: 'http://127.0.0.1:1',
+      mode: 'loopback_mock',
+      all: () => [],
+      matching: () => [],
+      set_retry_replay: () => {},
+      wait: async (_filter, timeoutMs) => {
+        observedTimeouts.push(timeoutMs);
+        return { timed_out: true };
+      },
+      wait_all: async () => [],
+      close: async () => {},
+    };
+    const runState = {
+      contributions: new Set(),
+      priorStepResults: new Map([['trigger', { passed: true }]]),
+      priorProbes: new Map(),
+      agentUrl: publisher?.url ?? '',
+      webhookReceiver: receiver,
+      runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+    };
+    const baseStep = {
+      id: 'assert_silence',
+      title: 'Assert no completion webhook',
+      task: 'expect_no_webhook',
+      triggered_by: 'trigger',
+    };
+
+    await executeWebhookAssertionStep(baseStep, 'p', {}, [], {}, runState);
+    await executeWebhookAssertionStep({ ...baseStep, timeout_seconds: 999 }, 'p', {}, [], {}, runState);
+
+    assert.deepStrictEqual(observedTimeouts, [5000, 300000]);
+  });
+
+  test('is exported by both CJS and ESM builds', async () => {
+    const esmAssertions = await import('../../dist/lib/testing/storyboard/webhook-assertions.mjs');
+    assert.strictEqual(webhookAssertions.WEBHOOK_ASSERTION_TASKS.has('expect_no_webhook'), true);
+    assert.strictEqual(esmAssertions.WEBHOOK_ASSERTION_TASKS.has('expect_no_webhook'), true);
+  });
+});
+
 describe('runStoryboard: expect_webhook_retry_keys_stable', () => {
   let publisher;
   afterEach(async () => {
@@ -1000,13 +1271,75 @@ describe('runStoryboard: replay_webhook_vector', () => {
     assert.ok(step.validations.some(v => v.check === 'webhook_replay_payload_schema' && v.passed === true));
   });
 
-  test('grades not_applicable when no replay receiver URL is configured', async () => {
+  test('grades the storyboard not applicable when no replay receiver URL is configured', async () => {
+    const steps = [
+      {
+        id: 'post_delivery_report_envelope',
+        title: 'POST delivery report inside MCP webhook envelope',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+      },
+      {
+        id: 'post_same_event_retry',
+        title: 'POST retry with same idempotency_key',
+        task: 'replay_webhook_vector',
+        vector_ref:
+          'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-retry-same-idempotency-key',
+      },
+      {
+        id: 'reject_bare_delivery_result',
+        title: 'Reject top-level notification_type result',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/bare-delivery-result',
+      },
+      {
+        id: 'reject_missing_idempotency_key',
+        title: 'Reject envelope without idempotency_key',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/missing-idempotency-key',
+      },
+      {
+        id: 'reject_unsupported_status',
+        title: 'Reject media buy status used as webhook status',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#negative/unsupported-top-level-status',
+      },
+    ];
+    const storyboard = storyboardWith(steps);
+    storyboard.phases = [
+      { id: 'positive_envelope_replay', title: 'Accept canonical webhook envelopes', steps: steps.slice(0, 2) },
+      { id: 'negative_envelope_rejections', title: 'Reject invalid webhook envelopes', steps: steps.slice(2) },
+    ];
+
+    const result = await runStoryboard('http://127.0.0.1:9/mcp', storyboard, {
+      ...RUN_OPTIONS_BASE,
+      agentTools: [],
+    });
+
+    assert.strictEqual(result.overall_passed, true);
+    assert.strictEqual(result.failed_count, 0);
+    assert.strictEqual(result.skipped_count, 1);
+    assert.strictEqual(result.phases.length, 1);
+    assert.strictEqual(result.phases[0].phase_id, 'requirement_unmet');
+    const step = result.phases[0].steps[0];
+    assert.strictEqual(step.skipped, true);
+    assert.strictEqual(step.skip.reason, 'not_applicable');
+    assert.strictEqual(step.skip.requirement, 'webhook_replay_receiver');
+    assert.match(step.skip.detail, /webhook_replay_receiver\.url/);
+  });
+
+  test('applies the receiver requirement before evaluating unrelated step-level skips', async () => {
     const storyboard = storyboardWith([
       {
         id: 'post_delivery_report_envelope',
         title: 'POST delivery report inside MCP webhook envelope',
         task: 'replay_webhook_vector',
         vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+      },
+      {
+        id: 'missing_agent_tool',
+        title: 'Missing agent tool',
+        task: 'missing_agent_tool',
       },
     ]);
 
@@ -1015,9 +1348,11 @@ describe('runStoryboard: replay_webhook_vector', () => {
       agentTools: [],
     });
 
-    const step = result.phases[0].steps[0];
-    assert.strictEqual(step.skipped, true);
-    assert.strictEqual(step.skip.reason, 'not_applicable');
-    assert.match(step.skip.detail, /webhook_replay_receiver\.url/);
+    assert.strictEqual(result.overall_passed, true);
+    assert.strictEqual(result.failed_count, 0);
+    assert.strictEqual(result.skipped_count, 1);
+    assert.strictEqual(result.phases[0].phase_id, 'requirement_unmet');
+    assert.strictEqual(result.phases[0].steps[0].skip.reason, 'not_applicable');
+    assert.strictEqual(result.phases[0].steps[0].skip.requirement, 'webhook_replay_receiver');
   });
 });

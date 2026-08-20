@@ -34,6 +34,11 @@ const HARNESS_TASKS = new Set([
   'fetch_brand_jwks',
   'assert_jwks_purpose',
   'expect_rate_limit_not_replayed',
+  'replay_trusted_match_context_vector',
+  'trusted_match_missing_auth_context_probe',
+  'trusted_match_invalid_auth_context_probe',
+  'trusted_match_missing_auth_identity_probe',
+  'trusted_match_invalid_auth_identity_probe',
 ]);
 
 // `$test_kit.*` substitution placeholders — resolved at run time, not tasks themselves.
@@ -56,6 +61,12 @@ function isPathReachable(schema, segments) {
   if (!type) return false;
 
   const [head, ...rest] = segments;
+
+  // Open payloads accept arbitrary nested structure, including arrays. This
+  // must run before numeric-index dispatch: a task result is intentionally
+  // `unknown`, so `result.packages[0]` is reachable even though the generic
+  // polling envelope cannot name the task-specific array schema.
+  if (type === 'unknown' || type === 'any') return true;
 
   // Unwrap wrappers transparently
   if (type === 'optional' || type === 'nullable' || type === 'catch') {
@@ -89,9 +100,16 @@ function isPathReachable(schema, segments) {
     if (type === 'array' && schema.element) {
       return isPathReachable(schema.element, rest);
     }
+    if (type === 'tuple') {
+      const items = schema._zod?.def?.items ?? [];
+      const item = items[head] ?? schema._zod?.def?.rest;
+      return item ? isPathReachable(item, rest) : false;
+    }
     return false;
   }
 
+  // Explicitly open payloads and passthrough catchalls accept arbitrary
+  // nested data, so any remaining path is structurally reachable.
   // Object: look up key in shape. When the key isn't declared but the
   // schema allows extra keys via `.passthrough()` (Zod's representation:
   // `_zod.def.catchall` carries the catchall schema, e.g. `z.unknown()`
@@ -168,6 +186,11 @@ function isPathRequired(schema, segments) {
 
   if (typeof head === 'number') {
     if (type === 'array' && schema.element) return isPathRequired(schema.element, rest);
+    if (type === 'tuple') {
+      const items = schema._zod?.def?.items ?? [];
+      const item = items[head] ?? schema._zod?.def?.rest;
+      return item ? isPathRequired(item, rest) : false;
+    }
     return false;
   }
 

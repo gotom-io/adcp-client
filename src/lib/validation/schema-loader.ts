@@ -37,6 +37,19 @@ const SCHEMA_FILENAME_SUFFIX: Record<Direction, string> = {
   'input-required': 'async-response-input-required',
 };
 
+// Protocol bundles may ship transport-specific schema projections alongside
+// the canonical AdCP schemas. They are not runtime validation sources: the
+// official clients own transport framing, while this loader validates the
+// canonical tool arguments/results. AdCP 3.2's `mcp/2026-07-28` projection
+// also uses JSON Schema 2020-12, whereas the canonical bundle remains
+// Draft-07. Mixing it into the canonical AJV registry both indexes duplicate
+// tools and makes a Draft-07 instance attempt to register another dialect.
+const TRANSPORT_PROJECTION_DIRECTORIES = new Set(['mcp']);
+
+function isRuntimeSchemaDirectory(name: string): boolean {
+  return name !== 'bundled' && !TRANSPORT_PROJECTION_DIRECTORIES.has(name);
+}
+
 /**
  * Map a consumer-provided version pin to the loader's bundle key.
  *
@@ -331,6 +344,8 @@ interface LoaderState {
   fileIndex: Map<string, string>;
   validators: Map<string, ValidateFunction>;
   rawSchemas: Map<string, Record<string, unknown>>;
+  entityPaths: Map<string, SchemaEntityPath[]>;
+  schemaIdFiles?: Map<string, string>;
   root: string;
   coreLoaded: boolean;
   version: string;
@@ -424,13 +439,37 @@ function collectSchemaRootVersionAliasGroups(root: string): Array<{ hint: string
   return groups;
 }
 
+function readSchemaRootDeclaredVersion(root: string): string | undefined {
+  const candidates = [path.join(root, 'index.json')];
+  if (path.basename(root) === 'bundled') candidates.push(path.join(path.dirname(root), 'index.json'));
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const index = loadJson(candidate);
+      if (typeof index.adcp_version === 'string' && index.adcp_version !== 'latest') {
+        return index.adcp_version;
+      }
+    } catch {
+      // The normal mismatch error below carries the actionable root/version context.
+    }
+  }
+  return undefined;
+}
+
 function assertSchemaRootMatchesVersion(version: string, root: string): Set<string> {
   const expectedAliases = schemaRootVersionAliases(version);
   const rootGroups = collectSchemaRootVersionAliasGroups(root);
   const rootAliases = collectSchemaRootVersionAliases(root);
+  const declaredVersion = readSchemaRootDeclaredVersion(root);
+  const declaredAliases = declaredVersion ? schemaRootVersionAliases(declaredVersion) : new Set<string>();
+  const latestIsPinnedByIndex = [...declaredAliases].some(alias => expectedAliases.has(alias));
   if (
     rootGroups.length > 0 &&
-    rootGroups.every(group => [...group.aliases].some(alias => expectedAliases.has(alias)))
+    rootGroups.every(
+      group =>
+        [...group.aliases].some(alias => expectedAliases.has(alias)) ||
+        (group.hint === 'latest' && latestIsPinnedByIndex)
+    )
   ) {
     return new Set([...expectedAliases, ...rootAliases]);
   }
@@ -443,7 +482,8 @@ function assertSchemaRootMatchesVersion(version: string, root: string): Set<stri
           .join(', ');
   throw new Error(
     `External AdCP schema root for version "${version}" at ${root} does not match the requested version and ` +
-      `must contain only schema ids matching ${Array.from(expectedAliases).sort().join(', ')}; found ${found}.`
+      `must contain only schema ids matching ${Array.from(expectedAliases).sort().join(', ')}, or "latest" ids ` +
+      `pinned by a matching root index.json adcp_version; found ${found}.`
   );
 }
 
@@ -511,6 +551,25 @@ export function withExternalSchemaRoot<T>(version: string, root: string | undefi
   return scopedExternalSchemaRoots.run(next, fn);
 }
 
+/**
+ * Return whether validation for `version` currently resolves through a
+ * caller-supplied schema bundle rather than the SDK's packaged snapshot.
+ *
+ * Storyboard validation uses this to make an explicit external JSON Schema
+ * bundle authoritative. Without that distinction, the runner can validate a
+ * response successfully with the supplied bundle and then fail the same
+ * response against the older generated Zod schemas compiled into the SDK.
+ *
+ * @internal — not part of the public API surface; may change without a major bump.
+ */
+export function isExternalSchemaRootActive(version: string): boolean {
+  const key = resolveBundleKey(version);
+  const scopedRoot = scopedExternalSchemaRoots.getStore()?.get(key);
+  if (scopedRoot && existsSync(scopedRoot)) return true;
+  const registeredRoot = externalSchemaRoots.get(key);
+  return registeredRoot !== undefined && existsSync(registeredRoot);
+}
+
 function walkJsonFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];
   const out: string[] = [];
@@ -535,32 +594,33 @@ function loadJson(file: string): LoadedSchema {
  * tools (the property-list family), which rejects envelope fields like
  * `replayed` that aren't declared in the tool-specific body.
  *
- * Scope is deliberately narrow: only the top-level object, plus each
- * direct branch of a root-level `oneOf` / `anyOf` / `allOf`. Nested
- * bodies stay strict so response-side drift detection still catches
- * typos inside `Product`, `Package`, `MediaBuy` etc. Applied only to
- * response variants; request schemas stay strict so outgoing drift
- * fails at the edge.
+ * Scope is deliberately narrow: only the top-level composition chain and
+ * its `oneOf` / `anyOf` / `allOf` branches. Composition wrappers may be
+ * nested (for example, `buy_products` is an `allOf` alias around the shared
+ * commitment response's `oneOf`), so recurse through combinators without
+ * descending into `properties`. Nested bodies therefore stay strict and
+ * response-side drift detection still catches typos inside `Product`,
+ * `Package`, `MediaBuy`, etc. Applied only to response variants; request
+ * schemas stay strict so outgoing drift fails at the edge.
  */
 function relaxResponseRoot(schema: LoadedSchema): LoadedSchema {
-  const clone = { ...schema };
-  if (clone.additionalProperties === false) {
-    clone.additionalProperties = true;
-  }
-  for (const key of ['oneOf', 'anyOf', 'allOf'] as const) {
-    const branches = clone[key];
-    if (Array.isArray(branches)) {
-      clone[key] = branches.map(branch => {
-        if (!branch || typeof branch !== 'object') return branch;
-        const branchClone = { ...(branch as Record<string, unknown>) };
-        if (branchClone.additionalProperties === false) {
-          branchClone.additionalProperties = true;
-        }
-        return branchClone;
-      });
+  const relaxCompositionNode = (node: Record<string, unknown>): Record<string, unknown> => {
+    const clone = { ...node };
+    if (clone.additionalProperties === false) {
+      clone.additionalProperties = true;
     }
-  }
-  return clone;
+    for (const key of ['oneOf', 'anyOf', 'allOf'] as const) {
+      const branches = clone[key];
+      if (Array.isArray(branches)) {
+        clone[key] = branches.map(branch =>
+          branch && typeof branch === 'object' ? relaxCompositionNode(branch as Record<string, unknown>) : branch
+        );
+      }
+    }
+    return clone;
+  };
+
+  return relaxCompositionNode(schema) as LoadedSchema;
 }
 
 function getAjvRegisteredIds(ajv: Ajv): Set<string> {
@@ -612,7 +672,7 @@ function buildFileIndex(root: string): Map<string, string> {
   // for any domain that ships both.
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    if (entry.name === 'bundled' || entry.name === 'core') continue;
+    if (!isRuntimeSchemaDirectory(entry.name) || entry.name === 'core') continue;
     const domainDir = path.join(root, entry.name);
     for (const file of walkJsonFiles(domainDir)) {
       const base = path.basename(file, '.json');
@@ -660,6 +720,7 @@ function ensureInit(version: string): LoaderState {
     fileIndex: buildFileIndex(root),
     validators: new Map(),
     rawSchemas: new Map(),
+    entityPaths: new Map(),
     root,
     coreLoaded: false,
     version: key,
@@ -714,7 +775,7 @@ function ensureCoreLoaded(s: LoaderState): void {
   const registeredIds = getAjvRegisteredIds(s.ajv);
   for (const entry of readdirSync(s.root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    if (entry.name === 'bundled') continue;
+    if (!isRuntimeSchemaDirectory(entry.name)) continue;
     const abs = path.join(s.root, entry.name);
     for (const file of walkJsonFiles(abs)) {
       const responseDirection = responseToolFiles.get(file);
@@ -815,6 +876,11 @@ export function getSchemaValidatorByRef(
   const registeredIds = new Set<string>();
   for (const schemaFile of walkJsonFiles(s.root)) {
     if (schemaFile.includes(`${path.sep}bundled${path.sep}`)) continue;
+    if (
+      [...TRANSPORT_PROJECTION_DIRECTORIES].some(directory => schemaFile.includes(`${path.sep}${directory}${path.sep}`))
+    ) {
+      continue;
+    }
     if (schemaFile === file) continue;
     const schema = loadJson(schemaFile);
     if (typeof schema.$id === 'string' && !registeredIds.has(schema.$id)) {
@@ -912,6 +978,117 @@ export function hasSchemaBundle(version: string): boolean {
   }
 }
 
+const mcpToolSchemaCache = new Map<string, Readonly<Record<string, unknown>> | null>();
+const mcpToolSummaryCache = new Map<string, string | null>();
+
+function boundedMcpToolSummary(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const summary = value.trim();
+  if (!summary) return undefined;
+
+  const words = summary.split(/\s+/);
+  return words.length < 100 ? summary : `${words.slice(0, 99).join(' ')}…`;
+}
+
+/** Load an exact self-contained tool projection from an MCP manifest. @internal */
+export function getMcpToolSchema(
+  toolName: string,
+  direction: 'input' | 'output',
+  options: { profile?: string; protocolVersion?: string } = {},
+  version: string = ADCP_VERSION
+): Readonly<Record<string, unknown>> | undefined {
+  const root = resolveSchemaRoot(version);
+  const profile = options.profile ?? 'all';
+  const cacheKey = `${root}\u001f${options.protocolVersion ?? 'latest'}\u001f${profile}\u001f${direction}\u001f${toolName}`;
+  const cached = mcpToolSchemaCache.get(cacheKey);
+  if (cached !== undefined) return cached ?? undefined;
+
+  const mcpRoot = path.join(root, 'mcp');
+  if (!existsSync(mcpRoot)) {
+    mcpToolSchemaCache.set(cacheKey, null);
+    return undefined;
+  }
+  const protocolVersions = options.protocolVersion
+    ? [options.protocolVersion]
+    : readdirSync(mcpRoot, { withFileTypes: true })
+        .filter(entry => entry.isDirectory())
+        .map(entry => entry.name)
+        .sort()
+        .reverse();
+  for (const protocolVersion of protocolVersions) {
+    const manifestRoot =
+      profile === 'all'
+        ? path.resolve(mcpRoot, protocolVersion)
+        : path.resolve(mcpRoot, protocolVersion, 'profiles', profile);
+    const manifestFile = path.join(manifestRoot, 'manifest.json');
+    if (!existsSync(manifestFile)) continue;
+    const manifest = loadJson(manifestFile) as {
+      tools?: Record<string, { inputSchema?: unknown; outputSchema?: unknown }>;
+    };
+    const schemaRef = manifest.tools?.[toolName]?.[direction === 'input' ? 'inputSchema' : 'outputSchema'];
+    if (typeof schemaRef !== 'string') continue;
+    const schemaFile = path.resolve(manifestRoot, schemaRef);
+    if (!schemaFile.startsWith(`${manifestRoot}${path.sep}`) || !existsSync(schemaFile)) continue;
+    const schema = Object.freeze(loadJson(schemaFile));
+    mcpToolSchemaCache.set(cacheKey, schema);
+    return schema;
+  }
+  mcpToolSchemaCache.set(cacheKey, null);
+  return undefined;
+}
+
+/** Load the concise tool summary published by an exact MCP manifest. @internal */
+export function getMcpToolSummary(
+  toolName: string,
+  options: { profile?: string; protocolVersion?: string } = {},
+  version: string = ADCP_VERSION
+): string | undefined {
+  const root = resolveSchemaRoot(version);
+  const profile = options.profile ?? 'all';
+  const cacheKey = `${root}\u001f${options.protocolVersion ?? 'latest'}\u001f${profile}\u001f${toolName}`;
+  const cached = mcpToolSummaryCache.get(cacheKey);
+  if (cached !== undefined) return cached ?? undefined;
+
+  const mcpRoot = path.join(root, 'mcp');
+  if (!existsSync(mcpRoot)) {
+    mcpToolSummaryCache.set(cacheKey, null);
+    return undefined;
+  }
+  const protocolVersions = options.protocolVersion
+    ? [options.protocolVersion]
+    : readdirSync(mcpRoot, { withFileTypes: true })
+        .filter(entry => entry.isDirectory())
+        .map(entry => entry.name)
+        .sort()
+        .reverse();
+  for (const protocolVersion of protocolVersions) {
+    const manifestRoot =
+      profile === 'all'
+        ? path.resolve(mcpRoot, protocolVersion)
+        : path.resolve(mcpRoot, protocolVersion, 'profiles', profile);
+    const manifestFile = path.join(manifestRoot, 'manifest.json');
+    if (!existsSync(manifestFile)) continue;
+    const manifest = loadJson(manifestFile) as {
+      tools?: Record<string, { summary?: unknown }>;
+    };
+    const summary = boundedMcpToolSummary(manifest.tools?.[toolName]?.summary);
+    if (summary === undefined) continue;
+    mcpToolSummaryCache.set(cacheKey, summary);
+    return summary;
+  }
+  mcpToolSummaryCache.set(cacheKey, null);
+  return undefined;
+}
+
+/** Load the exact self-contained request projection from an MCP role profile. */
+export function getMcpProfileInputSchema(
+  toolName: string,
+  profile: string,
+  version: string = ADCP_VERSION
+): Readonly<Record<string, unknown>> | undefined {
+  return getMcpToolSchema(toolName, 'input', { profile }, version);
+}
+
 /**
  * Test hook: reset cached state. With no argument, clears every version's
  * loader state; with a version, clears only the bundle that version
@@ -919,6 +1096,8 @@ export function hasSchemaBundle(version: string): boolean {
  * bundle).
  */
 export function _resetValidationLoader(version?: string): void {
+  mcpToolSchemaCache.clear();
+  mcpToolSummaryCache.clear();
   if (version === undefined) {
     states.clear();
   } else {
@@ -971,6 +1150,162 @@ export function schemaAllowsTopLevelField(toolName: string, field: string, versi
     return props !== undefined && field in props;
   } catch {
     return true;
+  }
+}
+
+export interface SchemaEntityPath {
+  /** Property path from the tool request root. `*` addresses every array item. */
+  path: string[];
+  /** AdCP `x-entity` annotation found on the identity-bearing leaf. */
+  xEntity: string;
+}
+
+/**
+ * Return every request field carrying an `x-entity` annotation. Unlike the
+ * server hydration map this walks nested arrays/objects, because storyboard
+ * fixture handles commonly live at `packages[*].product_id` and
+ * `packages[*].pricing_option_id`.
+ *
+ * Missing schemas fail closed with an empty list: handle substitution must
+ * never guess from a field name alone.
+ */
+export function getRequestSchemaEntityPaths(
+  toolName: string,
+  version: string = ADCP_VERSION
+): readonly SchemaEntityPath[] {
+  try {
+    const s = ensureInit(version);
+    const cacheKey = `${toolName}::request`;
+    const cached = s.entityPaths.get(cacheKey);
+    if (cached) return cached;
+    const file = s.fileIndex.get(cacheKey);
+    if (!file) return [];
+
+    const root = loadJson(file) as Record<string, unknown>;
+    const found = new Map<string, SchemaEntityPath>();
+    const stack = new Set<string>();
+
+    const resolvePointer = (document: unknown, fragment: string): unknown => {
+      if (!fragment || fragment === '#') return document;
+      if (!fragment.startsWith('#/')) return undefined;
+      let current = document;
+      for (const encoded of fragment.slice(2).split('/')) {
+        if (!current || typeof current !== 'object') return undefined;
+        const key = encoded.replace(/~1/g, '/').replace(/~0/g, '~');
+        current = (current as Record<string, unknown>)[key];
+      }
+      return current;
+    };
+
+    const resolveRef = (
+      ref: string,
+      currentFile: string,
+      currentDocument: Record<string, unknown>
+    ): { node: unknown; file: string; document: Record<string, unknown>; key: string } | undefined => {
+      const hash = ref.indexOf('#');
+      const refPath = hash >= 0 ? ref.slice(0, hash) : ref;
+      const fragment = hash >= 0 ? ref.slice(hash) : '';
+      if (!refPath) {
+        return {
+          node: resolvePointer(currentDocument, fragment),
+          file: currentFile,
+          document: currentDocument,
+          key: `${currentFile}${fragment}`,
+        };
+      }
+
+      const schemaRelative = refPath.match(/\/schemas\/[^/]+\/(.+)$/)?.[1];
+      const candidates = [
+        schemaRelative ? path.join(s.root, schemaRelative) : undefined,
+        path.resolve(path.dirname(currentFile), refPath),
+      ].filter((candidate): candidate is string => candidate !== undefined);
+      let targetFile = candidates.find(candidate => existsSync(candidate));
+      // Standard AdCP refs encode their schema-root-relative file path, so
+      // they resolve without parsing every JSON file in the bundle. Build the
+      // expensive $id index only for an unusual ref that cannot be resolved
+      // by path.
+      if (!targetFile) {
+        if (!s.schemaIdFiles) {
+          const idToFile = new Map<string, string>();
+          for (const schemaFile of walkJsonFiles(s.root)) {
+            try {
+              const schema = loadJson(schemaFile);
+              if (typeof schema.$id === 'string') idToFile.set(schema.$id, schemaFile);
+            } catch {
+              // A malformed unrelated schema is not a usable ref target.
+            }
+          }
+          s.schemaIdFiles = idToFile;
+        }
+        targetFile = s.schemaIdFiles.get(refPath);
+      }
+      if (!targetFile) return undefined;
+      const document = loadJson(targetFile) as Record<string, unknown>;
+      return {
+        node: resolvePointer(document, fragment),
+        file: targetFile,
+        document,
+        key: `${targetFile}${fragment}`,
+      };
+    };
+
+    const walk = (
+      node: unknown,
+      propertyPath: string[],
+      currentFile: string,
+      currentDocument: Record<string, unknown>,
+      depth: number
+    ): void => {
+      if (!node || typeof node !== 'object' || depth > 48) return;
+      const obj = node as Record<string, unknown>;
+      if (typeof obj['x-entity'] === 'string' && propertyPath.length > 0) {
+        const entityPath = { path: [...propertyPath], xEntity: obj['x-entity'] as string };
+        found.set(`${entityPath.path.join('.')}\0${entityPath.xEntity}`, entityPath);
+      }
+
+      if (typeof obj.$ref === 'string') {
+        const target = resolveRef(obj.$ref, currentFile, currentDocument);
+        if (target && target.node !== undefined) {
+          const guard = `${target.key}\0${propertyPath.join('.')}`;
+          if (!stack.has(guard)) {
+            stack.add(guard);
+            walk(target.node, propertyPath, target.file, target.document, depth + 1);
+            stack.delete(guard);
+          }
+        }
+      }
+
+      const properties = obj.properties;
+      if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+        for (const [key, child] of Object.entries(properties as Record<string, unknown>)) {
+          walk(child, [...propertyPath, key], currentFile, currentDocument, depth + 1);
+        }
+      }
+      if (obj.items !== undefined) {
+        walk(obj.items, [...propertyPath, '*'], currentFile, currentDocument, depth + 1);
+      }
+      for (const keyword of ['allOf', 'anyOf', 'oneOf'] as const) {
+        const branches = obj[keyword];
+        if (Array.isArray(branches)) {
+          for (const branch of branches) walk(branch, propertyPath, currentFile, currentDocument, depth + 1);
+        }
+      }
+      for (const keyword of ['if', 'then', 'else', 'not'] as const) {
+        if (obj[keyword] !== undefined) {
+          walk(obj[keyword], propertyPath, currentFile, currentDocument, depth + 1);
+        }
+      }
+    };
+
+    walk(root, [], file, root, 0);
+    const result = [...found.values()].sort((a, b) => {
+      const byPath = a.path.join('.').localeCompare(b.path.join('.'));
+      return byPath || a.xEntity.localeCompare(b.xEntity);
+    });
+    s.entityPaths.set(cacheKey, result);
+    return result;
+  } catch {
+    return [];
   }
 }
 

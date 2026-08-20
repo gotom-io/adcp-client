@@ -309,6 +309,7 @@ describe('SingleAgentClient Request Validation', () => {
           audienceTargeting: false,
           propertyListFiltering: false,
           contentStandards: false,
+          canonicalCreatives: true,
         },
         extensions: [],
         _synthetic: false,
@@ -515,7 +516,7 @@ describe('SingleAgentClient Request Validation', () => {
     // non-strict parse by asserting the injected request actually reaches
     // dispatch — not just "didn't throw a validation error."
     for (const [toolName, invoke] of [
-      ['list_creative_formats', agent => agent.listCreativeFormats],
+      ['list_creative_formats', agent => agent.listCreativeFormatsLegacy],
       ['get_signals', agent => agent.getSignals],
       ['list_creatives', agent => agent.listCreatives],
     ]) {
@@ -754,7 +755,7 @@ describe('SingleAgentClient Request Validation', () => {
 
       await assert.doesNotReject(async () => {
         try {
-          await agent.buildCreative({
+          await agent.buildCreativeLegacy({
             target_format_id: { agent_url: 'https://test.example', id: 'format1' },
             context: {
               build_id: 'build-789',
@@ -910,6 +911,8 @@ describe('v3 partial-schema field stripping', () => {
     );
     const stripLog = result.debug_logs.find(log => log.details?.code === 'input_schema_field_stripped');
     assert.ok(stripLog, 'stripped fields should be surfaced in structured debug_logs');
+    assert.match(stripLog.message, /not declared by either the agent tool input schema or canonical AdCP schema/);
+    assert.doesNotMatch(stripLog.message, /not declared in agent tool input schema/);
     assert.strictEqual(stripLog.details.task, 'get_products');
     assert.deepStrictEqual(
       stripLog.details.fields,
@@ -1035,7 +1038,7 @@ describe('v3 partial-schema field stripping', () => {
           {
             creative_id: 'cr_1',
             name: 'Test Creative',
-            format_id: { agent_url: 'https://test.example', id: 'format1' },
+            format_kind: 'video_hosted',
             assets: {
               video: {
                 asset_type: 'video',
@@ -1080,6 +1083,7 @@ describe('v3 partial-schema field stripping', () => {
           audienceTargeting: false,
           propertyListFiltering: false,
           contentStandards: false,
+          canonicalCreatives: true,
         },
         extensions: [],
         _synthetic: false,
@@ -1282,13 +1286,16 @@ describe('strict request validation against v2 servers', () => {
 
     try {
       await assert.doesNotReject(
-        agent.syncCreatives({
+        agent.syncCreativesLegacy({
           account: { account_id: 'acct-1' },
           creatives: [
             {
               creative_id: 'cre-1',
               name: 'Test Creative',
-              format_id: { agent_url: 'https://test.example', id: 'format1' },
+              format_id: {
+                agent_url: 'https://creative.adcontextprotocol.org/',
+                id: 'video_standard_30s',
+              },
               assets: {
                 video: {
                   asset_type: 'video',
@@ -1300,6 +1307,10 @@ describe('strict request validation against v2 servers', () => {
               },
             },
           ],
+          assignments: [
+            { creative_id: 'cre-1', package_id: 'pkg-1' },
+            { creative_id: 'cre-1', package_id: 'pkg-2' },
+          ],
         }),
         err => err.message?.includes('Validation failed for field')
       );
@@ -1310,6 +1321,11 @@ describe('strict request validation against v2 servers', () => {
     const call = capturedCalls.find(c => c.toolName === 'sync_creatives');
     assert.ok(call, 'sync_creatives should have reached the protocol layer');
     assert.strictEqual(call.args.account, undefined, 'account is stripped by the v2 adapter');
+    assert.deepStrictEqual(
+      call.args.assignments,
+      { 'cre-1': ['pkg-1', 'pkg-2'] },
+      'v3 assignment edges are projected to the v2.5 creative-keyed mapping'
+    );
     assert.ok(Array.isArray(call.args.creatives) && call.args.creatives.length === 1, 'creatives are preserved');
     // Manifest is preserved (v2.5 uses the same role-keyed shape as v3),
     // but the inner v3 `asset_type` discriminator is stripped — v2.5
@@ -1422,5 +1438,62 @@ describe('strict request validation against v2 servers', () => {
     assert.ok(call, 'get_products should have reached the protocol layer');
     assert.strictEqual(call.args.buying_mode, 'brief', 'buying_mode is preserved for v3');
     assert.deepStrictEqual(call.args.brand, { domain: 'example.com' }, 'brand is preserved for v3');
+  });
+
+  test('request-scoped capabilities override a stale cache during version adaptation', async () => {
+    const mockMCPAgent = {
+      id: 'scoped-v31-agent',
+      name: 'Scoped AdCP 3.1 Agent',
+      agent_uri: 'https://agents.example.com/mcp',
+      protocol: 'mcp',
+    };
+    const client = new AdCPClient([mockMCPAgent]);
+    const agent = client.agent(mockMCPAgent.id);
+    const inner = agent.client;
+
+    inner.discoveredEndpoint = mockMCPAgent.agent_uri;
+    inner.cachedCapabilities = {
+      version: 'v3',
+      majorVersions: [3],
+      supportedVersions: ['3.0'],
+      protocols: ['media_buy'],
+      features: {},
+      extensions: [],
+      _synthetic: false,
+    };
+    inner.getCapabilities = async () => ({
+      version: 'v3',
+      majorVersions: [3],
+      supportedVersions: ['3.1'],
+      protocols: ['media_buy'],
+      features: {},
+      extensions: [],
+      _synthetic: false,
+    });
+
+    const capturedCalls = [];
+    const originalCallTool = ProtocolClient.callTool;
+    ProtocolClient.callTool = async (_agentConfig, toolName, args) => {
+      capturedCalls.push({ toolName, args });
+      return { status: 'completed', products: [] };
+    };
+
+    try {
+      await agent.getProductsLegacy({
+        buying_mode: 'brief',
+        brief: 'Premium ad placements',
+        filters: { pricing_currencies: ['USD'] },
+      });
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+    }
+
+    const call = capturedCalls.find(c => c.toolName === 'get_products');
+    assert.ok(call, 'get_products should have reached the protocol layer');
+    assert.deepStrictEqual(
+      call.args.filters?.pricing_currencies,
+      ['USD'],
+      'the stale 3.0 cache must not strip fields supported by the request-scoped 3.1 seller'
+    );
   });
 });

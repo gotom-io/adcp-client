@@ -1,8 +1,6 @@
 import type {
   ResolvedBrand,
-  BrandHierarchyResolution,
-  BrandHierarchyBulkResolution,
-  ResolveBrandHierarchyOptions,
+  LookupBrandOptions,
   ResolvedProperty,
   PropertyInfo,
   RegistryClientConfig,
@@ -96,9 +94,7 @@ import type { PropertyType } from '../discovery/types';
 
 export type {
   ResolvedBrand,
-  BrandHierarchyResolution,
-  BrandHierarchyBulkResolution,
-  ResolveBrandHierarchyOptions,
+  LookupBrandOptions,
   ResolvedProperty,
   PropertyInfo,
   RegistryClientConfig,
@@ -284,10 +280,89 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_LARGE_RESPONSE_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const ERROR_BODY_PREVIEW_CHARS = 200;
+const MAX_BRAND_BULK_DOMAINS = 25;
 const MAX_BULK_DOMAINS = 100;
-const MAX_BRAND_HIERARCHY_CACHE_ENTRIES = 1000;
 const MAX_CHECK_DOMAINS = 10000; // per OpenAPI spec maxItems
 const COMMUNITY_MIRROR_PLATFORM_RE = /^[a-z0-9_-]{1,64}$/;
+const MAX_REGISTRY_ERROR_DETAILS_BYTES = 64 * 1024;
+const MAX_RETRY_AFTER_MS = 2_147_483_647;
+
+/** A non-success HTTP response returned by the AdCP Registry. */
+export class RegistryRequestError extends Error {
+  readonly status: number;
+  readonly method: string;
+  readonly retryAfterMs?: number;
+  /** Bounded, untrusted JSON returned by the remote registry. */
+  readonly details?: Record<string, unknown>;
+
+  constructor(
+    status: number,
+    message: string,
+    options: {
+      method: string;
+      retryAfterMs?: number;
+      details?: Record<string, unknown>;
+      cause?: unknown;
+    }
+  ) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = 'RegistryRequestError';
+    this.status = status;
+    this.method = options.method;
+    this.retryAfterMs = options.retryAfterMs;
+    this.details = options.details;
+  }
+}
+
+/** Cross-realm and duplicate-bundle-safe guard for registry HTTP errors. */
+export function isRegistryRequestError(error: unknown): error is RegistryRequestError {
+  if (error instanceof RegistryRequestError) return true;
+  if (error === null || typeof error !== 'object' || Array.isArray(error)) return false;
+  const candidate = error as Record<string, unknown>;
+  return (
+    candidate.name === 'RegistryRequestError' &&
+    typeof candidate.message === 'string' &&
+    typeof candidate.status === 'number' &&
+    Number.isFinite(candidate.status) &&
+    typeof candidate.method === 'string'
+  );
+}
+
+function parseRegistryErrorDetails(text: string): Record<string, unknown> | undefined {
+  if (new TextEncoder().encode(text).byteLength > MAX_REGISTRY_ERROR_DETAILS_BYTES) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedRetryAfterMsFromSeconds(seconds: number): number | undefined {
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  const milliseconds = seconds * 1000;
+  if (!Number.isFinite(milliseconds)) return MAX_RETRY_AFTER_MS;
+  return Math.min(milliseconds, MAX_RETRY_AFTER_MS);
+}
+
+function retryAfterMsFromDetails(details: unknown): number | undefined {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return undefined;
+  const record = details as Record<string, unknown>;
+  if (typeof record.retryAfterMs === 'number' && Number.isFinite(record.retryAfterMs) && record.retryAfterMs >= 0) {
+    return Math.min(record.retryAfterMs, MAX_RETRY_AFTER_MS);
+  }
+  const seconds = record.retryAfter ?? record.retry_after;
+  return typeof seconds === 'number' ? boundedRetryAfterMsFromSeconds(seconds) : undefined;
+}
+
+function retryAfterMsFromHeader(value: string | null): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || !/^\d+$/.test(trimmed)) return undefined;
+  const seconds = Number(trimmed);
+  return Number.isFinite(seconds) ? boundedRetryAfterMsFromSeconds(seconds) : MAX_RETRY_AFTER_MS;
+}
 
 /**
  * Build a catalog-only community mirror adagents.json descriptor.
@@ -350,10 +425,6 @@ export class RegistryClient {
   private readonly hasCustomMaxBodyBytes: boolean;
   private readonly redirect: 'follow' | 'error';
   private readonly fetchImpl: typeof globalThis.fetch;
-  private readonly brandHierarchyCache = new Map<
-    string,
-    { expiresAt: number; value: BrandHierarchyResolution | null }
-  >();
 
   constructor(config?: RegistryClientConfig) {
     this.baseUrl = (config?.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
@@ -374,11 +445,13 @@ export class RegistryClient {
    * Resolved registry data may include `brand_manifest` and `source` fields
    * suitable for downstream request construction. Treat all registry-supplied
    * strings as untrusted input and sanitize before injecting them into LLM
-   * prompts, instructions, or tool-planning context.
+   * prompts, instructions, or tool-planning context. Pass `{ fresh: true }` to
+   * bypass the registry cache and attempt a live origin read.
    */
-  async lookupBrand(domain: string): Promise<ResolvedBrand | null> {
+  async lookupBrand(domain: string, options?: LookupBrandOptions): Promise<ResolvedBrand | null> {
     if (!domain?.trim()) throw new Error('domain is required');
-    const url = `${this.baseUrl}/api/brands/resolve?domain=${encodeURIComponent(domain)}`;
+    const fresh = options?.fresh ? '&fresh=true' : '';
+    const url = `${this.baseUrl}/api/brands/resolve?domain=${encodeURIComponent(domain)}${fresh}`;
     return this.get(url, { nullOn404: true });
   }
 
@@ -390,105 +463,14 @@ export class RegistryClient {
     return this.get(url);
   }
 
-  /** Bulk resolve domains to their canonical brand identities (max 100). */
+  /** Bulk resolve domains to their canonical brand identities (max 25). */
   async lookupBrands(domains: string[]): Promise<Record<string, ResolvedBrand | null>> {
     if (domains.length === 0) return {};
-    if (domains.length > MAX_BULK_DOMAINS) {
-      throw new Error(`Cannot resolve more than ${MAX_BULK_DOMAINS} domains at once (got ${domains.length})`);
+    if (domains.length > MAX_BRAND_BULK_DOMAINS) {
+      throw new Error(`Cannot resolve more than ${MAX_BRAND_BULK_DOMAINS} domains at once (got ${domains.length})`);
     }
     const data = await this.post(`${this.baseUrl}/api/brands/resolve/bulk`, { domains });
     return data.results;
-  }
-
-  /**
-   * Resolve a domain to its ordered corporate brand hierarchy.
-   *
-   * The returned `chain` is ordered from the resolved brand itself through each
-   * parent to the house brand. A 404 from the registry returns `null`.
-   */
-  async resolveBrandHierarchy(
-    domain: string,
-    options?: ResolveBrandHierarchyOptions
-  ): Promise<BrandHierarchyResolution | null> {
-    const normalizedDomain = this.normalizeBrandHierarchyDomain(domain);
-    const ttlMs = this.resolveBrandHierarchyCacheTtlMs(options);
-    const cacheKey = this.brandHierarchyCacheKey(normalizedDomain);
-    const cached = this.getCachedBrandHierarchy(cacheKey, options, ttlMs);
-    if (cached !== undefined) return cached;
-
-    const params = new URLSearchParams({ domain: normalizedDomain });
-    if (options?.fresh) params.set('fresh', 'true');
-    const value = await this.get<BrandHierarchyResolution | null>(`${this.baseUrl}/api/brands/hierarchy?${params}`, {
-      nullOn404: true,
-    });
-    this.setCachedBrandHierarchy(cacheKey, value, options, ttlMs);
-    return this.cloneBrandHierarchy(value);
-  }
-
-  /**
-   * Resolve up to 100 domains to ordered corporate brand hierarchies.
-   *
-   * Results are keyed by the caller-supplied domain. Unknown domains map to
-   * `null`, matching `lookupBrands()`.
-   */
-  async resolveBrandHierarchies(
-    domains: string[],
-    options?: ResolveBrandHierarchyOptions
-  ): Promise<Record<string, BrandHierarchyResolution | null>> {
-    if (domains.length === 0) return {};
-    if (domains.length > MAX_BULK_DOMAINS) {
-      throw new Error(`Cannot resolve more than ${MAX_BULK_DOMAINS} domains at once (got ${domains.length})`);
-    }
-    const normalizedDomains = domains.map(domain => this.normalizeBrandHierarchyDomain(domain));
-    const ttlMs = this.resolveBrandHierarchyCacheTtlMs(options);
-
-    const results: Record<string, BrandHierarchyResolution | null> = Object.create(null);
-    const unresolved: string[] = [];
-    const unresolvedInputsByKey = new Map<string, string[]>();
-
-    for (let i = 0; i < domains.length; i++) {
-      const domain = domains[i]!;
-      const normalizedDomain = normalizedDomains[i]!;
-      const cacheKey = this.brandHierarchyCacheKey(normalizedDomain);
-      const cached = this.getCachedBrandHierarchy(cacheKey, options, ttlMs);
-      if (cached !== undefined) {
-        results[domain] = cached;
-        continue;
-      }
-      const inputs = unresolvedInputsByKey.get(cacheKey);
-      if (inputs) {
-        inputs.push(domain);
-      } else {
-        unresolved.push(normalizedDomain);
-        unresolvedInputsByKey.set(cacheKey, [domain]);
-      }
-    }
-
-    if (unresolved.length > 0) {
-      const body: { domains: string[]; fresh?: boolean } = { domains: unresolved };
-      if (options?.fresh) body.fresh = true;
-      const data = await this.post<BrandHierarchyBulkResolution>(`${this.baseUrl}/api/brands/hierarchy/bulk`, body);
-      if (!data || typeof data !== 'object' || !data.results || typeof data.results !== 'object') {
-        throw new Error('Registry hierarchy bulk response missing results');
-      }
-      const matchedKeys = new Set<string>();
-      for (const [domain, value] of Object.entries(data.results)) {
-        const cacheKey = this.brandHierarchyCacheKey(domain);
-        const inputs = unresolvedInputsByKey.get(cacheKey);
-        if (!inputs) continue;
-        matchedKeys.add(cacheKey);
-        for (const input of inputs) {
-          results[input] = this.cloneBrandHierarchy(value);
-        }
-        this.setCachedBrandHierarchy(cacheKey, value, options, ttlMs);
-      }
-      for (const [cacheKey, inputs] of unresolvedInputsByKey.entries()) {
-        if (matchedKeys.has(cacheKey)) continue;
-        throw new Error(`Registry hierarchy bulk response missing result for ${inputs[0]}`);
-      }
-    }
-
-    return results;
   }
 
   /** List brands in the registry with optional search and pagination. */
@@ -1236,7 +1218,7 @@ export class RegistryClient {
       return { events: [], cursor: null, has_more: false, cursor_expired: true };
     }
     if (!res.ok) {
-      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+      throw this.requestError(res, text, 'GET');
     }
     return this.parseJson(text);
   }
@@ -1394,7 +1376,7 @@ export class RegistryClient {
     const { res, text } = await this.requestText(url, { headers: this.getHeaders() });
     if (opts?.nullOn404 && res.status === 404) return null as T;
     if (!res.ok) {
-      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+      throw this.requestError(res, text, 'GET');
     }
     return this.parseJson(text);
   }
@@ -1406,7 +1388,7 @@ export class RegistryClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+      throw this.requestError(res, text, 'POST');
     }
     return this.parseJson(text);
   }
@@ -1418,7 +1400,7 @@ export class RegistryClient {
       body,
     });
     if (!res.ok) {
-      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+      throw this.requestError(res, text, 'POST');
     }
     return this.parseJson(text);
   }
@@ -1430,7 +1412,7 @@ export class RegistryClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+      throw this.requestError(res, text, 'PUT');
     }
     return this.parseJson(text);
   }
@@ -1441,7 +1423,7 @@ export class RegistryClient {
       headers: this.getHeaders(),
     });
     if (!res.ok) {
-      throw new Error(`Registry request failed (${res.status}): ${this.preview(text)}`);
+      throw this.requestError(res, text, 'DELETE');
     }
     return this.parseJson(text);
   }
@@ -1508,68 +1490,6 @@ export class RegistryClient {
       throw new Error('platform must match ^[a-z0-9_-]{1,64}$');
     }
     return normalizedPlatform;
-  }
-
-  private brandHierarchyCacheKey(domain: string): string {
-    return domain.trim().toLowerCase();
-  }
-
-  private normalizeBrandHierarchyDomain(domain: string): string {
-    const normalized = domain?.trim();
-    if (!normalized) throw new Error('domain is required');
-    if (normalized.length > 253) throw new Error('domain must be 253 characters or fewer');
-    return normalized;
-  }
-
-  private resolveBrandHierarchyCacheTtlMs(options: ResolveBrandHierarchyOptions | undefined): number | undefined {
-    if (options?.ttlMs == null) return undefined;
-    if (!Number.isFinite(options.ttlMs) || options.ttlMs < 0) {
-      throw new Error('ttlMs must be a finite non-negative number');
-    }
-    return options.ttlMs;
-  }
-
-  private getCachedBrandHierarchy(
-    cacheKey: string,
-    options: ResolveBrandHierarchyOptions | undefined,
-    ttlMs: number | undefined
-  ): BrandHierarchyResolution | null | undefined {
-    if (options?.fresh || ttlMs == null || ttlMs === 0) return undefined;
-    const cached = this.brandHierarchyCache.get(cacheKey);
-    if (!cached) return undefined;
-    if (cached.expiresAt <= Date.now()) {
-      this.brandHierarchyCache.delete(cacheKey);
-      return undefined;
-    }
-    this.brandHierarchyCache.delete(cacheKey);
-    this.brandHierarchyCache.set(cacheKey, cached);
-    return this.cloneBrandHierarchy(cached.value);
-  }
-
-  private setCachedBrandHierarchy(
-    cacheKey: string,
-    value: BrandHierarchyResolution | null,
-    options: ResolveBrandHierarchyOptions | undefined,
-    ttlMs: number | undefined
-  ): void {
-    if (ttlMs == null || ttlMs === 0) {
-      if (options?.fresh) this.brandHierarchyCache.delete(cacheKey);
-      return;
-    }
-    this.brandHierarchyCache.delete(cacheKey);
-    this.brandHierarchyCache.set(cacheKey, {
-      expiresAt: Date.now() + ttlMs,
-      value: this.cloneBrandHierarchy(value),
-    });
-    while (this.brandHierarchyCache.size > MAX_BRAND_HIERARCHY_CACHE_ENTRIES) {
-      const oldest = this.brandHierarchyCache.keys().next().value;
-      if (oldest == null) break;
-      this.brandHierarchyCache.delete(oldest);
-    }
-  }
-
-  private cloneBrandHierarchy(value: BrandHierarchyResolution | null): BrandHierarchyResolution | null {
-    return value == null ? null : { ...value, chain: value.chain.map(brand => ({ ...brand })) };
   }
 
   private resolveCommunityMirrorPublishArgs(
@@ -1647,7 +1567,13 @@ export class RegistryClient {
         redirect: this.redirect,
         signal: controller.signal,
       });
-      const text = await this.readBody(res, this.bodyLimitForUrl(url));
+      let text: string;
+      try {
+        text = await this.readBody(res, this.bodyLimitForUrl(url));
+      } catch (error) {
+        if (!res.ok) throw this.requestError(res, '', init.method ?? 'GET', error);
+        throw error;
+      }
       return { res, text };
     });
     requestPromise.catch(() => {});
@@ -1766,6 +1692,18 @@ export class RegistryClient {
     return text
       .slice(0, ERROR_BODY_PREVIEW_CHARS)
       .replace(/[\u0000-\u001f\u007f]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  }
+
+  private requestError(res: Response, text: string, method: string, cause?: unknown): RegistryRequestError {
+    const details = parseRegistryErrorDetails(text);
+    const retryAfterMs = retryAfterMsFromHeader(res.headers.get('retry-after')) ?? retryAfterMsFromDetails(details);
+    const preview = cause === undefined ? this.preview(text) : '[response body unavailable]';
+    return new RegistryRequestError(res.status, `Registry request failed (${res.status}): ${preview}`, {
+      method,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      ...(details !== undefined ? { details } : {}),
+      ...(cause !== undefined ? { cause } : {}),
+    });
   }
 
   private buildParams(options?: ListOptions & { source?: string }): string {

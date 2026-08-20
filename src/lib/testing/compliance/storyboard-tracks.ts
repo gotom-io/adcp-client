@@ -8,7 +8,33 @@
 
 import type { TestResult, TestStepResult, AgentProfile } from '../types';
 import type { ComplianceTrack, TrackResult, TrackStatus, AdvisoryObservation } from './types';
-import type { StoryboardResult, StoryboardStepResult } from '../storyboard/types';
+import type { AssertionResult, StoryboardResult, StoryboardStepResult } from '../storyboard/types';
+
+export interface DetachedAssertionFailure {
+  assertion: AssertionResult;
+  owningStep?: StoryboardStepResult;
+}
+
+/** Assertion failures that are not represented by a counted failed step. */
+export function collectDetachedAssertionFailures(result: StoryboardResult): DetachedAssertionFailure[] {
+  const failures: DetachedAssertionFailure[] = [];
+  for (const assertion of result.assertions ?? []) {
+    if (assertion.passed) continue;
+    if (assertion.scope === 'storyboard') {
+      failures.push({ assertion });
+      continue;
+    }
+    const assertionPhases =
+      assertion.pass_index === undefined
+        ? result.phases
+        : (result.passes?.find(pass => pass.pass_index === assertion.pass_index)?.phases ?? []);
+    const owningStep = assertionPhases.flatMap(phase => phase.steps).find(step => step.step_id === assertion.step_id);
+    if (owningStep?.skipped === true) {
+      failures.push({ assertion, owningStep });
+    }
+  }
+  return failures;
+}
 
 /** Labels for each compliance track. */
 export const TRACK_LABELS: Record<ComplianceTrack, string> = {
@@ -24,6 +50,7 @@ export const TRACK_LABELS: Record<ComplianceTrack, string> = {
   audiences: 'Audience Management',
   error_handling: 'Error Handling',
   brand: 'Brand Rights',
+  security_transport: 'Transport Security',
 };
 
 /**
@@ -56,6 +83,38 @@ export function mapStoryboardResultsToTrackResult(
 
   for (const sbResult of storyboardResults) {
     totalDuration += sbResult.total_duration_ms;
+    const assertionFailures = collectDetachedAssertionFailures(sbResult);
+
+    for (const { assertion, owningStep } of assertionFailures) {
+      observations.push({
+        category: 'error_compliance',
+        severity: 'error',
+        track,
+        message: `A ${assertion.scope}-scoped compliance assertion failed.`,
+        evidence: {
+          assertion_id: assertion.assertion_id,
+          description: assertion.description,
+          scope: assertion.scope,
+          ...(assertion.error !== undefined && { error: assertion.error }),
+          ...(assertion.hint !== undefined && { hint: assertion.hint }),
+          ...(assertion.observation_count !== undefined && { observation_count: assertion.observation_count }),
+          ...(assertion.status !== undefined && { status: assertion.status }),
+          ...(assertion.pass_index !== undefined && { pass_index: assertion.pass_index }),
+        },
+        source: owningStep
+          ? {
+              kind: 'storyboard_step',
+              code: 'storyboard-assertion-failed',
+              storyboard_id: sbResult.storyboard_id,
+              step_id: owningStep.step_id,
+            }
+          : {
+              kind: 'storyboard',
+              code: 'storyboard-assertion-failed',
+              storyboard_id: sbResult.storyboard_id,
+            },
+      });
+    }
 
     for (const phase of sbResult.phases) {
       const steps: TestStepResult[] = phase.steps.map(stepResult => mapStepToTestStep(stepResult));
@@ -73,6 +132,29 @@ export function mapStoryboardResultsToTrackResult(
       };
 
       scenarios.push(testResult);
+    }
+
+    // Phase scenarios retain their own verdicts. When the authoritative
+    // storyboard verdict fails despite every phase passing (for example, an
+    // onEnd assertion failure), add one storyboard-level scenario instead of
+    // falsely attributing the same failure to every phase.
+    if (
+      !sbResult.overall_passed &&
+      (sbResult.passed_count > 0 || assertionFailures.length > 0) &&
+      sbResult.phases.every(phase => phase.passed)
+    ) {
+      scenarios.push({
+        agent_url: sbResult.agent_url,
+        scenario: `${sbResult.storyboard_id}/storyboard` as any,
+        overall_passed: false,
+        steps: [],
+        summary:
+          assertionFailures.length > 0
+            ? `${sbResult.storyboard_title}: ${assertionFailures.length} assertion(s) failed`
+            : `${sbResult.storyboard_title}: storyboard-level verdict failed`,
+        total_duration_ms: 0,
+        tested_at: sbResult.tested_at,
+      });
     }
   }
 
@@ -143,6 +225,7 @@ function skipReasonLabel(reason: string | undefined): string | undefined {
     prerequisite_failed: 'Skipped: a prerequisite did not pass',
     missing_tool: 'Skipped: agent did not advertise the required tool',
     missing_test_controller: 'Not testable: requires comply_test_controller',
+    fixture_unavailable: 'Not testable: the runner fixture cannot satisfy the seller-declared contract',
     unsatisfied_contract: 'Skipped: test-kit contract is out of scope',
     peer_branch_taken: 'Skipped: a peer branch in the same any_of branch set already contributed the aggregation flag',
   };
@@ -163,10 +246,22 @@ function computeTrackStatus(results: StoryboardResult[]): TrackStatus {
   const totalFailed = results.reduce((sum, r) => sum + r.failed_count, 0);
   const totalSkipped = results.reduce((sum, r) => sum + r.skipped_count, 0);
   const totalSteps = totalPassed + totalFailed + totalSkipped;
+  const hasAssertionFailure = results.some(result => collectDetachedAssertionFailures(result).length > 0);
 
   if (totalSteps === 0) return 'skip';
-  if (totalSteps === totalSkipped) return 'skip';
   if (totalFailed > 0) return totalPassed === 0 ? 'fail' : 'partial';
+  if (hasAssertionFailure) return totalPassed === 0 ? 'fail' : 'partial';
+  if (totalSteps === totalSkipped) return 'skip';
+  // Storyboard-scoped assertions are not steps, so their failures correctly
+  // leave failed_count at zero. The runner's overall verdict is authoritative:
+  // some steps passed, but the cross-step invariant did not.
+  if (results.some(result => !result.overall_passed)) return 'partial';
+  const hasFixtureUnavailable = results.some(result =>
+    (result.passes?.flatMap(pass => pass.phases) ?? result.phases).some(phase =>
+      phase.steps.some(step => step.skip?.reason === 'fixture_unavailable')
+    )
+  );
+  if (hasFixtureUnavailable) return 'partial';
 
   // No failures. Demote to `silent` when every observation-bearing
   // invariant record reports zero observations. Step-level passes alone

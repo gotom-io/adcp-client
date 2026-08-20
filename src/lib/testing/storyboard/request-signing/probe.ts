@@ -1,17 +1,55 @@
 import { type LookupAddress, type LookupOptions } from 'dns';
 import { lookup as dnsLookup } from 'dns/promises';
 import { Agent, fetch as undiciFetch } from 'undici';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { isAlwaysBlocked, isPrivateIp } from '../probes';
 import type { SignedHttpRequest } from './builder';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_BODY_BYTES = 64 * 1024;
 
+function combineAbortSignals(first: AbortSignal, second: AbortSignal): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const sources = [first, second];
+  const listeners = new Map<AbortSignal, () => void>();
+  const dispose = () => {
+    for (const [signal, listener] of listeners) signal.removeEventListener('abort', listener);
+    listeners.clear();
+  };
+  for (const signal of sources) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    const listener = () => controller.abort(signal.reason);
+    listeners.set(signal, listener);
+    signal.addEventListener('abort', listener, { once: true });
+  }
+  if (controller.signal.aborted) dispose();
+  else controller.signal.addEventListener('abort', dispose, { once: true });
+  return { signal: controller.signal, dispose };
+}
+
 export interface ProbeOptions {
   /** Allow http:// and private-IP destinations. Default false. */
   allowPrivateIp?: boolean;
   /** Per-call timeout override (ms). */
   timeoutMs?: number;
+  /**
+   * MCP session ID to attach as `Mcp-Session-Id` on every outgoing request,
+   * injected after signing. `Mcp-Session-Id` is not a covered component per
+   * RFC 9421, so the signature remains valid even when the header is appended
+   * post-signing. Required by streamable-HTTP servers that mandate session
+   * state from a prior `initialize` handshake. Omit (or pass `undefined`) for
+   * stateless servers; pass `''` to explicitly skip injection when you know the
+   * server is session-less.
+   */
+  mcpSessionId?: string;
+  /** Negotiated MCP version to attach after signing. */
+  mcpProtocolVersion?: string;
+  /** Caller cancellation signal, composed with the per-probe timeout. */
+  signal?: AbortSignal;
 }
 
 export interface ProbeResult {
@@ -25,6 +63,26 @@ export interface ProbeResult {
   /** Network-level error; non-undefined means the request didn't complete. */
   error?: string;
   duration_ms: number;
+}
+
+/**
+ * Attach an MCP session header after request signing has completed.
+ *
+ * Keeping this operation separate from the request builder makes the ordering
+ * explicit: neither `Signature-Input` nor `Signature` is recomputed, so the
+ * session identifier can never enter the covered-component set.
+ */
+export function attachMcpSessionHeader(
+  signedHeaders: Record<string, string>,
+  mcpSessionId: string | undefined,
+  mcpProtocolVersion?: string
+): Record<string, string> {
+  if (!mcpSessionId && !mcpProtocolVersion) return signedHeaders;
+  return {
+    ...signedHeaders,
+    ...(mcpSessionId ? { 'Mcp-Session-Id': mcpSessionId } : {}),
+    ...(mcpProtocolVersion ? { 'MCP-Protocol-Version': mcpProtocolVersion } : {}),
+  };
 }
 
 /**
@@ -118,14 +176,21 @@ export async function probeSignedRequest(signed: SignedHttpRequest, options: Pro
     },
   });
 
+  // Attach Mcp-Session-Id after the signed headers so the header is not a
+  // covered component — the signature over the signed body/headers is already
+  // computed, and the session ID is orthogonal to the signature's integrity.
+  const outHeaders = attachMcpSessionHeader(signed.headers, options.mcpSessionId, options.mcpProtocolVersion);
+
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeout);
+  const combinedSignal = options.signal ? combineAbortSignals(options.signal, ac.signal) : undefined;
+  const signal = combinedSignal?.signal ?? ac.signal;
   try {
     const res = await undiciFetch(signed.url, {
       method: signed.method,
       redirect: 'manual',
-      signal: ac.signal,
-      headers: signed.headers,
+      signal,
+      headers: outHeaders,
       body: signed.body,
       dispatcher,
     });
@@ -174,8 +239,108 @@ export async function probeSignedRequest(signed: SignedHttpRequest, options: Pro
     return result;
   } finally {
     clearTimeout(timer);
+    combinedSignal?.dispose();
     result.duration_ms = Date.now() - start;
     await dispatcher.close().catch(() => {});
+  }
+}
+
+/**
+ * Perform the MCP Streamable HTTP `initialize` handshake and return the
+ * `Mcp-Session-Id` header value from the response. Call this once before
+ * dispatching signed conformance vectors so that each subsequent
+ * `tools/call` probe can carry the session ID without disturbing the
+ * covered-component set — `Mcp-Session-Id` is not a covered component per
+ * RFC 9421, so appending it after signing leaves signatures intact.
+ *
+ * Returns `{ sessionId: undefined }` when the server responds without a
+ * session header (stateless server, or one that does not require sessions).
+ * Returns `{ sessionId: undefined, error: '...' }` on network failure —
+ * callers that auto-initialize should propagate or surface this as a
+ * grading pre-condition failure rather than running all vectors session-less
+ * and watching them cascade to 400.
+ */
+export async function initializeMcpSession(
+  mcpUrl: string,
+  options: ProbeOptions = {},
+  /**
+   * Extra headers for the initialize handshake only — typically the agent's
+   * `authorization`. The handshake authenticates like any ordinary MCP client
+   * request; the signed vectors that follow stay bearer-less by design (the
+   * signature is their authentication), so this never leaks into vector
+   * requests.
+   */
+  extraHeaders: Record<string, string> = {}
+): Promise<{ sessionId: string | undefined; protocolVersion?: string; error?: string }> {
+  // The grader needs raw, post-signing control over subsequent tools/call
+  // requests, but session establishment must still follow the official MCP
+  // lifecycle. Adapt the hardened, DNS-pinned probe into the fetch surface
+  // accepted by the official SDK transport.
+  const lifecycleFetch: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    // Streamable HTTP's listening GET is optional. The signing grader never
+    // consumes server-initiated messages, so tell the official transport that
+    // this client does not open that stream. Buffering an SSE response through
+    // probeSignedRequest would otherwise hold one authenticated connection per
+    // vector until timeout.
+    if (request.method === 'GET') {
+      return new Response(null, { status: 405 });
+    }
+    const headers: Record<string, string> = {};
+    request.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    const body = request.method === 'GET' || request.method === 'HEAD' ? undefined : await request.clone().text();
+    const combinedSignal = options.signal ? combineAbortSignals(options.signal, request.signal) : undefined;
+    let result: ProbeResult;
+    try {
+      result = await probeSignedRequest(
+        {
+          method: request.method,
+          url: request.url,
+          headers,
+          ...(body !== undefined ? { body } : {}),
+        },
+        {
+          ...options,
+          signal: combinedSignal?.signal ?? request.signal,
+        }
+      );
+    } finally {
+      combinedSignal?.dispose();
+    }
+    if (result.error) throw new Error(result.error);
+
+    const responseBody =
+      result.status === 204 || result.status === 205 || result.body === null
+        ? null
+        : typeof result.body === 'string'
+          ? result.body
+          : JSON.stringify(result.body);
+    return new Response(responseBody, { status: result.status, headers: result.headers });
+  };
+
+  const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
+    requestInit: {
+      headers: extraHeaders,
+      redirect: 'manual',
+    },
+    fetch: lifecycleFetch,
+  });
+  const client = new Client({ name: 'adcp-signing-grader', version: '1.0.0' });
+  try {
+    await client.connect(transport);
+    return {
+      sessionId: transport.sessionId,
+      protocolVersion: transport.protocolVersion,
+    };
+  } catch (err) {
+    return {
+      sessionId: undefined,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    await client.close().catch(() => {});
   }
 }
 

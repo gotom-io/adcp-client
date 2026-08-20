@@ -19,13 +19,20 @@ const assert = require('node:assert');
 const { mapStoryboardResultsToTrackResult } = require('../../dist/lib/testing/compliance/storyboard-tracks.js');
 
 /** Minimal StoryboardResult factory — only the fields the rollup reads. */
-function sbResult({ passed = 1, failed = 0, skipped = 0, assertions = [] } = {}) {
+function sbResult({
+  passed = 1,
+  failed = 0,
+  skipped = 0,
+  overall_passed = failed === 0,
+  phases = [],
+  assertions = [],
+} = {}) {
   return {
     storyboard_id: 'fixture',
     storyboard_title: 'fixture',
     agent_url: 'https://example.test',
-    overall_passed: failed === 0,
-    phases: [],
+    overall_passed,
+    phases,
     passed_count: passed,
     failed_count: failed,
     skipped_count: skipped,
@@ -38,6 +45,277 @@ function sbResult({ passed = 1, failed = 0, skipped = 0, assertions = [] } = {})
 const PROFILE = { name: 'fixture', tools: [] };
 
 describe('TrackStatus silent rollup', () => {
+  it('preserves a storyboard-scoped assertion failure when every executed step passed', () => {
+    const result = mapStoryboardResultsToTrackResult(
+      'governance',
+      [
+        sbResult({
+          passed: 1,
+          failed: 0,
+          overall_passed: false,
+          phases: [
+            {
+              phase_id: 'lifecycle',
+              phase_title: 'Lifecycle',
+              passed: true,
+              duration_ms: 5,
+              steps: [
+                {
+                  step_id: 'read-state',
+                  phase_id: 'lifecycle',
+                  title: 'Read state',
+                  task: 'get_media_buys',
+                  passed: true,
+                  duration_ms: 5,
+                  validations: [],
+                  context: {},
+                },
+              ],
+            },
+          ],
+          assertions: [
+            {
+              assertion_id: 'status.monotonic',
+              passed: false,
+              description: 'Resource statuses transition only along spec lifecycle edges',
+              scope: 'storyboard',
+              error: 'Observed an illegal active -> pending transition',
+              status: 'fail',
+            },
+          ],
+        }),
+      ],
+      PROFILE
+    );
+
+    assert.strictEqual(result.status, 'partial');
+    assert.strictEqual(result.scenarios[0].overall_passed, true);
+    assert.strictEqual(result.scenarios[0].steps.filter(step => !step.passed).length, 0);
+    assert.strictEqual(result.scenarios[1].scenario, 'fixture/storyboard');
+    assert.strictEqual(result.scenarios[1].overall_passed, false);
+    assert.deepStrictEqual(result.scenarios[1].steps, []);
+    assert.deepStrictEqual(result.observations, [
+      {
+        category: 'error_compliance',
+        severity: 'error',
+        track: 'governance',
+        message: 'A storyboard-scoped compliance assertion failed.',
+        evidence: {
+          assertion_id: 'status.monotonic',
+          description: 'Resource statuses transition only along spec lifecycle edges',
+          scope: 'storyboard',
+          error: 'Observed an illegal active -> pending transition',
+          status: 'fail',
+        },
+        source: {
+          kind: 'storyboard',
+          code: 'storyboard-assertion-failed',
+          storyboard_id: 'fixture',
+        },
+      },
+    ]);
+  });
+
+  it('surfaces an authoritative failed storyboard verdict even without assertion diagnostics', () => {
+    const result = mapStoryboardResultsToTrackResult(
+      'core',
+      [
+        sbResult({
+          passed: 1,
+          overall_passed: false,
+          phases: [
+            {
+              phase_id: 'optional-only',
+              phase_title: 'Optional only',
+              passed: true,
+              duration_ms: 0,
+              steps: [],
+            },
+          ],
+        }),
+      ],
+      PROFILE
+    );
+
+    assert.strictEqual(result.status, 'partial');
+    assert.deepStrictEqual(
+      result.scenarios.map(scenario => [scenario.scenario, scenario.overall_passed]),
+      [
+        ['fixture/optional-only', true],
+        ['fixture/storyboard', false],
+      ]
+    );
+    assert.deepStrictEqual(result.observations, []);
+  });
+
+  it('keeps an all-skipped failed storyboard neutral without a synthetic failure', () => {
+    const result = mapStoryboardResultsToTrackResult(
+      'core',
+      [
+        sbResult({
+          passed: 0,
+          skipped: 1,
+          overall_passed: false,
+          phases: [
+            {
+              phase_id: 'optional-only',
+              phase_title: 'Optional only',
+              passed: true,
+              duration_ms: 0,
+              steps: [],
+            },
+          ],
+        }),
+      ],
+      PROFILE
+    );
+
+    assert.strictEqual(result.status, 'skip');
+    assert.deepStrictEqual(
+      result.scenarios.map(scenario => [scenario.scenario, scenario.overall_passed]),
+      [['fixture/optional-only', true]]
+    );
+    assert.deepStrictEqual(result.observations, []);
+  });
+
+  it('does not duplicate step-scoped assertion failures as storyboard observations', () => {
+    const result = mapStoryboardResultsToTrackResult(
+      'core',
+      [
+        sbResult({
+          passed: 0,
+          failed: 1,
+          overall_passed: false,
+          assertions: [
+            {
+              assertion_id: 'context.no_secret_echo',
+              passed: false,
+              description: 'Response must not echo a secret',
+              scope: 'step',
+              step_id: 'read-state',
+              error: 'Secret echoed',
+            },
+          ],
+        }),
+      ],
+      PROFILE
+    );
+
+    assert.strictEqual(result.status, 'fail');
+    assert.deepStrictEqual(result.observations, []);
+  });
+
+  it('surfaces a failed assertion attached to a skipped step', () => {
+    const step = {
+      step_id: 'optional-step',
+      phase_id: 'optional',
+      title: 'Optional step',
+      task: 'get_optional_resource',
+      passed: false,
+      skipped: true,
+      skip_reason: 'not_applicable',
+      duration_ms: 1,
+      validations: [{ check: 'assertion', passed: false, description: 'policy failed' }],
+      context: {},
+    };
+    const result = mapStoryboardResultsToTrackResult(
+      'core',
+      [
+        sbResult({
+          passed: 0,
+          failed: 0,
+          skipped: 1,
+          overall_passed: false,
+          phases: [{ phase_id: 'optional', phase_title: 'Optional', passed: true, duration_ms: 1, steps: [step] }],
+          assertions: [
+            {
+              assertion_id: 'optional.policy',
+              passed: false,
+              description: 'policy failed',
+              scope: 'step',
+              step_id: 'optional-step',
+            },
+          ],
+        }),
+      ],
+      PROFILE
+    );
+
+    assert.strictEqual(result.status, 'fail');
+    assert.strictEqual(result.observations.length, 1);
+    assert.strictEqual(result.observations[0].source.step_id, 'optional-step');
+  });
+
+  it('attributes a detached assertion to its owning multi-pass step', () => {
+    const passedStep = {
+      step_id: 'trip',
+      phase_id: 'p1',
+      title: 'Trip',
+      task: 'expect_rate_limit_not_replayed',
+      passed: true,
+      duration_ms: 1,
+      validations: [],
+      context: {},
+    };
+    const skippedStep = {
+      ...passedStep,
+      skipped: true,
+      skip_reason: 'rate_limit_not_triggered',
+      skip: { reason: 'not_applicable', detail: 'rate_limit_not_triggered' },
+    };
+    const phase = step => ({ phase_id: 'p1', phase_title: 'Phase', passed: true, duration_ms: 1, steps: [step] });
+    const storyboardResult = sbResult({
+      passed: 1,
+      skipped: 1,
+      overall_passed: false,
+      phases: [phase(passedStep)],
+      assertions: [
+        {
+          assertion_id: 'rate-limit-policy',
+          passed: false,
+          description: 'Policy assertion failed',
+          scope: 'step',
+          step_id: 'trip',
+          pass_index: 2,
+        },
+      ],
+    });
+    storyboardResult.passes = [
+      {
+        pass_index: 1,
+        dispatch_offset: 0,
+        overall_passed: true,
+        phases: [phase(passedStep)],
+        passed_count: 1,
+        failed_count: 0,
+        skipped_count: 0,
+        duration_ms: 1,
+      },
+      {
+        pass_index: 2,
+        dispatch_offset: 1,
+        overall_passed: false,
+        phases: [phase(skippedStep)],
+        passed_count: 0,
+        failed_count: 0,
+        skipped_count: 1,
+        duration_ms: 1,
+      },
+    ];
+
+    const result = mapStoryboardResultsToTrackResult('error_handling', [storyboardResult], PROFILE);
+
+    assert.strictEqual(result.status, 'partial');
+    assert.strictEqual(result.observations.length, 1);
+    assert.deepStrictEqual(result.observations[0].source, {
+      kind: 'storyboard_step',
+      code: 'storyboard-assertion-failed',
+      storyboard_id: 'fixture',
+      step_id: 'trip',
+    });
+    assert.strictEqual(result.observations[0].evidence.pass_index, 2);
+  });
+
   it("emits 'silent' when every observation-bearing assertion record reports zero observations", () => {
     const result = mapStoryboardResultsToTrackResult(
       'governance',

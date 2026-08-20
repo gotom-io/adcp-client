@@ -1,7 +1,6 @@
 // Official A2A client implementation - NO FALLBACKS
 import { A2AClient as A2AClientImpl } from '@a2a-js/sdk/client';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHmac, randomUUID } from 'node:crypto';
 import type { PushNotificationConfig } from '../types/tools.generated';
 import type { DebugLogEntry } from '../types/adcp';
 import { AuthenticationRequiredError, is401Error } from '../errors';
@@ -14,12 +13,14 @@ import { toSignerKey, isInlineSigningConfig, isProviderSigningConfig } from '../
 import { createSigningFetch, type FetchLike } from '../signing/fetch';
 import { createSigningFetchAsync } from '../signing/fetch-async';
 import type { AgentConfig } from '../types/adcp';
-import { redactIdempotencyKeyInArgs } from '../utils/idempotency';
+import { redactArgsForLog } from '../utils/redact-args';
 import { wrapFetchWithCapture } from './rawResponseCapture';
 import { wrapFetchWithSizeLimit } from './responseSizeLimit';
 import { wrapFetchWithTransportDiagnostics } from './transportDiagnostics';
 import { DEFAULT_REQUEST_TIMEOUT_MS, resolveRequestTimeoutMs, withAbortSignal } from './abort';
 import { getLatestA2ADataPartFromResponse } from '../utils/a2a-artifacts';
+import { createAgentTransportFetch } from '../net/agent-transport-fetch';
+import { isLikelyPrivateUrl } from '../net/address-guards';
 
 // The A2A SDK client is used untyped: request/response shapes are validated at
 // runtime against the AdCP wire contract, not against the SDK's exported
@@ -41,6 +42,8 @@ interface A2ACallContext {
   got401Ref: { value: boolean };
   signal?: AbortSignal;
   requestTimeoutMs?: number;
+  fetchFn?: typeof fetch;
+  allowPrivateIp?: boolean;
 }
 
 const callContextStorage = new AsyncLocalStorage<A2ACallContext>();
@@ -56,6 +59,24 @@ const callContextStorage = new AsyncLocalStorage<A2ACallContext>();
  */
 const a2aClientCache = new Map<string, InstanceType<typeof A2AClient>>();
 const pendingA2AClients = new Map<string, Promise<InstanceType<typeof A2AClient>>>();
+const MAX_CACHED_A2A_CLIENTS = 20;
+let a2aClientGeneration = 0;
+
+function getCachedA2AClient(cacheKey: string): InstanceType<typeof A2AClient> | undefined {
+  const client = a2aClientCache.get(cacheKey);
+  if (!client) return undefined;
+  a2aClientCache.delete(cacheKey);
+  a2aClientCache.set(cacheKey, client);
+  return client;
+}
+
+function evictLeastRecentlyUsedA2AClients(): void {
+  while (a2aClientCache.size > MAX_CACHED_A2A_CLIENTS) {
+    const oldestKey = a2aClientCache.keys().next().value as string | undefined;
+    if (oldestKey === undefined) return;
+    a2aClientCache.delete(oldestKey);
+  }
+}
 
 /**
  * Build the A2A connection-cache key. Mirrors the rationale in
@@ -67,38 +88,26 @@ const pendingA2AClients = new Map<string, Promise<InstanceType<typeof A2AClient>
  * credentials share a single cached A2AClient — single-CLI-process safe,
  * multi-tenant SDK consumer not safe.
  *
- * `customHeaders` also feed the key so tenant/routing headers cannot reuse
- * a card/client discovered for another caller.
+ * `customHeaders` also feed the key so tenant/routing headers cannot reuse a
+ * card/client discovered for another caller. Scoped fetch calls bypass this
+ * cache entirely (see `getOrCreateA2AClient`).
  */
 function a2aCacheKey(
   agentUrl: string,
   authToken?: string,
   signingCacheKey?: string,
-  customHeaders?: Record<string, string>
+  customHeaders?: Record<string, string>,
+  allowPrivateIp = false
 ): string {
-  // 64-bit Map-key disambiguator — NOT a password hash. The cached client
-  // closes over the full credential, so a hypothetical hash collision still
-  // sends the original credential on the wire, just possibly cache-miss
-  // and reconnect. Routed via `cacheDisambiguator` (HMAC-SHA256 with empty
-  // key) instead of bare `createHash` so CodeQL's
-  // `js/insufficient-password-hash` heuristic doesn't misclassify the
-  // dataflow — see the helper docstring for the full rationale.
+  // Use the exact credential/header material in this private, in-memory key.
+  // The cached client already retains the same credential, so hashing would
+  // not reduce secret lifetime and would introduce a collision boundary.
+  // This key is never logged or persisted.
   const fingerprint = authToken ?? extractA2AAuthHeader(customHeaders);
-  const tokenSuffix = fingerprint ? `::${cacheDisambiguator(fingerprint)}` : '';
-  const headersKey = headersCacheDisambiguator(customHeaders);
-  const headersSuffix = headersKey ? `::headers:${headersKey}` : '';
-  const signingSuffix = signingCacheKey ? `::${signingCacheKey}` : '';
-  return `${agentUrl}${tokenSuffix}${headersSuffix}${signingSuffix}`;
-}
-
-/**
- * Produce a stable 64-bit Map-key disambiguator from credential material.
- * Mirrors the helper in `src/lib/protocols/mcp.ts` — the two protocol
- * modules intentionally don't share runtime imports, so each carries its
- * own copy. See the MCP-side docstring for the full rationale.
- */
-function cacheDisambiguator(value: string): string {
-  return createHmac('sha256', '').update(value).digest('hex').slice(0, 16);
+  const headersKey = headersCacheMaterial(customHeaders);
+  // A serialized tuple avoids delimiter ambiguity between attacker-controlled
+  // URLs and the policy/auth suffixes (for example, a URL ending in a suffix).
+  return JSON.stringify([agentUrl, fingerprint ?? null, headersKey ?? null, signingCacheKey ?? null, allowPrivateIp]);
 }
 
 /**
@@ -114,7 +123,7 @@ function extractA2AAuthHeader(headers: Record<string, string> | undefined): stri
   return undefined;
 }
 
-function headersCacheDisambiguator(headers?: Record<string, string>): string | undefined {
+function headersCacheMaterial(headers?: Record<string, string>): string | undefined {
   const entries = Object.entries(headers ?? {})
     .filter(([key]) => {
       const lower = key.toLowerCase();
@@ -122,7 +131,7 @@ function headersCacheDisambiguator(headers?: Record<string, string>): string | u
     })
     .map(([key, value]) => [key.toLowerCase(), value] as const)
     .sort(([a], [b]) => a.localeCompare(b));
-  return entries.length > 0 ? cacheDisambiguator(JSON.stringify(entries)) : undefined;
+  return entries.length > 0 ? JSON.stringify(entries) : undefined;
 }
 
 function redactHeadersForDebug(headers: Record<string, string>): Record<string, string> {
@@ -151,6 +160,7 @@ function redactPushNotificationConfigForDebug(
  * is just cache eviction.
  */
 export function closeA2AConnections(): void {
+  a2aClientGeneration++;
   a2aClientCache.clear();
   pendingA2AClients.clear();
 }
@@ -195,7 +205,12 @@ const CANCEL_TIMEOUT_MS = 5000;
  * @param agent     The agent config (used for URL, auth token, signing).
  * @param taskId    The server-assigned A2A Task.id to cancel.
  */
-export async function cancelA2ATask(agent: AgentConfig, taskId: string): Promise<void> {
+export async function cancelA2ATask(
+  agent: AgentConfig,
+  taskId: string,
+  fetchFn?: typeof fetch,
+  allowPrivateIp?: boolean
+): Promise<void> {
   // Defense-in-depth (ad-tech-protocol-expert review of #1640): the cancel
   // POST is JSON-RPC at the bare A2A endpoint. Calling this on an MCP agent
   // would POST `tasks/cancel` JSON-RPC at an MCP endpoint and 404. The
@@ -206,38 +221,8 @@ export async function cancelA2ATask(agent: AgentConfig, taskId: string): Promise
     return;
   }
   const agentUrl = agent.agent_uri;
+  const transportFetch = createAgentTransportFetch(agentUrl, { trustedFetchFn: fetchFn, allowPrivateIp });
   const authToken = agent.auth_token;
-
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    accept: 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-    headers['x-adcp-auth'] = authToken;
-  }
-  // JSON-RPC 2.0 §4.1.3: `id: null` flags the request as a *notification*,
-  // and the server MUST NOT respond. A2A 0.3.0 §7.4 defines `tasks/cancel`
-  // as a request/response method (returns the canceled `Task` or
-  // `TaskNotCancelableError`), so a strict A2A server can legitimately
-  // reject `id: null` as a protocol violation. Use a real id and just drop
-  // the response on the floor — fire-and-forget is the caller's discipline,
-  // not a wire-protocol claim.
-  const body = JSON.stringify({
-    jsonrpc: '2.0',
-    id: randomUUID(),
-    method: 'tasks/cancel',
-    params: { id: taskId },
-  });
-  // Bound the cancel: a hung fetch would orphan-pin the event loop past the
-  // buyer's abort, defeating fire-and-forget. AbortSignal.timeout() is the
-  // standard primitive; the caller's `.catch()` swallows the AbortError.
-  const init: RequestInit = {
-    method: 'POST',
-    headers,
-    body,
-    signal: AbortSignal.timeout(CANCEL_TIMEOUT_MS),
-  };
 
   // adcp-client#1617 Phase 2: sign the cancel POST when the agent has a
   // signer configured. We bypass the `buildAgentSigningFetch` capability-
@@ -256,21 +241,36 @@ export async function cancelA2ATask(agent: AgentConfig, taskId: string): Promise
   // seller's advertised coverage from `getCapability()` and gating on
   // the `tasks/cancel` membership. The over-sign default stays as the
   // fallback for spec-silent sellers (3.0.x and earlier).
-  if (agent.request_signing) {
-    const upstream: FetchLike = (input, ini) => fetch(input as RequestInfo, ini);
-    if (isInlineSigningConfig(agent.request_signing)) {
-      const signed = createSigningFetch(upstream, toSignerKey(agent.request_signing));
-      await signed(agentUrl, init);
-      return;
-    }
-    if (isProviderSigningConfig(agent.request_signing)) {
-      const signed = createSigningFetchAsync(upstream, agent.request_signing.provider);
-      await signed(agentUrl, init);
-      return;
-    }
+  let requestFetch: FetchLike = (input, init) => transportFetch(input as RequestInfo | URL, init);
+  if (agent.request_signing && isInlineSigningConfig(agent.request_signing)) {
+    requestFetch = createSigningFetch(requestFetch, toSignerKey(agent.request_signing));
+  } else if (agent.request_signing && isProviderSigningConfig(agent.request_signing)) {
+    requestFetch = createSigningFetchAsync(requestFetch, agent.request_signing.provider);
   }
 
-  await fetch(agentUrl, init);
+  const timeoutSignal = AbortSignal.timeout(CANCEL_TIMEOUT_MS);
+  const fetchImpl: typeof fetch = (input, init = {}) => {
+    const headers = new Headers(init.headers);
+    if (authToken) {
+      headers.set('authorization', `Bearer ${authToken}`);
+      headers.set('x-adcp-auth', authToken);
+    }
+    const signal = init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+    return requestFetch(input, { ...init, headers, signal }) as Promise<Response>;
+  };
+
+  let client: InstanceType<typeof A2AClient> | undefined;
+  let lastError: unknown;
+  for (const cardUrl of buildCardUrls(agentUrl)) {
+    try {
+      client = await A2AClient.fromCardUrl(cardUrl, { fetchImpl });
+      break;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (!client) throw lastError instanceof Error ? lastError : new Error('A2A agent card discovery failed');
+  await client.cancelTask({ id: taskId });
 }
 
 async function getOrCreateA2AClient(
@@ -280,23 +280,40 @@ async function getOrCreateA2AClient(
   bypassCache = false
 ): Promise<InstanceType<typeof A2AClient>> {
   const signingContext = signingContextStorage.getStore();
-  const cacheKey = a2aCacheKey(agentUrl, authToken, signingContext?.cacheKey, customHeaders);
-  if (bypassCache) {
+  const callContext = callContextStorage.getStore();
+  const fetchFn = callContext?.fetchFn;
+  const cacheKey = a2aCacheKey(
+    agentUrl,
+    authToken,
+    signingContext?.cacheKey,
+    customHeaders,
+    callContext?.allowPrivateIp === true
+  );
+  // Scoped fetchers often carry request/tenant-specific egress policy. Keep
+  // those calls one-shot so neither agent-card discovery nor a client created
+  // under one policy can be reused by another caller, and so short-lived
+  // closure identities do not grow the global cache without bound.
+  if (bypassCache || fetchFn) {
     return createA2AClient(agentUrl, authToken);
   }
-  const cached = a2aClientCache.get(cacheKey);
+  const cached = getCachedA2AClient(cacheKey);
   if (cached) return cached;
 
   const pending = pendingA2AClients.get(cacheKey);
   if (pending) return pending;
 
+  const generation = a2aClientGeneration;
   const promise = createA2AClient(agentUrl, authToken)
     .then(client => {
+      if (generation !== a2aClientGeneration) {
+        throw new Error('A2A agent-card discovery completed after connection teardown');
+      }
       a2aClientCache.set(cacheKey, client);
+      evictLeastRecentlyUsedA2AClients();
       return client;
     })
     .finally(() => {
-      pendingA2AClients.delete(cacheKey);
+      if (pendingA2AClients.get(cacheKey) === promise) pendingA2AClients.delete(cacheKey);
     });
 
   pendingA2AClients.set(cacheKey, promise);
@@ -307,7 +324,7 @@ async function createA2AClient(
   agentUrl: string,
   authToken: string | undefined
 ): Promise<InstanceType<typeof A2AClient>> {
-  const fetchImpl = buildFetchImpl(authToken);
+  const fetchImpl = buildFetchImpl(authToken, agentUrl);
   const cardUrls = buildCardUrls(agentUrl);
 
   const context = callContextStorage.getStore();
@@ -333,18 +350,22 @@ async function createA2AClient(
   return client;
 }
 
-function buildFetchImpl(authToken: string | undefined) {
+function buildFetchImpl(authToken: string | undefined, agentUrl: string) {
   // The A2A client is cached per (url, authToken, signingCacheKey). We capture
   // the signing context at client-creation time so all subsequent calls that
   // share this cached client use the same signing identity — changing identity
   // requires a different cache entry, built on a separate call that enters ALS
   // with a different context.
   const signingContext = signingContextStorage.getStore();
+  const pinnedFetch = createAgentTransportFetch(agentUrl, {
+    trustedFetchFn: callContextStorage.getStore()?.fetchFn,
+    allowPrivateIp: callContextStorage.getStore()?.allowPrivateIp,
+  });
 
   // Innermost wrapper: enforce response body size cap from the active
   // `responseSizeLimitStorage` slot. Pass-through when no slot is set.
   const networkFetch = wrapFetchWithTransportDiagnostics(
-    wrapFetchWithSizeLimit((input, init) => fetch(input as any, init))
+    wrapFetchWithSizeLimit((input, init) => pinnedFetch(input, init))
   );
 
   // Inner fetch handles auth/header injection and 401 detection. If the
@@ -419,6 +440,7 @@ function buildFetchImpl(authToken: string | undefined) {
     upstream: (input, init) => baseFetch(input as any, init),
     signing: signingContext.signing,
     getCapability: signingContext.getCapability,
+    adcpVersion: signingContext.adcpVersion,
   });
   return wrapFetchWithCapture(signingFetch as typeof fetch);
 }
@@ -481,7 +503,9 @@ export async function callA2ATool(
   signingContext?: AgentSigningContext,
   session?: A2ASessionIds,
   signal?: AbortSignal,
-  requestTimeoutMs?: number
+  requestTimeoutMs?: number,
+  fetchFn?: typeof fetch,
+  allowPrivateIp?: boolean
 ): Promise<unknown> {
   return withSpan(
     'adcp.a2a.call_tool',
@@ -496,6 +520,8 @@ export async function callA2ATool(
         got401Ref: { value: false },
         signal,
         requestTimeoutMs,
+        fetchFn,
+        allowPrivateIp,
       };
       return signingContextStorage.run(signingContext, () =>
         callContextStorage.run(context, () =>
@@ -569,7 +595,7 @@ async function callA2AToolImpl(
     }
 
     const payloadSize = JSON.stringify(requestPayload).length;
-    const redactedParameters = redactIdempotencyKeyInArgs(parameters);
+    const redactedParameters = redactArgsForLog(parameters);
     const redactedPayload = {
       ...requestPayload,
       message: {
@@ -639,7 +665,15 @@ async function callA2AToolImpl(
       // case) rather than authToken, the cache key must reflect that or we
       // evict the wrong entry.
       const signingContext = signingContextStorage.getStore();
-      a2aClientCache.delete(a2aCacheKey(agentUrl, authToken, signingContext?.cacheKey, context.customHeaders));
+      a2aClientCache.delete(
+        a2aCacheKey(
+          agentUrl,
+          authToken,
+          signingContext?.cacheKey,
+          context.customHeaders,
+          context.allowPrivateIp === true
+        )
+      );
 
       debugLogs.push({
         type: 'error',
@@ -652,8 +686,14 @@ async function callA2AToolImpl(
       // policy) would otherwise leave consumers chasing OAuth metadata that
       // doesn't exist. Matches the MCP discovery throw site in
       // `SingleAgentClient.discoverMCPEndpoint`.
-      const challenge = await probeAuthChallenge(agentUrl);
-      const oauthMetadata = await discoverOAuthMetadata(agentUrl);
+      const challenge = await probeAuthChallenge(agentUrl, {
+        fetchFn: context.fetchFn,
+        allowPrivateIp: context.allowPrivateIp ?? isLikelyPrivateUrl(agentUrl),
+      });
+      const oauthMetadata = await discoverOAuthMetadata(agentUrl, {
+        trustedFetchFn: context.fetchFn,
+        allowPrivateIp: context.allowPrivateIp ?? isLikelyPrivateUrl(agentUrl),
+      });
       throw new AuthenticationRequiredError(agentUrl, oauthMetadata || undefined, undefined, challenge ?? undefined);
     }
 

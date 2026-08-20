@@ -23,6 +23,7 @@ import { classifyProbeUrl } from '../utils/probe-policy';
 import { SsrfRefusedError } from '../net/ssrf-fetch';
 import { ADCP_VERSION } from '../version';
 import type { VersionEnvelopeMode } from '../protocols';
+import { validateIncomingResponse } from '../validation/client-hooks';
 
 const TEST_CLIENT_VERSION_OPTIONS = Symbol('adcp.testClientVersionOptions');
 
@@ -31,6 +32,9 @@ interface TestClientVersionOptions {
   wireAdcpVersion?: string;
   versionEnvelope: VersionEnvelopeMode;
   authMode?: string;
+  fetchFn?: typeof fetch;
+  maxResponseBytes?: number;
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -194,6 +198,7 @@ export function createTestClient(agentUrl: string, protocol: 'mcp' | 'a2a' = 'mc
     ...(options.wireAdcpVersion !== undefined && { wireAdcpVersion: options.wireAdcpVersion }),
     ...(options.versionEnvelope !== undefined && { versionEnvelope: options.versionEnvelope }),
     ...(options.userAgent && { userAgent: options.userAgent }),
+    ...(options.transport && { transport: options.transport }),
   });
 
   const client = multiClient.agent('test');
@@ -204,6 +209,13 @@ export function createTestClient(agentUrl: string, protocol: 'mcp' | 'a2a' = 'mc
       ...(options.wireAdcpVersion !== undefined && { wireAdcpVersion: options.wireAdcpVersion }),
       versionEnvelope: options.versionEnvelope ?? 'auto',
       ...(authMode !== undefined && { authMode }),
+      ...(options.transport?.trustedFetchFn && { fetchFn: options.transport.trustedFetchFn }),
+      ...(options.transport?.maxResponseBytes !== undefined && {
+        maxResponseBytes: options.transport.maxResponseBytes,
+      }),
+      ...(options.transport?.requestTimeoutMs !== undefined && {
+        requestTimeoutMs: options.transport.requestTimeoutMs,
+      }),
     } satisfies TestClientVersionOptions,
     enumerable: false,
   });
@@ -247,7 +259,11 @@ function testClientMatchesVersionOptions(client: TestClient, options: TestOption
   ];
   const expectedAuthMode = authReuseMode(effectiveOptions);
   if (!meta) {
-    return effectiveOptions.adcpVersion === undefined && effectiveOptions.versionEnvelope === undefined;
+    return (
+      effectiveOptions.adcpVersion === undefined &&
+      effectiveOptions.versionEnvelope === undefined &&
+      effectiveOptions.transport === undefined
+    );
   }
   const expectedAdcpVersion = effectiveOptions.adcpVersion ?? ADCP_VERSION;
   const expectedWireAdcpVersion = effectiveOptions.wireAdcpVersion;
@@ -256,7 +272,10 @@ function testClientMatchesVersionOptions(client: TestClient, options: TestOption
     meta.adcpVersion === expectedAdcpVersion &&
     meta.wireAdcpVersion === expectedWireAdcpVersion &&
     meta.versionEnvelope === expectedVersionEnvelope &&
-    meta.authMode === expectedAuthMode
+    meta.authMode === expectedAuthMode &&
+    meta.fetchFn === effectiveOptions.transport?.trustedFetchFn &&
+    meta.maxResponseBytes === effectiveOptions.transport?.maxResponseBytes &&
+    meta.requestTimeoutMs === effectiveOptions.transport?.requestTimeoutMs
   );
 }
 
@@ -310,7 +329,7 @@ export async function getOrDiscoverProfile(
       step: { step: 'Discover agent capabilities', passed: true, duration_ms: 0 },
     };
   }
-  return discoverAgentProfile(client, options.signal);
+  return discoverAgentProfile(client, options.signal, options.adcpVersion);
 }
 
 /**
@@ -429,7 +448,9 @@ export async function runStep<T>(
  */
 export async function discoverAgentProfile(
   client: TestClient,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /** Compliance/schema line selected by the caller. Defaults to the client pin. */
+  schemaAdcpVersion?: string
 ): Promise<{ profile: AgentProfile; step: TestStepResult }> {
   const { result: agentInfo, step } = await runStep('Discover agent capabilities', 'getAgentInfo', () =>
     raceWithSignal(client.getAgentInfo({ signal }), signal)
@@ -455,8 +476,26 @@ export async function discoverAgentProfile(
   if (profile.tools.includes('get_adcp_capabilities')) {
     try {
       const caps = (await raceWithSignal(client.getAdcpCapabilities({}, undefined, { signal }), signal)) as TaskResult;
-      if (caps?.success && caps?.data) {
+      if (caps?.data) {
         profile.raw_capabilities = caps.data;
+        const validation = validateIncomingResponse(
+          'get_adcp_capabilities',
+          caps.data,
+          'strict',
+          undefined,
+          schemaAdcpVersion ?? client.getAdcpVersion()
+        );
+        if (!validation.valid) {
+          profile.capabilities_schema_issues = validation.issues.map(issue => ({
+            pointer: issue.pointer,
+            message: issue.message,
+          }));
+        }
+
+        // Even a schema-invalid response can contain enough trustworthy
+        // discriminators to select the storyboards the seller claimed. Keep
+        // parsing best-effort so the preflight notice augments downstream
+        // failures instead of suppressing them.
         const parsed = parseCapabilitiesResponse(caps.data);
         profile.adcp_version = parsed.version;
         profile.adcp_major_versions = parsed.majorVersions;
@@ -471,7 +510,8 @@ export async function discoverAgentProfile(
         }
         const libVersion = (caps.data as Record<string, unknown>).library_version;
         if (typeof libVersion === 'string') profile.library_version = libVersion;
-      } else {
+      }
+      if ((!caps?.success || !caps?.data) && !profile.capabilities_schema_issues?.length) {
         profile.capabilities_probe_error = caps?.error || 'get_adcp_capabilities returned no data';
       }
     } catch (err) {
@@ -600,7 +640,7 @@ export async function discoverCreativeFormats(
   const { result, step } = await runStep<TaskResult>(
     'Discover creative formats',
     'list_creative_formats',
-    async () => client.listCreativeFormats({}) as Promise<TaskResult>
+    async () => client.listCreativeFormatsLegacy({}) as Promise<TaskResult>
   );
 
   if (result?.success && result?.data) {
@@ -617,14 +657,14 @@ export async function discoverCreativeFormats(
       };
 
       // Check for deprecated assets_required usage
-      if (usesDeprecatedAssetsField(format)) {
+      if (usesDeprecatedAssetsField(format as unknown as Parameters<typeof usesDeprecatedAssetsField>[0])) {
         const displayId = typeof formatInfo.format_id === 'object' ? formatInfo.format_id.id : formatInfo.format_id;
         deprecatedFormats.push(displayId);
       }
 
       // Extract asset requirements from format spec using format-assets utilities
       // This handles both v2.6 `assets` and deprecated `assets_required` fields
-      const formatAssets = getFormatAssets(format);
+      const formatAssets = getFormatAssets(format as unknown as Parameters<typeof getFormatAssets>[0]);
       for (const asset of formatAssets) {
         const assetId = asset.item_type === 'individual' ? asset.asset_id : asset.asset_group_id;
 

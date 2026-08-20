@@ -10,7 +10,7 @@
 
 import { createTestClient, discoverAgentProfile } from '../client';
 import type { TestOptions, TestResult, AgentProfile, TestStepResult } from '../types';
-import { mapStoryboardResultsToTrackResult, TRACK_LABELS } from './storyboard-tracks';
+import { collectDetachedAssertionFailures, mapStoryboardResultsToTrackResult, TRACK_LABELS } from './storyboard-tracks';
 import { applyAdcpVersionRunOptions, runStoryboard } from '../storyboard/runner';
 import { validateTestKit } from '../storyboard/test-kit';
 import { checkAccountDiscoveryGate } from './spec-conformance';
@@ -47,18 +47,23 @@ import type {
   ComplianceTrack,
   ComplianceFailure,
   TrackResult,
+  TestedTrackEntry,
   ComplianceResult,
   ComplianceSummary,
   AdvisoryObservation,
   OverallStatus,
 } from './types';
-import { closeConnections } from '../../protocols';
+import { closeScopedConnections, withMCPConnectionScope } from '../../protocols';
 import type { VersionEnvelopeMode } from '../../protocols';
 import { detectController, hasTestController } from '../test-controller';
 import type { ControllerDetection } from '../test-controller';
 import { randomBytes } from 'crypto';
 import { isPre31AdcpVersion } from '../../utils/adcp-version-config';
 import { withExternalSchemaRoot } from '../../validation/schema-loader';
+import { redactOAuthUrlForOutput, redactOAuthUrlsInText } from '../storyboard/oauth-metadata-graph';
+import { LIBRARY_VERSION } from '../../version';
+import { validationFailsStep } from '../storyboard/validations';
+import { isLikelyPrivateUrl } from '../../net/address-guards';
 
 /**
  * All compliance tracks in display order.
@@ -76,7 +81,21 @@ const TRACK_ORDER: ComplianceTrack[] = [
   'audiences',
   'error_handling',
   'brand',
+  'security_transport',
 ];
+
+/** Build the reference-only `tested_tracks` projection without scenario payloads. */
+function toTestedTrackEntry(track: TrackResult | TestedTrackEntry): TestedTrackEntry {
+  return {
+    track: track.track,
+    status: track.status,
+    label: track.label,
+    observations: track.observations,
+    duration_ms: track.duration_ms,
+    ...(track.mode !== undefined && { mode: track.mode }),
+    _view: 'reference',
+  };
+}
 
 /**
  * Collect advisory observations from test results.
@@ -547,11 +566,21 @@ export interface ComplyOptions extends TestOptions {
    * storyboards. Passed through to `runStoryboard`.
    */
   webhook_replay_receiver?: StoryboardRunOptions['webhook_replay_receiver'];
+  /** Configure raw `POST /context` router replay storyboards. */
+  trusted_match_context_router_runner?: StoryboardRunOptions['trusted_match_context_router_runner'];
+  /** Configure guarded publisher-facing TMP Context/Identity authentication probes. */
+  trusted_match_publisher_auth_runner?: StoryboardRunOptions['trusted_match_publisher_auth_runner'];
   /**
    * Test-kit contract ids in scope for this run. Passed through to
    * `runStoryboard`. See `StoryboardRunOptions.contracts`.
    */
   contracts?: StoryboardRunOptions['contracts'];
+  /**
+   * Explicitly authorize the `expect_rate_limit_not_replayed` storyboard
+   * probe. Independent from `request_signing.allowLiveSideEffects`. Passed
+   * through to `runStoryboard`; default false.
+   */
+  allowLiveSideEffects?: StoryboardRunOptions['allowLiveSideEffects'];
   /** Explicit compliance cache version override. */
   version?: string;
   /** Explicit compliance cache directory override. */
@@ -591,11 +620,13 @@ export async function comply(agentUrl: string, options: ComplyOptions = {}): Pro
         `Production agents MUST terminate TLS. Pass { allow_http: true } (or --allow-http) for local development.`
     );
   }
-  try {
-    return await complyImpl(agentUrl, options);
-  } finally {
-    await closeConnections(options.protocol);
-  }
+  return withMCPConnectionScope(async () => {
+    try {
+      return await complyImpl(agentUrl, options);
+    } finally {
+      await closeScopedConnections(options.protocol);
+    }
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -842,6 +873,31 @@ function expandScenarios(storyboards: Storyboard[], resolveOptions: ResolveOptio
   return expanded;
 }
 
+/** @internal Capability applicability partition used by comply() after selection. */
+export function partitionStoryboardsByRequiredTools(
+  storyboards: Storyboard[],
+  discoveredTools: readonly string[]
+): { runnable: Storyboard[]; missing: NotApplicableStoryboard[] } {
+  const discoveredToolNames = new Set(discoveredTools);
+  const runnable: Storyboard[] = [];
+  const missing: NotApplicableStoryboard[] = [];
+  for (const sb of storyboards) {
+    const required = sb.required_tools ?? [];
+    const hasApplicableTool = required.length === 0 || required.some(tool => discoveredToolNames.has(tool));
+    if (!hasApplicableTool) {
+      missing.push({
+        storyboard_id: sb.id,
+        storyboard_title: sb.title,
+        track: sb.track,
+        reason: `missing required_tools: ${required.join(', ')}`,
+      });
+    } else {
+      runnable.push(sb);
+    }
+  }
+  return { runnable, missing };
+}
+
 /**
  * Group storyboard results by track.
  *
@@ -904,7 +960,7 @@ function buildNotApplicableStoryboardResult(agentUrl: string, na: NotApplicableS
   return {
     storyboard_id: na.storyboard_id,
     storyboard_title: na.storyboard_title,
-    agent_url: agentUrl,
+    agent_url: redactOAuthUrlForOutput(agentUrl),
     overall_passed: true,
     phases: [
       {
@@ -940,6 +996,7 @@ function buildNotApplicableStoryboardResult(agentUrl: string, na: NotApplicableS
     passed_count: 0,
     failed_count: 0,
     skipped_count: 1,
+    runner_capability_version: LIBRARY_VERSION,
     tested_at: now,
     notices: [],
   };
@@ -990,19 +1047,9 @@ export function extractFailures(
       for (const step of phase.steps) {
         if (step.passed || step.skipped) continue;
 
-        // Find the step definition in the storyboard for expected text
-        let expected: string | undefined;
-        if (sb) {
-          for (const p of sb.phases) {
-            const stepDef = p.steps.find(s => s.id === step.step_id);
-            if (stepDef?.expected) {
-              expected = stepDef.expected.trim();
-              break;
-            }
-          }
-        }
+        const expected = findStoryboardStepExpected(sb, step.step_id);
 
-        const firstFailedValidation = step.validations.find(v => !v.passed);
+        const firstFailedValidation = step.validations.find(validationFailsStep);
         const validationSummary = firstFailedValidation
           ? {
               ...(firstFailedValidation.id !== undefined && { id: firstFailedValidation.id }),
@@ -1031,9 +1078,40 @@ export function extractFailures(
         });
       }
     }
+
+    // Assertion failures on skipped steps are not counted as failed steps and
+    // the loop above intentionally ignores skips. Preserve those gating
+    // failures from the storyboard assertion surface instead of dropping them.
+    for (const { assertion, owningStep } of collectDetachedAssertionFailures(result)) {
+      if (!owningStep) continue;
+
+      failures.push({
+        track,
+        storyboard_id: result.storyboard_id,
+        step_id: owningStep.step_id,
+        step_title: owningStep.title,
+        task: owningStep.task,
+        error: assertion.error ?? assertion.description,
+        expected: findStoryboardStepExpected(sb, owningStep.step_id),
+        fix_command: buildFixCommand(agentRef, result.storyboard_id, owningStep.step_id, fixOptions),
+        validation: {
+          check: 'assertion',
+          description: `${assertion.assertion_id}: ${assertion.description}`,
+        },
+      });
+    }
   }
 
   return failures;
+}
+
+function findStoryboardStepExpected(storyboard: Storyboard | undefined, stepId: string): string | undefined {
+  if (!storyboard) return undefined;
+  for (const phase of storyboard.phases) {
+    const expected = phase.steps.find(step => step.id === stepId)?.expected;
+    if (expected) return expected.trim();
+  }
+  return undefined;
 }
 
 function buildFixCommand(
@@ -1072,7 +1150,10 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     signal: externalSignal,
     webhook_receiver,
     webhook_replay_receiver,
+    trusted_match_context_router_runner,
+    trusted_match_publisher_auth_runner,
     contracts,
+    allowLiveSideEffects,
     version,
     complianceDir,
     schemaRoot,
@@ -1119,12 +1200,36 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     // Discover agent capabilities once and share across all storyboards.
     // External cancellation still aborts discovery; timeout_ms is enforced
     // later as a soft storyboard-start budget.
-    const discoveryOptions =
-      testOptions.versionEnvelope === undefined
-        ? { ...effectiveOptions, versionEnvelope: 'major-only' as const }
-        : effectiveOptions;
-    const discoveryClient = createTestClient(agentUrl, effectiveOptions.protocol ?? 'mcp', discoveryOptions);
-    const { profile, step: profileStep } = await discoverAgentProfile(discoveryClient, signal);
+    // Discover with the configured release pin first. A major-only discovery
+    // forces modern same-major sellers to project their capabilities as 3.0,
+    // hiding the very fields needed to select current storyboards. Strict
+    // legacy sellers still get a compatibility retry below.
+    let discoveryOptions = effectiveOptions;
+    let discoveryClient = createTestClient(agentUrl, effectiveOptions.protocol ?? 'mcp', discoveryOptions);
+    let { profile, step: profileStep } = await discoverAgentProfile(
+      discoveryClient,
+      signal,
+      complianceIndex.adcp_version
+    );
+    if (
+      testOptions.versionEnvelope === undefined &&
+      profile.tools.includes('get_adcp_capabilities') &&
+      profile.raw_capabilities === undefined
+    ) {
+      const legacyDiscoveryOptions = { ...effectiveOptions, versionEnvelope: 'major-only' as const };
+      const legacyDiscoveryClient = createTestClient(
+        agentUrl,
+        effectiveOptions.protocol ?? 'mcp',
+        legacyDiscoveryOptions
+      );
+      const legacyDiscovery = await discoverAgentProfile(legacyDiscoveryClient, signal, complianceIndex.adcp_version);
+      if (legacyDiscovery.profile.raw_capabilities !== undefined) {
+        discoveryOptions = legacyDiscoveryOptions;
+        discoveryClient = legacyDiscoveryClient;
+        profile = legacyDiscovery.profile;
+        profileStep = legacyDiscovery.step;
+      }
+    }
     effectiveOptions = applyNegotiatedComplianceVersionOptions(profile, effectiveOptions, {
       complianceVersion: complianceIndex.adcp_version,
       ...(hostedStableLineAlias !== undefined && { hostedStableLineAlias }),
@@ -1206,7 +1311,12 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       // universal/security_baseline, which is designed precisely to diagnose
       // agents that mishandle auth. Fall back to the unreachable result only
       // when no such storyboards are available.
-      const authCheck = await detectAuthRejection(agentUrl, profileStep.error, signal);
+      const authCheck = await detectAuthRejection(
+        agentUrl,
+        profileStep.error,
+        signal,
+        effectiveOptions.transport?.trustedFetchFn
+      );
       if (authCheck.isAuth) {
         const degraded: AgentProfile = { name: profile.name || 'Unknown (auth required)', tools: [] };
         const candidate = explicitStoryboards?.length
@@ -1261,28 +1371,15 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     // not-applicable — the agent doesn't claim the specialism being tested. Running
     // them produces cascading skips that pull the track to `partial`, which is a false
     // signal for AAO badge grading (adcp-client#1680).
-    // Explicit storyboard IDs (options.storyboards) bypass this filter — they are an
-    // operator override and should run regardless of required_tools.
+    // Explicit storyboard IDs remain an operator override. Some targeted conformance
+    // runs intentionally exercise the storyboard's own missing-tool skip semantics.
     let runnableStoryboards: Storyboard[];
     if (explicitStoryboards?.length) {
       runnableStoryboards = applicableStoryboards;
     } else {
-      const discoveredToolNames = new Set(profile.tools);
-      const filtered: Storyboard[] = [];
-      for (const sb of applicableStoryboards) {
-        const missing = (sb.required_tools ?? []).filter(t => !discoveredToolNames.has(t));
-        if (missing.length > 0) {
-          missingToolStoryboards.push({
-            storyboard_id: sb.id,
-            storyboard_title: sb.title,
-            track: sb.track,
-            reason: `missing required_tools: ${missing.join(', ')}`,
-          });
-        } else {
-          filtered.push(sb);
-        }
-      }
-      runnableStoryboards = filtered;
+      const applicability = partitionStoryboardsByRequiredTools(applicableStoryboards, profile.tools);
+      runnableStoryboards = applicability.runnable;
+      missingToolStoryboards.push(...applicability.missing);
     }
 
     // Run storyboards
@@ -1290,10 +1387,19 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     const executedStoryboards: Storyboard[] = [];
     const runOptions: StoryboardRunOptions = {
       ...effectiveOptions,
+      ...(complianceDir !== undefined && { complianceDir }),
       agentTools: profile.tools,
       ...(webhook_receiver !== undefined && { webhook_receiver }),
       ...(webhook_replay_receiver !== undefined && { webhook_replay_receiver }),
+      ...(trusted_match_context_router_runner !== undefined && {
+        trusted_match_context_router_runner:
+          complianceDir !== undefined && trusted_match_context_router_runner.vectorsRoot === undefined
+            ? { ...trusted_match_context_router_runner, vectorsRoot: complianceDir }
+            : trusted_match_context_router_runner,
+      }),
+      ...(trusted_match_publisher_auth_runner !== undefined && { trusted_match_publisher_auth_runner }),
       ...(contracts !== undefined && { contracts }),
+      ...(allowLiveSideEffects !== undefined && { allowLiveSideEffects }),
       ...(signal !== undefined && { signal }),
     };
 
@@ -1362,7 +1468,10 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
 
       if (results.length > 0) {
         const trackResult = mapStoryboardResultsToTrackResult(track, results, profile);
-        const observations = collectObservations(track, trackResult.scenarios, profile);
+        const observations = [
+          ...trackResult.observations,
+          ...collectObservations(track, trackResult.scenarios, profile),
+        ];
         trackResult.observations = observations;
         allObservations.push(...observations);
         trackResults.push(trackResult);
@@ -1380,15 +1489,12 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     }
 
     const summary = buildSummary(trackResults, storyboardResults);
-    // Tag `_view` so grep-style triage can distinguish the canonical
-    // `tracks` entry from its appearance under the `tested_tracks` filter
-    // (adcp-client#1674). Shallow-copy on the `tested_tracks` side keeps
-    // the shared nested `scenarios` references intact while preventing
-    // the marker from colliding on the same object.
+    // Scenario detail is canonical under `tracks`; `tested_tracks` is a
+    // reference-only projection so full JSON output contains each scenario once.
     for (const t of trackResults) t._view = 'canonical';
-    const testedTracks: TrackResult[] = trackResults
+    const testedTracks: TestedTrackEntry[] = trackResults
       .filter(t => t.status === 'pass' || t.status === 'fail' || t.status === 'partial' || t.status === 'silent')
-      .map(t => ({ ...t, _view: 'reference' as const }));
+      .map(toTestedTrackEntry);
     const skippedTracks = trackResults
       .filter(t => t.status === 'skip')
       .map(t => ({
@@ -1399,7 +1505,8 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
 
     const overallStatus: OverallStatus = stoppedForTimeoutBudget ? 'partial' : computeOverallStatus(summary);
 
-    const agentRef = options.agent_alias || agentUrl;
+    const safeAgentUrl = redactOAuthUrlForOutput(agentUrl);
+    const agentRef = options.agent_alias || safeAgentUrl;
     const failures = extractFailures(storyboardResults, runnableStoryboards, agentRef, {
       complianceVersion: complianceIndex.adcp_version,
       ...(complianceDir !== undefined && { complianceDir }),
@@ -1407,8 +1514,8 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       ...(hostedStableLineAlias !== undefined && { hostedStableLineAlias }),
     });
 
-    // Aggregate notices from all storyboard runs. Dedup is by `code` (each
-    // notice type appears once in the rollup), but the per-occurrence
+    // Aggregate notices from all storyboard runs. Dedup is by `code`, or by
+    // (`code`, `capability_pointer`) for schema-validation notices, while the per-occurrence
     // `storyboard_ids` arrays are merged so auditors can see how widespread
     // a deprecation or future-required signal is without re-walking the
     // per-storyboard arrays. Order is stable: first occurrence wins for
@@ -1417,22 +1524,25 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     const aggregatedNotices = new Map<string, RunnerNotice>();
     for (const sbResult of storyboardResults) {
       for (const notice of sbResult.notices) {
-        const existing = aggregatedNotices.get(notice.code);
+        const noticeKey =
+          notice.capability_pointer === undefined ? notice.code : `${notice.code}\u0000${notice.capability_pointer}`;
+        const existing = aggregatedNotices.get(noticeKey);
         if (existing) {
           for (const sid of notice.storyboard_ids) {
             if (!existing.storyboard_ids.includes(sid)) existing.storyboard_ids.push(sid);
           }
         } else {
           // Clone so subsequent merges don't mutate the per-storyboard array.
-          aggregatedNotices.set(notice.code, { ...notice, storyboard_ids: [...notice.storyboard_ids] });
+          aggregatedNotices.set(noticeKey, { ...notice, storyboard_ids: [...notice.storyboard_ids] });
         }
       }
     }
     const noticesDedup = [...aggregatedNotices.values()];
 
     return {
-      agent_url: agentUrl,
+      agent_url: safeAgentUrl,
       adcp_version: complianceIndex.adcp_version,
+      completeness: stoppedForTimeoutBudget ? 'timed_out' : 'complete',
       agent_profile: profile,
       overall_status: overallStatus,
       tracks: trackResults,
@@ -1491,7 +1601,8 @@ function buildComplyTimeoutBudgetObservation(
 export async function detectAuthRejection(
   agentUrl: string,
   errorMsg: string | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  fetchFn?: typeof fetch
 ): Promise<{ isAuth: boolean; observations: AdvisoryObservation[] }> {
   const err = errorMsg || 'Unknown error';
   const observations: AdvisoryObservation[] = [];
@@ -1533,7 +1644,7 @@ export async function detectAuthRejection(
   if (!isAuth) {
     try {
       const probeSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000);
-      const probe = await fetch(agentUrl, {
+      const probe = await (fetchFn ?? fetch)(agentUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         redirect: 'manual',
@@ -1547,7 +1658,10 @@ export async function detectAuthRejection(
 
   if (isAuth) {
     const { discoverOAuthMetadata } = await import('../../auth/oauth/discovery');
-    const oauthMeta = await discoverOAuthMetadata(agentUrl);
+    const oauthMeta = await discoverOAuthMetadata(agentUrl, {
+      trustedFetchFn: fetchFn,
+      allowPrivateIp: isLikelyPrivateUrl(agentUrl),
+    });
     // Classify OAuth vs bearer based on (a) explicit OAuth phrasing in the
     // error text, or (b) a resolvable OAuth metadata document. Either is
     // enough; a plain 401 on a static-token endpoint matches neither.
@@ -1555,15 +1669,16 @@ export async function detectAuthRejection(
     if (looksOAuth) {
       // `oauthMeta.issuer` comes from the agent's well-known document — agent-
       // controlled, same fencing as capabilities_probe_error.
-      const issuer = oauthMeta?.issuer ? fenceAgentText(oauthMeta.issuer, 200) : '(unknown)';
+      const issuer = oauthMeta?.issuer ? fenceAgentText(redactOAuthUrlForOutput(oauthMeta.issuer), 200) : '(unknown)';
+      const safeAgentUrl = redactOAuthUrlForOutput(agentUrl);
       observations.push({
         category: 'auth',
         severity: 'error',
         message:
           `Agent requires OAuth (issuer: ${issuer}). ` +
-          `Inline: adcp storyboard run ${agentUrl} --oauth (requires a saved alias). ` +
-          `Save once: adcp --save-auth <alias> ${agentUrl} --oauth.`,
-        ...(oauthMeta?.issuer && { evidence: { oauth_issuer: oauthMeta.issuer } }),
+          `Inline: adcp storyboard run ${safeAgentUrl} --oauth (requires a saved alias). ` +
+          `Save once: adcp --save-auth <alias> ${safeAgentUrl} --oauth.`,
+        ...(oauthMeta?.issuer && { evidence: { oauth_issuer: redactOAuthUrlForOutput(oauthMeta.issuer) } }),
         source: { kind: 'probe', code: 'auth-oauth-required' },
       });
     } else {
@@ -1612,7 +1727,17 @@ async function runWithDegradedProfile(
     ...(options.webhook_replay_receiver !== undefined && {
       webhook_replay_receiver: options.webhook_replay_receiver,
     }),
+    ...(options.trusted_match_context_router_runner !== undefined && {
+      trusted_match_context_router_runner:
+        options.complianceDir !== undefined && options.trusted_match_context_router_runner.vectorsRoot === undefined
+          ? { ...options.trusted_match_context_router_runner, vectorsRoot: options.complianceDir }
+          : options.trusted_match_context_router_runner,
+    }),
+    ...(options.trusted_match_publisher_auth_runner !== undefined && {
+      trusted_match_publisher_auth_runner: options.trusted_match_publisher_auth_runner,
+    }),
     ...(options.contracts !== undefined && { contracts: options.contracts }),
+    ...(options.allowLiveSideEffects !== undefined && { allowLiveSideEffects: options.allowLiveSideEffects }),
     ...(signal !== undefined && { signal }),
   };
 
@@ -1643,7 +1768,13 @@ async function runWithDegradedProfile(
     const results = grouped.get(track) ?? [];
     if (results.length > 0) {
       const trackResult = mapStoryboardResultsToTrackResult(track, results, profile);
-      const obs = collectObservations(track, trackResult.scenarios, profile);
+      // In the degraded-profile path, an explicitly requested storyboard was
+      // attempted but its tool-gated scenarios may all skip because discovery
+      // itself was rejected. That is a partial assessment, not an untested
+      // track: retain a reference in `tested_tracks` so reports do not imply
+      // the probe was never run.
+      if (trackResult.status === 'skip') trackResult.status = 'partial';
+      const obs = [...trackResult.observations, ...collectObservations(track, trackResult.scenarios, profile)];
       trackResult.observations = obs;
       allObservations.push(...obs);
       trackResults.push(trackResult);
@@ -1662,7 +1793,8 @@ async function runWithDegradedProfile(
 
   const summary = buildSummary(trackResults, storyboardResults);
   const overallStatus: OverallStatus = stoppedForTimeoutBudget ? 'partial' : computeOverallStatus(summary);
-  const agentRef = options.agent_alias || agentUrl;
+  const safeAgentUrl = redactOAuthUrlForOutput(agentUrl);
+  const agentRef = options.agent_alias || safeAgentUrl;
   const failures = extractFailures(storyboardResults, storyboards, agentRef, {
     complianceVersion: adcpVersion,
     ...(options.complianceDir !== undefined && { complianceDir: options.complianceDir }),
@@ -1670,9 +1802,8 @@ async function runWithDegradedProfile(
     ...(options.hostedStableLineAlias !== undefined && { hostedStableLineAlias: options.hostedStableLineAlias }),
   });
 
-  // Tag canonical vs reference views to disambiguate the same
-  // TrackResult appearing in both `tracks` and `tested_tracks`
-  // (adcp-client#1674).
+  // Scenario detail is canonical under `tracks`; `tested_tracks` is a
+  // reference-only projection so full JSON output contains each scenario once.
   for (const t of trackResults) t._view = 'canonical';
   const skippedTracks = trackResults
     .filter(t => t.status === 'skip')
@@ -1683,14 +1814,15 @@ async function runWithDegradedProfile(
     }));
 
   return {
-    agent_url: agentUrl,
+    agent_url: safeAgentUrl,
     adcp_version: adcpVersion,
+    completeness: stoppedForTimeoutBudget ? 'timed_out' : 'complete',
     agent_profile: profile,
     overall_status: overallStatus,
     tracks: trackResults,
     tested_tracks: trackResults
       .filter(t => t.status === 'pass' || t.status === 'fail' || t.status === 'partial' || t.status === 'silent')
-      .map(t => ({ ...t, _view: 'reference' as const })),
+      .map(toTestedTrackEntry),
     skipped_tracks: skippedTracks,
     summary,
     observations: allObservations,
@@ -1715,16 +1847,22 @@ async function buildUnreachableResult(
   profile: AgentProfile,
   errorMsg: string | undefined,
   start: number,
-  _effectiveOptions: TestOptions,
+  effectiveOptions: TestOptions,
   adcpVersion: string,
   signal?: AbortSignal
 ): Promise<ComplianceResult> {
-  const { isAuth, observations } = await detectAuthRejection(agentUrl, errorMsg, signal);
-  const err = errorMsg || 'Unknown error';
+  const { isAuth, observations } = await detectAuthRejection(
+    agentUrl,
+    errorMsg,
+    signal,
+    effectiveOptions.transport?.trustedFetchFn
+  );
+  const err = redactOAuthUrlsInText(errorMsg || 'Unknown error');
   const headline = isAuth ? `Authentication required` : `Agent unreachable — ${err}`;
   return {
-    agent_url: agentUrl,
+    agent_url: redactOAuthUrlForOutput(agentUrl),
     adcp_version: adcpVersion,
+    completeness: 'complete',
     agent_profile: profile,
     overall_status: (isAuth ? 'auth_required' : 'unreachable') as OverallStatus,
     tracks: [],
@@ -1801,6 +1939,7 @@ function buildSummary(tracks: TrackResult[], storyboardResults: StoryboardResult
   const stepsSkipped = stepDisposition.stepsSkipped;
   const stepsNotSelected = stepDisposition.notSelected.length;
   const validationsNotApplicable = storyboardResults.reduce((s, r) => s + (r.validations_not_applicable ?? 0), 0);
+  const validationsAdvisoryFailed = storyboardResults.reduce((s, r) => s + (r.validations_advisory_failed ?? 0), 0);
   const totalSteps = stepsPassed + stepsFailed + stepsSkipped + stepsNotSelected;
   const schemasUsed: Array<{ schema_id: string; schema_url: string }> = [];
   const seenSchemas = new Set<string>();
@@ -1822,12 +1961,14 @@ function buildSummary(tracks: TrackResult[], storyboardResults: StoryboardResult
     total_steps: totalSteps,
     steps_passed: stepsPassed,
     steps_failed: stepsFailed,
+    ...(validationsAdvisoryFailed > 0 ? { validations_advisory_failed: validationsAdvisoryFailed } : {}),
     steps_skipped: stepsSkipped,
     steps_not_selected: stepsNotSelected,
     not_selected: stepDisposition.notSelected,
     not_selected_by_reason: stepDisposition.notSelectedByReason,
     skipped_by_reason: stepDisposition.skippedByReason,
     ...(validationsNotApplicable > 0 ? { validations_not_applicable: validationsNotApplicable } : {}),
+    runner_capability_version: LIBRARY_VERSION,
     ...(schemasUsed.length > 0 ? { schemas_used: schemasUsed } : {}),
   };
 }
@@ -1941,6 +2082,12 @@ export function formatComplianceResults(result: ComplianceResult): string {
 
   // Summary line
   output += `${result.summary.headline}\n\n`;
+  if (result.completeness === 'timed_out') {
+    const timeoutObservation = result.observations.find(
+      observation => observation.source?.code === 'timeout-budget-exceeded'
+    );
+    output += `⚠️  INCOMPLETE RUN: ${timeoutObservation?.message ?? 'The compliance timeout budget was reached before every selected storyboard ran.'}\n\n`;
+  }
   if (
     result.summary.steps_passed !== undefined ||
     result.summary.steps_failed !== undefined ||
@@ -1950,6 +2097,7 @@ export function formatComplianceResults(result: ComplianceResult): string {
     output +=
       `Steps: ${result.summary.steps_passed ?? 0} passed, ` +
       `${result.summary.steps_failed ?? 0} failed, ` +
+      `${result.summary.validations_advisory_failed ?? 0} advisory validation(s) failed, ` +
       `${result.summary.steps_skipped ?? 0} skipped, ` +
       `${result.summary.steps_not_selected ?? 0} not selected\n\n`;
     const notSelectedReasons = formatReasonCounts(result.summary.not_selected_by_reason);
@@ -1959,7 +2107,8 @@ export function formatComplianceResults(result: ComplianceResult): string {
     if (notSelectedReasons || skippedReasons) output += '\n';
   }
 
-  // Track results
+  // Scenario detail is canonical under `tracks`; `tested_tracks` deliberately
+  // contains no scenario arrays and is not used by the text formatter.
   output += `Capability Tracks\n`;
   output += `${'─'.repeat(50)}\n`;
 
@@ -2093,7 +2242,18 @@ function formatReasonCounts(counts: Partial<Record<string, number>> | undefined)
  * Format compliance results as JSON.
  */
 export function formatComplianceResultsJSON(result: ComplianceResult): string {
-  return JSON.stringify(result, null, 2);
+  // Normalize the reference projection at the serialization boundary too. This
+  // keeps output deduplicated when JavaScript callers pass a pre-v13 result
+  // object whose tested_tracks entries still carry scenario arrays.
+  const testedTracks = (result as Partial<ComplianceResult>).tested_tracks?.map(toTestedTrackEntry);
+  return JSON.stringify(
+    {
+      ...result,
+      ...(testedTracks !== undefined && { tested_tracks: testedTracks }),
+    },
+    null,
+    2
+  );
 }
 
 /**

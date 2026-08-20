@@ -34,6 +34,7 @@ import type { OAuthConfigStorage } from './types';
 import { resolveSecret } from './secret-resolver';
 import { isLikelyPrivateUrl } from '../../net';
 import { wrapFetchWithSizeLimit } from '../../protocols/responseSizeLimit';
+import { createAbortError, throwIfAborted, withAbortSignal } from '../../protocols/abort';
 
 /** Max length we'll echo from an AS-supplied error description into errors. */
 const MAX_AS_ERROR_LENGTH = 200;
@@ -88,6 +89,8 @@ export interface ExchangeClientCredentialsOptions {
    * user-supplied configs should leave this off.
    */
   allowPrivateIp?: boolean;
+  /** Caller-owned cancellation signal, composed with `timeoutMs`. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -170,7 +173,7 @@ function validateTokenEndpoint(tokenEndpoint: string, options: { allowPrivateIp?
 
   if (!options.allowPrivateIp && isLikelyPrivateUrl(tokenEndpoint)) {
     throw new ClientCredentialsExchangeError(
-      `token_endpoint resolves to a private or loopback address (${host}). Pass { allowPrivateIp: true } to exchangeClientCredentials / ensureClientCredentialsTokens if this is intentional (operator-driven CLI or local test setups).`,
+      `token_endpoint uses a private or loopback hostname/address (${host}). Pass { allowPrivateIp: true } to exchangeClientCredentials / ensureClientCredentialsTokens if this is intentional (operator-driven CLI or local test setups).`,
       'malformed'
     );
   }
@@ -193,6 +196,8 @@ export async function exchangeClientCredentials(
   credentials: AgentOAuthClientCredentials,
   options: ExchangeClientCredentialsOptions = {}
 ): Promise<AgentOAuthTokens> {
+  throwIfAborted(options.signal);
+
   // Wrap with the response-size-limit guard so a hostile token endpoint
   // can't buffer-bomb on every refresh. Pass-through when no
   // `withResponseSizeLimit` slot is active. (#1175)
@@ -240,19 +245,33 @@ export async function exchangeClientCredentials(
     body.set('client_secret', clientSecret);
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
   let response: Response;
+  let bodyText: string;
+  const timeoutError = new Error(`Client credentials exchange timed out after ${timeoutMs}ms`);
+  timeoutError.name = 'TimeoutError';
   try {
-    response = await fetchImpl(credentials.token_endpoint, {
-      method: 'POST',
-      headers,
-      body: body.toString(),
-      signal: controller.signal,
-    });
+    ({ response, bodyText } = await withAbortSignal(
+      [options.signal],
+      timeoutMs,
+      async signal => {
+        const tokenResponse = await fetchImpl(credentials.token_endpoint, {
+          method: 'POST',
+          // Never forward client credentials or accept tokens across a
+          // redirect. The validated endpoint is the only authorized sink.
+          redirect: 'manual',
+          headers,
+          body: body.toString(),
+          signal,
+        });
+        return { response: tokenResponse, bodyText: await tokenResponse.text() };
+      },
+      { timeoutError }
+    ));
   } catch (err) {
-    if ((err as { name?: string }).name === 'AbortError') {
+    if (options.signal?.aborted) {
+      throw createAbortError(options.signal.reason);
+    }
+    if (err === timeoutError) {
       throw new ClientCredentialsExchangeError(
         `Token endpoint ${credentials.token_endpoint} did not respond within ${timeoutMs}ms.`,
         'network'
@@ -262,11 +281,18 @@ export async function exchangeClientCredentials(
       `Failed to reach token endpoint ${credentials.token_endpoint}: ${(err as Error).message}`,
       'network'
     );
-  } finally {
-    clearTimeout(timeout);
   }
 
-  const bodyText = await response.text();
+  if (response.status >= 300 && response.status < 400) {
+    throw new ClientCredentialsExchangeError(
+      `Token endpoint refused: redirects are not followed during client credentials exchange (HTTP ${response.status}).`,
+      'network',
+      undefined,
+      undefined,
+      response.status
+    );
+  }
+
   let parsed: Record<string, unknown> | undefined;
   try {
     parsed = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : undefined;
@@ -326,15 +352,11 @@ export interface EnsureClientCredentialsOptions extends ExchangeClientCredential
 }
 
 /**
- * In-flight refresh coalescing map. Keyed by the tuple
- * `(agent.id, token_endpoint, client_id)` — concurrent
- * `ensureClientCredentialsTokens` calls for the same credentials share a
- * single token POST instead of each racing to exchange the same secret.
- *
- * Two different `AgentConfig` objects that accidentally reuse the same
- * `id` (e.g. two tenants both creating `cli-agent`) but hold different
- * credentials won't cross-contaminate — the endpoint + client_id in the
- * key keeps them distinct.
+ * In-flight refresh coalescing map. Scoped by `AgentConfig` object identity
+ * so only callers deliberately sharing one configuration can share a bearer.
+ * A string key built from public OAuth fields is insufficient here: two
+ * tenants can reuse an agent id, endpoint, and client id while differing in
+ * secret, scope, audience, or resource.
  *
  * Cleared on completion regardless of success/failure.
  *
@@ -344,17 +366,35 @@ export interface EnsureClientCredentialsOptions extends ExchangeClientCredential
  * For the CLI this is fine; for high-throughput server deployments,
  * coalesce upstream at the storage layer.
  */
-const inFlightRefresh = new Map<string, Promise<AgentOAuthTokens>>();
+interface InFlightRefresh {
+  promise: Promise<AgentOAuthTokens>;
+  controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
 
-/**
- * Compute the coalesce key for `ensureClientCredentialsTokens`. `force: true`
- * uses a distinct bucket so a 401-triggered forced refresh never piggybacks
- * on a still-pending non-forced exchange — the whole point of forcing is
- * that the in-flight token is *known* stale, so awaiting it would defeat
- * the retry.
- */
-function coalesceKeyFor(agent: AgentConfig, credentials: AgentOAuthClientCredentials, force: boolean): string {
-  return `${force ? 'force' : 'normal'}\u0000${agent.id}\u0000${credentials.token_endpoint}\u0000${credentials.client_id}`;
+type RefreshMode = 'normal' | 'force';
+
+const inFlightRefresh = new WeakMap<AgentConfig, Map<RefreshMode, InFlightRefresh>>();
+
+async function waitForRefresh(entry: InFlightRefresh, signal?: AbortSignal): Promise<AgentOAuthTokens> {
+  if (signal?.aborted) throw createAbortError(signal.reason);
+  entry.waiters += 1;
+  let abortListener: (() => void) | undefined;
+  try {
+    if (!signal) return await entry.promise;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      abortListener = () => reject(createAbortError(signal.reason));
+      signal.addEventListener('abort', abortListener, { once: true });
+    });
+    return await Promise.race([entry.promise, aborted]);
+  } finally {
+    if (abortListener && signal) signal.removeEventListener('abort', abortListener);
+    entry.waiters -= 1;
+    if (entry.waiters === 0 && !entry.settled && !entry.controller.signal.aborted) {
+      entry.controller.abort(createAbortError(signal?.reason ?? 'No callers remain for token refresh'));
+    }
+  }
 }
 
 /**
@@ -380,6 +420,8 @@ export async function ensureClientCredentialsTokens(
   agent: AgentConfig,
   options: EnsureClientCredentialsOptions = {}
 ): Promise<AgentOAuthTokens> {
+  throwIfAborted(options.signal);
+
   if (!agent.oauth_client_credentials) {
     throw new Error(
       `ensureClientCredentialsTokens called for agent '${agent.id}' with no oauth_client_credentials configured.`
@@ -397,20 +439,33 @@ export async function ensureClientCredentialsTokens(
     return cached!;
   }
 
-  const coalesceKey = coalesceKeyFor(agent, agent.oauth_client_credentials, options.force === true);
-  const existing = inFlightRefresh.get(coalesceKey);
-  if (existing) {
-    const tokens = await existing;
+  const refreshMode: RefreshMode = options.force ? 'force' : 'normal';
+  let agentRefreshes = inFlightRefresh.get(agent);
+  const existing = agentRefreshes?.get(refreshMode);
+  if (existing && !existing.controller.signal.aborted) {
+    const tokens = await waitForRefresh(existing, options.signal);
     agent.oauth_tokens = tokens;
     return tokens;
   }
 
-  const exchange = (async () => {
+  const controller = new AbortController();
+  const entry: InFlightRefresh = {
+    promise: undefined as unknown as Promise<AgentOAuthTokens>,
+    controller,
+    waiters: 0,
+    settled: false,
+  };
+  if (!agentRefreshes) {
+    agentRefreshes = new Map();
+    inFlightRefresh.set(agent, agentRefreshes);
+  }
+  entry.promise = (async () => {
     try {
       const tokens = await exchangeClientCredentials(agent.oauth_client_credentials!, {
         fetch: options.fetch,
         timeoutMs: options.timeoutMs,
         allowPrivateIp: options.allowPrivateIp,
+        signal: controller.signal,
       });
       agent.oauth_tokens = tokens;
       if (options.storage) {
@@ -418,10 +473,14 @@ export async function ensureClientCredentialsTokens(
       }
       return tokens;
     } finally {
-      inFlightRefresh.delete(coalesceKey);
+      entry.settled = true;
+      if (agentRefreshes?.get(refreshMode) === entry) {
+        agentRefreshes.delete(refreshMode);
+        if (agentRefreshes.size === 0) inFlightRefresh.delete(agent);
+      }
     }
   })();
 
-  inFlightRefresh.set(coalesceKey, exchange);
-  return exchange;
+  agentRefreshes.set(refreshMode, entry);
+  return waitForRefresh(entry, options.signal);
 }

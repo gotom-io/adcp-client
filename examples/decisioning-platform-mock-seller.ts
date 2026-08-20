@@ -47,18 +47,20 @@ import {
   type SalesIngestionPlatform,
   type AccountStore,
   type AdcpStructuredError,
-  type GetProductsPayload,
+  type GetProductsHandlerResult,
   type SyncCreativesRow,
 } from '@adcp/sdk/server';
 import type {
-  GetProductsRequest,
+  CanonicalSyncCreativeAsset,
   CreateMediaBuyRequest,
-  CreateMediaBuySuccess,
+  GetProductsRequest,
   UpdateMediaBuyRequest,
+} from '@adcp/sdk';
+import type {
+  CreateMediaBuySuccess,
   UpdateMediaBuySuccess,
   GetMediaBuyDeliveryRequest,
   GetMediaBuyDeliveryResponse,
-  CreativeAsset,
   AccountReference,
 } from '@adcp/sdk/types';
 
@@ -146,7 +148,7 @@ function rejectPreflight(errors: AdcpStructuredError[]): never {
   });
 }
 
-const SHARED_GET_PRODUCTS = async (_req: GetProductsRequest): Promise<GetProductsPayload> => ({
+const SHARED_GET_PRODUCTS = async (_req: GetProductsRequest): Promise<GetProductsHandlerResult> => ({
   cache_scope: 'account' as const,
   products: [
     {
@@ -154,7 +156,13 @@ const SHARED_GET_PRODUCTS = async (_req: GetProductsRequest): Promise<GetProduct
       name: 'Premium Video',
       description: 'Pre-roll video on premium inventory',
       delivery_type: 'non_guaranteed',
-      format_ids: [{ id: 'video_15s', agent_url: 'https://example.com/creative-agent/mcp' }],
+      format_options: [
+        {
+          format_option_id: 'video_15s',
+          format_kind: 'video_hosted',
+          params: { duration_ms_exact: 15_000 },
+        },
+      ],
       publisher_properties: [{ publisher_domain: 'publisher.example.com', selection_type: 'all' }],
       pricing_options: [
         {
@@ -173,10 +181,10 @@ const SHARED_GET_PRODUCTS = async (_req: GetProductsRequest): Promise<GetProduct
   ],
 });
 
-const SHARED_SYNC_CREATIVES = async (creatives: CreativeAsset[]): Promise<SyncCreativesRow[]> => {
+const SHARED_SYNC_CREATIVES = async (creatives: CanonicalSyncCreativeAsset[]): Promise<SyncCreativesRow[]> => {
   return creatives.map(c => {
-    const id = (c as { creative_id?: string }).creative_id ?? `cr_${Math.random()}`;
-    const needsReview = (c as { format_id?: { id?: string } }).format_id?.id?.startsWith('video_');
+    const id = c.creative_id;
+    const needsReview = c.format_kind === 'video_hosted' || c.format_kind === 'video_vast';
     return {
       creative_id: id,
       action: 'created',
@@ -255,7 +263,7 @@ export class MockHybridSeller implements DecisioningPlatform<MockSellerConfig, M
         const buyId = `mb_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
         const buy: MockMediaBuy = {
           media_buy_id: buyId,
-          status: 'pending_creatives',
+          media_buy_status: 'pending_creatives',
           confirmed_at: new Date().toISOString(),
           revision: 1,
           packages: [],
@@ -274,7 +282,7 @@ export class MockHybridSeller implements DecisioningPlatform<MockSellerConfig, M
           const buyId = `mb_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
           const buy: MockMediaBuy = {
             media_buy_id: buyId,
-            status: 'active',
+            media_buy_status: 'active',
             confirmed_at: new Date().toISOString(),
             revision: 1,
             packages: [],
@@ -294,10 +302,14 @@ export class MockHybridSeller implements DecisioningPlatform<MockSellerConfig, M
           field: 'media_buy_id',
         });
       }
-      if (patch.paused === true) existing.status = 'paused';
-      if (patch.paused === false && existing.status === 'paused') existing.status = 'active';
+      if (patch.paused === true) existing.media_buy_status = 'paused';
+      if (patch.paused === false && existing.media_buy_status === 'paused') existing.media_buy_status = 'active';
       existing.revision = (existing.revision ?? 0) + 1;
-      return { media_buy_id: existing.media_buy_id, status: existing.status, revision: existing.revision };
+      return {
+        media_buy_id: existing.media_buy_id,
+        media_buy_status: existing.media_buy_status,
+        revision: existing.revision,
+      };
     },
 
     syncCreatives: SHARED_SYNC_CREATIVES,
@@ -327,10 +339,11 @@ export function buildHybridServerExample(platform: MockHybridSeller) {
     version: '0.0.1',
     validation: { requests: 'off', responses: 'off' },
     mergeSeam: 'strict',
-    mediaBuy: {
-      // v5 leftover — listCreativeFormats isn't on SalesPlatform v1.0
-      // (deferred to rc.1). Custom handler here fills the gap until then.
-      listCreativeFormats: async () => ({ status: 'completed' as const, formats: [] }),
+    legacyHandlers: {
+      mediaBuy: {
+        // Explicit v5 raw-handler compatibility seam.
+        listCreativeFormats: async () => ({ status: 'completed' as const, formats: [] }),
+      },
     },
   });
 }

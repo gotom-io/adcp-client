@@ -8,6 +8,8 @@
  * - sync_creatives
  */
 
+import { randomUUID } from 'crypto';
+
 import type {
   AccountReference,
   SyncCreativesSuccess,
@@ -27,6 +29,7 @@ import {
 } from '../client';
 import { testDiscovery } from './discovery';
 import { getAuthoritativeMediaBuyStatus } from '../../utils/media-buy-status';
+import { generateIdempotencyKey } from '../../utils/idempotency';
 
 /**
  * Find a suitable product for testing based on options
@@ -77,15 +80,16 @@ export function buildCreateMediaBuyRequest(
     accountRef?: AccountReference;
   } = {}
 ): Record<string, unknown> {
-  const minSpend = pricingOption.min_spend_per_package || 0;
+  const configuredMinSpend = 'min_spend_per_package' in pricingOption ? pricingOption.min_spend_per_package : undefined;
+  const minSpend = typeof configuredMinSpend === 'number' ? configuredMinSpend : 0;
   const budget = options.budget || Math.max(1000, minSpend);
   const now = new Date();
   const startTime = new Date(now.getTime() + 24 * 60 * 60 * 1000); // Tomorrow
   const endTime = new Date(startTime.getTime() + 7 * 24 * 60 * 60 * 1000); // 7 days later
 
-  const isAuction =
-    !('fixed_price' in pricingOption) &&
-    (pricingOption.floor_price !== undefined || pricingOption.price_guidance !== undefined);
+  const floorPrice = 'floor_price' in pricingOption ? pricingOption.floor_price : undefined;
+  const priceGuidance = 'price_guidance' in pricingOption ? pricingOption.price_guidance : undefined;
+  const isAuction = !('fixed_price' in pricingOption) && (floorPrice !== undefined || priceGuidance !== undefined);
 
   const packageRequest: Record<string, unknown> = {
     product_id: product.product_id,
@@ -94,8 +98,8 @@ export function buildCreateMediaBuyRequest(
   };
 
   // Add bid_price if auction-based
-  if (isAuction && pricingOption.floor_price) {
-    packageRequest.bid_price = pricingOption.floor_price * 1.5;
+  if (isAuction && typeof floorPrice === 'number') {
+    packageRequest.bid_price = floorPrice * 1.5;
   }
 
   // Add inline creatives if provided
@@ -127,6 +131,20 @@ export function buildCreateMediaBuyRequest(
 
 function getDefaultFormatId(): FormatID {
   return { agent_url: 'https://creative.adcontextprotocol.org', id: 'display_300x250' };
+}
+
+function resolveSellerFormatId(value: unknown, agentUrl: string): FormatID | undefined {
+  const candidate = isRecord(value) && value.format_id !== undefined ? value.format_id : value;
+
+  if (typeof candidate === 'string') {
+    return { agent_url: agentUrl, id: candidate };
+  }
+
+  if (isRecord(candidate) && typeof candidate.id === 'string') {
+    return { agent_url: agentUrl, ...candidate, id: candidate.id } as FormatID;
+  }
+
+  return undefined;
 }
 
 function formatIdToString(formatId: FormatID): string {
@@ -164,6 +182,7 @@ function buildStaticInlineCreative(formatId: FormatID) {
     format_id: formatId,
     assets: {
       primary: {
+        asset_type: 'image' as const,
         url: 'https://via.placeholder.com/300x250?text=Inline+Creative',
         width: 300,
         height: 250,
@@ -765,15 +784,12 @@ export async function testCreativeSync(
   }
 
   // Get format info first
-  let formatId: Record<string, unknown> = {
-    agent_url: 'https://creative.adcontextprotocol.org',
-    id: 'display_300x250',
-  };
+  let formatId: FormatID = getDefaultFormatId();
   if (profile.tools.includes('list_creative_formats')) {
     const { result: formatsResult } = await runStep<TaskResult>(
       'Get formats for creative',
       'list_creative_formats',
-      async () => client.listCreativeFormats({}) as Promise<TaskResult>
+      async () => client.listCreativeFormatsLegacy({}) as Promise<TaskResult>
     );
 
     if (formatsResult?.success && formatsResult?.data) {
@@ -782,24 +798,21 @@ export async function testCreativeSync(
       const formats = data.formats as Record<string, unknown>[] | undefined;
       const firstFormat = formatIds?.[0] || formats?.[0];
       if (firstFormat) {
-        if (typeof firstFormat === 'string') {
-          formatId = { id: firstFormat };
-        } else {
-          const formatObj = firstFormat as Record<string, unknown>;
-          formatId = (formatObj.format_id as Record<string, unknown>) || formatObj;
-        }
+        formatId = resolveSellerFormatId(firstFormat, agentUrl) ?? formatId;
       }
     }
   }
 
   // Test sync_creatives with a simple creative
   // Assets must be an object keyed by asset_role, not an array
+  const syncKey = generateIdempotencyKey();
   const testCreative = {
-    creative_id: `test-creative-${Date.now()}`,
+    creative_id: `test-creative-${randomUUID()}`,
     name: 'E2E Test Creative',
     format_id: formatId,
     assets: {
       primary: {
+        asset_type: 'image' as const,
         url: 'https://via.placeholder.com/300x250',
         width: 300,
         height: 250,
@@ -815,6 +828,7 @@ export async function testCreativeSync(
       client.syncCreatives({
         account: accountRef,
         creatives: [testCreative],
+        idempotency_key: syncKey,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional: test request bypasses strict typing
       } as any) as Promise<TaskResult>
   );
@@ -994,7 +1008,7 @@ export async function testCreativeInline(
       `Build creative for inline flow (${formatIdToString(formatId)})`,
       'build_creative',
       async () =>
-        client.executeTask('build_creative', {
+        client.executeTaskLegacy('build_creative', {
           target_format_id: formatId,
           brand: resolveBrand(options),
           message: `Create an ad creative for the ${formatIdToString(formatId)} format that can be attached to a media buy`,
@@ -1149,7 +1163,7 @@ export async function testCreativeReference(
     `Build creative for reference flow (${formatIdToString(formatId)})`,
     'build_creative',
     async () =>
-      client.executeTask('build_creative', {
+      client.executeTaskLegacy('build_creative', {
         target_format_id: formatId,
         brand: resolveBrand(options),
         message: `Create a reusable ad creative for the ${formatIdToString(formatId)} format`,
@@ -1189,7 +1203,7 @@ export async function testCreativeReference(
     'Sync generated creative to library',
     'sync_creatives',
     async () =>
-      client.executeTask('sync_creatives', {
+      client.executeTaskLegacy('sync_creatives', {
         creatives: [syncedCreative],
       }) as Promise<TaskResult>
   );
@@ -1220,7 +1234,7 @@ export async function testCreativeReference(
   const { result: createResult, step: createStep } = await runStep<TaskResult>(
     'Create media buy with referenced creative',
     'create_media_buy',
-    async () => client.executeTask('create_media_buy', createRequest) as Promise<TaskResult>
+    async () => client.executeTaskLegacy('create_media_buy', createRequest) as Promise<TaskResult>
   );
 
   if (createResult?.success && createResult?.data) {
@@ -1350,14 +1364,18 @@ export async function resolveAccountForMediaBuy(
   return { accountRef: resolveAccount(options), steps };
 }
 
-function getMediaBuyAccountResolutionHints(profile: AgentProfile): MediaBuyAccountResolutionHints {
+export function getMediaBuyAccountResolutionHints(profile: AgentProfile): MediaBuyAccountResolutionHints {
   const capabilities = profile.raw_capabilities;
   if (!isRecord(capabilities) || !isRecord(capabilities.account)) {
     return {};
   }
 
   const requireOperatorAuth = capabilities.account.require_operator_auth;
-  return typeof requireOperatorAuth === 'boolean' ? { requireOperatorAuth } : {};
+  // `false` is the schema default. Once the account capability block exists,
+  // omission must not silently switch the runner into explicit discovery
+  // mode merely because list_accounts is also advertised. Preserve the
+  // legacy list_accounts heuristic only when no account block was available.
+  return { requireOperatorAuth: typeof requireOperatorAuth === 'boolean' ? requireOperatorAuth : false };
 }
 
 function selectMediaBuyAccount(
@@ -1407,7 +1425,11 @@ function accountMatchesBrand(
     return false;
   }
 
-  return typeof account.operator !== 'string' || account.operator === brand.domain;
+  // The operator is a separate natural-key dimension, not an alias for the
+  // brand domain. Agency-operated accounts routinely have
+  // `operator !== brand.domain`; the requested test brand is the only brand
+  // signal available to this selector.
+  return true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

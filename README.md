@@ -30,10 +30,11 @@ AdCP operations are **distributed and asynchronous by default**. An agent might:
 
 ```bash
 npm install @adcp/sdk@adcp-3.0   # 7.x, AdCP 3.0
-npm install @adcp/sdk@adcp-3.1   # 8.x beta, AdCP 3.1
+npm install @adcp/sdk             # 13.x, maintained AdCP 3.1 stable line
+npm install @adcp/sdk@beta        # 14.x beta, AdCP 3.2 beta
 ```
 
-Upgrading from v7? See **[MIGRATION-v8.md](./MIGRATION-v8.md)** — TL;DR is three changes for most adopters; full guide covers wire shape, type shape, and SDK behavior deltas. Moving from 8.0 beta to 8.1? See [`docs/migration-8.0-to-8.1.md`](./docs/migration-8.0-to-8.1.md), plus the inbound webhook recipe at [`docs/recipes/verifying-inbound-webhooks.md`](./docs/recipes/verifying-inbound-webhooks.md).
+Trying the v14 beta? Read the [14.0.0 beta release notes](./docs/releases/14.0.0-beta.0.md), then use the [13-to-14](./docs/migration-13-to-14.md) or [12-to-14](./docs/migration-12-to-14.md) migration guide. The npm `latest` tag remains on v13 for the maintained AdCP 3.1 stable line. Older paths: [12-to-13](./docs/migration-12-to-13.md), **[MIGRATION-v8.md](./MIGRATION-v8.md)**, and [8.0-to-8.1](./docs/migration-8.0-to-8.1.md).
 
 ### Narrow type imports (`@adcp/sdk/types/<tool>`)
 
@@ -119,6 +120,9 @@ const result = await agent.getProducts({ brief: 'Coffee brands' });
 if (result.status === 'completed') {
   // Agent completed synchronously!
   console.log('✅ Sync completion:', result.data.products.length, 'products');
+  // Products expose canonical format_options[]; legacy named-format refs do not
+  // cross the primary AgentClient boundary.
+  console.log(result.data.products[0]?.format_options[0]?.format_kind);
   // onGetProductsStatusChange handler ALREADY fired with status='completed' ✓
 }
 
@@ -416,7 +420,8 @@ result.metadata.replayed;
 import { IdempotencyConflictError, IdempotencyExpiredError } from '@adcp/sdk';
 
 if (result.errorInstance instanceof IdempotencyConflictError) {
-  // Agent re-planned with a different payload. Mint a fresh key and retry.
+  // Reconcile by natural key before deciding whether this is a new intent.
+  // Do not blindly mint a fresh key: the prior operation may have succeeded.
 }
 if (result.errorInstance instanceof IdempotencyExpiredError) {
   // Key past the seller's replay window. Look up by natural key before retrying.
@@ -491,9 +496,15 @@ await signingFetch('https://seller.example.com/mcp', {
 ```typescript
 import { createExpressVerifier, StaticJwksResolver, InMemoryReplayStore } from '@adcp/sdk/signing';
 
+// Raw-body capture MUST be mounted ahead of the verifier — express.json()
+// would otherwise consume the stream and the verifier would have no bytes to
+// hash. `rawBodyVerify` comes from `createExpressAdapter()`; the inline form is
+// equivalent.
+app.use(express.json({ verify: adapter.rawBodyVerify }));
+// or: app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); } }));
+
 app.post(
   '/mcp',
-  rawBodyMiddleware(),
   createExpressVerifier({
     capability: {
       supported: true,
@@ -551,16 +562,29 @@ const client = ADCPMultiAgentClient.fromEnv();
 
 ## Available Tools
 
-All AdCP tools with full type safety:
+Primary AdCP tools have typed request and response maps. Less-common or
+extension tools use `executeCustomTask<T>()` explicitly.
 
 **Media Buy Lifecycle:**
 
+The primary client surface speaks canonical creatives: products use
+`format_options[]`, packages select `format_option_refs[]`, and creatives use
+`format_kind` plus an optional `format_option_ref`. The SDK performs negotiated
+legacy-wire translation internally. Migration tooling can opt into the clearly
+named `createMediaBuyLegacy()`, `updateMediaBuyLegacy()`,
+`syncCreativesLegacy()`, `listCreativesLegacy()`, `buildCreativeLegacy()`, and
+`previewCreativeLegacy()` escape hatches. `executeCustomTask()` cannot invoke
+typed primary tasks or legacy creative tools; other less-common standard and
+extension tools intentionally use that explicit raw-task route.
+
 - `getProducts()` - Discover advertising products
-- `listCreativeFormats()` - Get supported creative formats
+- `listCreativeFormatsLegacy()` - Inspect the legacy named-format catalog (migration tooling only)
 - `createMediaBuy()` - Create new media buy
 - `updateMediaBuy()` - Update existing media buy
 - `syncCreatives()` - Upload/sync creative assets
 - `listCreatives()` - List creative assets
+- `buildCreativeLegacy()` - Build through the legacy named-format protocol (migration tooling only)
+- `previewCreativeLegacy()` - Preview through the legacy named-format protocol (migration tooling only)
 - `getMediaBuyDelivery()` - Get delivery performance
 
 **Audience & Targeting:**
@@ -650,28 +674,25 @@ Build a registry service that:
 
 Library provides discovery logic - you add persistence layer.
 
-### Brand Hierarchy Resolution
+### Brand relationship verification
 
-Use `RegistryClient.resolveBrandHierarchy()` when rules need the ordered corporate chain for a brand domain. The chain is ordered from the resolved brand itself to the house brand, so nearest-ancestor matching can scan from left to right.
+Use `RegistryClient.lookupBrand()` to resolve a domain and verify its relationship to a house. The public v3 registry does not expose an ordered-chain endpoint; v3 hierarchy is one level deep.
 
 ```ts
-import { RegistryClient, RegistrySync } from '@adcp/sdk';
+import { RegistryClient } from '@adcp/sdk';
 
-const registry = new RegistryClient({ apiKey: process.env.ADCP_REGISTRY_API_KEY });
+const registry = new RegistryClient();
+const brand = await registry.lookupBrand('leaf.example', { fresh: true });
 
-const brand = await registry.resolveBrandHierarchy('wpp-spain.com', { ttlMs: 60_000 });
-const domains = brand?.chain.map(node => node.canonical_domain) ?? [];
-
-const both = await registry.resolveBrandHierarchies(['wpp-spain.com', 'operator.example'], { ttlMs: 60_000 });
-
-const sync = new RegistrySync({ client: registry });
-await sync.start();
-const ancestors = sync.getAncestors('wpp-spain.com'); // self -> parents -> house
+const verifiedHouse =
+  brand && !brand.live_brand_json && (brand.relationship_trust === 'mutual' || brand.relationship_trust === 'inline')
+    ? brand.house_domain
+    : undefined;
 ```
 
-`ResolvedBrand.parent_brand` is a hierarchy reference, not a portable traversal API. New registry responses use the parent brand's canonical domain when known, but older rows may still carry a portfolio-internal `brand.json` id. Use the hierarchy APIs instead of N+1 walking `parent_brand`.
+Only `relationship_trust: "mutual"` and `"inline"` are reciprocated. For `mutual`, `relationship_verified_at` says when both sides were last observed agreeing. `claimed_house_domain` is a unilateral leaf claim and must not be used for authorization. `ResolvedBrand.parent_brand` is a registry reference that may be a portfolio-internal id, not a portable traversal API.
 
-`RegistrySync` maintains its hierarchy index from registry feed events. On a cold start before a relevant hierarchy event has been applied, call `resolveBrandHierarchy()` for a one-off read and treat `getAncestors()` as the zero-latency mirror once the feed has populated that domain.
+`source` answers a different question: where the selected identity record came from. Provenance is not relationship authorization, and callers must not infer a relationship from `source`. Treat an absent `relationship_trust` as unknown, not `standalone`. Pass `{ fresh: true }` when a live origin check is required; if `live_brand_json` is present, that check failed and the response came from stored evidence, so a strict live-evidence policy must reject it. Policies that permit stored evidence should apply their own age ceiling to `relationship_verified_at` and `relationship_declared_at`. If `promoted_from_schema` is present, inspect every `migration_warnings` entry. Until the registry guarantees a warning for every discarded legacy field, absence of a warning is not evidence that a legacy relationship was promoted.
 
 ### Community Mirror `adagents.json` Catalogs
 

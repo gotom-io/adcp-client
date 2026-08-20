@@ -3,7 +3,10 @@ const { describe, test } = require('node:test');
 const assert = require('node:assert');
 
 const { resolveAccountForAudiences, resolveAccountForMediaBuy } = require('../../dist/lib/testing/index.js');
-const { buildCreateMediaBuyRequest } = require('../../dist/lib/testing/scenarios/media-buy.js');
+const {
+  buildCreateMediaBuyRequest,
+  getMediaBuyAccountResolutionHints,
+} = require('../../dist/lib/testing/scenarios/media-buy.js');
 
 describe('resolveAccountForAudiences', () => {
   const defaultOptions = { brand: { domain: 'test.example' } };
@@ -320,6 +323,17 @@ describe('resolveAccountForMediaBuy', () => {
     assert.strictEqual(steps.length, 0);
   });
 
+  test('omitted require_operator_auth defaults to implicit when the account capability block exists', () => {
+    assert.deepStrictEqual(
+      getMediaBuyAccountResolutionHints({
+        name: 'seller',
+        tools: ['list_accounts'],
+        raw_capabilities: { account: { supported_billing: ['agent'] } },
+      }),
+      { requireOperatorAuth: false }
+    );
+  });
+
   test('declared explicit sandbox seller fails instead of falling back when no account is returned', async () => {
     const { accountRef, steps } = await resolveAccountForMediaBuy(
       { ...defaultOptions, sandbox: true },
@@ -362,6 +376,36 @@ describe('resolveAccountForMediaBuy', () => {
 
     assert.deepStrictEqual(accountRef, { account_id: 'acct-match' });
     assert.match(steps[0].details, /brand-matched account: acct-match/);
+  });
+
+  test('brand matching accepts an agency-operated account', async () => {
+    const { accountRef, steps } = await resolveAccountForMediaBuy(
+      defaultOptions,
+      ['list_accounts', 'create_media_buy'],
+      async () => ({
+        success: true,
+        data: {
+          accounts: [
+            {
+              account_id: 'acct-other',
+              brand: { domain: 'other.example' },
+              operator: 'other-agency.example',
+              status: 'active',
+            },
+            {
+              account_id: 'acct-agency',
+              brand: { domain: 'test.example' },
+              operator: 'pinnacle-agency.example',
+              status: 'active',
+            },
+          ],
+        },
+      }),
+      { requireOperatorAuth: true }
+    );
+
+    assert.deepStrictEqual(accountRef, { account_id: 'acct-agency' });
+    assert.match(steps[0].details, /brand-matched account: acct-agency/);
   });
 
   test('multiple matching accounts require explicit media_buy_account_id', async () => {
@@ -412,7 +456,7 @@ describe('resolveAccountForMediaBuy', () => {
   });
 });
 
-describe('buildCreateMediaBuyRequest accountRef override', () => {
+describe('buildCreateMediaBuyRequest', () => {
   const product = {
     product_id: 'prod-1',
     name: 'Product 1',
@@ -446,5 +490,46 @@ describe('buildCreateMediaBuyRequest accountRef override', () => {
         ),
       /Resolve an account before building the request/
     );
+  });
+
+  test('uses an auction floor to derive a 1.5x legacy bid price', () => {
+    const request = buildCreateMediaBuyRequest(
+      product,
+      { pricing_option_id: 'auction-floor', pricing_model: 'cpm', floor_price: 4 },
+      { brand: { domain: 'test.example' } }
+    );
+
+    assert.strictEqual(request.packages[0].bid_price, 6);
+  });
+
+  test('does not invent a bid when auction pricing has guidance only', () => {
+    const request = buildCreateMediaBuyRequest(
+      product,
+      { pricing_option_id: 'auction-guidance', pricing_model: 'cpm', price_guidance: { min: 2, max: 5 } },
+      { brand: { domain: 'test.example' } }
+    );
+
+    assert.strictEqual(request.packages[0].bid_price, undefined);
+  });
+
+  test('raises the default budget to the pricing option minimum spend', () => {
+    const request = buildCreateMediaBuyRequest(
+      product,
+      { pricing_option_id: 'minimum', pricing_model: 'cpm', fixed_price: 3, min_spend_per_package: 2500 },
+      { brand: { domain: 'test.example' } }
+    );
+
+    assert.strictEqual(request.packages[0].budget, 2500);
+  });
+
+  test('supports contingent pricing options without auction or minimum-spend fields', () => {
+    const request = buildCreateMediaBuyRequest(
+      product,
+      { pricing_option_id: 'revenue', pricing_model: 'revenue_share', currency: 'USD', revenue_share_rate: 0.1 },
+      { brand: { domain: 'test.example' } }
+    );
+
+    assert.strictEqual(request.packages[0].budget, 1000);
+    assert.strictEqual(request.packages[0].bid_price, undefined);
   });
 });

@@ -15,7 +15,11 @@ const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { runStoryboard, runStoryboardStep } = require('../../dist/lib/testing/storyboard/index.js');
-const { parseStoryboard, validateStoryboardShape } = require('../../dist/lib/testing/storyboard/loader.js');
+const {
+  loadStoryboardFile,
+  parseStoryboard,
+  validateStoryboardShape,
+} = require('../../dist/lib/testing/storyboard/loader.js');
 
 function buildStoryboard(overrides = {}) {
   return {
@@ -652,7 +656,7 @@ describe('Storyboard.requires gate (#1678): implicit webhook_receiver', () => {
     assert.equal(step.skip.requirement, 'webhook_receiver', 'recursive scan finds nested tokens');
   });
 
-  test('webhook tokens in rate_limit_trip target requests also trigger the gate', async () => {
+  test('authorized rate_limit_trip webhook tokens trigger the receiver gate after the side-effect gate', async () => {
     const sb = buildStoryboard({
       phases: [
         {
@@ -663,6 +667,7 @@ describe('Storyboard.requires gate (#1678): implicit webhook_receiver', () => {
               id: 'trip',
               title: 'Rate-limit trip target request needs a receiver',
               task: 'expect_rate_limit_not_replayed',
+              requires_contract: 'rate_limit_trip_runner',
               rate_limit_trip: {
                 trip_target_task: 'create_media_buy',
                 trip_target_sample_request: {
@@ -680,10 +685,22 @@ describe('Storyboard.requires gate (#1678): implicit webhook_receiver', () => {
       ],
     });
 
+    const unauthorizedResult = await runStoryboard('http://fake-local-99999', structuredClone(sb), {
+      _profile: profileWithoutController,
+      agentTools: profileWithoutController.tools,
+      contracts: ['rate_limit_trip_runner'],
+    });
+
+    const unauthorizedStep = unauthorizedResult.phases[0].steps[0];
+    assert.equal(unauthorizedStep.skipped, true);
+    assert.equal(unauthorizedStep.skip_reason, 'live_side_effect_opt_in_required');
+    assert.equal(unauthorizedStep.skip.reason, 'unsatisfied_contract');
+
     const result = await runStoryboard('http://fake-local-99999', sb, {
       _profile: profileWithoutController,
       agentTools: profileWithoutController.tools,
       contracts: ['rate_limit_trip_runner'],
+      allowLiveSideEffects: true,
     });
 
     const step = result.phases[0].steps[0];
@@ -777,6 +794,113 @@ phases:
 `;
     const parsed = parseStoryboard(yaml);
     assert.deepEqual(parsed.requires, ['webhook_receiver']);
+  });
+});
+
+// ────────────────────────────────────────────────────────────
+// adcp-client#2356: implicit webhook_replay_receiver requirement
+// ────────────────────────────────────────────────────────────
+
+describe('Storyboard.requires gate (#2356): implicit webhook_replay_receiver', () => {
+  test('replay_webhook_vector storyboards grade not_applicable when no receiver URL is configured', async () => {
+    const sb = buildStoryboard({
+      phases: [
+        {
+          id: 'receiver_conformance',
+          title: 'Inbound receiver conformance',
+          steps: [
+            {
+              id: 'replay_envelope',
+              title: 'Replay a canonical webhook envelope',
+              task: 'replay_webhook_vector',
+              vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await runStoryboard('http://fake-local-99999', sb, {
+      _profile: profileWithoutController,
+      agentTools: profileWithoutController.tools,
+    });
+
+    assert.equal(result.overall_passed, true, 'missing receiver URL is an applicability skip, not a failure');
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.failed_count, 0);
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip.reason, 'not_applicable');
+    assert.equal(step.skip.requirement, 'webhook_replay_receiver');
+    assert.match(step.skip.detail, /webhook_replay_receiver\.url/);
+  });
+
+  test('published webhook receiver storyboard skips as one whole scenario before discovery', async () => {
+    const sb = loadStoryboardFile('compliance/cache/latest/universal/webhook-receiver-envelope.yaml');
+
+    const result = await runStoryboard('http://127.0.0.1:1/mcp', sb);
+
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.passed_count, 0);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.skipped_count, 1, 'five replay steps collapse to one storyboard applicability skip');
+    assert.equal(result.phases.length, 1);
+    assert.equal(result.phases[0].phase_id, 'requirement_unmet');
+    assert.equal(result.phases[0].steps[0].skip.reason, 'not_applicable');
+    assert.equal(result.phases[0].steps[0].skip.requirement, 'webhook_replay_receiver');
+  });
+
+  test('out-of-scope contract-gated replay steps do not skip unrelated phases', async () => {
+    const sb = buildStoryboard({
+      phases: [
+        {
+          id: 'normal',
+          title: 'Normal phase',
+          steps: [
+            {
+              id: 'normal_read',
+              title: 'Normal read still runs',
+              task: 'get_products',
+              sample_request: { buying_mode: 'brief', brief: 'show products' },
+            },
+          ],
+        },
+        {
+          id: 'receiver_contract',
+          title: 'Out-of-scope receiver contract',
+          steps: [
+            {
+              id: 'replay_envelope',
+              title: 'Replay a canonical webhook envelope',
+              task: 'replay_webhook_vector',
+              requires_contract: 'webhook_replay_runner',
+              vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await runStoryboard('http://fake-local-99999', sb, {
+      _profile: profileWithoutController,
+      agentTools: profileWithoutController.tools,
+    });
+
+    assert.ok(
+      !result.phases.some(phase => phase.phase_id === 'requirement_unmet'),
+      'out-of-scope replay step must not trigger the storyboard-level receiver requirement'
+    );
+    assert.ok(
+      result.phases.some(phase => phase.phase_id === 'normal'),
+      'unrelated phase still runs'
+    );
+    const replay = result.phases
+      .find(phase => phase.phase_id === 'receiver_contract')
+      ?.steps.find(step => step.step_id === 'replay_envelope');
+    assert.equal(replay?.skipped, true);
+    assert.equal(replay?.skip_reason, 'missing_test_kit_contract');
+    assert.equal(replay?.skip.reason, 'unsatisfied_contract');
   });
 });
 

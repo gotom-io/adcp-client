@@ -42,17 +42,17 @@ export type { WireSafe, WireSpecRequestName, ScrubExtensionsOptions } from './wi
 export type { RequireCacheScopeWhenProducts, ServerPayload } from '../types/server-payload';
 export type {
   ActivateSignalPayload,
-  AcquireRightsAcquiredPayload,
-  AcquireRightsPayload,
-  AcquireRightsPendingApprovalPayload,
-  AcquireRightsRejectedPayload,
-  BuildCreativeMultiPayload,
-  BuildCreativePayload,
-  CalibrateContentPayload,
+  AcquireRightsAcquiredPayload as LegacyAcquireRightsAcquiredPayload,
+  AcquireRightsPayload as LegacyAcquireRightsPayload,
+  AcquireRightsPendingApprovalPayload as LegacyAcquireRightsPendingApprovalPayload,
+  AcquireRightsRejectedPayload as LegacyAcquireRightsRejectedPayload,
+  BuildCreativeMultiPayload as LegacyBuildCreativeMultiPayload,
+  BuildCreativePayload as LegacyBuildCreativePayload,
+  CalibrateContentPayload as LegacyCalibrateContentPayload,
   CheckGovernancePayload,
   CreateCollectionListPayload,
-  CreateContentStandardsPayload,
-  CreateMediaBuyPayload,
+  CreateContentStandardsPayload as LegacyCreateContentStandardsPayload,
+  CreateMediaBuyPayload as LegacyCreateMediaBuyPayload,
   CreatePropertyListPayload,
   CreativeApprovalPayload,
   CreativeApprovedPayload,
@@ -65,28 +65,28 @@ export type {
   GetAdCPCapabilitiesPayload,
   GetBrandIdentityPayload,
   GetCollectionListPayload,
-  GetContentStandardsPayload,
-  GetCreativeDeliveryPayload,
-  GetCreativeFeaturesPayload,
-  GetMediaBuyArtifactsPayload,
-  GetMediaBuyDeliveryPayload,
-  GetMediaBuysPayload,
+  GetContentStandardsPayload as LegacyGetContentStandardsPayload,
+  GetCreativeDeliveryPayload as LegacyGetCreativeDeliveryPayload,
+  GetCreativeFeaturesPayload as LegacyGetCreativeFeaturesPayload,
+  GetMediaBuyArtifactsPayload as LegacyGetMediaBuyArtifactsPayload,
+  GetMediaBuyDeliveryPayload as LegacyGetMediaBuyDeliveryPayload,
+  GetMediaBuysPayload as LegacyGetMediaBuysPayload,
   GetPlanAuditLogsPayload,
-  GetProductsPayload,
+  GetProductsPayload as LegacyGetProductsPayload,
   GetPropertyListPayload,
-  GetRightsPayload,
-  GetRightsResponsePayload,
+  GetRightsPayload as LegacyGetRightsPayload,
+  GetRightsResponsePayload as LegacyGetRightsResponsePayload,
   GetSignalsPayload,
   ListAccountsPayload,
   ListCollectionListsPayload,
-  ListContentStandardsPayload,
-  ListCreativeFormatsPayload,
-  ListCreativeFormatsResponsePayload,
-  ListCreativeFormatsServerPayload,
-  ListCreativesPayload,
+  ListContentStandardsPayload as LegacyListContentStandardsPayload,
+  ListCreativeFormatsPayload as LegacyListCreativeFormatsPayload,
+  ListCreativeFormatsResponsePayload as LegacyListCreativeFormatsResponsePayload,
+  ListCreativeFormatsServerPayload as LegacyListCreativeFormatsServerPayload,
+  ListCreativesPayload as LegacyListCreativesPayload,
   ListPropertyListsPayload,
   LogEventPayload,
-  PreviewCreativePayload,
+  PreviewCreativePayload as LegacyPreviewCreativePayload,
   ProvidePerformanceFeedbackPayload,
   ReportPlanOutcomePayload,
   ReportUsagePayload,
@@ -106,53 +106,56 @@ export type {
   SyncGovernanceSuccessPayload,
   SyncPlansPayload,
   UpdateCollectionListPayload,
-  UpdateContentStandardsPayload,
-  UpdateMediaBuyPayload,
+  UpdateContentStandardsPayload as LegacyUpdateContentStandardsPayload,
+  UpdateMediaBuyPayload as LegacyUpdateMediaBuyPayload,
   UpdatePropertyListPayload,
-  UpdateRightsPayload,
-  ValidateContentDeliveryPayload,
+  UpdateRightsPayload as LegacyUpdateRightsPayload,
+  ValidateContentDeliveryPayload as LegacyValidateContentDeliveryPayload,
 } from '../types/server-payload-aliases';
 
 export { assertNoExampleTlds } from './example-tld-guard';
 export type { AssertNoExampleTldsOptions } from './example-tld-guard';
 
+// Raw wire response builders remain available only through explicit
+// `legacy*` aliases on this primary barrel. The legacy/v5 subpath preserves
+// their historical names for handler-bag adopters.
 export {
-  capabilitiesResponse,
-  productsResponse,
-  mediaBuyResponse,
-  deliveryResponse,
-  listAccountsResponse,
-  listCreativeFormatsResponse,
-  updateMediaBuyResponse,
-  getMediaBuysResponse,
-  performanceFeedbackResponse,
-  buildCreativeResponse,
-  buildCreativeMultiResponse,
-  previewCreativeResponse,
-  creativeDeliveryResponse,
-  listCreativesResponse,
-  listPropertyListsResponse,
-  listCollectionListsResponse,
-  listContentStandardsResponse,
-  getPlanAuditLogsResponse,
-  syncCreativesResponse,
-  getSignalsResponse,
-  activateSignalResponse,
-  cancelMediaBuyResponse,
-  acquireRightsResponse,
-  acquireRightsAcquired,
-  acquireRightsPendingApproval,
-  acquireRightsRejected,
-  updateRightsResponse,
-  updateRightsSuccess,
-  creativeApprovalResponse,
-  creativeApprovalApproved,
-  creativeApprovalRejected,
-  creativeApprovalPendingReview,
-  creativeApprovalError,
-  syncAccountsResponse,
-  syncGovernanceResponse,
-  reportUsageResponse,
+  capabilitiesResponse as legacyCapabilitiesResponse,
+  productsResponse as legacyProductsResponse,
+  mediaBuyResponse as legacyMediaBuyResponse,
+  deliveryResponse as legacyDeliveryResponse,
+  listAccountsResponse as legacyListAccountsResponse,
+  listCreativeFormatsResponse as legacyListCreativeFormatsResponse,
+  updateMediaBuyResponse as legacyUpdateMediaBuyResponse,
+  getMediaBuysResponse as legacyGetMediaBuysResponse,
+  performanceFeedbackResponse as legacyPerformanceFeedbackResponse,
+  buildCreativeResponse as legacyBuildCreativeResponse,
+  buildCreativeMultiResponse as legacyBuildCreativeMultiResponse,
+  previewCreativeResponse as legacyPreviewCreativeResponse,
+  creativeDeliveryResponse as legacyCreativeDeliveryResponse,
+  listCreativesResponse as legacyListCreativesResponse,
+  listPropertyListsResponse as legacyListPropertyListsResponse,
+  listCollectionListsResponse as legacyListCollectionListsResponse,
+  listContentStandardsResponse as legacyListContentStandardsResponse,
+  getPlanAuditLogsResponse as legacyGetPlanAuditLogsResponse,
+  syncCreativesResponse as legacySyncCreativesResponse,
+  getSignalsResponse as legacyGetSignalsResponse,
+  activateSignalResponse as legacyActivateSignalResponse,
+  cancelMediaBuyResponse as legacyCancelMediaBuyResponse,
+  acquireRightsResponse as legacyAcquireRightsResponse,
+  acquireRightsAcquired as legacyAcquireRightsAcquired,
+  acquireRightsPendingApproval as legacyAcquireRightsPendingApproval,
+  acquireRightsRejected as legacyAcquireRightsRejected,
+  updateRightsResponse as legacyUpdateRightsResponse,
+  updateRightsSuccess as legacyUpdateRightsSuccess,
+  creativeApprovalResponse as legacyCreativeApprovalResponse,
+  creativeApprovalApproved as legacyCreativeApprovalApproved,
+  creativeApprovalRejected as legacyCreativeApprovalRejected,
+  creativeApprovalPendingReview as legacyCreativeApprovalPendingReview,
+  creativeApprovalError as legacyCreativeApprovalError,
+  syncAccountsResponse as legacySyncAccountsResponse,
+  syncGovernanceResponse as legacySyncGovernanceResponse,
+  reportUsageResponse as legacyReportUsageResponse,
   toStructuredContent,
 } from './responses';
 export type { McpToolResponse } from './responses';
@@ -235,7 +238,7 @@ export type {
   SeedFixtureCache,
 } from './test-controller';
 
-export { serve, UnknownHostError, hostname, resolveHost } from './serve';
+export { serve, taskScopeFromPrincipal, UnknownHostError, hostname, resolveHost } from './serve';
 export type { ServeContext, ServeOptions, ProtectedResourceMetadata } from './serve';
 
 export { createExpressAdapter } from './express-adapter';
@@ -353,30 +356,33 @@ export type {
   AdcpTestToolsCallRequest,
   AdcpTestResponse,
 } from './adcp-server';
+// Handler-bag types describe the raw v5 server surface. Primary-barrel names
+// are explicit Legacy aliases; the legacy/v5 subpath retains the originals.
 export type {
-  AdcpServerConfig,
+  AdcpServerConfig as LegacyAdcpServerConfig,
   WebhooksConfig,
-  AdcpToolMap,
+  AdcpToolMap as LegacyAdcpToolMap,
   AdcpServerToolName,
   AdcpCapabilitiesConfig,
   AdcpCapabilitiesOverrides,
-  AdcpCustomToolConfig,
+  AdcpCustomToolConfig as LegacyAdcpCustomToolConfig,
   McpAppUiMeta,
   McpAppMeta,
   AdcpLogger,
   SignedRequestsConfig,
   AdcpPreTransport,
   AdcpSignedRequestsState,
-  HandlerContext,
+  HandlerContext as LegacyHandlerContext,
   SessionKeyContext,
-  MediaBuyHandlers,
-  SignalsHandlers,
-  CreativeHandlers,
-  GovernanceHandlers,
-  AccountHandlers,
-  EventTrackingHandlers,
-  SponsoredIntelligenceHandlers,
-  ResolveAccountContext,
+  MediaBuyHandlers as LegacyMediaBuyHandlers,
+  ProposalNegotiationHandlers as LegacyProposalNegotiationHandlers,
+  SignalsHandlers as LegacySignalsHandlers,
+  CreativeHandlers as LegacyCreativeHandlers,
+  GovernanceHandlers as LegacyGovernanceHandlers,
+  AccountHandlers as LegacyAccountHandlers,
+  EventTrackingHandlers as LegacyEventTrackingHandlers,
+  SponsoredIntelligenceHandlers as LegacySponsoredIntelligenceHandlers,
+  ResolveAccountContext as LegacyResolveAccountContext,
 } from './create-adcp-server';
 
 export { DEFAULT_REPORTING_CAPABILITIES } from './product-defaults';
@@ -461,14 +467,47 @@ export type { SigningProvider } from '../signing/provider';
 export { createPinAndBindFetch, WEBHOOK_SSRF_POLICY, LOOPBACK_OK_WEBHOOK_SSRF_POLICY } from './pin-and-bind-fetch';
 export type { PinAndBindFetchOptions, DnsLookupAll } from './pin-and-bind-fetch';
 
-export { checkGovernance, governanceDeniedError } from './governance';
+export {
+  checkGovernance,
+  createAdcpGovernanceEnforcementMiddleware,
+  governanceDeniedError,
+  governanceUnavailableError,
+} from './governance';
 export type {
+  AdcpGovernanceEnforcementMiddleware,
   CheckGovernanceOptions,
   GovernanceCallResult,
   GovernanceApproved,
   GovernanceDenied,
   GovernanceConditions,
 } from './governance';
+
+export {
+  GovernanceAuthorizationError,
+  GovernanceReplayStoreAdapter,
+  InMemoryGovernanceReplayStore,
+  buildGovernanceExecutionCommitment,
+  buildGovernanceExecutionRequest,
+  computeGovernedPayloadHash,
+  createGovernanceEnforcementMiddleware,
+  verifyGovernanceAuthorization,
+} from '../governance';
+export type {
+  BuildGovernanceExecutionRequestInput,
+  GovernanceAuthorizationClaims,
+  GovernanceAuthorizationErrorCode,
+  GovernanceAuthorizationResult,
+  GovernanceAuthorizationSuccess,
+  GovernanceCommitment,
+  GovernanceEnforcementMiddleware,
+  GovernanceEnforcementMiddlewareConfig,
+  GovernanceEnforcementMiddlewareInput,
+  GovernanceReplayStore,
+  GovernanceReplayBinding,
+  GovernanceRevocationResolver,
+  GovernanceRevocationStatus,
+  VerifyGovernanceAuthorizationOptions,
+} from '../governance';
 
 export {
   clearDefaultResolvedListCache,
@@ -500,10 +539,11 @@ export type {
 // `createAdcpServerFromPlatform` wraps `createAdcpServer` (the lower-level
 // handler-bag entry above) with compile-time specialism enforcement
 // (`RequiredPlatformsFor<S>`), capability projection, idempotency wiring,
-// async tasks, status normalization, multi-tenant routing, and webhook
-// auto-emit. Adopters declare a typed `DecisioningPlatform` per-specialism
-// and the framework wires the rest. See `docs/migration-5.x-to-6.x.md`
-// and `skills/build-decisioning-platform/` for the full walkthrough.
+// async tasks, status normalization, multi-tenant routing, and async task
+// completion webhooks. Synchronous terminal responses remain inline by
+// default. Adopters declare a typed `DecisioningPlatform` per-specialism
+// and the framework wires the rest. See `docs/migration-5.x-to-6.x.md` and
+// `skills/build-decisioning-platform/` for the full walkthrough.
 //
 // Both `createAdcpServer` and `createAdcpServerFromPlatform` live on the
 // same import path so adopters discover them as siblings; pick the
@@ -517,6 +557,36 @@ export type {
 // future major. New code should not pin against `legacy/v5` either —
 // reach for `createAdcpServerFromPlatform` first.
 export * from './decisioning';
+export {
+  createProposalRefinementHandler,
+  createProposalSuccessor,
+  proposalRefinementScopeFromContext,
+  classifyProposalRefinementFailure,
+  defineProposalRefinementCapabilities,
+  ProposalSellerPreflightError,
+} from '../negotiation/seller';
+export { proposalTermsDigest, verifyProposalTermsDigest } from '../negotiation/verification';
+export type {
+  ProposalCommercialEvaluator,
+  ProposalFailureClassification,
+  ProposalEvaluationContext,
+  ProposalRefinementHandler,
+  ProposalRefinementHandlerOptions,
+  ProposalRefinementStore,
+  ProposalRefinementTransaction,
+  ProposalRefinementScope,
+  ProposalSourceExpectation,
+  ProposalSourceSnapshot,
+  ProposalSuccessorInput,
+} from '../negotiation/seller';
+export type {
+  CanonicalProposal,
+  ProposalCommercialTerms,
+  ProposalRefinementCapabilities,
+  ProposalRefinementResult,
+  RefineProposalsRequest,
+  RefineProposalsResponse,
+} from '../negotiation/types';
 
 // ---------------------------------------------------------------------------
 // Ctx-metadata store — opaque-blob round-trip for adapter-internal state

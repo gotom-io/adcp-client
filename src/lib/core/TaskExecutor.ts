@@ -3,10 +3,16 @@
 
 import { randomUUID } from 'crypto';
 import type { AgentConfig } from '../types';
-import { ProtocolClient } from '../protocols';
+import {
+  ProtocolClient,
+  normalizeTransportOptions,
+  prepareProtocolToolCall,
+  type PreparedProtocolToolCall,
+} from '../protocols';
 import { listMCPTasks } from '../protocols/mcp-tasks';
+import { withPreparedProtocolToolCall } from '../protocols/prepared-call-context';
 import { getAuthToken } from '../auth';
-import { is401Error, adcpErrorToTypedError } from '../errors';
+import { is401Error, adcpErrorToTypedError, ConfigurationError } from '../errors';
 import type { ADCPError } from '../errors';
 import type { Storage } from '../storage/interfaces';
 import {
@@ -17,14 +23,16 @@ import {
   type ValidationMode,
 } from '../validation/client-hooks';
 import { formatIssues } from '../validation/schema-validator';
-import { unwrapProtocolResponse, isAdcpError, isTerminalAdcpError } from '../utils/response-unwrapper';
+import { ADCP_VERSION } from '../version';
+import { unwrapProtocolResponse, isAdcpOperationSuccess } from '../utils/response-unwrapper';
 import { extractAdcpErrorInfo, extractCorrelationId } from '../utils/error-extraction';
-import { generateIdempotencyKey, isMutatingTask, redactIdempotencyKeyInArgs } from '../utils/idempotency';
+import { generateIdempotencyKey, requestUsesIdempotency, redactIdempotencyKeyInArgs } from '../utils/idempotency';
 import { normalizeGetProductsResponse } from '../utils/pricing-adapter';
 import { normalizeLegacyMediaBuyStatusForReturn } from '../utils/envelope-status-compat';
 import { getLatestA2ADataPartFromResponse } from '../utils/a2a-artifacts';
+import type { AdcpCapabilities } from '../utils/capabilities';
 import { cancelA2ATask } from '../protocols/a2a';
-import { isAbortOrTimeoutError } from '../protocols/abort';
+import { isAbortOrTimeoutError, throwIfAborted } from '../protocols/abort';
 import type {
   Message,
   InputRequest,
@@ -45,18 +53,23 @@ import { ProtocolResponseParser, ADCP_STATUS, type ADCPStatus } from './Protocol
 import type { Activity } from './AsyncHandler';
 import { GovernanceMiddleware } from './GovernanceMiddleware';
 import type { GovernanceConfig, GovernanceCheckResult } from './GovernanceTypes';
+import { targetDeclaresGovernanceEnforcement } from '../governance';
 import { attachMatch } from './match';
 import { resolveWebhookUrl } from './webhook-url';
+import {
+  attachTaskDeadlineGovernanceRecovery,
+  attachTaskDeadlineIdempotencyKey,
+  getTaskOperationId,
+  withTaskDeadline,
+} from './task-deadline';
+
+// Keep the direct `core/TaskExecutor` export identical to the package-level
+// typed timeout error thrown by the deadline wrapper.
+export { TaskTimeoutError } from '../errors';
+
 /**
  * Custom errors for task execution
  */
-export class TaskTimeoutError extends Error {
-  constructor(taskId: string, timeout: number) {
-    super(`Task ${taskId} timed out after ${timeout}ms`);
-    this.name = 'TaskTimeoutError';
-  }
-}
-
 export class MaxClarificationError extends Error {
   constructor(taskId: string, maxAttempts: number) {
     super(`Task ${taskId} exceeded maximum clarification attempts: ${maxAttempts}`);
@@ -76,6 +89,149 @@ export class InputRequiredError extends Error {
     super(`Server requires input but no handler provided. Question: ${question}`);
     this.name = 'InputRequiredError';
   }
+}
+
+const GOVERNED_CREDENTIAL_SCAN_MAX_NODES = 10_000;
+const GOVERNED_CREDENTIAL_SCAN_MAX_DEPTH = 64;
+const GOVERNED_CALLBACK_FIELDS = new Set(['push_notification_config', 'reporting_webhook', 'artifact_webhook']);
+
+type GovernedCredentialScanResult =
+  | { kind: 'credential'; path: string; callbackField: string }
+  | { kind: 'limit'; limit: 'nodes' | 'depth' };
+
+function webhookRegistrationFromPreparedCall(
+  agent: AgentConfig,
+  preparedCall: PreparedProtocolToolCall
+): { callbackUrl: string; mode: 'rfc9421' | 'hmac-sha256' } | undefined {
+  const candidate =
+    agent.protocol === 'a2a'
+      ? preparedCall.pushNotificationConfig
+      : preparedCall.args.push_notification_config &&
+          typeof preparedCall.args.push_notification_config === 'object' &&
+          !Array.isArray(preparedCall.args.push_notification_config)
+        ? (preparedCall.args.push_notification_config as Record<string, unknown>)
+        : undefined;
+  if (!candidate) return undefined;
+  if (typeof candidate.url !== 'string') {
+    throw new ConfigurationError('push_notification_config.url must be a string.', 'push_notification_config.url');
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(candidate, 'authentication')) {
+    return { callbackUrl: candidate.url, mode: 'rfc9421' };
+  }
+  const authentication = candidate.authentication;
+  if (!authentication || typeof authentication !== 'object' || Array.isArray(authentication)) {
+    throw new ConfigurationError(
+      'push_notification_config.authentication selects legacy verification and must be a supported object.',
+      'push_notification_config.authentication'
+    );
+  }
+  const schemes = (authentication as Record<string, unknown>).schemes;
+  const credentials = (authentication as Record<string, unknown>).credentials;
+  if (
+    !Array.isArray(schemes) ||
+    schemes.length !== 1 ||
+    schemes[0] !== 'HMAC-SHA256' ||
+    typeof credentials !== 'string' ||
+    credentials.length === 0
+  ) {
+    throw new ConfigurationError(
+      'This receiver supports legacy HMAC-SHA256 or RFC 9421 push notifications; Bearer and mixed schemes are not supported.',
+      'push_notification_config.authentication.schemes'
+    );
+  }
+  return {
+    callbackUrl: candidate.url,
+    mode: 'hmac-sha256',
+  };
+}
+
+/**
+ * Find callback authentication credentials before an exact downstream payload
+ * crosses the governance-agent boundary. AdCP 3.2 requires intent payloads to
+ * match the seller arguments byte-for-byte at the JSON-data-model level, so
+ * the SDK cannot safely redact a credential and reinsert it after approval:
+ * doing so would invalidate the seller's authorized_payload_hash check.
+ */
+function findGovernedAuthenticationCredential(value: unknown): GovernedCredentialScanResult | undefined {
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const visited = new WeakSet<object>();
+  let visitedNodes = 0;
+
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    if (!current.value || typeof current.value !== 'object') continue;
+    if (current.depth > GOVERNED_CREDENTIAL_SCAN_MAX_DEPTH) return { kind: 'limit', limit: 'depth' };
+    if (visited.has(current.value)) continue;
+    visited.add(current.value);
+    if (++visitedNodes > GOVERNED_CREDENTIAL_SCAN_MAX_NODES) return { kind: 'limit', limit: 'nodes' };
+
+    if (!Array.isArray(current.value)) {
+      const record = current.value as Record<string, unknown>;
+      for (const callbackField of GOVERNED_CALLBACK_FIELDS) {
+        const callback = record[callbackField];
+        if (!callback || typeof callback !== 'object' || Array.isArray(callback)) continue;
+        const authentication = (callback as Record<string, unknown>).authentication;
+        if (
+          authentication &&
+          typeof authentication === 'object' &&
+          !Array.isArray(authentication) &&
+          (authentication as Record<string, unknown>).credentials !== undefined
+        ) {
+          return {
+            kind: 'credential',
+            path: `${callbackField}.authentication.credentials`,
+            callbackField,
+          };
+        }
+      }
+    }
+
+    for (const key in current.value) {
+      if (!Object.prototype.hasOwnProperty.call(current.value, key)) continue;
+      const child = (current.value as Record<string, unknown>)[key];
+      if (!child || typeof child !== 'object') continue;
+      if (visitedNodes + stack.length >= GOVERNED_CREDENTIAL_SCAN_MAX_NODES) {
+        return { kind: 'limit', limit: 'nodes' };
+      }
+      stack.push({ value: child, depth: current.depth + 1 });
+    }
+  }
+  return undefined;
+}
+
+function assertGovernedPayloadHasNoCallbackCredentials(
+  taskName: string,
+  payload: Record<string, unknown>,
+  options: { sdkInjectedPushConfig?: boolean } = {}
+): void {
+  const scanResult = findGovernedAuthenticationCredential(payload);
+  if (!scanResult) return;
+  if (scanResult.kind === 'limit') {
+    const limitDescription =
+      scanResult.limit === 'nodes'
+        ? `${GOVERNED_CREDENTIAL_SCAN_MAX_NODES.toLocaleString('en-US')} nested objects`
+        : `${GOVERNED_CREDENTIAL_SCAN_MAX_DEPTH} object levels`;
+    throw new ConfigurationError(
+      `The SDK could not safely inspect the governed ${taskName} payload for callback credentials because it ` +
+        `exceeds the ${limitDescription} safety limit. Simplify the payload or move deeply nested extension data ` +
+        `out of the governed request before retrying.`,
+      'governance.payload'
+    );
+  }
+  const remedy =
+    scanResult.callbackField === 'push_notification_config'
+      ? options.sdkInjectedPushConfig
+        ? 'Retry with task options `{ disableWebhook: true }` and poll for completion, or use A2A task-status notifications.'
+        : 'Remove the credential-bearing push notification config and poll for completion, or use A2A task-status notifications.'
+      : `Remove the credential-bearing ${scanResult.callbackField} from this governed request and use a ` +
+        `non-webhook delivery path.`;
+  throw new ConfigurationError(
+    `Governed ${taskName} cannot forward ${scanResult.path} to the governance agent. ` +
+      `The SDK will not disclose receiver authentication credentials, and redacting modern AdCP 3.2 payloads ` +
+      `would invalidate seller authorization. ${remedy}`,
+    scanResult.path
+  );
 }
 
 /**
@@ -239,13 +395,20 @@ function parseTimestamp(value: unknown): number {
  * Return the idempotency_key this task should use: the caller's value if
  * present, otherwise a fresh UUID v4 for mutating tasks, otherwise undefined.
  */
-function resolveIdempotencyKey(taskName: string, params: any): string | undefined {
+function resolveIdempotencyKey(taskName: string, params: any, serverVersion?: 'v2' | 'v3'): string | undefined {
   const callerSupplied =
     params && typeof params === 'object' && typeof params.idempotency_key === 'string'
       ? params.idempotency_key
       : undefined;
   if (callerSupplied) return callerSupplied;
-  if (isMutatingTask(taskName)) return generateIdempotencyKey();
+  // v2.5 mutations use buyer_ref as their stable replay identity. Request
+  // adaptation has already derived it from the caller's canonical key. Do
+  // not inject a fresh v3-only idempotency_key after adaptation: that makes
+  // identical retries differ on the wire and can defeat legacy dedupe.
+  if (serverVersion === 'v2') {
+    return params && typeof params === 'object' && typeof params.buyer_ref === 'string' ? params.buyer_ref : undefined;
+  }
+  if (requestUsesIdempotency(taskName, params)) return generateIdempotencyKey();
   return undefined;
 }
 
@@ -276,12 +439,23 @@ interface TaskStatusPollResult {
   rawResponse: Record<string, unknown>;
 }
 
+const COMPACTED_TASK_STATE_LIMIT = 10_000;
+const TERMINAL_TASK_STATUSES = new Set<TaskStatus>([
+  'completed',
+  'failed',
+  'rejected',
+  'canceled',
+  'governance-denied',
+  'aborted',
+]);
+
 /**
  * Core task execution engine that handles the conversation loop with agents
  */
 export class TaskExecutor {
   private responseParser: ProtocolResponseParser;
   private activeTasks = new Map<string, TaskState>();
+  private compactedTaskIds = new Map<string, true>();
   private conversationStorage?: Map<string, Message[]>;
   private governanceMiddleware?: GovernanceMiddleware;
   private lastKnownServerVersion?: 'v2' | 'v3';
@@ -306,11 +480,19 @@ export class TaskExecutor {
       webhookUrlTemplate?: WebhookUrlTemplate;
       /** Agent ID for webhook URL generation */
       agentId?: string;
-      /** Webhook secret for HMAC authentication (min 32 chars) */
+      /** Webhook secret for legacy HMAC authentication. */
       webhookSecret?: string;
+      /** Persist sanitized callback mode provenance before dispatch. */
+      onWebhookRegistration?: (registration: {
+        agent: AgentConfig;
+        taskType: string;
+        operationId: string;
+        callbackUrl: string;
+        mode: 'rfc9421' | 'hmac-sha256';
+      }) => void | Promise<void>;
       /** Fail tasks when response schema validation fails (default: true) */
       strictSchemaValidation?: boolean;
-      /** Log all schema validation violations to debug logs (default: true) */
+      /** Emit schema validation violations to debug logs and the console (default: true) */
       logSchemaViolations?: boolean;
       /**
        * Schema-driven validation using the bundled AdCP JSON schemas.
@@ -386,6 +568,18 @@ export class TaskExecutor {
     return params && typeof params === 'object' && !Array.isArray(params)
       ? (params as Record<string, unknown>)
       : undefined;
+  }
+
+  /**
+   * Reconcile a push-delivered terminal status with the local runner task.
+   * Submitted task state is already compacted after dispatch; this schedules
+   * the same short final-status retention used by synchronous completions.
+   *
+   * @internal
+   */
+  observeExternalTaskStatus(taskId: string, status: TaskStatus, result?: unknown): void {
+    if (!['completed', 'failed', 'rejected', 'canceled'].includes(status)) return;
+    this.updateTaskStatus(taskId, status, result);
   }
 
   /**
@@ -490,7 +684,30 @@ export class TaskExecutor {
     params: any,
     inputHandler?: InputHandler,
     options: TaskOptions = {},
-    serverVersion?: 'v2' | 'v3'
+    serverVersion?: 'v2' | 'v3',
+    targetCapabilities?: AdcpCapabilities
+  ): Promise<TaskResult<T>> {
+    return withTaskDeadline(options, effectiveOptions =>
+      this.executeTaskWithinDeadline<T>(
+        agent,
+        taskName,
+        params,
+        inputHandler,
+        effectiveOptions,
+        serverVersion,
+        targetCapabilities
+      )
+    );
+  }
+
+  private async executeTaskWithinDeadline<T = any>(
+    agent: AgentConfig,
+    taskName: string,
+    params: any,
+    inputHandler?: InputHandler,
+    options: TaskOptions = {},
+    serverVersion?: 'v2' | 'v3',
+    targetCapabilities?: AdcpCapabilities
   ): Promise<TaskResult<T>> {
     if (serverVersion) this.lastKnownServerVersion = serverVersion;
     // The client-minted `taskId` is a local correlation id for tracking this
@@ -499,7 +716,7 @@ export class TaskExecutor {
     // flows in on the response and is surfaced via metadata.serverTaskId.
     // `options.contextId` / `options.taskId` ride on the A2A message envelope
     // and are threaded straight to the protocol adapter below.
-    const taskId = randomUUID();
+    const taskId = getTaskOperationId(options) ?? randomUUID();
     const startTime = Date.now();
     const workingTimeout = this.config.workingTimeout || 120000; // 120s max per PR #78
 
@@ -508,8 +725,11 @@ export class TaskExecutor {
     // re-generating on retry defeats the whole point of the envelope.
     // `options.skipIdempotencyAutoInject` disables this for compliance testing
     // that needs to exercise server-side missing-key behavior.
-    const idempotencyKey = options.skipIdempotencyAutoInject ? undefined : resolveIdempotencyKey(taskName, params);
-    if (idempotencyKey && params && typeof params === 'object' && !params.idempotency_key) {
+    const idempotencyKey = options.skipIdempotencyAutoInject
+      ? undefined
+      : resolveIdempotencyKey(taskName, params, serverVersion);
+    if (idempotencyKey) attachTaskDeadlineIdempotencyKey(options, idempotencyKey);
+    if (serverVersion !== 'v2' && idempotencyKey && params && typeof params === 'object' && !params.idempotency_key) {
       params = { ...params, idempotency_key: idempotencyKey };
     }
 
@@ -528,6 +748,26 @@ export class TaskExecutor {
       idempotencyKey,
     };
     this.activeTasks.set(taskId, taskState);
+
+    // Compact task state as soon as cancellation fires, even if a protocol
+    // adapter or caller callback never settles after receiving the signal.
+    // The outer deadline race guarantees prompt rejection; this listener is
+    // the matching resource-retention boundary for activeTasks.
+    const taskAbortListener = options.signal
+      ? () => {
+          const currentStatus = this.activeTasks.get(taskId)?.status;
+          if (currentStatus && !TERMINAL_TASK_STATUSES.has(currentStatus)) {
+            const reason = options.signal?.reason;
+            this.updateTaskStatus(
+              taskId,
+              'aborted',
+              undefined,
+              reason instanceof Error ? reason.message : reason == null ? 'The operation was aborted' : String(reason)
+            );
+          }
+        }
+      : undefined;
+    if (taskAbortListener) options.signal!.addEventListener('abort', taskAbortListener, { once: true });
 
     // Emit task creation event
     this.emitTaskEvent(
@@ -568,30 +808,73 @@ export class TaskExecutor {
         payload: { params: redactIdempotencyKeyInArgs(params) },
         timestamp: new Date().toISOString(),
       });
+      throwIfAborted(options.signal);
 
       // Run governance check if configured for this tool
-      if (this.governanceMiddleware?.requiresCheck(taskName)) {
-        const { result: govResult, params: adjustedParams } = await this.governanceMiddleware.checkProposed(
-          taskName,
-          params,
-          debugLogs
-        );
+      const governanceMiddleware = this.governanceMiddleware;
+      if (governanceMiddleware) {
+        const modernGovernance =
+          targetCapabilities !== undefined && targetDeclaresGovernanceEnforcement(targetCapabilities, taskName);
+        // Modern authorization binds the exact argument object the seller
+        // receives, including protocol-owned fields and MCP webhook
+        // registration. Legacy governance retains its historical application
+        // payload and must not receive SDK-injected callback credentials.
+        const governableParams = modernGovernance
+          ? prepareProtocolToolCall(agent, params, {
+              toolName: taskName,
+              webhookUrl,
+              webhookSecret: this.config.webhookSecret,
+              serverVersion,
+              adcpVersion: this.config.adcpVersion,
+              wireAdcpVersion: this.config.wireAdcpVersion,
+              versionEnvelope: this.config.versionEnvelope,
+            }).args
+          : params;
+        if (await governanceMiddleware.shouldCheck(taskName, governableParams, targetCapabilities)) {
+          const sdkInjectedPushConfig =
+            modernGovernance &&
+            agent.protocol === 'mcp' &&
+            webhookUrl !== undefined &&
+            this.config.webhookSecret !== undefined;
+          assertGovernedPayloadHasNoCallbackCredentials(taskName, governableParams, { sdkInjectedPushConfig });
+          const { result: govResult, params: adjustedParams } = await governanceMiddleware.checkProposed(
+            agent,
+            targetCapabilities!,
+            taskName,
+            governableParams,
+            debugLogs,
+            options.signal
+          );
+          throwIfAborted(options.signal);
+          assertGovernedPayloadHasNoCallbackCredentials(taskName, adjustedParams, { sdkInjectedPushConfig });
 
-        // Governance always blocks on denial/unapplied conditions.
-        const isBlocking = true;
+          // Governance always blocks on denial/unapplied conditions.
+          const isBlocking = true;
 
-        if (govResult.status === 'denied' && isBlocking) {
-          return attachMatch(this.buildGovernanceResult<T>(govResult, taskId, taskName, agent, startTime, debugLogs));
+          if (govResult.status === 'denied' && isBlocking) {
+            const denied = this.buildGovernanceResult<T>(govResult, taskId, taskName, agent, startTime, debugLogs);
+            this.updateTaskStatus(taskId, 'governance-denied', undefined, denied.error);
+            return attachMatch(denied);
+          }
+
+          if (govResult.status === 'conditions' && !govResult.conditionsApplied && isBlocking) {
+            const denied = this.buildGovernanceResult<T>(govResult, taskId, taskName, agent, startTime, debugLogs);
+            this.updateTaskStatus(taskId, 'governance-denied', undefined, denied.error);
+            return attachMatch(denied);
+          }
+
+          // Approved, or non-blocking mode (advisory/audit) allows execution to proceed
+          governanceCheckId = govResult.checkId;
+          governanceResult = govResult;
+          if (governanceCheckId) {
+            // Preserve the approved check identity as soon as the seller may be
+            // dispatched. If the deadline fires during response processing,
+            // callers can still reconcile the seller mutation against the
+            // original governance decision after restart.
+            attachTaskDeadlineGovernanceRecovery(options, { checkId: governanceCheckId });
+          }
+          effectiveParams = adjustedParams;
         }
-
-        if (govResult.status === 'conditions' && !govResult.conditionsApplied && isBlocking) {
-          return attachMatch(this.buildGovernanceResult<T>(govResult, taskId, taskName, agent, startTime, debugLogs));
-        }
-
-        // Approved, or non-blocking mode (advisory/audit) allows execution to proceed
-        governanceCheckId = govResult.checkId;
-        governanceResult = govResult;
-        effectiveParams = adjustedParams;
       }
 
       // Create initial message (uses effectiveParams which may have governance-applied conditions)
@@ -603,11 +886,36 @@ export class TaskExecutor {
         metadata: { toolName: taskName, type: 'request' },
       };
 
+      // Materialize once, persist callback provenance, and dispatch this same
+      // prepared object. A seller can post immediately after receiving the
+      // request, so the registration write must complete before the network
+      // boundary is crossed.
+      const preparedCall = prepareProtocolToolCall(agent, effectiveParams, {
+        toolName: taskName,
+        webhookUrl,
+        webhookSecret: this.config.webhookSecret,
+        serverVersion,
+        adcpVersion: this.config.adcpVersion,
+        wireAdcpVersion: this.config.wireAdcpVersion,
+        versionEnvelope: this.config.versionEnvelope,
+      });
+      if (webhookUrl && this.config.onWebhookRegistration) {
+        const registration = webhookRegistrationFromPreparedCall(agent, preparedCall);
+        if (registration) {
+          await this.config.onWebhookRegistration({
+            agent,
+            taskType: taskName,
+            operationId: taskId,
+            ...registration,
+          });
+        }
+      }
+
       // Send initial request and get streaming response with webhook URL.
       // Pass the caller's A2A session ids (contextId for conversation binding,
       // taskId for resuming a non-terminal server-side task). The adapter
       // drops these on the wire for MCP (no session concept there).
-      const response = await ProtocolClient.callTool(agent, taskName, effectiveParams, {
+      const callOptions = {
         debugLogs,
         webhookUrl,
         webhookSecret: this.config.webhookSecret,
@@ -625,7 +933,12 @@ export class TaskExecutor {
           contextId: options.contextId,
           idempotencyKey,
         },
-      });
+      };
+      const response = await withPreparedProtocolToolCall(
+        { agent, toolName: taskName, args: effectiveParams, preparedCall },
+        () => ProtocolClient.callTool(agent, taskName, effectiveParams, callOptions)
+      );
+      throwIfAborted(options.signal);
 
       // Emit protocol_response activity
       const respStatus = this.responseParser.getStatus(response) as string | undefined;
@@ -640,6 +953,7 @@ export class TaskExecutor {
         payload: response,
         timestamp: new Date().toISOString(),
       });
+      throwIfAborted(options.signal);
 
       // Add initial response message
       const responseMessage: Message = {
@@ -665,6 +979,7 @@ export class TaskExecutor {
         debugLogs,
         startTime
       );
+      throwIfAborted(options.signal);
 
       // Attach governance check result to the task result
       if (governanceResult) {
@@ -678,26 +993,47 @@ export class TaskExecutor {
       if (governanceCheckId && this.governanceMiddleware) {
         const govCtx = governanceResult?.governanceContext;
         if (result.status === 'completed' && govCtx) {
+          const outcomeIdempotencyKey = this.governanceMiddleware.getOutcomeIdempotencyKey(
+            governanceCheckId,
+            'completed'
+          );
+          attachTaskDeadlineGovernanceRecovery(options, {
+            checkId: governanceCheckId,
+            outcome: 'completed',
+            outcomeIdempotencyKey,
+          });
           result.governanceOutcome = await this.governanceMiddleware.reportOutcome(
             governanceCheckId,
             'completed',
             result.data as Record<string, unknown> | undefined,
             undefined,
             debugLogs,
-            govCtx
+            govCtx,
+            options.signal,
+            outcomeIdempotencyKey
           );
+          throwIfAborted(options.signal);
           if (!result.governanceOutcome) {
             result.governanceOutcomeError = 'Outcome reporting to governance agent failed';
           }
         } else if (result.error && govCtx) {
+          const outcomeIdempotencyKey = this.governanceMiddleware.getOutcomeIdempotencyKey(governanceCheckId, 'failed');
+          attachTaskDeadlineGovernanceRecovery(options, {
+            checkId: governanceCheckId,
+            outcome: 'failed',
+            outcomeIdempotencyKey,
+          });
           result.governanceOutcome = await this.governanceMiddleware.reportOutcome(
             governanceCheckId,
             'failed',
             undefined,
             { message: result.error },
             debugLogs,
-            govCtx
+            govCtx,
+            options.signal,
+            outcomeIdempotencyKey
           );
+          throwIfAborted(options.signal);
           if (!result.governanceOutcome) {
             result.governanceOutcomeError = 'Outcome reporting to governance agent failed';
           }
@@ -707,6 +1043,12 @@ export class TaskExecutor {
         }
       }
 
+      if (
+        ['completed', 'failed', 'rejected', 'canceled', 'governance-denied', 'aborted'].includes(result.status) &&
+        this.activeTasks.get(taskId)?.status !== result.status
+      ) {
+        this.updateTaskStatus(taskId, result.status as TaskStatus, result.data, result.error);
+      }
       return attachMatch(result);
     } catch (error) {
       if (isAbortOrTimeoutError(error)) {
@@ -714,21 +1056,37 @@ export class TaskExecutor {
           (error as Error & { idempotency_key?: string; idempotencyKey?: string }).idempotency_key = idempotencyKey;
           (error as Error & { idempotency_key?: string; idempotencyKey?: string }).idempotencyKey = idempotencyKey;
         }
+        const currentStatus = this.activeTasks.get(taskId)?.status;
+        if (currentStatus && !TERMINAL_TASK_STATUSES.has(currentStatus)) {
+          this.updateTaskStatus(taskId, 'aborted', undefined, error instanceof Error ? error.message : String(error));
+        }
         throw error;
       }
 
       // Report failed outcome on error
       if (governanceCheckId && this.governanceMiddleware && governanceResult?.governanceContext) {
+        const outcomeIdempotencyKey = this.governanceMiddleware.getOutcomeIdempotencyKey(governanceCheckId, 'failed');
+        attachTaskDeadlineGovernanceRecovery(options, {
+          checkId: governanceCheckId,
+          outcome: 'failed',
+          outcomeIdempotencyKey,
+        });
         await this.governanceMiddleware.reportOutcome(
           governanceCheckId,
           'failed',
           undefined,
           { message: (error as Error).message },
           debugLogs,
-          governanceResult.governanceContext
+          governanceResult.governanceContext,
+          options.signal,
+          outcomeIdempotencyKey
         );
       }
-      return attachMatch(this.createErrorResult<T>(taskId, agent, error, debugLogs, startTime));
+      const failed = this.createErrorResult<T>(taskId, agent, error, debugLogs, startTime);
+      this.updateTaskStatus(taskId, 'failed', undefined, failed.error);
+      return attachMatch(failed);
+    } finally {
+      if (taskAbortListener) options.signal!.removeEventListener('abort', taskAbortListener);
     }
   }
 
@@ -863,11 +1221,20 @@ export class TaskExecutor {
       case ADCP_STATUS.REJECTED:
       case ADCP_STATUS.CANCELED: {
         const failedData = this.extractResponseData(response, debugLogs, taskName);
-        const adcpErrorInfo = extractAdcpErrorInfo(failedData);
+        // Raw/in-process protocol clients may wrap the tool payload under
+        // `data` while carrying the task lifecycle status at the top level.
+        // The generic unwrapper intentionally preserves that wrapper, so
+        // select its nested payload here before extracting business errors.
+        const failedPayload =
+          response?.structuredContent === undefined &&
+          response?.content === undefined &&
+          response?.result === undefined &&
+          response?.data != null &&
+          typeof response.data === 'object'
+            ? response.data
+            : failedData;
+        const adcpErrorInfo = extractAdcpErrorInfo(failedPayload);
         const hasStructuredError = !!adcpErrorInfo;
-        const failedError = hasStructuredError
-          ? this.extractOperationError(failedData)
-          : response.error || response.message || `Task ${status}`;
         // Preserve failedData whenever the server returned a structured
         // payload — not just when extractAdcpErrorInfo recognizes an
         // `adcp_error`/`errors` envelope. Tool-level error shapes like
@@ -877,17 +1244,22 @@ export class TaskExecutor {
         // Only drop `data` when there's literally no structured payload —
         // i.e. falsy or an empty object.
         const hasStructuredPayload =
-          failedData != null &&
-          typeof failedData === 'object' &&
-          (Array.isArray(failedData) || Object.keys(failedData).length > 0);
+          failedPayload != null &&
+          typeof failedPayload === 'object' &&
+          (Array.isArray(failedPayload) || Object.keys(failedPayload).length > 0);
+        const structuredMessage = hasStructuredPayload ? this.extractOperationError(failedPayload) : undefined;
+        const failedError =
+          structuredMessage && structuredMessage !== 'Operation failed'
+            ? structuredMessage
+            : response.error || response.message || structuredMessage || `Task ${status}`;
         return {
           success: false as const,
           status: 'failed' as const,
-          data: hasStructuredError || hasStructuredPayload ? failedData : undefined,
+          data: hasStructuredError || hasStructuredPayload ? failedPayload : undefined,
           error: typeof failedError === 'string' ? failedError : `Task ${status}`,
           adcpError: adcpErrorInfo,
           errorInstance: this.buildErrorInstance(taskId, adcpErrorInfo),
-          correlationId: extractCorrelationId(failedData),
+          correlationId: extractCorrelationId(failedPayload),
           metadata: this.buildMetadata({
             taskId,
             taskName,
@@ -1056,7 +1428,7 @@ export class TaskExecutor {
    * Handles singular `error`, plural `errors` (AdCP schema), and `success: false`.
    */
   private isOperationSuccess(data: any, taskName?: string): boolean {
-    return data?.success !== false && !data?.error && !data?.adcp_error && !isTerminalAdcpError(data, taskName);
+    return isAdcpOperationSuccess(data, taskName);
   }
 
   /**
@@ -1068,9 +1440,18 @@ export class TaskExecutor {
       const ae = data.adcp_error;
       return ae.message ? `${ae.code}: ${ae.message}` : ae.code;
     }
+    const pluralError = Array.isArray(data?.errors)
+      ? data.errors
+          .map((error: any) => error?.message || error?.code)
+          .filter((value: unknown): value is string => typeof value === 'string' && value.length > 0)
+          .join('; ')
+      : undefined;
     return (
       data?.error ||
-      (isAdcpError(data) ? data.errors.map((e: any) => e.message || e.code).join('; ') : null) ||
+      pluralError ||
+      data?.error_detail ||
+      data?.reason ||
+      data?.rejection_reason ||
       data?.message ||
       'Operation failed'
     );
@@ -1107,6 +1488,15 @@ export class TaskExecutor {
   ): Promise<TaskResult<T>> {
     // Extract any data that came with the working response
     const partialData = this.extractResponseData(initialResponse, debugLogs, taskName);
+    const metadata = this.buildMetadata({
+      taskId,
+      taskName,
+      agent,
+      startTime,
+      status: 'working',
+      response: initialResponse,
+    });
+    this.compactIntermediateTaskState(taskId, 'working');
 
     // Return working status immediately - this is a valid intermediate state
     // Callers can use the taskId to poll for completion or set up webhooks
@@ -1114,14 +1504,7 @@ export class TaskExecutor {
       success: true, // The task is progressing, not failed
       status: 'working',
       data: partialData,
-      metadata: this.buildMetadata({
-        taskId,
-        taskName,
-        agent,
-        startTime,
-        status: 'working',
-        response: initialResponse,
-      }),
+      metadata,
       conversation: messages,
       debug_logs: debugLogs,
     };
@@ -1172,6 +1555,11 @@ export class TaskExecutor {
     // grepping debug logs can pinpoint the seller-side spec violation.
     const extractedServerTaskId = this.responseParser.getTaskId(response);
     const serverTaskId = extractedServerTaskId ?? taskId;
+    // Snapshot only what continuations need. Referencing `options.transport`
+    // inside either closure would retain the entire per-call options object,
+    // including unrelated adopter metadata, for as long as the continuation
+    // remains reachable.
+    const pollingTransport = options.transport;
     if (!extractedServerTaskId) {
       debugLogs.push({
         type: 'warning',
@@ -1189,28 +1577,70 @@ export class TaskExecutor {
     const submitted: SubmittedContinuation<T> = {
       taskId: serverTaskId,
       webhookUrl,
-      track: (transport?: import('../protocols').TransportOptions) =>
-        this.getTaskStatus(agent, serverTaskId, transport ?? options.transport),
-      waitForCompletion: (pollInterval = 60000, signal?: AbortSignal) =>
-        this.pollTaskCompletion<T>(agent, serverTaskId, pollInterval, options.transport, signal),
+      track: async (transport?: import('../protocols').TransportOptions) => {
+        const task = await this.getTaskStatus(agent, serverTaskId, transport ?? pollingTransport);
+        if (['completed', 'failed', 'rejected', 'canceled'].includes(task.status)) {
+          this.updateTaskStatus(taskId, task.status as TaskStatus, task.result, task.error);
+        }
+        return task;
+      },
+      waitForCompletion: async (pollInterval = 60000, signal?: AbortSignal) => {
+        const completed = await this.pollTaskCompletion<T>(agent, serverTaskId, pollInterval, pollingTransport, signal);
+        // `pollTaskCompletion` also returns paused input-required/auth-required
+        // states. Preserve that status so callers can resume the seller task;
+        // only genuinely terminal statuses trigger delayed state eviction.
+        this.updateTaskStatus(taskId, completed.status as TaskStatus, completed.data, completed.error);
+        return completed;
+      },
     };
+
+    const metadata = this.buildMetadata({
+      taskId,
+      taskName,
+      agent,
+      startTime,
+      status: 'submitted',
+      response,
+    });
+    this.compactIntermediateTaskState(taskId, 'submitted');
 
     return {
       success: true, // The task is progressing, not failed
       status: 'submitted',
       submitted,
       data: partialData,
-      metadata: this.buildMetadata({
-        taskId,
-        taskName,
-        agent,
-        startTime,
-        status: 'submitted',
-        response,
-      }),
+      metadata,
       conversation: messages,
       debug_logs: debugLogs,
     };
+  }
+
+  /**
+   * A working/submitted response carries everything needed to poll externally.
+   * Keeping the original request in activeTasks after dispatch would pin
+   * inline assets, webhook credentials, conversation payloads, and per-call
+   * options for an unbounded amount of time while the seller works. Retain
+   * only lifecycle metadata and the separately tracked idempotency key.
+   */
+  private compactIntermediateTaskState(
+    taskId: string,
+    status: 'working' | 'submitted' | 'input-required' | 'auth-required' | 'deferred'
+  ): void {
+    const task = this.activeTasks.get(taskId);
+    if (!task) return;
+    task.status = status;
+    task.params = undefined;
+    task.messages = [];
+    task.options = {};
+    delete task.pendingInput;
+    this.compactedTaskIds.delete(taskId);
+    this.compactedTaskIds.set(taskId, true);
+    while (this.compactedTaskIds.size > COMPACTED_TASK_STATE_LIMIT) {
+      const oldest = this.compactedTaskIds.keys().next().value;
+      if (oldest === undefined) break;
+      this.compactedTaskIds.delete(oldest);
+      this.activeTasks.delete(oldest);
+    }
   }
 
   /**
@@ -1240,20 +1670,22 @@ export class TaskExecutor {
     if (!inputHandler) {
       // Extract any data that came with the response (some agents include partial results)
       const partialData = this.extractResponseData(response, debugLogs, taskName);
+      const metadata = this.buildMetadata({
+        taskId,
+        taskName,
+        agent,
+        startTime,
+        status: 'input-required',
+        response,
+        inputRequest,
+      });
+      this.compactIntermediateTaskState(taskId, 'input-required');
 
       return {
         success: true, // The task is progressing, not failed
         status: 'input-required',
         data: partialData,
-        metadata: this.buildMetadata({
-          taskId,
-          taskName,
-          agent,
-          startTime,
-          status: 'input-required',
-          response,
-          inputRequest,
-        }),
+        metadata,
         conversation: messages,
         debug_logs: debugLogs,
       };
@@ -1305,6 +1737,7 @@ export class TaskExecutor {
 
     // Call handler
     const handlerResponse = await inputHandler(context);
+    throwIfAborted(options.signal);
 
     // Check if handler wants to defer
     if (isDeferResponse(handlerResponse)) {
@@ -1321,7 +1754,18 @@ export class TaskExecutor {
           messages,
           createdAt: Date.now(),
         });
+        try {
+          throwIfAborted(options.signal);
+        } catch (error) {
+          // Cancellation may race a storage adapter that ignores the signal.
+          // Remove the just-written resume record before propagating it.
+          await this.config.deferredStorage.delete(token);
+          throw error;
+        }
       }
+      // Deferred storage is the resume source of truth. Avoid retaining a
+      // duplicate full request (including assets/credentials) in activeTasks.
+      this.compactIntermediateTaskState(taskId, 'deferred');
 
       const deferred: DeferredContinuation<T> = {
         token,
@@ -1348,6 +1792,7 @@ export class TaskExecutor {
     }
 
     // Handler provided input - continue with the task
+    throwIfAborted(options.signal);
     return this.continueTaskWithInput<T>(
       agent,
       taskId,
@@ -1528,9 +1973,12 @@ export class TaskExecutor {
             // adcp-client#1617 Phase 2: pass the full agent so cancelA2ATask
             // can sign the POST when agent.request_signing is configured.
             // signed-requests sellers no longer 401 the cancel.
-            void cancelA2ATask(agent, taskId).catch(() => {
-              /* see SECURITY note above */
-            });
+            const cancelTransport = normalizeTransportOptions(transport ?? this.config.transport);
+            void cancelA2ATask(agent, taskId, cancelTransport?.trustedFetchFn, cancelTransport?.allowPrivateIp).catch(
+              () => {
+                /* see SECURITY note above */
+              }
+            );
           } catch {
             /* see SECURITY note above */
           }
@@ -1718,18 +2166,42 @@ export class TaskExecutor {
       throw new Error(`Deferred task not found: ${token}`);
     }
 
-    // Continue task with the provided input (no handler for resumed deferred tasks)
-    const resumed = await this.continueTaskWithInput<T>(
-      state.agent,
-      state.taskId,
-      state.taskName,
-      state.params,
-      state.contextId,
-      input,
-      state.messages,
-      undefined // No handler for deferred tasks - input was provided by human
-    );
-    return attachMatch(resumed);
+    try {
+      // Continue task with the provided input (no handler for resumed deferred tasks)
+      const resumed = await this.continueTaskWithInput<T>(
+        state.agent,
+        state.taskId,
+        state.taskName,
+        state.params,
+        state.contextId,
+        input,
+        state.messages,
+        undefined // No handler for deferred tasks - input was provided by human
+      );
+      const remainsPaused = ['input-required', 'auth-required', 'deferred'].includes(resumed.status);
+      if (
+        ['completed', 'failed', 'rejected', 'canceled', 'governance-denied', 'aborted'].includes(resumed.status) &&
+        this.activeTasks.get(state.taskId)?.status !== resumed.status
+      ) {
+        this.updateTaskStatus(state.taskId, resumed.status as TaskStatus, resumed.data, resumed.error);
+      }
+      if (!remainsPaused) {
+        await this.config.deferredStorage.delete(token);
+      }
+      return attachMatch(resumed);
+    } catch (error) {
+      // A thrown continuation failure is terminal for this deferred token.
+      // Release both persistence and the in-memory request payload before the
+      // error escapes to the caller.
+      this.updateTaskStatus(state.taskId, 'failed', undefined, error instanceof Error ? error.message : String(error));
+      try {
+        await this.config.deferredStorage.delete(token);
+      } catch {
+        // Local request compaction above is the safety boundary. Preserve the
+        // original continuation/delete error if external cleanup also fails.
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1913,6 +2385,10 @@ export class TaskExecutor {
   async getTaskInfo(taskId: string): Promise<TaskInfo | null> {
     const localTask = this.activeTasks.get(taskId);
     if (localTask) {
+      if (this.compactedTaskIds.has(taskId)) {
+        this.compactedTaskIds.delete(taskId);
+        this.compactedTaskIds.set(taskId, true);
+      }
       return {
         taskId: localTask.taskId,
         status: localTask.status,
@@ -2030,7 +2506,7 @@ export class TaskExecutor {
    * Converts v2-style responses to v3 format before validation.
    * This ensures validation passes for both v2 and v3 server responses.
    */
-  private normalizeResponseForValidation(response: any, taskName: string): any {
+  private normalizeResponseForValidation(response: any, taskName: string, legacyWire = false): any {
     if (!response) return response;
 
     // Strip underscore-prefixed client-side annotations (`_message` is added
@@ -2044,8 +2520,14 @@ export class TaskExecutor {
         if (!k.startsWith('_')) stripped[k] = v;
       }
     } else {
-      return taskName === 'get_products' ? normalizeGetProductsResponse(response) : response;
+      return taskName === 'get_products' && !legacyWire ? normalizeGetProductsResponse(response) : response;
     }
+
+    // Validate v2.5 against the exact response that crossed the wire. Public
+    // canonicalization happens later in SingleAgentClient; applying it here
+    // would compare canonical `fixed_price`/`format_options` fields to the
+    // legacy schema that correctly requires `rate`/`is_fixed`/`format_ids`.
+    if (legacyWire) return stripped;
 
     switch (taskName) {
       case 'get_products':
@@ -2070,7 +2552,6 @@ export class TaskExecutor {
     const logViolations = this.config.logSchemaViolations !== false;
 
     try {
-      const normalizedResponse = this.normalizeResponseForValidation(response, taskName);
       // Validate against the version the agent actually spoke. Without
       // this, v2.5 sellers (e.g. Wonderstruck) return valid v2.5-shaped
       // responses and the SDK rejects them as malformed v3 — surfaces as
@@ -2080,8 +2561,11 @@ export class TaskExecutor {
       const validationVersion =
         this.lastKnownServerVersion === 'v2'
           ? 'v2.5'
-          : (this.responseAdcpVersionForValidation() ?? this.config.adcpVersion);
-      const outcome = validateIncomingResponse(taskName, normalizedResponse, mode, debugLogs, validationVersion);
+          : (this.responseAdcpVersionForValidation() ?? this.config.adcpVersion ?? ADCP_VERSION);
+      const normalizedResponse = this.normalizeResponseForValidation(response, taskName, validationVersion === 'v2.5');
+      // TaskExecutor owns the user-facing log entry below. Passing debugLogs
+      // into the lower-level hook would emit a second, unversioned duplicate.
+      const outcome = validateIncomingResponse(taskName, normalizedResponse, mode, undefined, validationVersion);
       if (outcome.valid) return { valid: true, errors: [] };
 
       const errorStrings = outcome.issues.map(i => `${i.pointer}: ${i.message}`);
@@ -2094,17 +2578,26 @@ export class TaskExecutor {
             outcome.issues
           )}`,
           errors: errorStrings,
+          issues: outcome.issues,
           schemaVariant: outcome.variant,
+          schemaVersion: validationVersion,
           mode,
         });
       }
 
       if (mode === 'warn') {
-        console.warn(`Schema validation failed for ${taskName} (non-blocking):`, errorStrings);
+        if (logViolations) {
+          console.warn(
+            `Schema validation failed for ${taskName} against AdCP ${validationVersion} (non-blocking):`,
+            errorStrings
+          );
+        }
         return { valid: true, errors: [] };
       }
 
-      console.error(`Schema validation failed for ${taskName}:`, errorStrings);
+      if (logViolations) {
+        console.error(`Schema validation failed for ${taskName} against AdCP ${validationVersion}:`, errorStrings);
+      }
       return { valid: false, errors: errorStrings };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'unknown error';
@@ -2127,6 +2620,9 @@ export class TaskExecutor {
   private updateTaskStatus(taskId: string, status: TaskStatus, result?: any, error?: string): void {
     const task = this.activeTasks.get(taskId);
     if (task) {
+      // Once cancellation has released request state, late work must not
+      // resurrect the task or emit completion after the caller has retried.
+      if (task.status === 'aborted' && status !== 'aborted') return;
       const previousStatus = task.status;
       task.status = status;
 
@@ -2154,11 +2650,23 @@ export class TaskExecutor {
         timestamp: new Date().toISOString(),
       });
 
+      if (status === 'input-required' || status === 'auth-required') {
+        this.compactIntermediateTaskState(taskId, status);
+      }
+
       // If task is finished, remove from active tasks after a delay.
       // unref() ensures this timer doesn't prevent the process from exiting.
-      if (['completed', 'failed', 'rejected', 'canceled'].includes(status)) {
+      if (TERMINAL_TASK_STATUSES.has(status)) {
+        // Keep lifecycle metadata briefly for status inspection, but release
+        // request/conversation/options immediately. These may contain inline
+        // creative assets and webhook or transport credentials.
+        task.params = undefined;
+        task.messages = [];
+        task.options = {};
+        delete task.pendingInput;
         setTimeout(() => {
           this.activeTasks.delete(taskId);
+          this.compactedTaskIds.delete(taskId);
         }, 30000).unref(); // Keep for 30 seconds for final status checks
       }
     }

@@ -22,6 +22,18 @@ export type {
   A2ATaskEnvelope,
   AgentEntry,
   Storyboard,
+  StoryboardFixtureResolution,
+  FixtureResolutionStrategy,
+  FixtureMatchOperator,
+  FixtureMatchClause,
+  FixtureResolutionDeclaration,
+  ProductFixtureResolutionDeclaration,
+  PricingOptionFixtureResolutionDeclaration,
+  FixtureResolutionStatus,
+  FixtureResolutionRecord,
+  FixtureResolutionAttempt,
+  FixtureResolutionEvidence,
+  FixtureResolutionCoverageGap,
   StoryboardInvariants,
   StoryboardInvariantsObject,
   StepInvariantsObject,
@@ -45,6 +57,14 @@ export type {
   ImpairmentCoherenceNotApplicableHint,
   StoryboardContext,
   StoryboardRunOptions,
+  TrustedMatchContextProviderEndpoint,
+  TrustedMatchContextRegistrationContext,
+  TrustedMatchContextRouterRunnerOptions,
+  TrustedMatchPublisherAuthOperation,
+  TrustedMatchPublisherCredentialState,
+  TrustedMatchPublisherAuthTls,
+  TrustedMatchPublisherAuthProbeConfiguration,
+  TrustedMatchPublisherAuthRunner,
   ValidationResult,
   StoryboardStepPreview,
   StoryboardStepResult,
@@ -102,11 +122,22 @@ export {
   listStrictOnlyFailures,
   resolveCapabilityPath,
   evaluateCapabilityPredicate,
+  describeStoryboardCapabilityGates,
   buildDiscoveryFailedResult,
 } from './runner';
 
 // Parser (single-file load for spec evolution / targeted testing)
 export { parseStoryboard, loadStoryboardFile } from './loader';
+
+// AdCP 3.2 fixture-handle resolution
+export {
+  applyFixtureBindingsToRequest,
+  buildFixtureResolutionSpecs,
+  FixtureBindingRegistry,
+  matchesFixtureRequirements,
+  normalizeFixtureMatchExpression,
+  validateFixtureResolutionDeclarations,
+} from './fixture-resolution';
 
 // Compliance cache: capability-driven resolution
 export {
@@ -145,6 +176,9 @@ export type {
 // Task mapping
 export { TASK_TO_METHOD, executeStoryboardTask } from './task-map';
 
+// Storyboard-only creative asset directives
+export { expandCreativeAssetDirectives, findUnresolvedCreativeAssetDirectives } from './creative-assets';
+
 // Path utilities
 export { parsePath, resolvePath, setPath } from './path';
 
@@ -168,6 +202,26 @@ export { buildRequest, hasRequestBuilder } from './request-builder';
 
 // Validations
 export { runValidations } from './validations';
+export {
+  gradeOAuthMetadataGraph,
+  gradeOAuthMetadataGraphVector,
+  loadOAuthMetadataGraphVectors,
+  buildAuthorizationServerMetadataUrl,
+  buildProtectedResourceMetadataUrl,
+  normalizeOAuthResourceForComparison,
+  redactOAuthUrlForOutput,
+} from './oauth-metadata-graph';
+export type {
+  GradeOAuthMetadataGraphOptions,
+  OAuthMetadataFetchResponse,
+  OAuthMetadataFetchTransport,
+  OAuthMetadataGraphErrorCode,
+  OAuthMetadataGraphFinding,
+  OAuthMetadataGraphGrade,
+  OAuthMetadataGraphObservation,
+  OAuthMetadataGraphVector,
+  OAuthMetadataGraphVectorCorpus,
+} from './oauth-metadata-graph';
 export {
   RateLimitTripObserver,
   RATE_LIMIT_TRIP_CONTRACT,

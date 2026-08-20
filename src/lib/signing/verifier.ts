@@ -6,7 +6,12 @@ import {
   rejectNonAsciiHost,
   type RequestLike,
 } from './canonicalize';
-import { contentDigestMatches } from './content-digest';
+import {
+  contentDigestMatches,
+  contentDigestUsesEncoding,
+  requestSigningEncodingForVersion,
+  type SfBinaryEncoding,
+} from './content-digest';
 import { RequestSignatureError } from './errors';
 import { parseSignature, parseSignatureInput, type ParsedSignatureInput } from './parser';
 import { jwkToPublicKey, verifySignature } from './crypto';
@@ -38,6 +43,13 @@ export interface VerifyRequestOptions {
    * always-verify mode (where every request is signed) can leave this blank.
    */
   operation?: string;
+  /**
+   * Trusted endpoint release pin; never inferred from request payload data.
+   * When omitted, the verifier accepts both the legacy 3.0/3.1 Base64URL
+   * representation and the 3.2+ RFC 8941 Base64 representation. Digest
+   * coverage still follows `capability.covers_content_digest`.
+   */
+  adcpVersion?: string;
   agentUrlForKeyid?: (keyid: string) => string | undefined;
 }
 
@@ -46,6 +58,8 @@ export async function verifyRequestSignature(
   options: VerifyRequestOptions
 ): Promise<VerifyResult> {
   const now = options.now ? options.now() : Math.floor(Date.now() / 1000);
+  const pinnedBinaryEncoding =
+    options.adcpVersion !== undefined ? requestSigningEncodingForVersion(options.adcpVersion) : undefined;
   const sigInputHeader = getHeaderValue(request.headers, 'Signature-Input');
   const sigHeader = getHeaderValue(request.headers, 'Signature');
 
@@ -106,8 +120,26 @@ export async function verifyRequestSignature(
 
   // Step 1: parse.
   const parsedInput = parseSignatureInput(sigInputHeader);
-  const parsedSig = parseSignature(sigHeader, parsedInput.label);
-  rejectNonAsciiHost(request.url);
+  const binaryEncodingCandidates = signatureEncodingCandidates(
+    pinnedBinaryEncoding,
+    options.capability?.covers_content_digest
+  );
+  let parsedSig: ReturnType<typeof parseSignature> | undefined;
+  let parsedEncoding: SfBinaryEncoding | undefined;
+  let parseError: unknown;
+  for (const candidate of binaryEncodingCandidates) {
+    try {
+      parsedSig = parseSignature(sigHeader, parsedInput.label, candidate);
+      parsedEncoding = candidate;
+      break;
+    } catch (error) {
+      parseError ??= error;
+    }
+  }
+  if (!parsedSig) throw parseError;
+  const effectiveEncoding = pinnedBinaryEncoding ?? parsedEncoding!;
+  const canonicalizationProfile = effectiveEncoding === 'rfc8941-base64' ? '3.2' : 'legacy';
+  if (canonicalizationProfile === 'legacy') rejectNonAsciiHost(request.url);
   validateSingleValuedCoveredHeaders(parsedInput.components, request);
 
   // Step 2: required params present.
@@ -135,7 +167,13 @@ export async function verifyRequestSignature(
   validateWindow(parsedInput.params.created, parsedInput.params.expires, now);
 
   // Step 6: covered components.
-  validateCoveredComponents(parsedInput.components, options.capability, request);
+  // The 3.2 digest floor comes only from the trusted endpoint pin. Never
+  // derive it from the request's attacker-controlled serialization.
+  const effectiveCapability =
+    pinnedBinaryEncoding === 'rfc8941-base64'
+      ? { ...options.capability, covers_content_digest: 'required' as const }
+      : options.capability;
+  validateCoveredComponents(parsedInput.components, effectiveCapability, request);
 
   // Step 7: resolve keyid.
   const jwk = await options.jwks.resolve(parsedInput.params.keyid);
@@ -173,23 +211,35 @@ export async function verifyRequestSignature(
   // signature captured on one endpoint (e.g. /create_media_buy) MUST NOT
   // count against the replay budget for a different endpoint under the
   // same keyid. Canonicalize once and reuse for both pre-check and commit.
-  const replayScope = canonicalTargetUri(request.url);
+  const replayScope = canonicalTargetUri(request.url, canonicalizationProfile);
 
-  // Step 12 pre-checks (rate-abuse cap + replay hit) run before crypto so a
+  // Step 12 pre-checks (replay hit + rate-abuse cap) run before crypto so a
   // compromised-key cache cap or a replayed nonce short-circuits an expensive
-  // Ed25519/ECDSA verify. The committing insert happens after step 11.
-  if (await options.replayStore.isCapHit(jwk.kid, replayScope, now)) {
-    throw new RequestSignatureError(
-      'request_signature_rate_abuse',
-      12,
-      `Per-keyid replay cache cap exceeded for keyid=${jwk.kid}`
-    );
-  }
+  // Ed25519/ECDSA verify. Replay is checked first to preserve the store
+  // contract's replay-over-cap result precedence. The committing insert
+  // happens after step 11.
   if (await options.replayStore.has(jwk.kid, replayScope, parsedInput.params.nonce, now)) {
     throw new RequestSignatureError(
       'request_signature_replayed',
       12,
       `Replay of (keyid=${jwk.kid}, nonce=${parsedInput.params.nonce}) within signature window`
+    );
+  }
+  if (await options.replayStore.isCapHit(jwk.kid, replayScope, now)) {
+    // The nonce may have been committed between the first replay probe and
+    // the cap probe. Re-check so same-nonce losers retain the store
+    // contract's replay-over-cap classification under that race.
+    if (await options.replayStore.has(jwk.kid, replayScope, parsedInput.params.nonce, now)) {
+      throw new RequestSignatureError(
+        'request_signature_replayed',
+        12,
+        `Replay of (keyid=${jwk.kid}, nonce=${parsedInput.params.nonce}) within signature window`
+      );
+    }
+    throw new RequestSignatureError(
+      'request_signature_rate_abuse',
+      12,
+      `Per-keyid replay cache cap exceeded for keyid=${jwk.kid}`
     );
   }
 
@@ -200,7 +250,8 @@ export async function verifyRequestSignature(
     parsedInput.components,
     request,
     parsedInput.params,
-    parsedInput.signatureParamsValue
+    parsedInput.signatureParamsValue,
+    canonicalizationProfile
   );
   const publicKey = jwkToPublicKey(jwk);
   const valid = verifySignature(parsedInput.params.alg, publicKey, Buffer.from(base, 'utf8'), parsedSig.bytes);
@@ -215,7 +266,12 @@ export async function verifyRequestSignature(
   // Step 11: content-digest match (only if covered).
   if (parsedInput.components.includes('content-digest')) {
     const digestHeader = getHeaderValue(request.headers, 'Content-Digest');
-    if (!digestHeader || !contentDigestMatches(digestHeader, request.body ?? '')) {
+    const encodingMatches =
+      !!digestHeader &&
+      contentDigestEncodingCandidates(pinnedBinaryEncoding, options.capability.covers_content_digest).some(candidate =>
+        contentDigestUsesEncoding(digestHeader, candidate)
+      );
+    if (!digestHeader || !encodingMatches || !contentDigestMatches(digestHeader, request.body ?? '')) {
       throw new RequestSignatureError(
         'request_signature_digest_mismatch',
         11,
@@ -248,6 +304,30 @@ export async function verifyRequestSignature(
 
   const agent_url = options.agentUrlForKeyid?.(jwk.kid);
   return { status: 'verified', keyid: jwk.kid, agent_url, verified_at: now };
+}
+
+function signatureEncodingCandidates(
+  pinned: SfBinaryEncoding | undefined,
+  digestPolicy: VerifierCapability['covers_content_digest'] | undefined
+): readonly SfBinaryEncoding[] {
+  if (!pinned) return ['rfc8941-base64', 'legacy-base64url'];
+  if (digestPolicy !== 'either') return [pinned];
+  return [pinned, alternateBinaryEncoding(pinned)];
+}
+
+function contentDigestEncodingCandidates(
+  pinned: SfBinaryEncoding | undefined,
+  digestPolicy: VerifierCapability['covers_content_digest']
+): readonly SfBinaryEncoding[] {
+  // Legacy bundles contain both historical Base64URL digests and standards-
+  // compliant RFC 8941 Base64 digests. A strict 3.2 endpoint narrows to the
+  // latter; rolling-upgrade and unpinned verifiers accept both serializations.
+  if (pinned === 'rfc8941-base64' && digestPolicy !== 'either') return [pinned];
+  return ['rfc8941-base64', 'legacy-base64url'];
+}
+
+function alternateBinaryEncoding(encoding: SfBinaryEncoding): SfBinaryEncoding {
+  return encoding === 'rfc8941-base64' ? 'legacy-base64url' : 'rfc8941-base64';
 }
 
 function jsonRpcProtocolMethods(body: string | undefined): string[] {

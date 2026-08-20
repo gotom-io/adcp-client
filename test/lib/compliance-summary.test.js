@@ -94,11 +94,39 @@ describe('buildComplianceSummary', () => {
     assert.deepStrictEqual(s.skipped_by_reason, {});
   });
 
+  test('propagates timeout completeness to JSON, text, and Markdown summaries', () => {
+    const result = passingResult();
+    result.overall_status = 'partial';
+    result.completeness = 'timed_out';
+    const s = buildComplianceSummary(result, { sdkVersion: '14.0.0', adcpVersion: '3.2.0-beta.3' });
+    assert.strictEqual(s.completeness, 'timed_out');
+
+    const text = formatComplianceSummaryText(s);
+    assert.ok(text.indexOf('Incomplete:') < text.indexOf('Steps:'));
+    assert.match(text, /STORYBOARD-INCOMPLETE/);
+    assert.doesNotMatch(text, /wired but unexercised/);
+
+    const markdown = formatComplianceSummaryMarkdown(s);
+    assert.match(markdown, /Storyboard run timed out/);
+    assert.ok(markdown.indexOf('**Incomplete:**') < markdown.indexOf('**Steps:**'));
+    assert.doesNotMatch(markdown, /wired but partly unexercised/);
+  });
+
   test('surfaces validation-level not_applicable counts for gating consumers', () => {
     const result = passingResult();
     result.summary.validations_not_applicable = 2;
     const s = buildComplianceSummary(result, { sdkVersion: '6.9.0', adcpVersion: '3.0.6' });
     assert.strictEqual(s.validations_not_applicable, 2);
+  });
+
+  test('surfaces advisory failures beside failed steps without changing the verdict', () => {
+    const result = passingResult();
+    result.summary.validations_advisory_failed = 3;
+    const s = buildComplianceSummary(result, { sdkVersion: '13.0.0-rc.11', adcpVersion: '3.1.11' });
+    assert.strictEqual(s.failed, 0);
+    assert.strictEqual(s.validations_advisory_failed, 3);
+    assert.match(formatComplianceSummaryText(s), /0 failed, 3 advisory validation\(s\) failed/);
+    assert.match(formatComplianceSummaryMarkdown(s), /0 failed, 3 advisory validation\(s\) failed/);
   });
 
   test('failing run flattens failures into the contract shape', () => {

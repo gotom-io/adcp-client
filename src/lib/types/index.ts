@@ -7,10 +7,15 @@ export type {
   TestResult,
   TestRequest,
   ApiResponse,
-  CreativeFormat,
-  AdvertisingProduct,
+  LegacyCreativeFormatSummary,
+  LegacyAdvertisingProduct,
   MediaBuy,
   Targeting,
+  LegacyManagedCreativeAsset,
+  LegacyManageSyncCreativesRequest,
+  LegacyManageListCreativesRequest,
+  LegacyManageListCreativesResponse,
+  LegacyManagedCreativeFilters,
   ManageCreativeAssetsRequest,
   ManageCreativeAssetsResponse,
   CreateMediaBuyAsyncResponseData,
@@ -25,6 +30,25 @@ export type {
 // We expose the new canonical name AND keep the historical `FormatID` alias
 // so SDK consumers don't break across the version bump.
 export type { FormatReferenceStructuredObject } from './core.generated';
+// Canonical-format declarations are part of the 3.2 authoring surface. Keep
+// these curated exports available from `@adcp/sdk/types` so adopters can type
+// check the shared array-valued `slots` contract without importing generated
+// implementation files.
+export type {
+  CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement,
+  CanonicalFormatBase,
+  CanonicalFormatDAASTAudio,
+  CanonicalFormatDisplayTag,
+  CanonicalFormatHostedAudio,
+  CanonicalFormatHostedVideo,
+  CanonicalFormatHTML5Banner,
+  CanonicalFormatImageCarousel,
+  CanonicalFormatNativeInFeed,
+  CanonicalFormatResponsiveCreative,
+  CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven,
+  CanonicalFormatVASTVideo,
+  ExtensionObject,
+} from './core.generated';
 import type { FormatReferenceStructuredObject } from './core.generated';
 export type { RequireCacheScopeWhenProducts, ServerPayload } from './server-payload';
 export * from './server-payload-aliases';
@@ -43,7 +67,7 @@ export type FormatID = FormatReferenceStructuredObject;
 // adopters never reach into generated files.
 //
 // Intentionally excluded — name conflicts with legacy adcp.ts shapes:
-//   SyncCreativesRequest, ListCreativesRequest, ListCreativesResponse,
+//   LegacyManageSyncCreativesRequest, LegacyManageListCreativesRequest, LegacyManageListCreativesResponse,
 //   ManageCreativeAssetsRequest, ManageCreativeAssetsResponse (adcp.ts versions
 //   already public via `export * from './adcp'` above; use those).
 // Intentionally excluded — comply-runner internals, not specialism surface:
@@ -186,11 +210,15 @@ export type {
   GetCreativeFeaturesResponse,
   GetCreativeDeliveryRequest,
   GetCreativeDeliveryResponse,
+  SyncCreativesRequest,
   SyncCreativesResponse,
   SyncCreativesSuccess,
   SyncCreativesError,
   SyncCreativesSubmitted,
   SyncCreativesAsyncSubmitted,
+  ListCreativesRequest,
+  ListCreativesResponse,
+  CreativeFilters,
   CreativeAsset,
   CreativeQuality,
   Format,
@@ -308,11 +336,10 @@ export * from './format-asset-slots';
 // Discriminated union of creative asset INSTANCES (what a buyer delivers
 // inside `creative_manifest.assets`). Companion to format-asset-slots.ts
 // (which describes what a publisher SELLS in `Format.assets[]`). The
-// individual ImageAsset / VideoAsset / etc. interfaces are generated; this
-// file is the missing canonical union over them.
-// Note: tools.generated.ts also has `AssetVariant`, a narrower generated union
-// that omits AudioAsset. `AssetInstance` (this file) is the curated, complete
-// union — prefer it. `AssetVariant` is intentionally not re-exported.
+// individual ImageAsset / VideoAsset / etc. interfaces and their canonical
+// `AssetVariant` union are generated. `AssetInstance` aliases that union so
+// every registry-backed asset branch remains available without curated drift.
+// `AssetVariant` itself is intentionally not re-exported.
 export * from './asset-instances';
 
 // Strict per-row types for sync_* response success arms. The codegen
@@ -336,6 +363,7 @@ export * from './inline-enums.generated';
 // `enums/*.json` files). Each alias is `@deprecated` so editor tooling
 // surfaces the canonical replacement; slated for removal in the next major.
 export * from './inline-enums.aliases';
+export * from './enum-compat';
 
 // Back-compat aliases for the 6 error-details schemas renamed in AdCP 3.0.x
 // (adcp#3149 / adcp#3566 canonicalized SCREAMING_SNAKE titles into Title Case).

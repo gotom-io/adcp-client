@@ -13,10 +13,10 @@ import type { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index
 import type { DebugLogEntry } from '../types/adcp';
 import type { TaskInfo } from '../core/ConversationTypes';
 import { withCachedConnection } from './mcp';
-import { createMCPAuthHeaders } from '../auth';
-import { withSpan, injectTraceHeaders } from '../observability/tracing';
+import { createMCPRequestHeaders } from '../auth';
+import { withSpan } from '../observability/tracing';
 import { signingContextStorage, type AgentSigningContext } from '../signing/client';
-import { redactIdempotencyKeyInArgs } from '../utils/idempotency';
+import { redactArgsForLog as sharedRedactArgsForLog } from '../utils/redact-args';
 import { withResponseSizeLimit } from './responseSizeLimit';
 import { withTransportDiagnostics, type TransportActivityHandler } from './transportDiagnostics';
 import { isAbortOrTimeoutError, resolveClientRequestTimeoutMs } from './abort';
@@ -30,7 +30,12 @@ type CallToolResponse = {
 };
 
 interface MCPTaskProtocolOptions {
-  transport?: { maxResponseBytes?: number };
+  transport?: {
+    maxResponseBytes?: number;
+    trustedFetchFn?: typeof fetch;
+    requestTimeoutMs?: number;
+    allowPrivateIp?: boolean;
+  };
   onTransportActivity?: TransportActivityHandler;
   transportActivityContext?: {
     agentId: string;
@@ -130,12 +135,7 @@ function mapMCPTaskToTaskInfo(
  * Build auth headers for MCP connections.
  */
 function buildAuthHeaders(authToken?: string, customHeaders?: Record<string, string>): Record<string, string> {
-  const traceHeaders = injectTraceHeaders();
-  return {
-    ...customHeaders,
-    ...traceHeaders,
-    ...(authToken ? createMCPAuthHeaders(authToken) : {}),
-  };
+  return createMCPRequestHeaders(customHeaders, authToken);
 }
 
 /**
@@ -147,17 +147,7 @@ function buildAuthHeaders(authToken?: string, customHeaders?: Record<string, str
  *   full logging via `ADCP_LOG_IDEMPOTENCY_KEYS=1`
  */
 function redactArgsForLog(args: Record<string, unknown>): Record<string, unknown> {
-  let redacted: Record<string, unknown> = args;
-  if (redacted.push_notification_config) {
-    redacted = {
-      ...redacted,
-      push_notification_config: {
-        ...(redacted.push_notification_config as object),
-        authentication: '***',
-      },
-    };
-  }
-  return redactIdempotencyKeyInArgs(redacted);
+  return sharedRedactArgsForLog(args);
 }
 
 /**
@@ -192,6 +182,8 @@ export async function callMCPToolWithTasks(
     signingContext?: AgentSigningContext;
     signal?: AbortSignal;
     requestTimeoutMs?: number;
+    fetchFn?: typeof fetch;
+    allowPrivateIp?: boolean;
   }
 ): Promise<unknown> {
   // Keep the public debug-log contract identical across modern and legacy
@@ -224,6 +216,8 @@ export async function callMCPToolWithTasks(
     ...(options?.signingContext && { signingContext: options.signingContext }),
     ...(options?.signal && { signal: options.signal }),
     ...(options?.requestTimeoutMs !== undefined && { requestTimeoutMs: options.requestTimeoutMs }),
+    ...(options?.fetchFn && { fetchFn: options.fetchFn }),
+    ...(options?.allowPrivateIp !== undefined && { allowPrivateIp: options.allowPrivateIp }),
   });
   if (modernAttempt.handled) {
     debugLogs.push({
@@ -262,8 +256,12 @@ export async function callMCPToolWithTasks(
               options?.signal,
               options?.requestTimeoutMs
             ),
-          undefined,
-          { signal: options?.signal, requestTimeoutMs: options?.requestTimeoutMs }
+          options?.fetchFn,
+          {
+            signal: options?.signal,
+            requestTimeoutMs: options?.requestTimeoutMs,
+            allowPrivateIp: options?.allowPrivateIp,
+          }
         );
       })
   );
@@ -576,15 +574,27 @@ export async function listMCPTasks(
         onTransportActivity: options.onTransportActivity,
       },
       () =>
-        withCachedConnection(agentUrl, authToken, authHeaders, debugLogs, 'tasks/list', async client => {
-          const result = await client.experimental.tasks.listTasks();
-          debugLogs.push({
-            type: 'info',
-            message: `MCP Tasks: listTasks returned ${result.tasks.length} tasks`,
-            timestamp: new Date().toISOString(),
-          });
-          return result.tasks.map((task: any) => mapMCPTaskToTaskInfo(task));
-        })
+        withCachedConnection(
+          agentUrl,
+          authToken,
+          authHeaders,
+          debugLogs,
+          'tasks/list',
+          async client => {
+            const result = await client.experimental.tasks.listTasks();
+            debugLogs.push({
+              type: 'info',
+              message: `MCP Tasks: listTasks returned ${result.tasks.length} tasks`,
+              timestamp: new Date().toISOString(),
+            });
+            return result.tasks.map((task: any) => mapMCPTaskToTaskInfo(task));
+          },
+          options.transport?.trustedFetchFn,
+          {
+            requestTimeoutMs: options.transport?.requestTimeoutMs,
+            allowPrivateIp: options.transport?.allowPrivateIp,
+          }
+        )
     )
   );
 }

@@ -9,6 +9,7 @@ const {
   InMemoryStateStore,
   ADCP_PRE_TRANSPORT,
   ADCP_SIGNED_REQUESTS_STATE,
+  BuyerAgentRegistry,
 } = require('../dist/lib/server/legacy/v5/index.js');
 const { StaticJwksResolver, InMemoryReplayStore, InMemoryRevocationStore } = require('../dist/lib/signing/server.js');
 const { signRequest } = require('../dist/lib/signing/signer.js');
@@ -59,6 +60,7 @@ function sellerConfig({
   withSpecialism = true,
   capabilityRequestSigning,
   signedRequestsRequiredFor = ['create_media_buy'],
+  omitSignedRequestsRequiredFor = false,
 } = {}) {
   const defaultRequestSigning = {
     supported: true,
@@ -97,16 +99,17 @@ function sellerConfig({
   };
   if (withSignedRequests) {
     config.signedRequests = makeStores();
-    if (signedRequestsRequiredFor !== undefined) {
+    if (!omitSignedRequestsRequiredFor && signedRequestsRequiredFor !== undefined) {
       config.signedRequests.required_for = signedRequestsRequiredFor;
     }
   }
   return config;
 }
 
-async function startServer(factory) {
+async function startServer(factory, options = {}) {
   return new Promise(resolve => {
     const srv = serve(factory, {
+      ...options,
       port: 0,
       onListening: url => resolve({ server: srv, url, port: new URL(url).port }),
     });
@@ -136,7 +139,23 @@ function mcpGetProductsBody() {
     method: 'tools/call',
     params: {
       name: 'get_products',
-      arguments: { brief: 'test' },
+      arguments: { buying_mode: 'brief', brief: 'test' },
+    },
+  });
+}
+
+function mcpFinalizeProposalBody() {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id: 4,
+    method: 'tools/call',
+    params: {
+      name: 'get_products',
+      arguments: {
+        buying_mode: 'refine',
+        refine: [{ scope: 'proposal', action: 'finalize', proposal_id: 'proposal-1' }],
+        idempotency_key: 'proposal-finalize-signing-test-0001',
+      },
     },
   });
 }
@@ -156,17 +175,18 @@ function mcpUpdateMediaBuyBody() {
   });
 }
 
-async function postSigned({ url, body, sign, nonce }) {
+async function postSigned({ url, body, sign, nonce, signUrl = url, requestHeaders = {} }) {
   const parsed = new URL(url);
   const headers = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
+    ...requestHeaders,
   };
   if (sign) {
     const signOpts = { coverContentDigest: true };
     if (nonce !== undefined) signOpts.nonce = nonce;
     const signed = signRequest(
-      { method: 'POST', url, headers, body },
+      { method: 'POST', url: signUrl, headers, body },
       { keyid: 'test-ed25519-2026', alg: 'ed25519', privateKey: edPrivate },
       signOpts
     );
@@ -401,6 +421,55 @@ describe('createAdcpServer: signedRequests auto-wiring', () => {
     });
   });
 
+  describe('canonical public URL verification', () => {
+    let started;
+
+    before(async () => {
+      started = await startServer(
+        () => createAdcpServer(sellerConfig({ withSignedRequests: true, withSpecialism: true })),
+        {
+          publicUrl: 'https://seller.example.com/mcp',
+          trustForwardedHost: true,
+          allowedHosts: ['localhost', '127.0.0.1', 'seller.example.com'],
+        }
+      );
+    });
+
+    after(async () => {
+      if (started?.server) {
+        await new Promise(resolve => started.server.close(resolve));
+      }
+    });
+
+    it('binds auto-wired signatures to the HTTPS public URL instead of the internal listener', async () => {
+      const body = mcpCreateMediaBuyBody();
+      const requestHeaders = {
+        'X-Forwarded-Host': 'seller.example.com',
+        'X-Forwarded-Proto': 'https',
+      };
+
+      const wrongScheme = await postSigned({
+        url: started.url,
+        signUrl: 'http://seller.example.com/mcp',
+        body,
+        sign: true,
+        nonce: 'auto-wire-wrong-scheme-0001',
+        requestHeaders,
+      });
+      assert.strictEqual(wrongScheme.status, 401, 'an HTTP-bound signature must not authorize the HTTPS endpoint');
+
+      const canonical = await postSigned({
+        url: started.url,
+        signUrl: 'https://seller.example.com/mcp',
+        body,
+        sign: true,
+        nonce: 'auto-wire-canonical-url-0001',
+        requestHeaders,
+      });
+      assert.strictEqual(canonical.status, 200, 'a signature bound to the canonical HTTPS endpoint should pass');
+    });
+  });
+
   describe('no-signedRequests server preserves existing behavior', () => {
     let started;
 
@@ -441,7 +510,7 @@ describe('createAdcpServer: signedRequests auto-wiring', () => {
               covers_content_digest: 'either',
               required_for: ['create_media_buy'],
             },
-            signedRequestsRequiredFor: undefined,
+            omitSignedRequestsRequiredFor: true,
           })
         )
       );
@@ -472,6 +541,93 @@ describe('createAdcpServer: signedRequests auto-wiring', () => {
       assert.strictEqual(res.status, 401, 'create_media_buy must reject unsigned traffic');
       const payload = await res.json();
       assert.strictEqual(payload.error, 'request_signature_required');
+    });
+  });
+
+  describe('required_for fallback protects request-aware proposal finalization', () => {
+    let started;
+
+    before(async () => {
+      started = await startServer(() =>
+        createAdcpServer(
+          sellerConfig({
+            withSignedRequests: true,
+            withSpecialism: true,
+            capabilityRequestSigning: {
+              supported: true,
+              covers_content_digest: 'either',
+            },
+            omitSignedRequestsRequiredFor: true,
+          })
+        )
+      );
+    });
+
+    after(async () => {
+      if (started?.server) await new Promise(resolve => started.server.close(resolve));
+    });
+
+    it('rejects unsigned get_products proposal finalization under the default signing policy', async () => {
+      const res = await postSigned({ url: started.url, body: mcpFinalizeProposalBody(), sign: false });
+      assert.strictEqual(res.status, 401, 'state-changing proposal finalize must require signing');
+      const payload = await res.json();
+      assert.strictEqual(payload.error, 'request_signature_required');
+    });
+
+    it('requires ordinary get_products reads to be signed because required_for is tool-level', async () => {
+      const res = await postSigned({ url: started.url, body: mcpGetProductsBody(), sign: false });
+      assert.strictEqual(res.status, 401, 'tool-level policy cannot distinguish ordinary reads from finalize');
+    });
+
+    it('advertises get_products in the effective required_for list so buyers know to sign it', async () => {
+      const agent = createAdcpServer(
+        sellerConfig({
+          withSignedRequests: true,
+          withSpecialism: true,
+          capabilityRequestSigning: { supported: true, covers_content_digest: 'either' },
+          omitSignedRequestsRequiredFor: true,
+        })
+      );
+      const response = await agent.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'get_adcp_capabilities', arguments: {} },
+      });
+      assert.ok(response.structuredContent.request_signing.required_for.includes('get_products'));
+    });
+  });
+
+  describe('capability overrides and verifier enforcement share one effective policy', () => {
+    let started;
+
+    before(async () => {
+      started = await startServer(() => {
+        const config = sellerConfig({
+          withSignedRequests: true,
+          withSpecialism: true,
+          capabilityRequestSigning: {
+            supported: true,
+            covers_content_digest: 'either',
+            required_for: ['create_media_buy'],
+          },
+          omitSignedRequestsRequiredFor: true,
+        });
+        config.capabilities.overrides = {
+          request_signing: { required_for: ['get_products'] },
+        };
+        return createAdcpServer(config);
+      });
+    });
+
+    after(async () => {
+      if (started?.server) await new Promise(resolve => started.server.close(resolve));
+    });
+
+    it('enforces the post-override required_for list instead of the raw capability config', async () => {
+      const read = await postSigned({ url: started.url, body: mcpGetProductsBody(), sign: false });
+      assert.strictEqual(read.status, 401, 'advertised override must also control verifier enforcement');
+
+      const create = await postSigned({ url: started.url, body: mcpCreateMediaBuyBody(), sign: false });
+      assert.strictEqual(create.status, 200, 'tool removed by the override must not remain signature-required');
     });
   });
 
@@ -781,6 +937,123 @@ describe('createAdcpServer: signedRequests auto-wiring', () => {
       );
       assert.deepStrictEqual(resolverCalls, ['test-ed25519-2026']);
     });
+
+    it('bridges the verified signer into handler auth and BuyerAgentRegistry resolution', async () => {
+      const buyerAgent = {
+        agent_url: 'https://buyer.example.com',
+        display_name: 'Buyer',
+        status: 'active',
+        billing_capabilities: new Set(['operator']),
+      };
+      let registryUrl;
+      let capturedContext;
+      const config = sellerConfig({ withSignedRequests: true, withSpecialism: true });
+      config.signedRequests.agentUrlForKeyid = () => buyerAgent.agent_url;
+      config.agentRegistry = BuyerAgentRegistry.signingOnly({
+        resolveByAgentUrl: async agentUrl => {
+          registryUrl = agentUrl;
+          return buyerAgent;
+        },
+      });
+      config.mediaBuy.getProducts = async (_params, ctx) => {
+        capturedContext = ctx;
+        return { products: [] };
+      };
+
+      const started = await startServer(() => createAdcpServer(config));
+      try {
+        const body = mcpGetProductsBody();
+        const res = await postSigned({ url: started.url, body, sign: true, nonce: 'auto-identity-bridge-01' });
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(registryUrl, buyerAgent.agent_url);
+        assert.strictEqual(capturedContext.authInfo.credential.kind, 'http_sig');
+        assert.strictEqual(capturedContext.authInfo.credential.keyid, 'test-ed25519-2026');
+        assert.strictEqual(capturedContext.authInfo.credential.agent_url, buyerAgent.agent_url);
+        assert.strictEqual(capturedContext.agent.agent_url, buyerAgent.agent_url);
+      } finally {
+        await new Promise(resolve => started.server.close(resolve));
+      }
+    });
+
+    it('combines matching authenticate-hook and signer identities', async () => {
+      let capturedContext;
+      const config = sellerConfig({ withSignedRequests: true, withSpecialism: true });
+      config.signedRequests.agentUrlForKeyid = () => 'https://buyer.example.com';
+      config.signedRequests.makePrincipal = () => ({ principal: 'internal-user-42' });
+      config.mediaBuy.getProducts = async (_params, ctx) => {
+        capturedContext = ctx;
+        return { products: [] };
+      };
+
+      const started = await startServer(() => createAdcpServer(config), {
+        authenticate: async () => ({
+          principal: 'internal-user-42',
+          token: 'request-local-token',
+          credential: { kind: 'api_key', key_id: 'api-key-42' },
+        }),
+      });
+      try {
+        const body = mcpGetProductsBody();
+        const res = await postSigned({ url: started.url, body, sign: true, nonce: 'auto-identity-merge-01' });
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(capturedContext.authInfo.clientId, 'internal-user-42');
+        assert.strictEqual(capturedContext.authInfo.token, 'request-local-token');
+        assert.strictEqual(capturedContext.authInfo.credential.kind, 'http_sig');
+      } finally {
+        await new Promise(resolve => started.server.close(resolve));
+      }
+    });
+
+    it('rejects mismatched authenticate-hook and signer identities before handler dispatch', async () => {
+      let handlerCalled = false;
+      const config = sellerConfig({ withSignedRequests: true, withSpecialism: true });
+      config.signedRequests.agentUrlForKeyid = () => 'https://buyer.example.com';
+      config.mediaBuy.getProducts = async () => {
+        handlerCalled = true;
+        return { products: [] };
+      };
+
+      const started = await startServer(() => createAdcpServer(config), {
+        authenticate: async () => ({
+          principal: 'internal-user-42',
+          token: 'request-local-token',
+          credential: { kind: 'api_key', key_id: 'api-key-42' },
+        }),
+      });
+      try {
+        const body = mcpGetProductsBody();
+        const res = await postSigned({ url: started.url, body, sign: true, nonce: 'auto-identity-mismatch-01' });
+        assert.strictEqual(res.status, 401);
+        assert.match(res.headers.get('www-authenticate'), /error="request_signature_invalid"/);
+        assert.strictEqual((await res.json()).error, 'request_signature_invalid');
+        assert.strictEqual(handlerCalled, false);
+      } finally {
+        await new Promise(resolve => started.server.close(resolve));
+      }
+    });
+
+    it('fails closed when signedRequests.makePrincipal does not map the signer', async () => {
+      let handlerCalled = false;
+      const config = sellerConfig({ withSignedRequests: true, withSpecialism: true });
+      config.signedRequests.agentUrlForKeyid = () => 'https://buyer.example.com';
+      config.signedRequests.makePrincipal = () => null;
+      config.mediaBuy.getProducts = async () => {
+        handlerCalled = true;
+        return { products: [] };
+      };
+
+      const started = await startServer(() => createAdcpServer(config));
+      try {
+        const body = mcpGetProductsBody();
+        const res = await postSigned({ url: started.url, body, sign: true, nonce: 'auto-identity-unmapped-01' });
+        assert.strictEqual(res.status, 401);
+        assert.match(res.headers.get('www-authenticate'), /error="request_signature_invalid"/);
+        assert.strictEqual((await res.json()).error, 'request_signature_invalid');
+        assert.strictEqual(handlerCalled, false);
+      } finally {
+        await new Promise(resolve => started.server.close(resolve));
+      }
+    });
   });
 
   describe('explicit serve.preTransport wins over auto-wiring', () => {
@@ -791,6 +1064,8 @@ describe('createAdcpServer: signedRequests auto-wiring', () => {
       const started = await new Promise(resolve => {
         const srv = serve(factory, {
           port: 0,
+          publicUrl: 'https://seller.example.com/mcp',
+          allowedHosts: ['localhost'],
           preTransport: async () => {
             preTransportCalls++;
             return false; // let MCP dispatch continue

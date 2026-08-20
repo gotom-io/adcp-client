@@ -7,7 +7,8 @@
  * which wraps this constructor with the typed specialism interfaces,
  * compile-time capability enforcement, ctx_metadata auto-hydration,
  * idempotency-principal synthesis, status mappers, multi-tenant routing,
- * and webhook auto-emit. See `docs/migration-5.x-to-6.x.md`.
+ * and async task completion webhooks. Synchronous terminal responses remain
+ * inline by default. See `docs/migration-5.x-to-6.x.md`.
  *
  * Reasons to import from `legacy/v5` rather than `@adcp/sdk/server`:
  *
@@ -36,6 +37,49 @@
 // top-level `@adcp/sdk/server` export. It now lives only here.
 export { createAdcpServer } from '../../create-adcp-server';
 
+// Preserve the original low-level response-builder names on the explicit v5
+// subpath. The primary root/server barrels expose these only as `legacy*`
+// aliases so raw wire construction cannot be mistaken for the canonical
+// DecisioningPlatform surface.
+export {
+  capabilitiesResponse,
+  productsResponse,
+  mediaBuyResponse,
+  deliveryResponse,
+  listAccountsResponse,
+  listCreativeFormatsResponse,
+  updateMediaBuyResponse,
+  getMediaBuysResponse,
+  performanceFeedbackResponse,
+  buildCreativeResponse,
+  buildCreativeMultiResponse,
+  previewCreativeResponse,
+  creativeDeliveryResponse,
+  listCreativesResponse,
+  listPropertyListsResponse,
+  listCollectionListsResponse,
+  listContentStandardsResponse,
+  getPlanAuditLogsResponse,
+  syncCreativesResponse,
+  getSignalsResponse,
+  activateSignalResponse,
+  cancelMediaBuyResponse,
+  acquireRightsResponse,
+  acquireRightsAcquired,
+  acquireRightsPendingApproval,
+  acquireRightsRejected,
+  updateRightsResponse,
+  updateRightsSuccess,
+  creativeApprovalResponse,
+  creativeApprovalApproved,
+  creativeApprovalRejected,
+  creativeApprovalPendingReview,
+  creativeApprovalError,
+  syncAccountsResponse,
+  syncGovernanceResponse,
+  reportUsageResponse,
+} from '../../responses';
+
 // Re-export everything else from `@adcp/sdk/server` so a v5 adopter's
 // migration path is a single-line import swap:
 //   from '@adcp/sdk/server'  →  from '@adcp/sdk/server/legacy/v5'
@@ -59,6 +103,7 @@ export type {
   HandlerContext,
   SessionKeyContext,
   MediaBuyHandlers,
+  ProposalNegotiationHandlers,
   SignalsHandlers,
   CreativeHandlers,
   GovernanceHandlers,

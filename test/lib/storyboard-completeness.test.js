@@ -44,11 +44,17 @@ const HARNESS_TASKS = new Set([
   // observes the shared receiver rather than driving the agent, so these
   // steps have no request shape.
   'expect_webhook',
+  'expect_no_webhook',
   'expect_webhook_retry_keys_stable',
   'expect_webhook_signature_valid',
   // Inbound webhook receiver conformance replays a fixture into the local
   // receiver instead of invoking a seller protocol tool.
   'replay_webhook_vector',
+  'replay_trusted_match_context_vector',
+  'trusted_match_missing_auth_context_probe',
+  'trusted_match_invalid_auth_context_probe',
+  'trusted_match_missing_auth_identity_probe',
+  'trusted_match_invalid_auth_identity_probe',
   'fetch_brand_jwks',
   'assert_jwks_purpose',
   'expect_rate_limit_not_replayed',
@@ -91,7 +97,9 @@ describe('storyboard structural completeness', () => {
         assert.ok(sb.id, 'missing id');
         assert.ok(sb.version, 'missing version');
         assert.ok(sb.title, 'missing title');
-        assert.ok(sb.narrative, 'missing narrative');
+        // 3.2 storyboards may use the concise top-level `summary` in place
+        // of the older long-form `narrative` field.
+        assert.ok(sb.narrative || sb.summary, 'missing narrative or summary');
         assert.ok(Array.isArray(sb.phases), 'phases must be an array');
       });
 

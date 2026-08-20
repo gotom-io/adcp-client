@@ -17,7 +17,7 @@ import type {
   RepeatableGroupSlot,
 } from '../lib/types/format-asset-slots';
 
-// --- Image: the field is `formats`, not `file_types` ---
+// --- Image: `formats` is canonical; runtime validation stays forward-compatible ---
 const goodImage: IndividualImageAssetSlot = {
   item_type: 'individual',
   asset_type: 'image',
@@ -33,13 +33,14 @@ const badImage: IndividualImageAssetSlot = {
   asset_id: 'hero',
   required: true,
   requirements: {
-    // @ts-expect-error — `file_types` is not a spec field; the correct name is `formats`
+    // @ts-expect-error non-canonical fields remain wire-valid at runtime but
+    // do not widen the named TypeScript interface with an index signature.
     file_types: ['jpg'],
   },
 };
 void badImage;
 
-// --- Video: unit is milliseconds, not seconds ---
+// --- Video: milliseconds are canonical; legacy seconds fields stay rejected ---
 const goodVideo: IndividualVideoAssetSlot = {
   item_type: 'individual',
   asset_type: 'video',
@@ -54,7 +55,7 @@ const badVideoMinSeconds: IndividualVideoAssetSlot = {
   asset_type: 'video',
   asset_id: 'ad',
   required: true,
-  // @ts-expect-error — use `min_duration_ms` (spec is milliseconds, not seconds)
+  // @ts-expect-error use min_duration_ms on the typed surface.
   requirements: { min_duration_seconds: 6 },
 };
 void badVideoMinSeconds;
@@ -64,19 +65,19 @@ const badVideoMaxSeconds: IndividualVideoAssetSlot = {
   asset_type: 'video',
   asset_id: 'ad',
   required: true,
-  // @ts-expect-error — use `max_duration_ms`
+  // @ts-expect-error use max_duration_ms on the typed surface.
   requirements: { max_duration_seconds: 30 },
 };
 void badVideoMaxSeconds;
 
-// --- Video: containers, not file_types ---
+// --- Video: `containers` is canonical; arbitrary siblings do not widen the type ---
 const badVideoFileTypes: IndividualVideoAssetSlot = {
   item_type: 'individual',
   asset_type: 'video',
   asset_id: 'ad',
   required: true,
   requirements: {
-    // @ts-expect-error — the field is `containers` for video, not `file_types`
+    // @ts-expect-error use containers on the typed surface.
     file_types: ['mp4'],
   },
 };

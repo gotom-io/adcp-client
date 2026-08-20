@@ -229,6 +229,46 @@ describe('webhook verifier: webhook_target_uri_malformed (adcp#2467)', () => {
     assert.match(thrown.message, /https/);
   });
 
+  /**
+   * The https-only rule carves out loopback for the storyboard runner's
+   * `loopback_mock` receiver. That exemption must cover only real loopback: a
+   * registered name like `127.attacker.example` resolves to whatever its owner
+   * chooses, so accepting it would let an ordinary public webhook drop TLS.
+   */
+  test('http to a registered name merely beginning with "127." is rejected', async () => {
+    const { now, request } = minimallySignedRequest();
+    request.url = 'http://127.attacker.example/adcp/webhook/foo/agent_123/op_abc';
+
+    let thrown;
+    try {
+      await verify(request, jwks(), { now });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof WebhookSignatureError, `Expected WebhookSignatureError, got ${thrown}`);
+    assert.strictEqual(thrown.code, 'webhook_target_uri_malformed');
+    assert.match(thrown.message, /https/);
+  });
+
+  test('http to genuine loopback still passes the target-uri check', async () => {
+    // Swapping the URL invalidates the signature, so this fails later in the
+    // pipeline — the point is that it is NOT rejected at step 6a.
+    const { now, request } = minimallySignedRequest();
+    request.url = 'http://127.0.0.1:9099/adcp/webhook/foo/agent_123/op_abc';
+
+    let thrown;
+    try {
+      await verify(request, jwks(), { now });
+    } catch (err) {
+      thrown = err;
+    }
+    assert.notStrictEqual(
+      thrown?.code,
+      'webhook_target_uri_malformed',
+      'loopback must remain exempt from the https-only rule'
+    );
+  });
+
   test('URL with userinfo rejected with webhook_target_uri_malformed', async () => {
     const { now, request } = minimallySignedRequest();
     request.url = 'https://user:pass@buyer.example.com/adcp/webhook/foo/agent_123/op_abc';
@@ -257,6 +297,31 @@ describe('webhook verifier: webhook_target_uri_malformed (adcp#2467)', () => {
     assert.ok(thrown instanceof WebhookSignatureError, `Expected WebhookSignatureError, got ${thrown}`);
     assert.strictEqual(thrown.code, 'webhook_target_uri_malformed');
     assert.match(thrown.message, /fragment/);
+  });
+});
+
+describe('webhook verifier: AdCP 3.2 target canonicalization', () => {
+  test('rejects a webhook when raw percent-encoded query bytes are changed in transit', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const signerKey = signerKeyFor('test-ed25519-webhook-2026');
+    const original = {
+      method: 'POST',
+      url: 'https://buyer.example.com/adcp/webhook?route=%7e',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"idempotency_key":"whk_query_bytes"}',
+    };
+    const signed = signWebhook(original, signerKey, { now: () => now });
+    const mutated = {
+      ...original,
+      url: 'https://buyer.example.com/adcp/webhook?route=~',
+      headers: { ...original.headers, ...signed.headers },
+    };
+    const jwks = new StaticJwksResolver([toPublicJwk(keyByKid('test-ed25519-webhook-2026'))]);
+
+    await assert.rejects(
+      verify(mutated, jwks, { now }),
+      err => err instanceof WebhookSignatureError && err.code === 'webhook_signature_invalid'
+    );
   });
 });
 
@@ -427,6 +492,47 @@ describe('webhook verifier: step 9a / 13 rate_abuse', () => {
     assert.ok(thrown instanceof WebhookSignatureError);
     assert.strictEqual(thrown.code, 'webhook_signature_rate_abuse');
     assert.strictEqual(thrown.failedStep, 9);
+  });
+
+  test('replay pre-check takes precedence when the cap is also hit', async () => {
+    const cappedReplayStore = {
+      has: async () => true,
+      isCapHit: async () => true,
+      insert: async () => 'ok',
+    };
+    let thrown;
+    try {
+      await runWithStore(cappedReplayStore);
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof WebhookSignatureError);
+    assert.strictEqual(thrown.code, 'webhook_signature_replayed');
+    assert.strictEqual(thrown.failedStep, 12);
+  });
+
+  test('rechecks replay when a concurrent same-nonce insert fills the cap', async () => {
+    let hasCalls = 0;
+    let insertCalls = 0;
+    const racyCappedStore = {
+      has: async () => ++hasCalls === 2,
+      isCapHit: async () => true,
+      insert: async () => {
+        insertCalls += 1;
+        return 'ok';
+      },
+    };
+    let thrown;
+    try {
+      await runWithStore(racyCappedStore);
+    } catch (err) {
+      thrown = err;
+    }
+    assert.ok(thrown instanceof WebhookSignatureError);
+    assert.strictEqual(thrown.code, 'webhook_signature_replayed');
+    assert.strictEqual(thrown.failedStep, 12);
+    assert.strictEqual(hasCalls, 2);
+    assert.strictEqual(insertCalls, 0);
   });
 
   test('insert returns rate_abuse at commit phase', async () => {

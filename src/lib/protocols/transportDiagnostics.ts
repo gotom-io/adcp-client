@@ -77,10 +77,12 @@ const SENSITIVE_HEADER_NAMES = new Set([
   'mcp-session-id',
 ]);
 
+const SENSITIVE_EXACT_KEYS = new Set(['governance_context', 'consultation_context']);
+
 const SENSITIVE_KEY_RE =
-  /(^|[_-])(authorization|cookie|credentials?|secret|signature|token|api[_-]?key|private[_-]?key|idempotency[_-]?key|password)([_-]|$)/i;
+  /(^|[_-])(authorization|cookie|credentials?|secret|signature|token|api[_-]?key|private[_-]?key|idempotency[_-]?key|governance[_-]?context|consultation[_-]?context|password)([_-]|$)/i;
 const SENSITIVE_TEXT_FIELD_RE =
-  /((?:"[^"]*(?:authorization|cookie|credentials?|secret|signature|token|api[_-]?key|private[_-]?key|idempotency[_-]?key|password)[^"]*"\s*:\s*)|(?:^|[&\s])[^=&\s]*(?:authorization|cookie|credentials?|secret|signature|token|api[_-]?key|private[_-]?key|idempotency[_-]?key|password)[^=&\s]*=)("[^"]*"|[^&\s,}]+)/gi;
+  /((?:"[^"]*(?:authorization|cookie|credentials?|secret|signature|token|api[_-]?key|private[_-]?key|idempotency[_-]?key|governance[_-]?context|consultation[_-]?context|password)[^"]*"\s*:\s*)|(?:^|[&\s])[^=&\s]*(?:authorization|cookie|credentials?|secret|signature|token|api[_-]?key|private[_-]?key|idempotency[_-]?key|governance[_-]?context|consultation[_-]?context|password)[^=&\s]*=)("[^"]*"|[^&\s,}]+)/gi;
 const URL_LIKE_RE = /\bhttps?:\/\/[^\s"'<>]+/gi;
 
 export const transportDiagnosticsStorage = globalAsyncLocalStorage<TransportDiagnosticsSlot>('transportDiagnostics');
@@ -321,7 +323,8 @@ function normalizedKey(key: string): string {
 }
 
 function isSensitiveKey(key: string): boolean {
-  return SENSITIVE_KEY_RE.test(normalizedKey(key));
+  const normalized = normalizedKey(key);
+  return SENSITIVE_EXACT_KEYS.has(normalized) || SENSITIVE_KEY_RE.test(normalized);
 }
 
 function isDiagnosticTextContentType(contentType: string): boolean {
@@ -359,7 +362,12 @@ async function readResponseTextBounded(
       if (text.length > limit) {
         truncated = true;
         text = text.slice(0, limit);
-        await reader.cancel();
+        // A cloned Response body is one branch of a tee. Waiting for this
+        // cancellation can wait for the original branch to be consumed, but
+        // the caller cannot consume it until this diagnostics wrapper returns.
+        // Start cancellation to release the bounded diagnostic branch without
+        // putting that circular dependency on the request path.
+        void reader.cancel().catch(() => {});
         break;
       }
     }

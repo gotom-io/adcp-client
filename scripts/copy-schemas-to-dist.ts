@@ -19,14 +19,17 @@
  * Skipped from copy:
  *   - `latest` symlink — duplicates a real version directory
  *   - `*.previous` backup snapshots from `sync-schemas` replaceTree
+ *   - superseded prerelease bundles that are not the current ADCP_VERSION
  *   - older patch versions of stable releases — collapsed into the
  *     highest-patch sibling
- *   - `tmp/`, `compliance/` subtrees — runtime validator doesn't read them
+ *   - `tmp/`, `compliance/`, and most transport-projection (`mcp/`)
+ *     subtrees. The active MCP media-buy role profile is retained for exact
+ *     `tools/list` request-schema discovery.
  *
  * Invoked by the `build:lib` npm script after tsc emits JS.
  */
 
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import path from 'path';
 
 interface ParsedVersion {
@@ -198,6 +201,67 @@ function patchInlineTaskTypeEnums(root: string): void {
   }
 }
 
+/**
+ * Select only the self-contained MCP request projections used by modern
+ * tools/list. Response projections are deliberately excluded: they add tens
+ * of megabytes to the package and to an LLM's discovery context without
+ * helping a caller construct tool arguments.
+ */
+function mcpInputProjectionPaths(schemaRoot: string): Set<string> {
+  const allowed = new Set<string>();
+  const mcpRoot = path.join(schemaRoot, 'mcp');
+  if (!existsSync(mcpRoot)) return allowed;
+
+  for (const protocolEntry of readdirSync(mcpRoot, { withFileTypes: true })) {
+    if (!protocolEntry.isDirectory()) continue;
+    const protocolRoot = path.join(mcpRoot, protocolEntry.name);
+    const manifests = [
+      path.join(protocolRoot, 'manifest.json'),
+      path.join(protocolRoot, 'profiles', 'media-buy', 'manifest.json'),
+    ];
+    for (const manifestFile of manifests) {
+      if (!existsSync(manifestFile)) continue;
+      const manifestRoot = path.dirname(manifestFile);
+      const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as {
+        tools?: Record<string, { inputSchema?: unknown }>;
+      };
+      allowed.add(path.relative(schemaRoot, manifestFile));
+      for (const tool of Object.values(manifest.tools ?? {})) {
+        if (typeof tool.inputSchema !== 'string') continue;
+        const schemaFile = path.resolve(manifestRoot, tool.inputSchema);
+        if (!schemaFile.startsWith(`${manifestRoot}${path.sep}`) || !existsSync(schemaFile)) continue;
+        allowed.add(path.relative(schemaRoot, schemaFile));
+      }
+    }
+  }
+  return allowed;
+}
+
+function stripMcpOutputSchemaReferences(schemaRoot: string): void {
+  const mcpRoot = path.join(schemaRoot, 'mcp');
+  if (!existsSync(mcpRoot)) return;
+  const visit = (root: string): void => {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      const abs = path.join(root, entry.name);
+      if (entry.isDirectory()) {
+        visit(abs);
+        continue;
+      }
+      if (!entry.isFile() || entry.name !== 'manifest.json') continue;
+      const manifest = JSON.parse(readFileSync(abs, 'utf8')) as {
+        schema_fields?: unknown;
+        tools?: Record<string, { outputSchema?: unknown }>;
+      };
+      for (const tool of Object.values(manifest.tools ?? {})) delete tool.outputSchema;
+      if (Array.isArray(manifest.schema_fields)) {
+        manifest.schema_fields = manifest.schema_fields.filter(field => field === 'inputSchema');
+      }
+      writeFileSync(abs, `${JSON.stringify(manifest, null, 2)}\n`);
+    }
+  };
+  visit(mcpRoot);
+}
+
 function main(): void {
   const repoRoot = path.resolve(__dirname, '..');
   const cacheRoot = path.join(repoRoot, 'schemas', 'cache');
@@ -243,25 +307,45 @@ function main(): void {
     candidates.push(parsed);
   }
 
-  const selected = selectVersionsToCopy(candidates);
+  const currentProtocolVersion = readFileSync(path.join(repoRoot, 'ADCP_VERSION'), 'utf8').trim();
+  const publishableCandidates = candidates.filter(
+    candidate =>
+      candidate.prerelease === undefined ||
+      candidate.prerelease === 'legacy' ||
+      candidate.version === currentProtocolVersion
+  );
+  const selected = selectVersionsToCopy(publishableCandidates);
   const collapsed = candidates.filter(c => !selected.some(s => s.source.version === c.version));
 
   const destBase = path.join(repoRoot, 'dist', 'lib', 'schemas-data');
+  // A normal incremental build must produce the same publish payload as a
+  // clean build. Remove bundle keys selected by an earlier protocol pin (for
+  // example 3.2.0-beta.0 after moving to beta.1) before copying the current
+  // supported set.
+  rmSync(destBase, { recursive: true, force: true });
+  mkdirSync(destBase, { recursive: true });
 
   for (const { source, key } of selected) {
     const srcRoot = path.join(cacheRoot, source.version);
     const destRoot = path.join(destBase, key);
+    const allowedMcpFiles = mcpInputProjectionPaths(srcRoot);
+    rmSync(destRoot, { recursive: true, force: true });
     mkdirSync(destRoot, { recursive: true });
     cpSync(srcRoot, destRoot, {
       recursive: true,
       filter: src => {
         const rel = path.relative(srcRoot, src);
         if (!rel) return true;
-        const top = rel.split(path.sep)[0];
+        const parts = rel.split(path.sep);
+        const top = parts[0];
         if (top === 'tmp' || top === 'compliance') return false;
+        if (top === 'mcp') {
+          return [...allowedMcpFiles].some(allowed => allowed === rel || allowed.startsWith(`${rel}${path.sep}`));
+        }
         return true;
       },
     });
+    stripMcpOutputSchemaReferences(destRoot);
     relaxAdagentsAuthorizedAgentsMinItems(destRoot);
     patchPrereleaseGetProductsTaskType(destRoot);
     const note = key === source.version ? '' : ` (key collapsed from ${source.version})`;
@@ -269,7 +353,10 @@ function main(): void {
   }
 
   for (const v of collapsed) {
-    console.log(`[copy-schemas-to-dist] collapsed ${v.version} (older patch in ${v.major}.${v.minor}.x; not bundled)`);
+    const reason = v.prerelease
+      ? `superseded prerelease; current pin is ${currentProtocolVersion}`
+      : `older patch in ${v.major}.${v.minor}.x`;
+    console.log(`[copy-schemas-to-dist] skipped ${v.version} (${reason}; not bundled)`);
   }
 
   for (const name of skipped) {

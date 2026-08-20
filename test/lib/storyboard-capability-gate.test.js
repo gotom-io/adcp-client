@@ -159,7 +159,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
 
     // Structured skip block: canonical spec reason + human-readable detail
     assert.ok(step.skip, 'step.skip block present');
-    assert.equal(step.skip.reason, 'unsatisfied_contract', 'canonical spec reason');
+    assert.equal(step.skip.reason, 'not_applicable', 'canonical spec reason');
     assert.ok(
       step.skip.detail.includes('adcp.idempotency.supported'),
       `detail must mention the capability path: ${step.skip.detail}`
@@ -189,7 +189,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     assert.equal(step.step_id, 'capability_unsupported');
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
     assert.ok(step.skip.detail.includes('auto_approve'));
     assert.ok(step.skip.detail.includes('did not declare'));
@@ -254,7 +254,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
     assert.ok(step.skip.detail.includes('did not declare'));
   });
@@ -273,7 +273,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.creative_approval_mode'));
     assert.ok(step.skip.detail.includes('did not declare'));
     assert.deepEqual(calls, [], 'top-level gate should skip before dispatching');
@@ -322,7 +322,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.features.inline_creative_management'));
     assert.ok(step.skip.detail.includes('did not declare'));
   });
@@ -340,7 +340,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.features.inline_creative_management'));
     assert.ok(step.skip.detail.includes('did not declare'));
   });
@@ -359,7 +359,7 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.supports_proposals'));
     assert.ok(step.skip.detail.includes('false'));
   });
@@ -377,15 +377,15 @@ describe('requires_capability storyboard skip gate (#933)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(step.skip.detail.includes('media_buy.supports_proposals'));
     assert.ok(step.skip.detail.includes('did not declare'));
   });
 
-  test('DETAILED_SKIP_TO_CANONICAL maps capability_unsupported to unsatisfied_contract', () => {
+  test('DETAILED_SKIP_TO_CANONICAL maps capability_unsupported to not_applicable', () => {
     assert.equal(
       DETAILED_SKIP_TO_CANONICAL['capability_unsupported'],
-      'unsatisfied_contract',
+      'not_applicable',
       'canonical spec reason for capability_unsupported'
     );
   });
@@ -474,7 +474,7 @@ describe('requires_capability `present:` matcher (#1811)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(
       step.skip.detail.includes('media_buy.conversion_tracking'),
       `detail must mention the capability path: ${step.skip.detail}`
@@ -682,7 +682,7 @@ describe('requires_capability `contains:` matcher (#1817)', () => {
     const step = result.phases[0].steps[0];
     assert.equal(step.skipped, true);
     assert.equal(step.skip_reason, 'capability_unsupported');
-    assert.equal(step.skip.reason, 'unsatisfied_contract');
+    assert.equal(step.skip.reason, 'not_applicable');
     assert.ok(
       step.skip.detail.includes('media_buy.conversion_tracking.supported_targets'),
       `detail must mention capability path: ${step.skip.detail}`
@@ -823,6 +823,83 @@ describe('requires_capability `contains:` matcher (#1817)', () => {
     assert.ok(evaluateCapabilityPredicate(containsNumber, ['42'])?.includes('must contain'));
     assert.ok(evaluateCapabilityPredicate(containsString, [42])?.includes('must contain'));
   });
+
+  test('contains: structurally matches object-valued capability entries', async () => {
+    const governanceTask = {
+      task: 'activate_signal',
+      modes: ['signed_context'],
+    };
+    const storyboard = {
+      ...supportedTargetsGatedStoryboard,
+      requires_capability: {
+        path: 'adcp.governance_enforcement.tasks',
+        contains: governanceTask,
+      },
+    };
+    const profile = {
+      name: 'Test Agent (signed signal governance)',
+      tools: ['get_adcp_capabilities', 'log_event'],
+      raw_capabilities: {
+        adcp: {
+          governance_enforcement: {
+            tasks: [{ modes: ['signed_context'], task: 'activate_signal' }],
+          },
+        },
+      },
+    };
+
+    const { client } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', storyboard, {
+      protocol: 'mcp',
+      agentTools: profile.tools,
+      _profile: profile,
+      _client: client,
+    });
+
+    assert.equal(result.skipped_count, 0, 'matching object gate must not be skipped');
+    assert.equal(
+      evaluateCapabilityPredicate(
+        storyboard.requires_capability,
+        profile.raw_capabilities.adcp.governance_enforcement.tasks
+      ),
+      null,
+      'object key order must not affect membership'
+    );
+    assert.ok(
+      evaluateCapabilityPredicate(storyboard.requires_capability, [
+        { task: 'activate_signal', modes: ['unsigned_context'] },
+      ])?.includes('must contain'),
+      'nested array values remain significant'
+    );
+  });
+});
+
+describe('requires_capability `not_contains:` matcher', () => {
+  test('evaluateCapabilityPredicate: pins negative membership semantics', () => {
+    const notContainsString = { path: 'account.supported_billing', not_contains: 'advertiser' };
+    const notContainsNumber = { path: 'x.y', not_contains: 42 };
+
+    assert.equal(evaluateCapabilityPredicate(notContainsString, ['operator', 'agent']), null);
+    assert.equal(evaluateCapabilityPredicate(notContainsString, []), null);
+    assert.ok(evaluateCapabilityPredicate(notContainsString, ['operator', 'advertiser'])?.includes('must not contain'));
+
+    assert.ok(evaluateCapabilityPredicate(notContainsString, undefined)?.includes('no value'));
+    assert.ok(evaluateCapabilityPredicate(notContainsString, 'operator')?.includes('must not contain'));
+    assert.ok(evaluateCapabilityPredicate(notContainsString, null)?.includes('must not contain'));
+
+    assert.equal(evaluateCapabilityPredicate(notContainsNumber, ['42']), null, 'membership is strict');
+    assert.ok(evaluateCapabilityPredicate(notContainsNumber, [42])?.includes('must not contain'));
+
+    const notContainsObject = {
+      path: 'adcp.governance_enforcement.tasks',
+      not_contains: { task: 'activate_signal', modes: ['signed_context'] },
+    };
+    assert.ok(
+      evaluateCapabilityPredicate(notContainsObject, [
+        { modes: ['signed_context'], task: 'activate_signal' },
+      ])?.includes('must not contain')
+    );
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -902,6 +979,36 @@ const creativeApprovalPhaseGatedStoryboard = {
   ],
 };
 
+const unsupportedBillingPhaseGatedStoryboard = {
+  id: 'phase_capability_gate_unsupported_billing_test',
+  version: '1.0.0',
+  title: 'Unsupported billing rejection',
+  category: 'test',
+  summary: 'Runs only when advertiser billing is not advertised.',
+  narrative: '',
+  agent: { interaction_model: 'sync', capabilities: [] },
+  caller: { role: 'buyer_agent' },
+  phases: [
+    {
+      id: 'unsupported_advertiser_billing',
+      title: 'Reject unsupported advertiser billing',
+      requires_capability: {
+        path: 'account.supported_billing',
+        not_contains: 'advertiser',
+      },
+      steps: [
+        {
+          id: 'sync_accounts_unsupported_billing',
+          title: 'Submit unsupported billing',
+          task: 'sync_accounts',
+          sample_request: {},
+          validations: [],
+        },
+      ],
+    },
+  ],
+};
+
 function makeCapabilityGateClient(responder = () => ({ success: true, data: {} })) {
   const calls = [];
   const client = {
@@ -914,6 +1021,47 @@ function makeCapabilityGateClient(responder = () => ({ success: true, data: {} }
 }
 
 describe('phase-level requires_capability gate (#2224)', () => {
+  test('not_contains runs a phase when the advertised array omits the value', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', unsupportedBillingPhaseGatedStoryboard, {
+      protocol: 'mcp',
+      agentTools: ['get_adcp_capabilities', 'sync_accounts'],
+      _profile: {
+        name: 'Test Agent (operator billing only)',
+        tools: ['get_adcp_capabilities', 'sync_accounts'],
+        raw_capabilities: { account: { supported_billing: ['operator'] } },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.skipped_count, 0);
+    assert.equal(result.passed_count, 1);
+    assert.deepEqual(
+      calls.map(call => call.name),
+      ['sync_accounts']
+    );
+  });
+
+  test('not_contains skips a phase when the advertised array includes the value', async () => {
+    const { client, calls } = makeCapabilityGateClient();
+    const result = await runStoryboard('https://example.invalid/mcp', unsupportedBillingPhaseGatedStoryboard, {
+      protocol: 'mcp',
+      agentTools: ['get_adcp_capabilities', 'sync_accounts'],
+      _profile: {
+        name: 'Test Agent (advertiser billing supported)',
+        tools: ['get_adcp_capabilities', 'sync_accounts'],
+        raw_capabilities: { account: { supported_billing: ['operator', 'advertiser'] } },
+      },
+      _client: client,
+    });
+
+    assert.equal(result.skipped_count, 1);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.phases[0].steps[0].skip_reason, 'not_applicable');
+    assert.ok(result.phases[0].steps[0].skip.detail.includes('must not contain'));
+    assert.deepEqual(calls, []);
+  });
+
   test('skips deterministic_session as not_applicable when sponsored_intelligence is not advertised', async () => {
     const result = await runStoryboard('http://fake-local-99992', deterministicSessionPhaseGatedStoryboard, {
       _profile: {

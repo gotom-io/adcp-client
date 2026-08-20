@@ -1,11 +1,12 @@
 /**
  * Helpers for reading typed assets out of `creative_manifest.assets`.
  *
- * `creative_manifest.assets` is a keyed map (`{ [asset_id]: AssetInstance }`)
- * where each value is a discriminated union by `asset_type`. Adopters
- * narrowing per-call write the same null-check + discriminator-check
- * boilerplate over and over. These helpers replace that boilerplate
- * without compromising the discriminator-narrowing story.
+ * `creative_manifest.assets` is a keyed map
+ * (`{ [asset_id]: AssetInstance | AssetInstance[] }`) where each individual
+ * value is a discriminated union by `asset_type`. Adopters narrowing per-call
+ * write the same null-check + discriminator-check boilerplate over and over.
+ * These helpers replace that boilerplate without compromising the
+ * discriminator-narrowing story.
  *
  * Status: Preview / 6.0.
  *
@@ -15,6 +16,9 @@
 import type { CreativeManifest } from '../../types/tools.generated';
 import type { AssetInstance, AssetInstanceType } from '../../types/asset-instances';
 import { AdcpError } from './async-outcome';
+
+/** Identity-free manifest view accepted by canonical asset helpers. */
+export type CreativeAssetsContainer = Pick<CreativeManifest, 'assets'>;
 
 /**
  * Type-narrowed asset accessor by asset_id and expected asset_type.
@@ -36,7 +40,7 @@ import { AdcpError } from './async-outcome';
  * For the require-or-throw flavor, see {@link requireAsset}.
  */
 export function getAsset<T extends AssetInstanceType>(
-  manifest: CreativeManifest | undefined,
+  manifest: CreativeAssetsContainer | undefined,
   assetId: string,
   assetType: T
 ): Extract<AssetInstance, { asset_type: T }> | undefined {
@@ -69,7 +73,7 @@ export function getAsset<T extends AssetInstanceType>(
  * @since AdCP 3.1.0-beta.2 (slot widening to `AssetVariant | AssetVariant[]`).
  */
 export function getAssetSlot<T extends AssetInstanceType>(
-  manifest: CreativeManifest | undefined,
+  manifest: CreativeAssetsContainer | undefined,
   assetId: string,
   assetType: T
 ): Array<Extract<AssetInstance, { asset_type: T }>> | undefined {
@@ -95,7 +99,7 @@ export function getAssetSlot<T extends AssetInstanceType>(
  * ```
  */
 export function requireAsset<T extends AssetInstanceType>(
-  manifest: CreativeManifest | undefined,
+  manifest: CreativeAssetsContainer | undefined,
   assetId: string,
   assetType: T,
   messageOverride?: string

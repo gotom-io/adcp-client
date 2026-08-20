@@ -1,8 +1,9 @@
 /**
  * Strict/lenient response-schema validation + run-level aggregation (issue
  * #820, fourth proposal). `runValidations` must attach an AJV-based strict
- * verdict to every `response_schema` ValidationResult without flipping the
- * step's pass/fail (which stays Zod-driven for backwards compatibility).
+ * verdict to every `response_schema` ValidationResult. Packaged-cache runs
+ * stay Zod-driven for backwards compatibility; an explicit external schema
+ * root makes AJV authoritative for current-source validation.
  *
  * Tests hit the storyboard validation layer directly — `runValidations`
  * with a synthetic `ValidationContext`. No runner boot or network needed.
@@ -10,9 +11,28 @@
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { runValidations } = require('../../dist/lib/testing/storyboard/validations.js');
 const { summarizeStrictValidation, listStrictOnlyFailures } = require('../../dist/lib/testing/storyboard/runner.js');
+const { _resetValidationLoader, withExternalSchemaRoot } = require('../../dist/lib/validation/schema-loader.js');
+
+const EXTERNAL_VERSION = '9.9.0-beta.1';
+
+function writeExternalResponseSchema(root, toolName, schema) {
+  const bundled = path.join(root, 'bundled');
+  fs.mkdirSync(bundled, { recursive: true });
+  fs.writeFileSync(
+    path.join(bundled, `${toolName.replaceAll('_', '-')}-response.json`),
+    JSON.stringify({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      $id: `/schemas/${EXTERNAL_VERSION}/test/${toolName.replaceAll('_', '-')}-response.json`,
+      ...schema,
+    })
+  );
+}
 
 function ctx(taskName, data, responseSchemaRef) {
   return {
@@ -29,6 +49,113 @@ function ctxWith(taskName, data, responseSchemaRef, extra) {
 }
 
 describe('storyboard validations: strict/lenient response_schema delta', () => {
+  test('external schemaRoot accepts current-source responses rejected by packaged Zod', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-external-authority-'));
+    try {
+      writeExternalResponseSchema(root, 'list_creative_formats', {
+        type: 'object',
+        required: ['current_source_marker'],
+        properties: { current_source_marker: { const: true } },
+        additionalProperties: false,
+      });
+
+      const [result] = withExternalSchemaRoot(EXTERNAL_VERSION, root, () =>
+        runValidations(
+          [{ check: 'response_schema', description: 'response conforms to current source' }],
+          ctxWith('list_creative_formats', { current_source_marker: true }, 'test/list-response.json', {
+            adcpVersion: EXTERNAL_VERSION,
+          })
+        )
+      );
+
+      assert.strictEqual(result.passed, true, result.error);
+      assert.strictEqual(result.strict.valid, true);
+      assert.strictEqual(result.strict.lenient_valid, false);
+      assert.match(result.schema_id, new RegExp(`/schemas/${EXTERNAL_VERSION.replaceAll('.', '\\.')}/`));
+    } finally {
+      _resetValidationLoader(EXTERNAL_VERSION);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('external schemaRoot rejects packaged-Zod responses that current source disallows', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-external-authority-'));
+    try {
+      writeExternalResponseSchema(root, 'list_creative_formats', {
+        type: 'object',
+        required: ['current_source_marker'],
+        properties: { current_source_marker: { const: true } },
+        additionalProperties: false,
+      });
+
+      const [result] = withExternalSchemaRoot(EXTERNAL_VERSION, root, () =>
+        runValidations(
+          [{ check: 'response_schema', description: 'response conforms to current source' }],
+          ctxWith('list_creative_formats', { formats: [] }, 'test/list-response.json', {
+            adcpVersion: EXTERNAL_VERSION,
+          })
+        )
+      );
+
+      assert.strictEqual(result.passed, false);
+      assert.strictEqual(result.strict.valid, false);
+      assert.strictEqual(result.strict.lenient_valid, true);
+      assert.ok(result.actual.some(issue => issue.keyword === 'required'));
+
+      const summary = summarizeStrictValidation([
+        { phase_id: 'external', steps: [{ step_id: 'reject', task: 'list_creative_formats', validations: [result] }] },
+      ]);
+      assert.strictEqual(summary.strict_only_failures, 1);
+      assert.strictEqual(summary.lenient_also_failed, 0);
+    } finally {
+      _resetValidationLoader(EXTERNAL_VERSION);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('external schemaRoot validates tools absent from the packaged Zod map', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-external-authority-'));
+    try {
+      writeExternalResponseSchema(root, 'future_protocol_tool', {
+        type: 'object',
+        required: ['future_value'],
+        properties: { future_value: { type: 'string' } },
+        additionalProperties: false,
+      });
+
+      const [result] = withExternalSchemaRoot(EXTERNAL_VERSION, root, () =>
+        runValidations(
+          [{ check: 'response_schema', description: 'future tool response conforms' }],
+          ctxWith('future_protocol_tool', { future_value: 'same-change' }, 'test/future-tool-response.json', {
+            adcpVersion: EXTERNAL_VERSION,
+          })
+        )
+      );
+
+      assert.strictEqual(result.passed, true, result.error);
+      assert.strictEqual(result.strict.valid, true);
+      assert.strictEqual(result.strict.lenient_valid, null);
+
+      const [rejected] = withExternalSchemaRoot(EXTERNAL_VERSION, root, () =>
+        runValidations(
+          [{ check: 'response_schema', description: 'future tool response conforms' }],
+          ctxWith('future_protocol_tool', { future_value: 42 }, 'test/future-tool-response.json', {
+            adcpVersion: EXTERNAL_VERSION,
+          })
+        )
+      );
+      const summary = summarizeStrictValidation([
+        { phase_id: 'external', steps: [{ step_id: 'future', task: 'future_protocol_tool', validations: [rejected] }] },
+      ]);
+      assert.strictEqual(summary.strict_only_failures, 0);
+      assert.strictEqual(summary.lenient_also_failed, 0);
+      assert.strictEqual(summary.lenient_unobserved, 1);
+    } finally {
+      _resetValidationLoader(EXTERNAL_VERSION);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('clean response: strict.valid=true, passed=true, no issues emitted', () => {
     // Minimal valid list_creative_formats response — `formats` is the only
     // required field at the root; an empty array satisfies both Zod and AJV.
@@ -86,16 +213,16 @@ describe('storyboard validations: strict/lenient response_schema delta', () => {
     assert.match(v.error, /cache_scope/);
   });
 
-  test('strictness-delta scenario: Zod accepts a bad URI, AJV rejects format: uri', () => {
-    // Zod's generated `z.string()` doesn't enforce `format` keywords. AJV
-    // does. A response where `format_id.agent_url` is a bare word rather
-    // than a URI is the canonical "lenient passes, strict fails" case —
-    // the delta signal #820 wants agent developers to see.
+  test('generated Zod and strict AJV both reject a bad URI', () => {
+    // URI formats are now enforced in generated Zod schemas as well as the
+    // strict AJV pass. This used to be the canonical strictness-delta fixture;
+    // retaining it as a parity regression guard prevents the lenient path
+    // from silently accepting malformed portable identifiers again.
     const response = {
       formats: [
         {
           // agent_url is declared `format: uri` per core/format-id.json.
-          // "not-a-uri" satisfies z.string() but fails AJV's URI check.
+          // "not-a-uri" fails both generated Zod and AJV URI validation.
           format_id: { agent_url: 'not-a-uri', id: 'display_static' },
           name: 'Display Static',
           description: 'Static display format',
@@ -108,22 +235,17 @@ describe('storyboard validations: strict/lenient response_schema delta', () => {
       ctx('list_creative_formats', response, 'creative/list-creative-formats-response.json')
     );
     const v = results[0];
-    assert.strictEqual(v.passed, true, 'Zod path accepts bare string (lenient-pass)');
+    assert.strictEqual(v.passed, false, 'generated Zod rejects the bare string');
+    assert.match(v.error, /agent_url|URL|url|uri/i);
     assert.ok(v.strict);
     assert.strictEqual(v.strict.valid, false, 'AJV rejects bare string where format: uri is required');
     assert.ok(v.strict.issues);
     const hasFormat = v.strict.issues.some(i => i.keyword === 'format');
     assert.ok(hasFormat, `expected a format issue, got: ${JSON.stringify(v.strict.issues)}`);
-    // Warning must be populated on strict-only failure so LLM-driven
-    // self-correction and CI graphs that scan error/warning fields see
-    // something — the runner shouldn't flip passed (backwards compat)
-    // but also shouldn't leave the strict finding only in nested arrays.
-    assert.ok(typeof v.warning === 'string', 'warning surfaced on strict-only failure');
-    assert.match(v.warning, /strict JSON-schema rejected/);
-    assert.match(v.warning, /format/);
+    assert.strictEqual(v.warning, undefined, 'the primary Zod failure already carries the diagnostic');
   });
 
-  test('strictness warning preserves authored validation id', () => {
+  test('URI parity failure preserves authored validation id', () => {
     const response = {
       formats: [
         {
@@ -139,8 +261,8 @@ describe('storyboard validations: strict/lenient response_schema delta', () => {
       ctx('list_creative_formats', response, 'creative/list-creative-formats-response.json')
     );
     const v = results[0];
-    assert.strictEqual(v.passed, true);
-    assert.ok(typeof v.warning === 'string', 'warning surfaced on strict-only failure');
+    assert.strictEqual(v.passed, false);
+    assert.strictEqual(v.warning, undefined);
     assert.strictEqual(v.id, 'check_format_agent_url_uri');
   });
 

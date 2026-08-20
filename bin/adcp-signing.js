@@ -5,12 +5,14 @@ const { readFileSync, writeFileSync, existsSync } = require('node:fs');
 const path = require('node:path');
 
 const {
+  canonicalTargetUri,
   InMemoryReplayStore,
   InMemoryRevocationStore,
   RequestSignatureError,
   StaticJwksResolver,
   verifyRequestSignature,
 } = require('../dist/lib/signing/index.js');
+const { writeJsonOutput } = require('./adcp-json-stdout.js');
 
 function generateKey(argv) {
   let alg = 'ed25519';
@@ -136,23 +138,24 @@ async function verifyVector(argv) {
   const replayStore = new InMemoryReplayStore();
   const revocationStore = new InMemoryRevocationStore();
   const state = vector.test_harness_state ?? {};
-  if (state.replay_cache_entries) {
-    for (const entry of state.replay_cache_entries) {
-      replayStore.preload(entry.keyid, entry.nonce, entry.ttl_seconds, now);
-    }
-  }
-  if (state.revocation_list) revocationStore.load(state.revocation_list);
-  if (state.replay_cache_per_keyid_cap_hit) {
-    replayStore.setCapHitForTesting(state.replay_cache_per_keyid_cap_hit.keyid);
-  }
-
-  const jwksEntries = vector.jwks_override
-    ? vector.jwks_override.keys
-    : (vector.jwks_ref ?? []).map(kid => keysByKid.get(kid)).filter(Boolean);
-  const jwks = new StaticJwksResolver(jwksEntries);
-  const operation = new URL(vector.request.url).pathname.split('/').filter(Boolean).pop();
-
   try {
+    if (state.replay_cache_entries) {
+      const scope = canonicalTargetUri(vector.request.url);
+      for (const entry of state.replay_cache_entries) {
+        replayStore.preload(entry.keyid, scope, entry.nonce, entry.ttl_seconds, now);
+      }
+    }
+    if (state.revocation_list) revocationStore.load(state.revocation_list);
+    if (state.replay_cache_per_keyid_cap_hit) {
+      replayStore.setCapHitForTesting(state.replay_cache_per_keyid_cap_hit.keyid);
+    }
+
+    const jwksEntries = vector.jwks_override
+      ? vector.jwks_override.keys
+      : (vector.jwks_ref ?? []).map(kid => keysByKid.get(kid)).filter(Boolean);
+    const jwks = new StaticJwksResolver(jwksEntries);
+    const operation = new URL(vector.request.url).pathname.split('/').filter(Boolean).pop();
+
     const verified = await verifyRequestSignature(vector.request, {
       capability: vector.verifier_capability,
       jwks,
@@ -160,8 +163,9 @@ async function verifyVector(argv) {
       revocationStore,
       now: () => now,
       operation,
+      adcpVersion: vector.signing_profile_version ?? '3.1',
     });
-    console.log(JSON.stringify({ outcome: 'accepted', verified_signer: verified, operation }, null, 2));
+    await writeJsonOutput({ outcome: 'accepted', verified_signer: verified, operation });
     return { accepted: true };
   } catch (err) {
     if (err instanceof RequestSignatureError) {
@@ -171,7 +175,7 @@ async function verifyVector(argv) {
         failed_step: err.failedStep,
         message: err.message,
       };
-      console.log(JSON.stringify(payload, null, 2));
+      await writeJsonOutput(payload);
       return { accepted: false, code: err.code };
     }
     throw err;

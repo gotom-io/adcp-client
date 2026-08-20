@@ -44,7 +44,7 @@ const RESULTS = (() => {
 import { readFileSync, writeFileSync } from 'fs';
 import { __test__ } from ${JSON.stringify(targetPath)};
 
-const { stripComments, shouldWarnOnExportCollision } = __test__;
+const { stripComments, shouldWarnOnExportCollision, closure } = __test__;
 const cases = ${JSON.stringify(cases)};
 const stripResults = cases.map(({ label, a, b }) => ({
   label,
@@ -71,11 +71,47 @@ const collisionResults = [
 const toolsGenerated = readFileSync(${JSON.stringify(path.join(REPO_ROOT, 'src/lib/types/tools.generated.ts'))}, 'utf8');
 const generatedSurface = {
   importsCoreSharedTypes: /import type \\{[\\s\\S]*\\bAudienceConstraints\\b[\\s\\S]*\\bPurchaseType\\b[\\s\\S]*\\} from '\\.\\/core\\.generated';/.test(toolsGenerated),
-  reExportsCoreSharedTypes: toolsGenerated.includes("export type { AudienceConstraints, PurchaseType } from './core.generated';"),
+  reExportsCoreSharedTypes: [
+    'AudienceConstraints',
+    'CatalogItemDeliveryMetrics',
+    'Format',
+    'GeoDeliveryMetrics',
+    'KeywordDeliveryMetrics',
+    'PurchaseType',
+  ].every(name =>
+    new RegExp("export type \\\\{[^;]*\\\\b" + name + "\\\\b[^;]*\\\\} from '\\\\.\\\\/core\\\\.generated';").test(toolsGenerated)
+  ),
   declaresAudienceConstraints: /export interface AudienceConstraints\\b/.test(toolsGenerated),
+  declaresCatalogItemDeliveryMetrics: /export type CatalogItemDeliveryMetrics\\b/.test(toolsGenerated),
+  declaresFormat: /export (?:interface|type) Format\\b/.test(toolsGenerated),
+  declaresGeoDeliveryMetrics: /export type GeoDeliveryMetrics\\b/.test(toolsGenerated),
+  declaresKeywordDeliveryMetrics: /export type KeywordDeliveryMetrics\\b/.test(toolsGenerated),
   declaresPurchaseType: /export type PurchaseType\\b/.test(toolsGenerated),
 };
-writeFileSync(${JSON.stringify(outPath)}, JSON.stringify({ stripResults, collisionResults, generatedSurface }));
+const protocolRequiredClosure = [...closure(new Map([
+  ['GetProductsRequest', {
+    name: 'GetProductsRequest',
+    kind: 'interface',
+    body: 'export interface GetProductsRequest { targeting?: TargetingRequirements; }',
+    sourceFile: 'tools.generated.d.ts',
+  }],
+  ['TargetingRequirements', {
+    name: 'TargetingRequirements',
+    kind: 'interface',
+    body: 'export interface TargetingRequirements { geo_countries?: Required; }',
+    sourceFile: 'core.generated.d.ts',
+  }],
+  ['Required', {
+    name: 'Required',
+    kind: 'type',
+    body: 'export type Required = true;',
+    sourceFile: 'core.generated.d.ts',
+  }],
+]), ['GetProductsRequest'])];
+writeFileSync(
+  ${JSON.stringify(outPath)},
+  JSON.stringify({ stripResults, collisionResults, generatedSurface, protocolRequiredClosure })
+);
 `
   );
 
@@ -144,5 +180,17 @@ test('tools.generated: core-authored shared types are imported and re-exported w
   assert.strictEqual(RESULTS.generatedSurface.importsCoreSharedTypes, true);
   assert.strictEqual(RESULTS.generatedSurface.reExportsCoreSharedTypes, true);
   assert.strictEqual(RESULTS.generatedSurface.declaresAudienceConstraints, false);
+  assert.strictEqual(RESULTS.generatedSurface.declaresCatalogItemDeliveryMetrics, false);
+  assert.strictEqual(RESULTS.generatedSurface.declaresFormat, false);
+  assert.strictEqual(RESULTS.generatedSurface.declaresGeoDeliveryMetrics, false);
+  assert.strictEqual(RESULTS.generatedSurface.declaresKeywordDeliveryMetrics, false);
   assert.strictEqual(RESULTS.generatedSurface.declaresPurchaseType, false);
+});
+
+test('dependency closure keeps the AdCP Required=true protocol type in narrow slices', () => {
+  assert.deepEqual(
+    RESULTS.protocolRequiredClosure.sort(),
+    ['GetProductsRequest', 'Required', 'TargetingRequirements'],
+    'Required must resolve to the AdCP protocol export, not be skipped as TypeScript Required<T>'
+  );
 });

@@ -18,7 +18,258 @@ const {
   tryLegacyFormatIdsFromOptions,
   legacyFormatIdsForFormatOption,
   legacyFormatIdsForCapability,
+  lintPackageFormatSelectorDimensions,
+  projectCreativeForDelivery,
+  projectMediaBuyCreativesForDelivery,
 } = require('../../dist/lib/v2/projection/index.js');
+
+const AAO_AGENT_URL = 'https://creative.adcontextprotocol.org/';
+
+describe('lintPackageFormatSelectorDimensions', () => {
+  test('accepts equivalent fixed-size canonical and legacy selectors', () => {
+    assert.deepStrictEqual(
+      lintPackageFormatSelectorDimensions({
+        format_kind: 'image',
+        params: { width: 300, height: 250 },
+        format_ids: [{ agent_url: AAO_AGENT_URL, id: 'display_300x250_image' }],
+      }),
+      []
+    );
+  });
+
+  test('reports width/height atomicity failures on either selector', () => {
+    const diagnostics = lintPackageFormatSelectorDimensions({
+      format_kind: 'image',
+      params: { width: 300 },
+      format_ids: [{ agent_url: AAO_AGENT_URL, id: 'display_300x250_image', height: 250 }],
+    });
+
+    assert.deepStrictEqual(
+      diagnostics.map(diagnostic => [diagnostic.code, diagnostic.selector, diagnostic.field]),
+      [
+        ['FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE', 'canonical', 'params'],
+        ['FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE', 'legacy', 'format_ids[0]'],
+      ]
+    );
+  });
+
+  test('reports conflicting canonical and resolved legacy dimensions', () => {
+    const diagnostics = lintPackageFormatSelectorDimensions({
+      format_kind: 'image',
+      params: { width: 300, height: 250 },
+      format_ids: [{ agent_url: AAO_AGENT_URL, id: 'display_728x90_image' }],
+    });
+
+    assert.strictEqual(diagnostics.length, 1);
+    assert.strictEqual(diagnostics[0].code, 'FORMAT_SELECTOR_DIMENSIONS_MISMATCH');
+    assert.deepStrictEqual(diagnostics[0].canonical_dimensions, { width: 300, height: 250 });
+    assert.deepStrictEqual(diagnostics[0].legacy_dimensions, { width: 728, height: 90 });
+  });
+
+  test('reports dimensions that conflict with the resolved legacy catalog', () => {
+    for (const duration_ms of [undefined, 30000]) {
+      const diagnostics = lintPackageFormatSelectorDimensions({
+        format_ids: [
+          {
+            agent_url: AAO_AGENT_URL,
+            id: 'display_728x90_image',
+            width: 300,
+            height: 250,
+            ...(duration_ms === undefined ? {} : { duration_ms }),
+          },
+        ],
+      });
+
+      assert.deepStrictEqual(
+        diagnostics.map(diagnostic => [diagnostic.code, diagnostic.selector, diagnostic.field]),
+        [['FORMAT_SELECTOR_DIMENSIONS_MISMATCH', 'legacy', 'format_ids[0]']]
+      );
+    }
+  });
+
+  test('does not relabel video duration projection failures as image dimension diagnostics', () => {
+    for (const duration_ms of [15000, 0]) {
+      assert.deepStrictEqual(
+        lintPackageFormatSelectorDimensions({
+          format_ids: [{ agent_url: AAO_AGENT_URL, id: 'video_standard_30s', duration_ms }],
+        }),
+        []
+      );
+    }
+  });
+
+  test('does not relabel non-image catalog conflicts as image dimension diagnostics', () => {
+    assert.deepStrictEqual(
+      lintPackageFormatSelectorDimensions({
+        format_ids: [
+          {
+            agent_url: AAO_AGENT_URL,
+            id: 'display_728x90_html',
+            width: 300,
+            height: 250,
+          },
+        ],
+      }),
+      []
+    );
+  });
+
+  test('reports dimensionless dual image selectors without guessing dimensions', () => {
+    const diagnostics = lintPackageFormatSelectorDimensions(
+      {
+        format_kind: 'image',
+        params: {},
+        format_ids: [{ agent_url: 'https://formats.example/', id: 'display_image' }],
+      },
+      {
+        legacyFormatConverter: () => ({
+          format_kind: 'image',
+          format_option_id: 'generic_image',
+          params: {},
+        }),
+      }
+    );
+
+    assert.deepStrictEqual(
+      diagnostics.map(diagnostic => [diagnostic.code, diagnostic.selector, diagnostic.field]),
+      [
+        ['FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE', 'canonical', 'params'],
+        ['FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE', 'legacy', 'format_ids[0]'],
+      ]
+    );
+  });
+
+  test('accepts valid single-path and inherently canonical-only selectors', () => {
+    for (const selector of [
+      { format_kind: 'image', params: { width: 300, height: 250 } },
+      { format_ids: [{ agent_url: AAO_AGENT_URL, id: 'display_300x250_image' }] },
+      { format_kind: 'sponsored_placement', params: { source_catalog: 'retail' } },
+    ]) {
+      assert.deepStrictEqual(lintPackageFormatSelectorDimensions(selector), []);
+    }
+  });
+
+  test('reports incomplete and invalid dimensions from resolved legacy-only projections', () => {
+    const diagnostics = lintPackageFormatSelectorDimensions(
+      {
+        format_ids: [
+          { agent_url: 'https://formats.example/', id: 'partial_image' },
+          { agent_url: 'https://formats.example/', id: 'invalid_image' },
+        ],
+      },
+      {
+        legacyFormatConverter: ({ formatId }) => ({
+          format_kind: 'image',
+          format_option_id: formatId.id,
+          params: formatId.id === 'partial_image' ? { width: 300 } : { width: 0, height: 250 },
+        }),
+      }
+    );
+
+    assert.deepStrictEqual(
+      diagnostics.map(diagnostic => [diagnostic.code, diagnostic.selector, diagnostic.field]),
+      [
+        ['FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE', 'legacy', 'format_ids[0]'],
+        ['FORMAT_SELECTOR_DIMENSIONS_INVALID', 'legacy', 'format_ids[1]'],
+      ]
+    );
+  });
+
+  test('preserves product-aware converter context', () => {
+    const seen = [];
+    const diagnostics = lintPackageFormatSelectorDimensions(
+      {
+        format_kind: 'image',
+        params: { width: 300, height: 250 },
+        format_ids: [{ agent_url: 'https://formats.example/', id: 'contextual_image' }],
+      },
+      {
+        projectionContext: { productId: 'product-42', field: 'packages[3]' },
+        legacyFormatConverter: context => {
+          seen.push({ productId: context.productId, field: context.field });
+          return context.productId === 'product-42'
+            ? { format_kind: 'image', format_option_id: 'contextual', params: { width: 728, height: 90 } }
+            : null;
+        },
+      }
+    );
+
+    assert.deepStrictEqual(
+      diagnostics.map(diagnostic => [diagnostic.code, diagnostic.field]),
+      [['FORMAT_SELECTOR_DIMENSIONS_MISMATCH', 'packages[3].format_ids[0]']]
+    );
+    assert.deepStrictEqual(seen, [{ productId: 'product-42', field: 'packages[3].format_ids[0]' }]);
+  });
+
+  test('does not treat multi-size image selectors as one fixed-size projection', () => {
+    assert.deepStrictEqual(
+      lintPackageFormatSelectorDimensions({
+        format_kind: 'image',
+        params: {
+          sizes: [
+            { width: 300, height: 250 },
+            { width: 728, height: 90 },
+          ],
+        },
+        format_ids: [
+          { agent_url: AAO_AGENT_URL, id: 'display_300x250_image' },
+          { agent_url: AAO_AGENT_URL, id: 'display_728x90_image' },
+        ],
+      }),
+      []
+    );
+  });
+
+  test('still enforces width/height atomicity within multi-size selectors', () => {
+    const diagnostics = lintPackageFormatSelectorDimensions({
+      format_kind: 'image',
+      params: {
+        sizes: [{ width: 300, height: 250 }, { width: 728 }],
+      },
+    });
+
+    assert.deepStrictEqual(
+      diagnostics.map(diagnostic => [diagnostic.code, diagnostic.selector, diagnostic.field]),
+      [['FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE', 'canonical', 'params.sizes[1]']]
+    );
+  });
+
+  test('rejects empty multi-size declarations and dimensionless size entries', () => {
+    const cases = [
+      [{ sizes: [] }, 'params.sizes'],
+      [{ sizes: [{}] }, 'params.sizes[0]'],
+    ];
+
+    for (const [params, field] of cases) {
+      const diagnostics = lintPackageFormatSelectorDimensions({ format_kind: 'image', params });
+      assert.deepStrictEqual(
+        diagnostics.map(diagnostic => [diagnostic.code, diagnostic.field]),
+        [['FORMAT_SELECTOR_DIMENSIONS_INVALID', field]]
+      );
+    }
+  });
+
+  test('validates direct dimensions even when sizes are also present', () => {
+    const sizes = [{ width: 300, height: 250 }];
+    const cases = [
+      [{ width: 300, sizes }, 'FORMAT_SELECTOR_DIMENSIONS_INCOMPLETE'],
+      [{ width: 0, height: 250, sizes }, 'FORMAT_SELECTOR_DIMENSIONS_INVALID'],
+      [{ width: 300, height: 250, sizes }, 'FORMAT_SELECTOR_DIMENSIONS_INVALID'],
+    ];
+
+    for (const [params, code] of cases) {
+      const diagnostics = lintPackageFormatSelectorDimensions({ format_kind: 'image', params });
+      assert.deepStrictEqual(
+        diagnostics.map(diagnostic => [diagnostic.code, diagnostic.field]),
+        [[code, 'params']]
+      );
+    }
+  });
+});
+
+function legacyWireFormatIds(refs) {
+  return projectMediaBuyCreativesForDelivery({ packages: [{ ...refs }] }, 'legacy').packages[0].format_ids;
+}
 
 describe('legacyFormatIdsFromOptions', () => {
   test('single-size declaration returns the seller-asserted v1 ref', () => {
@@ -111,7 +362,7 @@ describe('legacyFormatIdsFromOptions', () => {
   });
 });
 
-describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
+describe('packageRefsForFormatOptions (canonical surface with private downgrade metadata)', () => {
   const product = {
     product_id: 'p1',
     format_options: [
@@ -133,17 +384,25 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
     ],
   };
 
-  test('emits both format_option_refs[] and format_ids[] (dual emission)', () => {
+  test('emits only canonical refs publicly and downgrades at the wire boundary', () => {
     const refs = packageRefsForFormatOptions(product, ['nytimes_mrec', 'nytimes_video_30s']);
     assert.deepStrictEqual(refs.format_option_refs, [
       { scope: 'product', format_option_id: 'nytimes_mrec' },
       { scope: 'product', format_option_id: 'nytimes_video_30s' },
     ]);
-    assert.strictEqual(refs.format_ids.length, 2);
-    assert.deepStrictEqual(refs.format_ids.map(f => f.id).sort(), ['display_300x250_image', 'video_standard_30s']);
+    assert.strictEqual(refs.format_ids, undefined);
+    assert.doesNotMatch(JSON.stringify(refs), /agent_url|format_id/);
+    assert.deepStrictEqual(Object.getOwnPropertySymbols(refs), []);
+    assert.deepStrictEqual(Object.keys(refs.format_option_refs), ['0', '1']);
+    assert.deepStrictEqual(
+      legacyWireFormatIds(refs)
+        .map(f => f.id)
+        .sort(),
+      ['display_300x250_image', 'video_standard_30s']
+    );
   });
 
-  test('v2-only format option omits format_ids entirely (no minItems:1 violation on the wire)', () => {
+  test('v2-only format option fails cleanly when a legacy wire is required', () => {
     // Buyer is purchasing an inherently-v2 declaration. format_option_refs
     // carries the choice; format_ids is OMITTED (not `[]`) because
     // emitting `[]` violates the wire schema's `minItems: 1` constraint.
@@ -153,6 +412,53 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
     assert.deepStrictEqual(refs.format_option_refs, [{ scope: 'product', format_option_id: 'sponsored_v2_only' }]);
     assert.strictEqual(refs.format_ids, undefined, 'format_ids must be omitted, not []');
     assert.strictEqual('format_ids' in refs, false);
+    assert.throws(() => legacyWireFormatIds(refs), /no complete legacy representation/);
+  });
+
+  test('canonical_formats_only survives JSON persistence and cannot be overridden by a resolver', () => {
+    const refs = packageRefsForFormatOptions(
+      {
+        format_options: [
+          {
+            format_option_id: 'canonical-takeover',
+            format_kind: 'custom',
+            format_shape: 'multi_placement_takeover',
+            format_schema: {
+              uri: 'https://seller.example/formats/takeover.json',
+              digest: `sha256:${'a'.repeat(64)}`,
+            },
+            params: {},
+            canonical_formats_only: true,
+          },
+        ],
+      },
+      ['canonical-takeover']
+    );
+    const persisted = JSON.parse(JSON.stringify(refs));
+    let resolverCalls = 0;
+
+    assert.strictEqual(persisted.format_option_refs[0].canonical_formats_only, true);
+    assert.throws(
+      () =>
+        projectCreativeForDelivery(
+          {
+            creative_id: 'canonical-custom',
+            format_kind: 'custom',
+            format_option_ref: persisted.format_option_refs[0],
+            assets: {},
+          },
+          persisted,
+          'legacy',
+          'sync_creatives',
+          undefined,
+          () => {
+            resolverCalls += 1;
+            return { agent_url: 'https://legacy.example/formats', id: 'forbidden_override' };
+          }
+        ),
+      /did not provide one unambiguous legacy format reference/
+    );
+    assert.strictEqual(resolverCalls, 0);
   });
 
   test('publisher catalog options emit publisher-scoped refs', () => {
@@ -172,7 +478,7 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
     assert.deepStrictEqual(refs.format_option_refs, [
       { scope: 'publisher', publisher_domain: 'meta.com', format_option_id: 'meta_reels' },
     ]);
-    assert.strictEqual(refs.format_ids[0].id, 'meta_reels');
+    assert.strictEqual(legacyWireFormatIds(refs)[0].id, 'meta_reels');
   });
 
   test('bare string selectors only resolve product-local format options', () => {
@@ -196,7 +502,7 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
     );
 
     assert.deepStrictEqual(refs.format_option_refs, [{ scope: 'product', format_option_id: 'shared_video' }]);
-    assert.strictEqual(refs.format_ids[0].id, 'product_video');
+    assert.strictEqual(legacyWireFormatIds(refs)[0].id, 'product_video');
   });
 
   test('publisher-scoped format options require publisher_domain in selectors', () => {
@@ -350,10 +656,10 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
         },
       ],
     };
-    const refs = packageRefsForFormatOptions(productWithSizedDupes, ['cap_300x250', 'cap_728x90']);
+    const refs = legacyWireFormatIds(packageRefsForFormatOptions(productWithSizedDupes, ['cap_300x250', 'cap_728x90']));
     // Both refs preserved despite shared id — dimensions discriminate.
-    assert.strictEqual(refs.format_ids.length, 2);
-    assert.deepStrictEqual(refs.format_ids.map(f => `${f.id}@${f.width}x${f.height}`).sort(), [
+    assert.strictEqual(refs.length, 2);
+    assert.deepStrictEqual(refs.map(f => `${f.id}@${f.width}x${f.height}`).sort(), [
       'display_image@300x250',
       'display_image@728x90',
     ]);
@@ -377,10 +683,10 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
         },
       ],
     };
-    const refs = packageRefsForFormatOptions(productWithTrueDupes, ['cap_a', 'cap_b']);
+    const refs = legacyWireFormatIds(packageRefsForFormatOptions(productWithTrueDupes, ['cap_a', 'cap_b']));
     // 3 declared, 2 unique on the wire (the duplicate 300x250 collapses).
-    assert.strictEqual(refs.format_ids.length, 2);
-    assert.deepStrictEqual(refs.format_ids.map(f => f.id).sort(), ['display_300x250_image', 'display_728x90_image']);
+    assert.strictEqual(refs.length, 2);
+    assert.deepStrictEqual(refs.map(f => f.id).sort(), ['display_300x250_image', 'display_728x90_image']);
   });
 
   test('error available list filters to format_option_id-bearing entries', () => {
@@ -465,7 +771,9 @@ describe('packageRefsForFormatOptions (3.1.0-beta.5+ dual-emission)', () => {
       budget: { currency: 'USD', total: 5000 },
     };
     assert.ok(Array.isArray(pkg.format_option_refs));
-    assert.ok(Array.isArray(pkg.format_ids));
+    assert.strictEqual(pkg.format_ids, undefined);
+    assert.doesNotMatch(JSON.stringify(pkg), /agent_url|format_id/);
+    assert.ok(Array.isArray(legacyWireFormatIds(pkg)));
     assert.strictEqual(pkg.budget.total, 5000);
   });
 });

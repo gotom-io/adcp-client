@@ -28,7 +28,11 @@ function startAgent(config) {
         ...config,
         validation: { requests: 'off', responses: 'off', ...(config?.validation ?? {}) },
       }),
-    { port: 0, onListening: () => {} }
+    {
+      port: 0,
+      authenticate: () => ({ principal: 'conformance-seeder-test' }),
+      onListening: () => {},
+    }
   );
   return waitForListening(s).then(() => ({ server: s, port: s.address().port }));
 }
@@ -42,6 +46,7 @@ describe('conformance: seedFixtures', () => {
     const { server, port } = await startAgent({
       mediaBuy: {
         getProducts: async () => ({
+          cache_scope: 'public',
           products: [
             {
               product_id: 'prod_display',
@@ -187,6 +192,7 @@ describe('conformance: seedFixtures', () => {
     const { server, port } = await startAgent({
       mediaBuy: {
         getProducts: async () => ({
+          cache_scope: 'public',
           products: [
             {
               product_id: 'prod1',
@@ -217,7 +223,7 @@ describe('conformance: seedFixtures', () => {
   test('create_media_buy warns when get_products returns no products', async () => {
     const { server, port } = await startAgent({
       mediaBuy: {
-        getProducts: async () => ({ products: [] }),
+        getProducts: async () => ({ products: [], cache_scope: 'public' }),
       },
     });
     agents.push({ server });
@@ -229,6 +235,228 @@ describe('conformance: seedFixtures', () => {
     assert.equal(result.fixtures.media_buy_ids, undefined);
     assert.equal(result.warnings.length, 1);
     assert.match(result.warnings[0].reason, /no products/);
+  });
+
+  test('buy_products seeder exercises list_products → buy_products and captures the compact media buy', async () => {
+    const observed = { listed: [], bought: [], requested: [], refined: [] };
+    const digest = 'sha256:' + 'A'.repeat(43);
+    const commercialTerms = {
+      brand: { domain: 'compact-brand.example', brand_id: 'compact_brand' },
+      purchases: [
+        {
+          product_id: 'compact_product_1',
+          pricing_option_id: 'compact_price_1',
+          pricing: {
+            pricing_option_id: 'compact_price_1',
+            pricing_model: 'cpm',
+            currency: 'USD',
+            fixed_price: 10,
+          },
+          start_time: '2099-01-01T00:00:00Z',
+          end_time: '2099-03-31T00:00:00Z',
+        },
+      ],
+      start_time: '2099-01-01T00:00:00Z',
+      end_time: '2099-03-31T00:00:00Z',
+    };
+    const proposal = (proposal_id, proposal_status, parent_proposal_id) => ({
+      proposal_id,
+      proposal_kind: 'new_media_buy',
+      ...(parent_proposal_id ? { parent_proposal_id } : {}),
+      proposal_status,
+      expires_at: '2098-12-31T00:00:00Z',
+      name: `Compact proposal ${proposal_id}`,
+      commercial_terms: commercialTerms,
+      terms_digest: digest,
+    });
+    let proposalSequence = 0;
+    const { server, port } = await startAgent({
+      adcpVersion: '3.2.0-beta.3',
+      // This regression fixture must stay valid against the selected beta.1
+      // response schemas. Strict mode turns schema drift into a test failure
+      // instead of the SDK's usual non-blocking validation warning.
+      validation: { responses: 'strict' },
+      mediaBuy: {
+        listProducts: async params => {
+          observed.listed.push(params);
+          return {
+            outcome: 'listed',
+            products: [
+              {
+                product_id: 'compact_product_1',
+                name: 'Compact product',
+                pricing_options: [
+                  {
+                    pricing_option_id: 'compact_price_1',
+                    pricing_model: 'cpm',
+                    currency: 'USD',
+                    fixed_price: 10,
+                  },
+                ],
+              },
+            ],
+            feed_version: 'feed-compact-1',
+            pricing_version: 'pricing-compact-1',
+            cache_scope: 'account',
+          };
+        },
+        buyProducts: async params => {
+          observed.bought.push(params);
+          return {
+            media_buy_id: 'mb_compact_seeded',
+            media_buy_status: 'active',
+            revision: 1,
+            accepted_proposal: {
+              ...proposal('proposal_direct_1', 'accepted'),
+              media_buy_id: 'mb_compact_seeded',
+              accepted_at: '2098-08-18T12:00:00Z',
+            },
+            purchase_bindings: [
+              { purchase_index: 0, product_id: 'compact_product_1', package_id: 'package_compact_1' },
+            ],
+            available_actions: [],
+          };
+        },
+        requestProposals: async params => {
+          observed.requested.push(params);
+          proposalSequence++;
+          return {
+            outcome: 'proposed',
+            proposals: [proposal(`proposal_draft_${proposalSequence}`, 'draft')],
+            products: [
+              {
+                product_id: 'compact_product_1',
+                name: 'Compact product',
+                pricing_options: [
+                  {
+                    pricing_option_id: 'compact_price_1',
+                    pricing_model: 'cpm',
+                    currency: 'USD',
+                    fixed_price: 10,
+                  },
+                ],
+              },
+            ],
+          };
+        },
+      },
+      proposalNegotiation: {
+        capabilities: { supported_dimensions: [] },
+        resolveScope: () => ({ tenant_id: 'seed-test', principal_id: 'seed-test' }),
+        refineProposals: async params => {
+          observed.refined.push(params);
+          return {
+            results: params.refinements.map(refinement => ({
+              source_proposal_id: refinement.proposal_id,
+              outcome: 'finalized',
+              proposal: proposal('proposal_committed_1', 'committed', refinement.proposal_id),
+            })),
+            products: [
+              {
+                product_id: 'compact_product_1',
+                name: 'Compact product',
+                pricing_options: [
+                  {
+                    pricing_option_id: 'compact_price_1',
+                    pricing_model: 'cpm',
+                    currency: 'USD',
+                    fixed_price: 10,
+                  },
+                ],
+              },
+            ],
+          };
+        },
+      },
+    });
+    agents.push({ server });
+
+    const result = await seedFixtures(`http://localhost:${port}/mcp`, {
+      protocol: 'mcp',
+      seeders: ['buy_products'],
+      brand: { domain: 'compact-brand.example', brand_id: 'compact_brand' },
+    });
+
+    assert.deepEqual(
+      result.fixtures.media_buy_ids,
+      ['mb_compact_seeded'],
+      `compact seeder result: ${JSON.stringify(result)}`
+    );
+    assert.deepEqual(result.warnings, []);
+    assert.deepEqual(result.fixtures.products, [
+      {
+        product_id: 'compact_product_1',
+        pricing_option_id: 'compact_price_1',
+        feed_version: 'feed-compact-1',
+        pricing_version: 'pricing-compact-1',
+        account: {
+          brand: { domain: 'compact-brand.example', brand_id: 'compact_brand' },
+          operator: 'compact-brand.example',
+        },
+      },
+    ]);
+    assert.deepEqual(result.fixtures.media_buys, [
+      {
+        media_buy_id: 'mb_compact_seeded',
+        revision: 1,
+        account: {
+          brand: { domain: 'compact-brand.example', brand_id: 'compact_brand' },
+          operator: 'compact-brand.example',
+        },
+      },
+    ]);
+    assert.deepEqual(
+      result.fixtures.proposals.map(proposal => [proposal.proposal_id, proposal.proposal_status]),
+      [
+        ['proposal_draft_1', 'draft'],
+        ['proposal_draft_2', 'draft'],
+        ['proposal_committed_1', 'committed'],
+      ]
+    );
+    assert.equal(observed.listed.length, 1);
+    assert.deepEqual(observed.listed[0].brand, {
+      domain: 'compact-brand.example',
+      brand_id: 'compact_brand',
+    });
+    assert.equal(observed.bought.length, 1);
+    assert.equal(observed.bought[0].adcp_version, '3.2-beta.3');
+    assert.equal(observed.bought[0].adcp_major_version, 3);
+    assert.match(observed.bought[0].idempotency_key, /^[0-9a-f-]{36}$/);
+    assert.equal(observed.bought[0].feed_version, 'feed-compact-1');
+    assert.equal(observed.bought[0].pricing_version, 'pricing-compact-1');
+    assert.deepEqual(observed.bought[0].purchases, [
+      { product_id: 'compact_product_1', pricing_option_id: 'compact_price_1' },
+    ]);
+    assert.equal(observed.requested.length, 2);
+    assert.equal(observed.refined.length, 1);
+    assert.deepEqual(observed.refined[0].refinements, [{ proposal_id: 'proposal_draft_1', action: 'finalize' }]);
+  });
+
+  test('default seeding does not probe the compact lifecycle unless the selected bundle enables it', async () => {
+    let compactCalls = 0;
+    const { server, port } = await startAgent({
+      adcpVersion: '3.2.0-beta.3',
+      mediaBuy: {
+        getProducts: async () => ({ products: [], cache_scope: 'public' }),
+        listProducts: async () => {
+          compactCalls++;
+          return { outcome: 'listed', products: [], feed_version: 'feed-1', cache_scope: 'public' };
+        },
+        buyProducts: async () => {
+          compactCalls++;
+          return { media_buy_id: 'mb_unexpected', media_buy_status: 'active', revision: 1 };
+        },
+      },
+    });
+    agents.push({ server });
+
+    const result = await seedFixtures(`http://localhost:${port}/mcp`, { protocol: 'mcp' });
+
+    assert.equal(compactCalls, 0);
+    assert.equal(
+      result.warnings.some(warning => warning.seeder === 'buy_products'),
+      false
+    );
   });
 });
 

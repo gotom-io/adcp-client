@@ -542,6 +542,55 @@ describe('MCPOAuthProvider', () => {
     assert.strictEqual(result.toString(), 'https://canonical.example.com/mcp');
   });
 
+  test('validateResourceURL prefers the operator resource override for refresh', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      resourceOverride: 'https://operator.example.com',
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const result = await provider.validateResourceURL(
+      'https://test-agent.example.org/mcp',
+      'https://metadata.example.com/mcp'
+    );
+    assert.strictEqual(result.toString(), 'https://operator.example.com/');
+  });
+
+  test('validateResourceURL uses an override persisted on AgentConfig', async () => {
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+    agent.oauth_resource = 'https://persisted.example.com';
+
+    const result = await provider.validateResourceURL('https://test-agent.example.org/mcp');
+    assert.strictEqual(result.toString(), 'https://persisted.example.com/');
+  });
+
+  test('validateResourceURL honors explicit null by falling back to protected-resource metadata', async () => {
+    agent.oauth_resource = 'https://persisted.example.com';
+    const provider = new MCPOAuthProvider({
+      agent,
+      flowHandler: mockFlowHandler,
+      resourceOverride: null,
+      clientMetadata: {
+        ...DEFAULT_CLIENT_METADATA,
+        redirect_uris: ['http://localhost:8766/callback'],
+      },
+    });
+
+    const result = await provider.validateResourceURL('https://example.com/mcp', 'https://metadata.example.com/mcp');
+    assert.strictEqual(result.toString(), 'https://metadata.example.com/mcp');
+  });
+
   test('validateResourceURL returns undefined when no resource', async () => {
     const provider = new MCPOAuthProvider({
       agent,
@@ -568,7 +617,7 @@ describe('MCPOAuthProvider', () => {
 
     await assert.rejects(
       () => provider.validateResourceURL('https://example.com/mcp', 'http://insecure.example.com/mcp'),
-      { message: /non-HTTPS resource URL/ }
+      { message: /must use HTTPS/ }
     );
   });
 
@@ -643,6 +692,90 @@ describe('CLIFlowHandler', () => {
     // Should complete without throwing
     assert.ok(true);
   });
+
+  /**
+   * The callback server listens on loopback, so any local process or page can
+   * reach it. Binding the callback to the state that went out with the
+   * authorization request is what stops one of them from injecting a code.
+   *
+   * These cases all resolve before `openBrowser`, so no browser is launched.
+   */
+  describe('callback binding', () => {
+    test('refuses to start a flow whose authorization URL carries no state', async () => {
+      const handler = new CLIFlowHandler({ quiet: true });
+      await assert.rejects(
+        () => handler.redirectToAuthorization(new URL('https://auth.example.com/authorize?client_id=abc')),
+        /missing the "state" parameter/
+      );
+    });
+
+    test('refuses a non-http authorization scheme', async () => {
+      const handler = new CLIFlowHandler({ quiet: true });
+      await assert.rejects(
+        () => handler.redirectToAuthorization(new URL('file:///etc/passwd?state=s1')),
+        /Refusing to open authorization URL/
+      );
+    });
+
+    test('rejects a callback that arrives with no authorization request pending', async () => {
+      // expectedState is null here, so there is nothing to bind to and the
+      // callback must be refused rather than resolved with the supplied code.
+      const handler = new CLIFlowHandler({ callbackPort: 8791, timeout: 5000, quiet: true });
+      // Attach the rejection assertion before triggering the callback, so the
+      // rejection is never momentarily unhandled.
+      const rejection = assert.rejects(() => handler.waitForCallback(), /state mismatch/);
+
+      // Give the server a moment to bind before probing it.
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const res = await fetch('http://127.0.0.1:8791/callback?code=injected_code');
+      assert.strictEqual(res.status, 400, 'the injecting caller gets an error page, not a success page');
+
+      await rejection;
+      await handler.cleanup();
+    });
+
+    /** Drive the real authorization path without launching a browser. */
+    async function startFlow(handler, state) {
+      handler.openBrowser = async () => {};
+      await handler.redirectToAuthorization(new URL(`https://auth.example.com/authorize?client_id=abc&state=${state}`));
+    }
+
+    test('rejects a callback whose state does not match the request', async () => {
+      const handler = new CLIFlowHandler({ callbackPort: 8792, timeout: 5000, quiet: true });
+      await startFlow(handler, 'the_real_state');
+      const rejection = assert.rejects(() => handler.waitForCallback(), /state mismatch/);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch('http://127.0.0.1:8792/callback?code=injected_code&state=attacker_state');
+
+      await rejection;
+      await handler.cleanup();
+    });
+
+    test('rejects a callback that omits state entirely', async () => {
+      const handler = new CLIFlowHandler({ callbackPort: 8794, timeout: 5000, quiet: true });
+      await startFlow(handler, 'the_real_state');
+      const rejection = assert.rejects(() => handler.waitForCallback(), /state mismatch/);
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch('http://127.0.0.1:8794/callback?code=injected_code');
+
+      await rejection;
+      await handler.cleanup();
+    });
+
+    test('accepts a callback whose state matches the request', async () => {
+      const handler = new CLIFlowHandler({ callbackPort: 8793, timeout: 5000, quiet: true });
+      await startFlow(handler, 'the_real_state');
+      const pending = handler.waitForCallback();
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch('http://127.0.0.1:8793/callback?code=good_code&state=the_real_state');
+
+      assert.strictEqual(await pending, 'good_code');
+      await handler.cleanup();
+    });
+  });
 });
 
 describe('createCLIOAuthProvider', () => {
@@ -698,32 +831,44 @@ describe('discoverOAuthMetadata', () => {
   function mockFetch(urlToResponse) {
     return async url => {
       const entry = urlToResponse[url];
-      if (!entry) return { ok: false, status: 404, json: async () => ({}) };
-      return { ok: true, status: 200, json: async () => entry };
+      if (!entry) return new Response('{}', { status: 404 });
+      return new Response(JSON.stringify(entry), { status: 200, headers: { 'content-type': 'application/json' } });
     };
   }
 
   test('root URL discovers at /.well-known/oauth-authorization-server', async () => {
     let fetchedUrl;
     const metadata = await discoverOAuthMetadata('https://example.com', {
-      fetch: async url => {
+      trustedFetchFn: async url => {
         fetchedUrl = url;
-        return { ok: true, json: async () => validMetadata };
+        return new Response(JSON.stringify(validMetadata), { status: 200 });
       },
     });
     assert.strictEqual(fetchedUrl, 'https://example.com/.well-known/oauth-authorization-server');
     assert.deepStrictEqual(metadata, validMetadata);
   });
 
+  test('explicit private-network opt-in supports loopback OAuth discovery', async () => {
+    const metadata = await discoverOAuthMetadata('http://127.0.0.1:3000/mcp', {
+      allowPrivateIp: true,
+      trustedFetchFn: async url => {
+        assert.strictEqual(url.toString(), 'http://127.0.0.1:3000/.well-known/oauth-authorization-server/mcp');
+        return new Response(JSON.stringify(validMetadata), { status: 200 });
+      },
+    });
+
+    assert.deepStrictEqual(metadata, validMetadata);
+  });
+
   test('path URL tries path-aware discovery first', async () => {
     const fetched = [];
     const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
-      fetch: async url => {
+      trustedFetchFn: async url => {
         fetched.push(url);
         if (url === 'https://example.com/.well-known/oauth-authorization-server/mcp') {
-          return { ok: true, json: async () => validMetadata };
+          return new Response(JSON.stringify(validMetadata), { status: 200 });
         }
-        return { ok: false, status: 404, json: async () => ({}) };
+        return new Response('{}', { status: 404 });
       },
     });
     assert.deepStrictEqual(metadata, validMetadata);
@@ -733,7 +878,7 @@ describe('discoverOAuthMetadata', () => {
 
   test('path URL falls back to root when path-aware returns 404', async () => {
     const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
-      fetch: mockFetch({
+      trustedFetchFn: mockFetch({
         'https://example.com/.well-known/oauth-authorization-server': validMetadata,
       }),
     });
@@ -742,7 +887,7 @@ describe('discoverOAuthMetadata', () => {
 
   test('trailing slash is stripped from path', async () => {
     const metadata = await discoverOAuthMetadata('https://example.com/mcp/', {
-      fetch: mockFetch({
+      trustedFetchFn: mockFetch({
         'https://example.com/.well-known/oauth-authorization-server/mcp': validMetadata,
       }),
     });
@@ -751,33 +896,25 @@ describe('discoverOAuthMetadata', () => {
 
   test('returns null when no endpoint responds', async () => {
     const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
-      fetch: mockFetch({}),
+      trustedFetchFn: mockFetch({}),
     });
     assert.strictEqual(metadata, null);
   });
 
   test('returns null when metadata lacks required fields', async () => {
     const metadata = await discoverOAuthMetadata('https://example.com', {
-      fetch: async () => ({
-        ok: true,
-        json: async () => ({ issuer: 'https://example.com' }),
-      }),
+      trustedFetchFn: async () => new Response(JSON.stringify({ issuer: 'https://example.com' }), { status: 200 }),
     });
     assert.strictEqual(metadata, null);
   });
 
   test('falls back to root when path-aware URL returns malformed JSON', async () => {
     const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
-      fetch: async url => {
+      trustedFetchFn: async url => {
         if (url === 'https://example.com/.well-known/oauth-authorization-server/mcp') {
-          return {
-            ok: true,
-            json: async () => {
-              throw new SyntaxError('Unexpected token');
-            },
-          };
+          return new Response('{not-json', { status: 200 });
         }
-        return { ok: true, json: async () => validMetadata };
+        return new Response(JSON.stringify(validMetadata), { status: 200 });
       },
     });
     assert.deepStrictEqual(metadata, validMetadata);
@@ -785,11 +922,24 @@ describe('discoverOAuthMetadata', () => {
 
   test('returns null for network errors', async () => {
     const metadata = await discoverOAuthMetadata('https://example.com', {
-      fetch: async () => {
+      trustedFetchFn: async () => {
         throw new Error('network error');
       },
     });
     assert.strictEqual(metadata, null);
+  });
+
+  test('does not follow metadata redirects to an unvalidated destination', async () => {
+    const fetched = [];
+    const metadata = await discoverOAuthMetadata('https://example.com/mcp', {
+      trustedFetchFn: async url => {
+        fetched.push(url.toString());
+        return new Response('', { status: 302, headers: { location: 'http://127.0.0.1/latest/meta-data' } });
+      },
+    });
+    assert.strictEqual(metadata, null);
+    assert.ok(fetched.length > 0);
+    assert.ok(fetched.every(url => new URL(url).hostname === 'example.com'));
   });
 });
 

@@ -69,10 +69,27 @@ function buildAcquired(rightsId, brandId, pricingOptionId) {
     rights_constraint: {
       rights_id: rightsId,
       rights_agent: { url: 'https://rights.example.com/mcp', id: 'rights-agent' },
+      rights_holder: { domain: 'acme-corp.example.com', brand_id: brandId },
+      grant_status: 'active',
       uses: ['endorsement'],
       countries: ['US'],
       valid_from: '2026-05-01T00:00:00Z',
       valid_until: '2026-12-31T23:59:59Z',
+      content_digest: `sha256:${'a'.repeat(64)}`,
+      attestation_refs: [
+        {
+          issuer: { type: 'brand', brand: { domain: 'acme-corp.example.com', brand_id: brandId } },
+          claim_type: 'https://adcontextprotocol.org/claims/rights/grant',
+          subject: {
+            type: 'resource',
+            resource_type: 'https://adcontextprotocol.org/claims/subjects/rights-grant',
+            namespace: 'https://rights.example.com/mcp',
+            id: rightsId,
+            content_digest: `sha256:${'a'.repeat(64)}`,
+          },
+          locator: { type: 'issuer_credential_id', credential_id: rightsId, resolver_id: 'primary' },
+        },
+      ],
     },
   };
 }
@@ -99,8 +116,8 @@ function brandRightsPlatform(brOverrides = {}) {
     },
     brandRights: {
       getBrandIdentity: async () => ACME_BRAND_IDENTITY,
-      getRights: async () => ({ rights: [RIGHTS_OFFERING] }),
-      acquireRights: async req => {
+      getRightsLegacy: async () => ({ rights: [RIGHTS_OFFERING] }),
+      acquireRightsLegacy: async req => {
         // Demo branch: pre-approved buyers clear sync; everyone else gets pending.
         if (req.buyer.brand_id === 'brand_pre_approved') {
           return buildAcquired(req.rights_id, RIGHTS_OFFERING.brand_id, req.pricing_option_id);

@@ -1,13 +1,27 @@
 // Multi-agent orchestrator providing simple, intuitive API
 
 import type { AgentConfig } from '../types';
-import { AgentClient, type V2AugmentedGetProductsResponse } from './AgentClient';
-import type { SingleAgentClientConfig } from './SingleAgentClient';
-import { ADCP_VERSION } from '../version';
+import {
+  AgentClient,
+  type CanonicalGetProductsResponse,
+  type CanonicalProjectionTaskOptions,
+  type ProposalRefinementTaskOptions,
+} from './AgentClient';
+import type { RefineProposalsInput, RefineProposalsResponse } from '../negotiation/types';
+import type {
+  CreativeDeliveryTaskOptions,
+  SingleAgentClientConfig,
+  SyncCreativesTaskOptions,
+  VerifyAndParseWebhookOptions,
+  WebhookHandlerAdapter,
+  WebhookHandlerRequest,
+  WebhookParseResult,
+} from './SingleAgentClient';
+import { ADCP_VERSION, type AdcpVersion } from '../version';
 import { resolveAdcpVersion } from '../utils/adcp-version-config';
 import { ConfigurationManager } from './ConfigurationManager';
 import { CreativeAgentClient, STANDARD_CREATIVE_AGENTS } from './CreativeAgentClient';
-import type { CreativeFormat } from './CreativeAgentClient';
+import type { LegacyCreativeFormat } from './CreativeAgentClient';
 import type { InputHandler, TaskOptions, TaskResult, TaskInfo } from './ConversationTypes';
 import type { WebhookHeaderValue } from '../webhooks';
 import type {
@@ -21,10 +35,11 @@ import type {
   UpdateMediaBuyResponse,
   SyncCreativesRequest,
   SyncCreativesResponse,
-  ListCreativesRequest,
   ListCreativesResponse,
   GetMediaBuyDeliveryRequest,
   GetMediaBuyDeliveryResponse,
+  GetCreativeDeliveryRequest,
+  GetCreativeDeliveryResponse,
   ProvidePerformanceFeedbackRequest,
   ProvidePerformanceFeedbackResponse,
   GetSignalsRequest,
@@ -33,6 +48,20 @@ import type {
   ActivateSignalResponse,
 } from '../types/tools.generated';
 import type { MutatingRequestInput } from '../utils/idempotency';
+import type {
+  CanonicalCreateMediaBuyRequest,
+  CanonicalCreativeResponse,
+  CanonicalGetProductsRequest,
+  CanonicalListCreativesRequest,
+  CanonicalListCreativesResponse,
+  CanonicalSyncCreativesRequest,
+  CanonicalUpdateMediaBuyRequest,
+} from '../v2/projection/creative-delivery';
+
+export interface MultiAgentWebhookHandlerAdapter extends WebhookHandlerAdapter {
+  /** Resolve agent identity from trusted routing state, never from the unverified payload. */
+  getAgentId?: (request: WebhookHandlerRequest) => string | undefined | Promise<string | undefined>;
+}
 
 /**
  * Collection of agent clients for parallel operations across multiple AdCP agents.
@@ -101,45 +130,42 @@ export class AgentCollection {
   /**
    * Execute getProducts on all agents in parallel.
    *
-   * Each agent's response is auto-augmented with v2 `format_options[]`
-   * by default — see `AgentClient.getProducts()`. Pass
-   * `{ project: false }` to opt out across all agents in this fan-out.
+   * Each agent's response is reduced to canonical `format_options[]`
+   * by default — see `AgentClient.getProducts()`.
    */
   async getProducts(
-    params: GetProductsRequest,
+    params: CanonicalGetProductsRequest,
     inputHandler?: InputHandler,
-    options?: TaskOptions & { project?: true }
-  ): Promise<TaskResult<V2AugmentedGetProductsResponse>[]>;
-  async getProducts(
-    params: GetProductsRequest,
-    inputHandler?: InputHandler,
-    options?: TaskOptions & { project: false }
-  ): Promise<TaskResult<GetProductsResponse>[]>;
-  async getProducts(
-    params: GetProductsRequest,
-    inputHandler?: InputHandler,
-    options?: TaskOptions & { project?: boolean }
-  ): Promise<TaskResult<GetProductsResponse | V2AugmentedGetProductsResponse>[]> {
-    // Discriminate on the literal `project` flag so the per-client call
-    // hits the matching overload — TS can't narrow `boolean` to the
-    // overload's literal `true | undefined` / `false` shapes on its own.
-    if (options?.project === false) {
-      const optsOff = options as TaskOptions & { project: false };
-      return this.executeAllSettled(client => client.getProducts(params, inputHandler, optsOff));
-    }
-    const optsOn = options as (TaskOptions & { project?: true }) | undefined;
-    return this.executeAllSettled(client => client.getProducts(params, inputHandler, optsOn));
+    options?: CanonicalProjectionTaskOptions
+  ): Promise<TaskResult<CanonicalGetProductsResponse>[]> {
+    return this.executeAllSettled(client => client.getProducts(params, inputHandler, options));
   }
 
-  /**
-   * Execute listCreativeFormats on all agents in parallel
-   */
-  async listCreativeFormats(
+  /** Revise/finalize proposals across every selected agent. */
+  async refineProposals(
+    params: RefineProposalsInput,
+    inputHandler?: InputHandler,
+    options?: ProposalRefinementTaskOptions
+  ): Promise<TaskResult<RefineProposalsResponse>[]> {
+    return this.executeAllSettled(client => client.refineProposals(params, inputHandler, options));
+  }
+
+  /** @deprecated Explicit raw-wire fan-out for migration tooling. */
+  async getProductsLegacy(
+    params: GetProductsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<GetProductsResponse>[]> {
+    return this.executeAllSettled(client => client.getProductsLegacy(params, inputHandler, options));
+  }
+
+  /** @deprecated Migration-only fan-out for legacy named-format catalogs. */
+  async listCreativeFormatsLegacy(
     params: ListCreativeFormatsRequest,
     inputHandler?: InputHandler,
     options?: TaskOptions
   ): Promise<TaskResult<ListCreativeFormatsResponse>[]> {
-    return this.executeAllSettled(client => client.listCreativeFormats(params, inputHandler, options));
+    return this.executeAllSettled(client => client.listCreativeFormatsLegacy(params, inputHandler, options));
   }
 
   /**
@@ -147,10 +173,10 @@ export class AgentCollection {
    * Note: This might not make sense for all use cases, but provided for completeness
    */
   async createMediaBuy(
-    params: MutatingRequestInput<CreateMediaBuyRequest>,
+    params: MutatingRequestInput<CanonicalCreateMediaBuyRequest>,
     inputHandler?: InputHandler,
-    options?: TaskOptions
-  ): Promise<TaskResult<CreateMediaBuyResponse>[]> {
+    options?: CreativeDeliveryTaskOptions
+  ): Promise<TaskResult<CanonicalCreativeResponse<CreateMediaBuyResponse>>[]> {
     return this.executeAllSettled(client => client.createMediaBuy(params, inputHandler, options));
   }
 
@@ -158,10 +184,10 @@ export class AgentCollection {
    * Execute updateMediaBuy on all agents in parallel
    */
   async updateMediaBuy(
-    params: MutatingRequestInput<UpdateMediaBuyRequest>,
+    params: MutatingRequestInput<CanonicalUpdateMediaBuyRequest>,
     inputHandler?: InputHandler,
-    options?: TaskOptions
-  ): Promise<TaskResult<UpdateMediaBuyResponse>[]> {
+    options?: CreativeDeliveryTaskOptions
+  ): Promise<TaskResult<CanonicalCreativeResponse<UpdateMediaBuyResponse>>[]> {
     return this.executeAllSettled(client => client.updateMediaBuy(params, inputHandler, options));
   }
 
@@ -169,10 +195,10 @@ export class AgentCollection {
    * Execute syncCreatives on all agents in parallel
    */
   async syncCreatives(
-    params: MutatingRequestInput<SyncCreativesRequest>,
+    params: MutatingRequestInput<CanonicalSyncCreativesRequest>,
     inputHandler?: InputHandler,
-    options?: TaskOptions
-  ): Promise<TaskResult<SyncCreativesResponse>[]> {
+    options?: SyncCreativesTaskOptions
+  ): Promise<TaskResult<CanonicalCreativeResponse<SyncCreativesResponse>>[]> {
     return this.executeAllSettled(client => client.syncCreatives(params, inputHandler, options));
   }
 
@@ -180,10 +206,10 @@ export class AgentCollection {
    * Execute listCreatives on all agents in parallel
    */
   async listCreatives(
-    params: ListCreativesRequest,
+    params: CanonicalListCreativesRequest,
     inputHandler?: InputHandler,
     options?: TaskOptions
-  ): Promise<TaskResult<ListCreativesResponse>[]> {
+  ): Promise<TaskResult<CanonicalListCreativesResponse>[]> {
     return this.executeAllSettled(client => client.listCreatives(params, inputHandler, options));
   }
 
@@ -194,8 +220,17 @@ export class AgentCollection {
     params: GetMediaBuyDeliveryRequest,
     inputHandler?: InputHandler,
     options?: TaskOptions
-  ): Promise<TaskResult<GetMediaBuyDeliveryResponse>[]> {
+  ): Promise<TaskResult<CanonicalCreativeResponse<GetMediaBuyDeliveryResponse>>[]> {
     return this.executeAllSettled(client => client.getMediaBuyDelivery(params, inputHandler, options));
+  }
+
+  /** Execute canonical creative delivery reporting across all agents. */
+  async getCreativeDelivery(
+    params: GetCreativeDeliveryRequest,
+    inputHandler?: InputHandler,
+    options?: CanonicalProjectionTaskOptions
+  ): Promise<TaskResult<CanonicalCreativeResponse<GetCreativeDeliveryResponse>>[]> {
+    return this.executeAllSettled(client => client.getCreativeDelivery(params, inputHandler, options));
   }
 
   /**
@@ -362,7 +397,7 @@ export class AgentCollection {
  *
  * All standard AdCP operations are available:
  * - `getProducts()` - Discover advertising products
- * - `listCreativeFormats()` - Get supported creative formats
+ * - `listCreativeFormatsLegacy()` - Inspect legacy named-format catalogs for migration tooling
  * - `createMediaBuy()` - Create new media buy
  * - `updateMediaBuy()` - Update existing media buy
  * - `syncCreatives()` - Upload/sync creative assets
@@ -526,6 +561,10 @@ export class ADCPMultiAgentClient {
       authToken?: string;
       debug?: boolean;
       timeout?: number;
+      /** Public schema/version pin used by the client validators and adapters. */
+      adcpVersion?: AdcpVersion | (string & {});
+      /** Exact release-line pin emitted on the wire (including prereleases). */
+      wireAdcpVersion?: AdcpVersion | (string & {});
     } = {}
   ): ADCPMultiAgentClient {
     const {
@@ -535,6 +574,8 @@ export class ADCPMultiAgentClient {
       authToken,
       debug = false,
       timeout,
+      adcpVersion,
+      wireAdcpVersion,
     } = options;
 
     const agent: AgentConfig = {
@@ -550,6 +591,8 @@ export class ADCPMultiAgentClient {
     return new ADCPMultiAgentClient([agent], {
       debug,
       workingTimeout: timeout,
+      ...(adcpVersion !== undefined && { adcpVersion }),
+      ...(wireAdcpVersion !== undefined && { wireAdcpVersion }),
     });
   }
 
@@ -943,10 +986,46 @@ export class ADCPMultiAgentClient {
     return agent.getWebhookUrl(taskType, operationId);
   }
 
+  /** Verify without dispatching, using an agent id obtained from trusted routing context. */
+  async verifyAndParseWebhook(agentId: string, options: VerifyAndParseWebhookOptions): Promise<WebhookParseResult> {
+    return this.getAgent(agentId).verifyAndParseWebhook(options);
+  }
+
+  /**
+   * Create a multi-agent HTTP receiver. Agent selection comes only from the
+   * adapter or route `agent_id`/`agentId` parameter, never the webhook body.
+   */
+  createWebhookHandler(adapter: MultiAgentWebhookHandlerAdapter = {}) {
+    return async (
+      req: WebhookHandlerRequest,
+      res: {
+        status: (code: number) => { json: (body: unknown) => void };
+        json?: unknown;
+        writeHead: (code: number, headers: Record<string, string>) => void;
+        end: (body: string) => void;
+      }
+    ) => {
+      const agentId = (await adapter.getAgentId?.(req)) || req.params?.agent_id || req.params?.agentId;
+      if (!agentId || !this.hasAgent(agentId)) {
+        const body = { error: 'Trusted webhook route does not identify a configured agent.' };
+        if (res.json) res.status(400).json(body);
+        else {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        }
+        return;
+      }
+      return this.getAgent(agentId).createWebhookHandler(adapter)(req, res);
+    };
+  }
+
   /**
    * Handle webhook from any agent (async task completion or notifications)
    *
    * Automatically routes webhook to the correct agent based on agent_id in payload.
+   *
+   * @deprecated Legacy HMAC compatibility only. Use `createWebhookHandler()`
+   * so agent identity and complete RFC 9421 request context come from trusted routing.
    *
    * @param payload - Webhook payload from agent (must contain agent_id or operation_id)
    * @param taskType - Task type (e.g create_media_buy) from url param or url part of the webhook delivery
@@ -1054,7 +1133,7 @@ export class ADCPMultiAgentClient {
    * );
    *
    * // List formats
-   * const formats = await creativeAgent.listFormats();
+   * const formats = await creativeAgent.listFormatsLegacy();
    * ```
    */
   createCreativeAgent(agentUrl: string, protocol: 'mcp' | 'a2a' = 'mcp', authToken?: string): CreativeAgentClient {
@@ -1075,7 +1154,7 @@ export class ADCPMultiAgentClient {
    * @example
    * ```typescript
    * const creativeAgent = client.getStandardCreativeAgent();
-   * const formats = await creativeAgent.listFormats();
+   * const formats = await creativeAgent.listFormatsLegacy();
    * ```
    */
   getStandardCreativeAgent(protocol: 'mcp' | 'a2a' = 'mcp'): CreativeAgentClient {
@@ -1094,15 +1173,15 @@ export class ADCPMultiAgentClient {
    *
    * @example
    * ```typescript
-   * const formats = await client.discoverFormats();
+   * const formats = await client.discoverFormatsLegacy();
    *
    * // Find specific format
    * const banner = formats.find(f => f.format_id.id === 'display_300x250_image');
    * ```
    */
-  async discoverFormats(): Promise<CreativeFormat[]> {
+  async discoverFormatsLegacy(): Promise<LegacyCreativeFormat[]> {
     const creativeAgent = this.getStandardCreativeAgent();
-    return creativeAgent.listFormats();
+    return creativeAgent.listFormatsLegacy();
   }
 
   /**
@@ -1115,12 +1194,12 @@ export class ADCPMultiAgentClient {
    * @example
    * ```typescript
    * // Find all 300x250 formats
-   * const mediumRectangles = await client.findFormatsByDimensions(300, 250);
+   * const mediumRectangles = await client.findLegacyFormatsByDimensions(300, 250);
    * ```
    */
-  async findFormatsByDimensions(width: number, height: number): Promise<CreativeFormat[]> {
+  async findLegacyFormatsByDimensions(width: number, height: number): Promise<LegacyCreativeFormat[]> {
     const creativeAgent = this.getStandardCreativeAgent();
-    return creativeAgent.findByDimensions(width, height);
+    return creativeAgent.findLegacyByDimensions(width, height);
   }
 }
 

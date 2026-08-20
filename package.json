@@ -1,6 +1,6 @@
 {
   "name": "@adcp/sdk",
-  "version": "12.0.4",
+  "version": "14.0.0-beta.4",
   "description": "AdCP SDK — client, server, and compliance harnesses for the AdContext Protocol (MCP + A2A)",
   "workspaces": [
     ".",
@@ -152,6 +152,16 @@
       "require": {
         "types": "./dist/lib/testing/personas/index.d.ts",
         "default": "./dist/lib/testing/personas/index.js"
+      }
+    },
+    "./testing/storyboard/request-signing": {
+      "import": {
+        "types": "./dist/lib/testing/storyboard/request-signing/index.d.mts",
+        "default": "./dist/lib/testing/storyboard/request-signing/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/testing/storyboard/request-signing/index.d.ts",
+        "default": "./dist/lib/testing/storyboard/request-signing/index.js"
       }
     },
     "./auth": {
@@ -428,6 +438,9 @@
       "testing/personas": [
         "dist/lib/testing/personas/index.d.ts"
       ],
+      "testing/storyboard/request-signing": [
+        "dist/lib/testing/storyboard/request-signing/index.d.ts"
+      ],
       "server/legacy/v5": [
         "dist/lib/server/legacy/v5/index.d.ts"
       ],
@@ -445,9 +458,16 @@
     "skills/**/*",
     ".claude-plugin/**/*",
     "compliance/cache/**/*",
+    "!compliance/cache/*.previous/**/*",
+    "!compliance/cache/3.2.0-beta.0/**/*",
+    "!compliance/cache/3.2.0-beta.1/**/*",
     "ADCP_VERSION",
     "docs/llms.txt",
+    "docs/releases/**/*.md",
+    "docs/migration-*.md",
+    "MIGRATION-*.md",
     "docs/guides/BUILD-AN-AGENT.md",
+    "docs/guides/MEDIA-BUY-3.2-COMPATIBILITY.md",
     "docs/guides/CANONICAL-REFERENCE-RESOLVER.md",
     "docs/guides/PREVIEW-ASSET-DURABILITY.md",
     "examples/**/*",
@@ -460,25 +480,25 @@
     "sync:agents": "node scripts/import-claude-agents.mjs",
     "prepublishOnly": "npm run clean && npm run sync-schemas:all && (test -f src/lib/types/tools.generated.ts || npm run generate-types) && npm run build:lib && node --test-timeout=60000 --test-force-exit --test test/lib/adcp-client.test.js test/lib/validation.test.js test/lib/zod-schemas.test.js",
     "build": "npm run build:lib",
-    "build:lib": "npm run sync-version && npm run schemas:ensure && tsx scripts/generate-wire-spec-fields.ts && tsup && tsc --project tsconfig.lib.json --emitDeclarationOnly && tsx scripts/copy-schemas-to-dist.ts && tsx scripts/copy-v2-projection-catalog.ts && tsx scripts/generate-per-tool-types.ts && tsx scripts/generate-dmts-declarations.ts",
+    "build:lib": "npm run sync-version && npm run schemas:ensure && tsx scripts/generate-wire-spec-fields.ts && tsup && node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc --project tsconfig.lib.json --emitDeclarationOnly && tsx scripts/copy-schemas-to-dist.ts && tsx scripts/copy-v2-projection-catalog.ts && tsx scripts/generate-per-tool-types.ts && tsx scripts/generate-dmts-declarations.ts",
     "build:test-agents": "npm run build:lib && tsc -p test-agents/tsconfig.json --rootDir test-agents",
     "pretest": "npm run schemas:ensure",
-    "test": "npm run test:node && npm test --workspace=packages/eslint-plugin --if-present",
+    "test": "npm run test:node && npm test --workspace=packages/eslint-plugin --if-present && npm test --workspace=@adcp/reference-renderers",
     "test:node": "npm run test:node:fast && npm run test:node:slow",
-    "test:node:fast": "NODE_ENV=test node --test-timeout=60000 --test-force-exit --test $(find test -maxdepth 1 -name '*.test.js' ! -name 'generate-zod-object-intersections.test.js' -print) $(find test/lib -maxdepth 1 -name '*.test.js' ! -name 'cli-auth-scheme.test.js' ! -name 'cli-webhook-receiver-flag.test.js' ! -name 'conformance-cli.test.js' -print)",
-    "test:node:fast:shard": "test -n \"$TEST_SHARD\" && NODE_ENV=test node --test-timeout=60000 --test-force-exit --test-shard=$TEST_SHARD --test $(find test -maxdepth 1 -name '*.test.js' ! -name 'generate-zod-object-intersections.test.js' -print) $(find test/lib -maxdepth 1 -name '*.test.js' ! -name 'cli-auth-scheme.test.js' ! -name 'cli-webhook-receiver-flag.test.js' ! -name 'conformance-cli.test.js' -print)",
-    "test:node:slow": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test test/generate-zod-object-intersections.test.js test/lib/cli-auth-scheme.test.js test/lib/cli-webhook-receiver-flag.test.js test/lib/conformance-cli.test.js",
+    "test:node:fast": "NODE_ENV=test node --test-timeout=60000 --test-force-exit --test $(find test -maxdepth 1 -name '*.test.js' ! -name 'generate-zod-object-intersections.test.js' -print) $(find test/lib -maxdepth 1 -name '*.test.js' ! -name 'cli-auth-scheme.test.js' ! -name 'cli-soft-fail.test.js' ! -name 'cli-webhook-receiver-flag.test.js' ! -name 'conformance-cli.test.js' ! -name 'storyboard-notices.test.js' -print)",
+    "test:node:fast:shard": "test -n \"$TEST_SHARD\" && NODE_ENV=test node --test-timeout=60000 --test-force-exit --test-shard=$TEST_SHARD --test $(find test -maxdepth 1 -name '*.test.js' ! -name 'generate-zod-object-intersections.test.js' -print) $(find test/lib -maxdepth 1 -name '*.test.js' ! -name 'cli-auth-scheme.test.js' ! -name 'cli-soft-fail.test.js' ! -name 'cli-webhook-receiver-flag.test.js' ! -name 'conformance-cli.test.js' ! -name 'storyboard-notices.test.js' -print)",
+    "test:node:slow": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test test/generate-zod-object-intersections.test.js test/lib/cli-auth-scheme.test.js test/lib/cli-soft-fail.test.js test/lib/cli-webhook-receiver-flag.test.js test/lib/conformance-cli.test.js test/lib/storyboard-notices.test.js",
     "pretest:lib": "npm run schemas:ensure",
     "test:lib": "npm run test:lib:fast && npm run test:lib:slow",
-    "test:lib:fast": "NODE_ENV=test node --test-timeout=60000 --test-force-exit --test $(find test/lib -maxdepth 1 -name '*.test.js' ! -name 'cli-auth-scheme.test.js' ! -name 'cli-webhook-receiver-flag.test.js' ! -name 'conformance-cli.test.js' -print)",
-    "test:lib:slow": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test test/lib/cli-auth-scheme.test.js test/lib/cli-webhook-receiver-flag.test.js test/lib/conformance-cli.test.js",
+    "test:lib:fast": "NODE_ENV=test node --test-timeout=60000 --test-force-exit --test $(find test/lib -maxdepth 1 -name '*.test.js' ! -name 'cli-auth-scheme.test.js' ! -name 'cli-soft-fail.test.js' ! -name 'cli-webhook-receiver-flag.test.js' ! -name 'conformance-cli.test.js' ! -name 'storyboard-notices.test.js' -print)",
+    "test:lib:slow": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test test/lib/cli-auth-scheme.test.js test/lib/cli-soft-fail.test.js test/lib/cli-webhook-receiver-flag.test.js test/lib/conformance-cli.test.js test/lib/storyboard-notices.test.js",
     "pretest:examples": "npm run build",
     "test:examples": "NODE_ENV=test node --test-timeout=180000 --test-force-exit --test-concurrency=1 --test test/examples/*.test.js",
     "test:e2e": "node --test test/e2e/registry-live.test.js",
     "test:e2e:local-app": "node test/e2e/adcp-e2e.test.js",
     "test:protocols": "node test/run-protocol-tests.js",
     "changeset": "changeset",
-    "version": "changeset version && npm install --package-lock-only --ignore-scripts && npm run sync-version",
+    "version": "changeset version && npm install --package-lock-only --ignore-scripts && npm run sync-version && npm run generate-agent-docs",
     "release": "tsx scripts/publish-adcp-release.ts",
     "test:protocol-compliance": "node test/run-protocol-tests.js --only compliance",
     "test:protocol-schema": "node test/run-protocol-tests.js --only schema",
@@ -489,11 +509,11 @@
     "sync-schemas": "tsx scripts/sync-schemas.ts",
     "sync-schemas:v2.5": "tsx scripts/sync-v2-5-schemas.ts",
     "sync-schemas:3.1-beta": "tsx scripts/sync-3-1-beta-schemas.ts",
-    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.0.12 && npm run sync-schemas:v2.5 && npm run sync-schemas:3.1-beta",
+    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.1.15 && npm run sync-schemas -- 3.0.24 && npm run sync-schemas:v2.5 && npm run sync-schemas:3.1-beta",
     "sync-registry-schemas": "tsx scripts/generate-registry-types.ts --sync",
     "schemas:ensure": "tsx scripts/schemas-ensure.ts",
     "schema-diff": "tsx scripts/schema-diff.ts",
-    "generate-types": "tsx scripts/generate-types.ts && tsx scripts/generate-enum-arrays.ts && tsx scripts/generate-manifest-derived.ts && tsx scripts/generate-entity-hydration.ts",
+    "generate-types": "tsx scripts/generate-types.ts && tsx scripts/generate-enum-arrays.ts && tsx scripts/generate-manifest-derived.ts && tsx scripts/generate-entity-hydration.ts && tsx scripts/generate-media-buy-update-fields.ts",
     "generate-manifest-derived": "tsx scripts/generate-manifest-derived.ts",
     "generate-entity-hydration": "tsx scripts/generate-entity-hydration.ts",
     "generate-types:v2.5": "tsx scripts/generate-v2-5-types.ts",
@@ -508,7 +528,8 @@
     "compliance:fork-matrix": "node --test --test-timeout=300000 'test/examples/hello-*.test.js' test/examples/proxy-seller-snap.test.js",
     "typecheck:skill-examples": "tsx scripts/typecheck-skill-examples.ts",
     "check:skill-sync": "tsx scripts/check-skill-sync.ts",
-    "check:package": "publint --strict && attw --pack .",
+    "check:package": "publint --strict && node --max-old-space-size=8192 ./node_modules/@arethetypeswrong/cli/dist/index.js --pack .",
+    "check:package-size": "node scripts/check-package-size.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "check:adopter-types": "tsx scripts/check-adopter-types.ts",
     "check:adopter-types-narrow": "tsx scripts/check-adopter-types-narrow.ts",
@@ -517,7 +538,7 @@
     "lint": "eslint 'src/lib/testing/**/*.ts'",
     "lint:fix": "eslint 'src/lib/testing/**/*.ts' --fix",
     "lint:workflows": "node scripts/lint-workflows.js",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node --max-old-space-size=8192 ./node_modules/typescript/bin/tsc --noEmit",
     "typecheck:examples": "tsc --noEmit --project tsconfig.examples.json",
     "clean": "rm -rf dist/",
     "docs": "typedoc",
@@ -528,7 +549,7 @@
     "ci:quick": "npm run format:check && npm run typecheck && npm run build:lib && npm test",
     "ci:schema-check": "npm run sync-schemas && npm run generate-types && npm run generate-registry-types -- --sync && git diff --exit-code -I '// Generated at:' src/lib/types/ src/lib/agents/ src/lib/registry/types.generated.ts schemas/registry/registry.yaml || (echo '⚠️  Generated files are out of sync. Run: npm run sync-schemas && npm run generate-types && npm run generate-registry-types -- --sync' && exit 1)",
     "ci:codegen-strict": "tsx scripts/check-no-loose-oneof.ts",
-    "ci:docs-check": "npm run generate-agent-docs && git diff --exit-code -I '> Generated at:' -I '> (Library: )?@adcp/sdk v' docs/llms.txt docs/TYPE-SUMMARY.md || (echo '⚠️  Agent docs are out of sync. Run: npm run generate-agent-docs' && exit 1)",
+    "ci:docs-check": "npm run generate-agent-docs && git diff --exit-code -I '> Generated at:' docs/llms.txt docs/TYPE-SUMMARY.md || (echo '⚠️  Agent docs are out of sync. Run: npm run generate-agent-docs' && exit 1)",
     "ci:doc-links": "tsx scripts/check-doc-links.ts",
     "ci:pre-push": "npm run ci:schema-check && npm run ci:codegen-strict && npm run ci:quick",
     "hooks:install": "node scripts/install-hooks.js",
@@ -568,16 +589,17 @@
     "email": "bugs@adcontextprotocol.org"
   },
   "dependencies": {
-    "@modelcontextprotocol/client": "2.0.0-beta.4",
-    "@modelcontextprotocol/node": "2.0.0-beta.4",
-    "@modelcontextprotocol/server": "2.0.0-beta.4",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "@types/ws": "^8.18.1",
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
     "fast-check": "^3.23.2",
     "jose": "^6.2.2",
     "secure-json-parse": "^4.1.0",
-    "structured-headers": "^2.0.2",
+    "semver": "^7.8.5",
+    "structured-headers": "2.0.2",
     "tldts": "^7.0.29",
     "undici": "^6.27.0",
     "ws": "^8.21.0",
@@ -604,6 +626,7 @@
   },
   "devDependencies": {
     "@a2a-js/sdk": "^0.3.13",
+    "@apidevtools/json-schema-ref-parser": "^11.9.3",
     "@arethetypeswrong/cli": "^0.18.5",
     "@changesets/cli": "^2.29.7",
     "@commitlint/cli": "^19.6.0",
@@ -613,9 +636,10 @@
     "@types/express": "4.17.25",
     "@types/node": "^20.19.39",
     "@types/pg": "^8.20.0",
+    "@types/semver": "^7.8.0",
     "@types/tar": "^6.1.13",
     "actionlint": "^2.0.6",
-    "esbuild": "^0.27.0",
+    "esbuild": "^0.28.1",
     "esbuild-fix-imports-plugin": "^1.0.23",
     "eslint": "^10.0.3",
     "json-schema-to-typescript": "^15.0.4",
@@ -625,7 +649,7 @@
     "prettier": "^3.6.2",
     "publint": "^0.3.21",
     "redis": "^4.7.0",
-    "tar": "^7.5.13",
+    "tar": "^7.5.21",
     "ts-to-zod": "^5.0.1",
     "tsup": "^8.5.1",
     "tsx": "^4.6.0",
@@ -639,6 +663,7 @@
     "node": ">=20.0.0"
   },
   "overrides": {
+    "esbuild": "$esbuild",
     "rollup": ">=4.59.0",
     "@types/glob": "^8.1.0",
     "js-yaml": "^4.1.1",
@@ -647,7 +672,7 @@
     },
     "minimatch": "^10.2.1"
   },
-  "adcp_version": "3.1.2",
+  "adcp_version": "3.2.0-beta.3",
   "sideEffects": [
     "**/default-invariants.*"
   ]

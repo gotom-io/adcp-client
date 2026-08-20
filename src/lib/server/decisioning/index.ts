@@ -174,11 +174,11 @@ export type { ResolveAccountHooks, ResolveGuardOptions } from './resolve-presets
 // Specialism interfaces (v1.0)
 export type {
   CreativeBuilderPlatform,
-  BuildCreativeReturn,
-  BuildCreativePayload,
-  BuildCreativeMultiPayload,
-  PreviewCreativePayload as CreativePreviewCreativePayload,
-  ListCreativeFormatsPayload as CreativeListCreativeFormatsPayload,
+  LegacyBuildCreativeReturn,
+  LegacyBuildCreativePayload,
+  LegacyBuildCreativeMultiPayload,
+  LegacyPreviewCreativePayload,
+  LegacyListCreativeFormatsPayload,
   // Deprecated aliases — kept for one-release source compat. Both
   // resolve to CreativeBuilderPlatform; see specialisms/creative.ts.
   CreativeTemplatePlatform,
@@ -189,13 +189,15 @@ export type {
 
 export type {
   CreativeAdServerPlatform,
-  BuildCreativeReturn as CreativeAdServerBuildCreativeReturn,
-  BuildCreativePayload as CreativeAdServerBuildCreativePayload,
-  BuildCreativeMultiPayload as CreativeAdServerBuildCreativeMultiPayload,
-  PreviewCreativePayload as CreativeAdServerPreviewCreativePayload,
-  ListCreativeFormatsPayload as CreativeAdServerListCreativeFormatsPayload,
+  LegacyBuildCreativeReturn as CreativeAdServerLegacyBuildCreativeReturn,
+  LegacyBuildCreativePayload as CreativeAdServerLegacyBuildCreativePayload,
+  LegacyBuildCreativeMultiPayload as CreativeAdServerLegacyBuildCreativeMultiPayload,
+  LegacyPreviewCreativePayload as CreativeAdServerLegacyPreviewCreativePayload,
+  LegacyListCreativeFormatsPayload as CreativeAdServerLegacyListCreativeFormatsPayload,
   ListCreativesPayload as CreativeAdServerListCreativesPayload,
+  GetCreativeDeliveryPayload,
   GetCreativeDeliveryPayload as CreativeAdServerGetCreativeDeliveryPayload,
+  LegacyGetCreativeDeliveryPayload as CreativeAdServerLegacyGetCreativeDeliveryPayload,
 } from './specialisms/creative-ad-server';
 
 export type {
@@ -208,14 +210,14 @@ export type {
 
 export type {
   ContentStandardsPlatform,
-  ListContentStandardsPayload,
-  GetContentStandardsPayload,
-  CreateContentStandardsPayload,
-  UpdateContentStandardsPayload,
-  CalibrateContentPayload,
-  ValidateContentDeliveryPayload,
-  GetMediaBuyArtifactsPayload,
-  GetCreativeFeaturesPayload,
+  LegacyListContentStandardsPayload,
+  LegacyGetContentStandardsPayload,
+  LegacyCreateContentStandardsPayload,
+  LegacyUpdateContentStandardsPayload,
+  LegacyCalibrateContentPayload,
+  LegacyValidateContentDeliveryPayload,
+  LegacyGetMediaBuyArtifactsPayload,
+  LegacyGetCreativeFeaturesPayload,
 } from './specialisms/content-standards';
 
 export type {
@@ -237,21 +239,38 @@ export type {
   SalesPlatform,
   SalesCorePlatform,
   SalesIngestionPlatform,
+  MediaBuyLifecyclePlatform,
+  MediaBuyLifecycleCorePlatform,
+  MediaBuyLifecycleProposalPlatform,
   GetProductsPayload,
+  LegacyGetProductsPayload,
   GetProductsHandlerResult,
   CreateMediaBuyPayload,
+  LegacyCreateMediaBuyPayload,
   CreateMediaBuyHandlerResult,
   UpdateMediaBuyPayload,
+  LegacyUpdateMediaBuyPayload,
+  UpdateMediaBuyHandlerResult,
   GetMediaBuyDeliveryPayload,
+  LegacyGetMediaBuyDeliveryPayload,
   GetMediaBuysPayload,
+  LegacyGetMediaBuysPayload,
   ProvidePerformanceFeedbackPayload,
-  ListCreativeFormatsPayload,
+  LegacyListCreativeFormatsPayload as SalesLegacyListCreativeFormatsPayload,
   ListCreativesPayload,
+  LegacyListCreativesPayload,
   SyncCreativesPayload,
   SyncCreativesHandlerResult,
   SyncCatalogsPayload,
   LogEventPayload,
   SyncEventSourcesPayload,
+  ListProductsPayload,
+  RequestProposalsPayload,
+  RefineProposalsPayload,
+  DeclineProposalsPayload,
+  BuyProductsPayload,
+  AcceptProposalPayload,
+  ControlMediaBuyPayload,
 } from './specialisms/sales';
 
 export type {
@@ -281,12 +300,12 @@ export type {
 export type {
   BrandRightsPlatform,
   GetBrandIdentityPayload,
-  GetRightsPayload,
-  AcquireRightsAcquiredPayload,
-  AcquireRightsPendingApprovalPayload,
-  AcquireRightsRejectedPayload,
-  AcquireRightsPayload,
-  UpdateRightsPayload,
+  LegacyGetRightsPayload,
+  LegacyAcquireRightsAcquiredPayload,
+  LegacyAcquireRightsPendingApprovalPayload,
+  LegacyAcquireRightsRejectedPayload,
+  LegacyAcquireRightsPayload,
+  LegacyUpdateRightsPayload,
   CreativeApprovedPayload,
   CreativeRejectedPayload,
   CreativePendingReviewPayload,
@@ -301,13 +320,13 @@ export type {
 export type {
   GetBrandIdentityRequest,
   GetBrandIdentitySuccess,
-  GetRightsRequest,
-  GetRightsSuccess,
-  AcquireRightsRequest,
-  AcquireRightsAcquired,
-  AcquireRightsPendingApproval,
-  AcquireRightsRejected,
-  AcquireRightsError,
+  GetRightsRequest as LegacyGetRightsRequest,
+  GetRightsSuccess as LegacyGetRightsSuccess,
+  AcquireRightsRequest as LegacyAcquireRightsRequest,
+  AcquireRightsAcquired as LegacyAcquireRightsAcquired,
+  AcquireRightsPendingApproval as LegacyAcquireRightsPendingApproval,
+  AcquireRightsRejected as LegacyAcquireRightsRejected,
+  AcquireRightsError as LegacyAcquireRightsError,
   RightUse,
   RightType,
   RightsConstraint,
@@ -322,6 +341,7 @@ export {
   createAdcpServerFromPlatform,
   getAllAdcpMigrations,
   type CreateAdcpServerFromPlatformOptions,
+  type LegacyDecisioningHandlerGroups,
   type RequiredOptsFor,
   type DecisioningAdcpServer,
   type DecisioningObservabilityHooks,
@@ -361,11 +381,17 @@ export {
 // Manifest helpers — typed accessors for creative_manifest.assets values.
 // Save adopters from writing the same null-check + discriminator-check
 // boilerplate per call.
-export { getAsset, requireAsset } from './manifest-helpers';
+export { getAsset, getAssetSlot, requireAsset } from './manifest-helpers';
+export type { CreativeAssetsContainer } from './manifest-helpers';
 
 // List helpers — wrap row arrays + pagination into the heavier wire shapes
 // (today: list_creatives, which carries query_summary alongside the rows).
-export { buildListCreativesResponse, type BuildListCreativesResponseOpts } from './list-helpers';
+export {
+  buildListCreativesResponse,
+  buildListCreativesResponseLegacy,
+  type BuildListCreativesResponseOpts,
+  type BuildListCreativesResponseLegacyOpts,
+} from './list-helpers';
 
 // Start-time helper — normalize the wire `start_time` union into a Date,
 // with platform-aware ASAP lead-time injection.
@@ -418,6 +444,8 @@ export {
 // Framework dispatch wiring lands in a follow-up release.
 export type {
   ProposalManager,
+  ProposalGetProductsPayload,
+  LegacyProposalGetProductsPayload,
   ProposalCapabilities,
   ProposalSalesSpecialism,
   Recipe,
@@ -448,9 +476,13 @@ export {
 } from './proposal';
 export type { FinalizeActionRef, ProposalLifecycleLogger, FinalizeInterceptResult, ReservedProposal } from './proposal';
 
-// Wire-shape assembly helpers — emit correct Product / PricingOption /
-// package shapes from intent-shaped input. Reduces 30+ lines of wire
-// boilerplate per resource. Used in slim skill examples so LLMs scaffold
-// correct shapes from first attempt.
-export { buildProduct, buildPricingOption, buildPackage } from './assembly-helpers';
-export type { BuildProductInput, BuildPricingOptionInput, BuildPackageInput } from './assembly-helpers';
+// Canonical assembly helpers — emit Product / PricingOption / package shapes
+// from intent-shaped input. Raw named-format product assembly is available
+// only through the explicit buildProductLegacy compatibility helper.
+export { buildProduct, buildProductLegacy, buildPricingOption, buildPackage } from './assembly-helpers';
+export type {
+  BuildProductInput,
+  BuildProductLegacyInput,
+  BuildPricingOptionInput,
+  BuildPackageInput,
+} from './assembly-helpers';

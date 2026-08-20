@@ -138,19 +138,17 @@ const mockResult = {
       track: 'core',
       status: 'pass',
       label: 'Core Protocol',
-      scenarios: [],
-      skipped_scenarios: [],
       observations: [],
       duration_ms: 100,
+      _view: 'reference',
     },
     {
       track: 'products',
       status: 'fail',
       label: 'Product Discovery',
-      scenarios: [],
-      skipped_scenarios: [],
       observations: [],
       duration_ms: 50,
+      _view: 'reference',
     },
   ],
   skipped_tracks: [{ track: 'signals', label: 'Signals', reason: 'No storyboards produced results for this track' }],
@@ -201,6 +199,33 @@ describe('formatComplianceResults', () => {
   test('shows summary headline', () => {
     const output = formatComplianceResults(mockResult);
     assert.ok(output.includes('1 passing, 1 failing'), 'Should show headline');
+  });
+
+  test('puts a visible incomplete-run warning immediately before step totals', () => {
+    const timedOut = {
+      ...mockResult,
+      completeness: 'timed_out',
+      summary: {
+        ...mockResult.summary,
+        steps_passed: 12,
+        steps_failed: 0,
+        steps_skipped: 2,
+        steps_not_selected: 0,
+      },
+      observations: [
+        {
+          category: 'performance',
+          severity: 'warning',
+          message: 'Stopped starting new storyboards after 3/5 selected storyboard(s).',
+          source: { kind: 'profile', code: 'timeout-budget-exceeded' },
+        },
+      ],
+    };
+    const output = formatComplianceResults(timedOut);
+    assert.match(
+      output,
+      /INCOMPLETE RUN: Stopped starting new storyboards after 3\/5 selected storyboard\(s\)\.\n\nSteps: 12 passed, 0 failed/
+    );
   });
 });
 

@@ -50,8 +50,8 @@ const ADOPTER_SOURCE = `
 import type {
   AdcpServer,
   ActivateSignalPayload,
-  BuildCreativePayload,
-  BuildCreativeMultiPayload,
+  LegacyBuildCreativePayload,
+  LegacyBuildCreativeMultiPayload,
   CheckGovernancePayload,
   CreativeApprovedPayload,
   CreatePropertyListPayload,
@@ -62,11 +62,11 @@ import type {
   GetAccountFinancialsHandlerResult,
   GetBrandIdentityPayload,
   GetProductsPayload,
-  GetRightsPayload,
+  LegacyGetRightsPayload,
   ListAccountsHandlerResult,
   ListAccountsPayload,
-  ListCreativeFormatsPayload,
-  ListContentStandardsPayload,
+  LegacyListCreativeFormatsPayload,
+  LegacyListContentStandardsPayload,
   OperationalContext,
   OperationalPlatform,
   RightsTerms,
@@ -81,7 +81,7 @@ import type {
   SyncCreativesHandlerResult,
   SyncEventSourcesPayload,
   SyncGovernanceHandlerResult,
-  UpdateRightsPayload,
+  LegacyUpdateRightsPayload,
   UpdateMediaBuyPayload,
 } from '@adcp/sdk/server';
 import { createAdcpServerFromPlatform, defineOperationalPlatform } from '@adcp/sdk/server';
@@ -90,23 +90,77 @@ import { createSingleAgentClient, extractAdcpErrorFromMcp, extractAdcpErrorFromT
 import type {
   CreateMediaBuyPayload as TypesCreateMediaBuyPayload,
   CreateMediaBuySuccess,
+  CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement,
+  CanonicalFormatBase,
+  CanonicalFormatDAASTAudio,
+  CanonicalFormatDisplayTag,
+  CanonicalFormatHostedAudio,
+  CanonicalFormatHostedVideo,
+  CanonicalFormatHTML5Banner,
+  CanonicalFormatImageCarousel,
+  CanonicalFormatNativeInFeed,
+  CanonicalFormatResponsiveCreative,
+  CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven,
+  CanonicalFormatVASTVideo,
   CreativeManifest,
+  ExtensionObject,
   GetProductsPayload as TypesGetProductsPayload,
   ServerPayload as ServerPayloadFromTypes,
   UpdateMediaBuyPayload as TypesUpdateMediaBuyPayload,
 } from '@adcp/sdk/types';
 import type {
   AccountReference,
+  CreativeBrief,
   FormatSchemaReferenceResult,
   CreateMediaBuyPayload as RootCreateMediaBuyPayload,
   GetProductsPayload as RootGetProductsPayload,
+  LegacyProduct,
+  LegacyGetProductsResponse,
   MediaBuyAvailableAction,
+  ProductCardFields,
+  ProductCardDetailedFields,
   SLAWindow,
   SlaWindow,
   UpdateMediaBuyPayload as RootUpdateMediaBuyPayload,
 } from '@adcp/sdk';
+import type {
+  AdCPVersionEnvelope,
+  AudienceCharacteristic,
+  CanonicalFormatBase as ToolCanonicalFormatBase,
+  CommercialTerms,
+  ExplicitPackagesWithFixedAllocation,
+  Placement,
+  PostalCountrySystem,
+  ProductFormatDeclaration,
+  ProtocolEnvelope,
+  SelectedPlacements,
+  SignalDefinitionEnrichment,
+  SignalTargetingExpression,
+} from '@adcp/sdk/types/tools.generated';
+import type {
+  BrandReference1,
+  BrandReference2,
+  BrandReference3,
+  BrandReference4,
+  BrandReference5,
+  BrandReference6,
+  BrandReference7,
+  BrandReference8,
+  BrandReference9,
+  BrandReference10,
+  BrandReference11,
+  BrandReference12,
+  BusinessEntity1,
+  MeasurementTerms1,
+  None1,
+  None2,
+  PlatformExtensionReference1,
+  Product1,
+  Property1,
+} from '@adcp/sdk/types/core.generated';
 import { createCanonicalReferenceResolver as createSubpathCanonicalReferenceResolver } from '@adcp/sdk/canonical-references';
 import { customToolFor, customToolForSchema, TOOL_INPUT_SCHEMAS, TOOL_INPUT_SHAPES, TOOL_REQUEST_SCHEMAS } from '@adcp/sdk/schemas';
+import * as publicSchemas from '@adcp/sdk/schemas';
 
 declare const _server: AdcpServer;
 void _server;
@@ -177,7 +231,7 @@ const rightsTerms = {} as RightsTerms;
 // protocol task envelope (status, timestamp, context_id, etc.).
 const _payloadResults: [
   Result<GetProductsPayload, Error>,
-  Result<ListCreativeFormatsPayload, Error>,
+  Result<LegacyListCreativeFormatsPayload, Error>,
   Result<CreateMediaBuyPayload, Error>,
   Result<UpdateMediaBuyPayload, Error>,
   Result<SyncCreativesPayload, Error>,
@@ -185,13 +239,13 @@ const _payloadResults: [
   Result<ListAccountsPayload, Error>,
   Result<GetMediaBuysPayload, Error>,
   Result<GetMediaBuyDeliveryPayload, Error>,
-  Result<BuildCreativePayload, Error>,
-  Result<BuildCreativeMultiPayload, Error>,
+  Result<LegacyBuildCreativePayload, Error>,
+  Result<LegacyBuildCreativeMultiPayload, Error>,
   Result<SyncAudiencesPayload, Error>,
   Result<ActivateSignalPayload, Error>,
   Result<GetBrandIdentityPayload, Error>,
-  Result<GetRightsPayload, Error>,
-  Result<UpdateRightsPayload, Error>,
+  Result<LegacyGetRightsPayload, Error>,
+  Result<LegacyUpdateRightsPayload, Error>,
   Result<CreativeApprovedPayload, Error>,
   Result<CreateMediaBuyHandlerResult, Error>,
   Result<SyncCreativesHandlerResult, Error>,
@@ -214,7 +268,13 @@ const _payloadResults: [
   ok({ deployments: [] }),
   ok({ brand_id: 'brand_1', house: { domain: 'acme.com', name: 'Acme' }, names: [{ en: 'Acme' }] }),
   ok({ rights: [] }),
-  ok({ rights_id: 'rights_1', terms: rightsTerms }),
+  ok({
+    rights_id: 'rights_1',
+    terms: rightsTerms,
+    generation_credentials: [],
+    rights_constraint: {} as LegacyUpdateRightsPayload['rights_constraint'],
+    implementation_date: null,
+  }),
   ok({ approval_status: 'approved', rights_id: 'rights_1' }),
   ok(_createMediaBuyPayload),
   ok([]),
@@ -286,7 +346,7 @@ const _propertyListPayload: CreatePropertyListPayload = {
   list: { list_id: 'list_1', name: 'Test list' },
   auth_token: 'token_1',
 };
-const _contentStandardsPayload: ListContentStandardsPayload = { standards: [] };
+const _contentStandardsPayload: LegacyListContentStandardsPayload = { standards: [] };
 const _siPayload: SIGetOfferingPayload = { available: true };
 void _checkGovernancePayload;
 void _propertyListPayload;
@@ -298,14 +358,14 @@ const _serverPayload: ServerPayload<CreateMediaBuySuccess> = {
   confirmed_at: '2026-01-01T00:00:00Z',
   revision: 1,
   packages: [],
-  status: 'active',
+  media_buy_status: 'active',
 };
 const _typesPayload: ServerPayloadFromTypes<CreateMediaBuySuccess> = _serverPayload;
 void _typesPayload;
 const _rootPayloadAlias: RootCreateMediaBuyPayload = _serverPayload;
 const _typesPayloadAlias: TypesCreateMediaBuyPayload = _rootPayloadAlias;
 const _rootGetProductsPayload: RootGetProductsPayload = { products: [], cache_scope: 'account' };
-const _typesGetProductsPayload: TypesGetProductsPayload = _rootGetProductsPayload;
+const _typesGetProductsPayload = { products: [], cache_scope: 'account' } satisfies TypesGetProductsPayload;
 const _rootUpdatePayload: RootUpdateMediaBuyPayload = _updateMediaBuyPayload;
 const _typesUpdatePayload: TypesUpdateMediaBuyPayload = _rootUpdatePayload;
 const _slaWindow: SLAWindow = { response_max: 'PT1H', completion_max: 'P1D' };
@@ -321,6 +381,128 @@ void _typesUpdatePayload;
 void _availableAction;
 // @ts-expect-error named payload aliases must not expose SDK-owned protocol envelope fields
 void _rootPayloadAlias.task_id;
+
+// Issue #2573: generated named interfaces must remain compatible with
+// standard utility types and structurally equivalent adopter declarations.
+// Runtime validation stays open to future wire fields; the exported named
+// TypeScript surface must not acquire a catch-all index signature as a side
+// effect. Explicit extension maps remain indexable by design.
+type _BriefWithoutName = Omit<CreativeBrief, 'name'>;
+declare const _briefWithoutName: _BriefWithoutName;
+const _omittedBriefHeadline: string | undefined = _briefWithoutName.messaging?.headline;
+
+type _BriefMessaging = Pick<CreativeBrief, 'messaging'>;
+declare const _briefMessaging: _BriefMessaging;
+const _pickedBriefHeadline: string | undefined = _briefMessaging.messaging?.headline;
+
+interface _AdopterCreativeBrief {
+  name: string;
+  messaging?: {
+    headline?: string;
+  };
+}
+declare const _adopterCreativeBrief: _AdopterCreativeBrief;
+const _structurallyAssignedBrief: CreativeBrief = _adopterCreativeBrief;
+
+// Nested inline shapes must be just as source-compatible as named top-level
+// interfaces. Both sides of this assignment are exported by the SDK: the
+// projection helper produces ProductCardFields, while LegacyProduct embeds
+// the corresponding wire shape inline.
+declare const _helperProductCard: ProductCardFields;
+const _generatedProductCard: NonNullable<LegacyProduct['product_card']> = _helperProductCard;
+const _helperProductCardReverse: ProductCardFields = _generatedProductCard;
+type _ProductCardWithoutDescription = Omit<NonNullable<LegacyProduct['product_card']>, 'description'>;
+const _productCardWithoutDescription: _ProductCardWithoutDescription = _helperProductCard;
+declare const _helperProductCardDetailed: ProductCardDetailedFields;
+const _generatedProductCardDetailed: NonNullable<LegacyProduct['product_card_detailed']> = _helperProductCardDetailed;
+const _helperProductCardDetailedReverse: ProductCardDetailedFields = _generatedProductCardDetailed;
+type _LegacyResponseProduct = NonNullable<LegacyGetProductsResponse['products']>[number];
+const _legacyResponseProductCard: NonNullable<_LegacyResponseProduct['product_card']> = _helperProductCard;
+
+const _extensionMap: ExtensionObject = { vendor: { feature: true } };
+const _extensionValue: unknown = _extensionMap.vendor;
+void _omittedBriefHeadline;
+void _pickedBriefHeadline;
+void _structurallyAssignedBrief;
+void _generatedProductCard;
+void _helperProductCardReverse;
+void _productCardWithoutDescription;
+void _generatedProductCardDetailed;
+void _helperProductCardDetailedReverse;
+void _legacyResponseProductCard;
+void _extensionValue;
+
+type _HasNoStringIndex<T> = string extends keyof T ? false : true;
+const _exactPackageFlowTypes: [
+  _HasNoStringIndex<SelectedPlacements>,
+  _HasNoStringIndex<ExplicitPackagesWithFixedAllocation>,
+  _HasNoStringIndex<CommercialTerms>,
+  _HasNoStringIndex<ProductFormatDeclaration>,
+  _HasNoStringIndex<Placement>,
+  _HasNoStringIndex<AudienceCharacteristic>,
+] = [true, true, true, true, true, true];
+void _exactPackageFlowTypes;
+
+type _LegacyGeneratedAliases =
+  | BrandReference1 | BrandReference2 | BrandReference3 | BrandReference4 | BrandReference5 | BrandReference6
+  | BrandReference7 | BrandReference8 | BrandReference9 | BrandReference10 | BrandReference11 | BrandReference12
+  | BusinessEntity1 | MeasurementTerms1 | None1 | None2 | PlatformExtensionReference1 | Product1 | Property1;
+declare const _legacyGeneratedAlias: _LegacyGeneratedAliases;
+void _legacyGeneratedAlias;
+
+declare const _historicalToolExports: [
+  AdCPVersionEnvelope,
+  ToolCanonicalFormatBase,
+  PostalCountrySystem,
+  ProtocolEnvelope,
+  SignalDefinitionEnrichment,
+  SignalTargetingExpression,
+];
+void _historicalToolExports;
+
+const _legacyGeneratedSchemaAliases = [
+  publicSchemas.BrandReference1Schema, publicSchemas.BrandReference2Schema, publicSchemas.BrandReference3Schema,
+  publicSchemas.BrandReference4Schema, publicSchemas.BrandReference5Schema, publicSchemas.BrandReference6Schema,
+  publicSchemas.BrandReference7Schema, publicSchemas.BrandReference8Schema, publicSchemas.BrandReference9Schema,
+  publicSchemas.BrandReference10Schema, publicSchemas.BrandReference11Schema, publicSchemas.BrandReference12Schema,
+  publicSchemas.BusinessEntity1Schema, publicSchemas.MeasurementTerms1Schema, publicSchemas.None1Schema,
+  publicSchemas.None2Schema, publicSchemas.PlatformExtensionReference1Schema, publicSchemas.Product1Schema,
+  publicSchemas.Property1Schema,
+];
+void _legacyGeneratedSchemaAliases;
+
+// Canonical format overlays refine the base declaration with defaults and
+// format-specific fields. Their slots property must remain assignable from
+// the shared array contract rather than being widened to a record by codegen.
+const _canonicalSlots = [
+  { asset_group_id: 'audio_main', asset_type: 'audio' as const, required: true },
+] satisfies NonNullable<CanonicalFormatBase['slots']>;
+const _canonicalSlotAssignments: [
+  Pick<CanonicalFormatDisplayTag, 'slots'>,
+  Pick<CanonicalFormatImageCarousel, 'slots'>,
+  Pick<CanonicalFormatHostedVideo, 'slots'>,
+  Pick<CanonicalFormatVASTVideo, 'slots'>,
+  Pick<CanonicalFormatHostedAudio, 'slots'>,
+  Pick<CanonicalFormatDAASTAudio, 'slots'>,
+  Pick<CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven, 'slots'>,
+  Pick<CanonicalFormatNativeInFeed, 'slots'>,
+  Pick<CanonicalFormatResponsiveCreative, 'slots'>,
+  Pick<CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement, 'slots'>,
+  Pick<CanonicalFormatHTML5Banner, 'slots'>,
+] = [
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+  { slots: _canonicalSlots },
+];
+void _canonicalSlotAssignments;
 
 const _canonicalResolver = createSubpathCanonicalReferenceResolver();
 const _formatSchemaResult = null as unknown as FormatSchemaReferenceResult;

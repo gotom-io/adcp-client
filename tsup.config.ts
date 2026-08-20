@@ -4,13 +4,11 @@ import { transformSync } from 'esbuild';
 import { defineConfig } from 'tsup';
 import { fixImportsPlugin } from 'esbuild-fix-imports-plugin';
 
-// Only files that actually reference `__dirname` or `require` in their body
-// need the ESM shim below (no source file reads bare `__filename`, so it's
-// only an intermediate in computing `__dirname` from `import.meta.url`, not
-// its own shim target); injecting it into every ESM output (as a global
-// esbuild `banner`) drags `node:url`/`node:path`/`node:module` imports into
-// pure-data/pure-logic modules that never touch them, which a browser
-// bundler can't resolve (adcp#2364).
+// Files that reference `__dirname` or `require` in their body need the ESM
+// shim below. Protocol transport modules also receive it: Bun uses the
+// createRequire binding to load dual ESM/CJS MCP dependencies consistently.
+// Applying the shim to every ESM output would still drag Node built-ins into
+// pure-data modules that browser bundlers consume (adcp#2364).
 //
 // Runs pre-transform via `onLoad` — prepending to the TS source rather than
 // the emitted JS — so esbuild's own sourcemap generation accounts for the
@@ -37,7 +35,10 @@ function conditionalNodeShimPlugin() {
       build.onLoad({ filter: /\.ts$/ }, args => {
         const source = readFileSync(args.path, 'utf8');
         const { code } = transformSync(source, { loader: 'ts', legalComments: 'none' });
-        if (!needsShim.test(code)) return null;
+        const isProtocolTransport = args.path.includes(
+          `${nodePath.sep}src${nodePath.sep}lib${nodePath.sep}protocols${nodePath.sep}`
+        );
+        if (!isProtocolTransport && !needsShim.test(code)) return null;
         return { contents: `${banner}\n${source}`, loader: 'ts' };
       });
     },
@@ -96,10 +97,9 @@ function fixDynamicImportExtensions() {
 //
 // `fixImportsPlugin` (see tsup#1240) supplies what `bundle: false` leaves out:
 // it appends the correct extension to relative imports, rewrites directory
-// imports to `/index`, and resolves tsconfig path aliases. Its alias step is
-// neutralised by pointing the build at a paths-free tsconfig (below), because
-// the only `paths` entry (`structured-headers`) is a typecheck-only pin to the
-// package's CJS type file and must stay a bare external import at runtime.
+// imports to `/index`, and resolves tsconfig path aliases. Pointing the build
+// at a paths-free tsconfig keeps its alias step neutral so external package
+// imports remain bare at runtime.
 // Declarations are emitted separately by `tsc --emitDeclarationOnly`.
 export default defineConfig({
   entry: ['src/lib/**/*.ts', '!src/lib/**/*.test.ts', '!src/lib/**/*.d.ts', '!src/lib/**/*.type-checks.ts'],
@@ -109,8 +109,6 @@ export default defineConfig({
   platform: 'node',
   bundle: false,
   // A paths-free tsconfig so the import-fixer's alias resolution is a no-op.
-  // The only `paths` entry (`structured-headers`) is a typecheck-only pin;
-  // at runtime it must stay a bare external import, not a rewritten path.
   tsconfig: 'tsconfig.build.json',
   sourcemap: true,
   clean: true,

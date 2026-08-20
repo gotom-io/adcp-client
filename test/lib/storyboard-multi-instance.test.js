@@ -67,6 +67,7 @@ async function startFakeAgent({
   label,
   tools = ['__test_write', '__test_read', '__test_probe', 'get_adcp_capabilities'],
   capabilities = { version: '1.0', protocols: [], specialisms: [] },
+  products = [],
   failToolsList = false,
 }) {
   const requests = [];
@@ -136,6 +137,9 @@ async function startFakeAgent({
     if (toolName === 'get_adcp_capabilities') {
       return ok(capabilities);
     }
+    if (toolName === 'get_products') {
+      return ok({ products, cache_scope: 'public' });
+    }
     return notFound(`unknown tool ${toolName} on instance ${label}`);
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
@@ -162,6 +166,18 @@ function storyboardWith(steps) {
     agent: { interaction_model: '*', capabilities: [] },
     caller: { role: 'buyer_agent' },
     phases: [{ id: 'p', title: 'crud', steps }],
+  };
+}
+
+function compoundCapabilityStoryboard() {
+  return {
+    ...storyboardWith([{ id: 'discover', title: 'discover', task: 'get_products', auth: 'none', sample_request: {} }]),
+    id: 'compound_capability_discovery',
+    requires_all_capabilities: [
+      { path: 'media_buy.propagation_surfaces', contains: 'snapshot' },
+      { path: 'creative.has_creative_library', equals: true },
+    ],
+    required_tools: ['get_products', 'sync_creatives'],
   };
 }
 
@@ -353,6 +369,52 @@ describe('runStoryboard: multi-instance multi-pass', () => {
     agentB = undefined;
   });
 
+  test('post-discovery normal run skips a failed compound gate before scenario dispatch', async () => {
+    agentA = await startFakeAgent({
+      state: new Map(),
+      label: 'A',
+      tools: ['get_adcp_capabilities', 'get_products', 'sync_creatives'],
+      capabilities: {
+        media_buy: { propagation_surfaces: ['snapshot'] },
+        creative: { has_creative_library: false },
+      },
+    });
+    const result = await runStoryboard(agentA.url, compoundCapabilityStoryboard(), {
+      protocol: 'mcp',
+      allow_http: true,
+    });
+    assert.strictEqual(result.phases[0].steps[0].skip_reason, 'capability_unsupported');
+    assert.deepStrictEqual(
+      agentA.requests.map(request => request.tool),
+      ['get_adcp_capabilities']
+    );
+  });
+
+  test('real multi-pass discovery skips once before any pass or scenario dispatch', async () => {
+    const options = {
+      state: new Map(),
+      tools: ['get_adcp_capabilities', 'get_products', 'sync_creatives'],
+      capabilities: {
+        media_buy: { propagation_surfaces: ['snapshot'] },
+        creative: { has_creative_library: false },
+      },
+    };
+    agentA = await startFakeAgent({ ...options, label: 'A' });
+    agentB = await startFakeAgent({ ...options, label: 'B' });
+    const result = await runStoryboard([agentA.url, agentB.url], compoundCapabilityStoryboard(), {
+      protocol: 'mcp',
+      allow_http: true,
+      multi_instance_strategy: 'multi-pass',
+    });
+    assert.strictEqual(result.phases[0].steps[0].skip_reason, 'capability_unsupported');
+    assert.strictEqual(result.passes, undefined);
+    assert.ok([...agentA.requests, ...agentB.requests].some(request => request.tool === 'get_adcp_capabilities'));
+    assert.deepStrictEqual(
+      [...agentA.requests, ...agentB.requests].filter(request => request.tool !== 'get_adcp_capabilities'),
+      []
+    );
+  });
+
   test('runs N passes with swapped starting replica and reports per-pass detail', async () => {
     const shared = new Map();
     agentA = await startFakeAgent({ state: shared, label: 'A' });
@@ -392,6 +454,78 @@ describe('runStoryboard: multi-instance multi-pass', () => {
     // Top-level `phases` exposes the first pass's phases for single-pass consumers.
     assert.strictEqual(result.phases[0].steps[0].agent_index, 1);
     assert.strictEqual(result.phases[0].steps[1].agent_index, 2);
+  });
+
+  test('coalesces unresolved fixture evidence into one coverage gap across passes', async () => {
+    const shared = new Map();
+    const tools = ['get_products', 'create_media_buy'];
+    agentA = await startFakeAgent({ state: shared, label: 'A', tools });
+    agentB = await startFakeAgent({ state: shared, label: 'B', tools });
+    const storyboard = {
+      id: 'multi_pass_fixture_gap',
+      version: '3.2.0',
+      title: 'Multi-pass fixture gap',
+      category: 'testing',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: '*', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      prerequisites: { description: '', controller_seeding: false },
+      fixtures: { products: [{ product_id: 'usd' }, { product_id: 'eur' }] },
+      fixture_resolution: {
+        products: [
+          {
+            handle: 'usd',
+            strategies: ['discover'],
+            match: [{ path: '/currency', operator: 'equals', value: 'USD' }],
+          },
+          {
+            handle: 'eur',
+            strategies: ['discover'],
+            match: [{ path: '/currency', operator: 'equals', value: 'EUR' }],
+          },
+        ],
+      },
+      phases: [
+        {
+          id: 'buy',
+          title: 'Buy',
+          steps: [{ id: 'create', title: 'Create', task: 'create_media_buy', sample_request: {}, validations: [] }],
+        },
+      ],
+    };
+    const result = await runStoryboard([agentA.url, agentB.url], storyboard, {
+      protocol: 'mcp',
+      allow_http: true,
+      agentTools: tools,
+      _profile: { name: 'fake', tools: tools.map(name => ({ name })) },
+      multi_instance_strategy: 'multi-pass',
+    });
+
+    assert.strictEqual(result.passes.length, 2);
+    const gaps = result.coverage_gaps.filter(gap => gap.reason === 'fixture_unsatisfied');
+    assert.strictEqual(result.coverage_gaps.length, 1);
+    assert.strictEqual(gaps.length, 1);
+    assert.deepStrictEqual(
+      gaps[0].fixtures.map(fixture => fixture.handle),
+      ['usd', 'eur']
+    );
+    assert.strictEqual(result.passes.flatMap(pass => pass.phases.flatMap(phase => phase.steps)).length, 0);
+    assert.strictEqual(result.passed_count, 0);
+    assert.strictEqual(result.failed_count, 0);
+    assert.strictEqual(result.skipped_count, 1);
+    assert.strictEqual(result.overall_passed, true);
+    for (const [index, pass] of result.passes.entries()) {
+      assert.strictEqual(pass.passed_count, 0);
+      assert.strictEqual(pass.failed_count, 0);
+      assert.strictEqual(pass.skipped_count, index === 0 ? 1 : 0);
+    }
+    assert.ok(Array.isArray(result.fixture_resolutions));
+    assert.strictEqual(Object.hasOwn(result, 'fixture_resolution'), false);
+    assert.strictEqual(
+      [...agentA.requests, ...agentB.requests].filter(request => request.tool === 'get_products').length,
+      1
+    );
   });
 
   test('does not pre-seed when discovery shows every executable phase is capability-gated out', async () => {
@@ -449,6 +583,71 @@ describe('runStoryboard: multi-instance multi-pass', () => {
       allRequests.filter(r => r.tool === 'comply_test_controller'),
       [],
       'all executable phases are gated out, so controller seeding must not run'
+    );
+  });
+
+  test('preflights an initial creative fixture gap before multi-pass controller seeding', async () => {
+    const shared = new Map();
+    const tools = ['get_adcp_capabilities', 'comply_test_controller', 'sync_creatives'];
+    agentA = await startFakeAgent({ state: shared, label: 'A', tools });
+    agentB = await startFakeAgent({ state: shared, label: 'B', tools });
+    const storyboard = {
+      id: 'multi_pass_creative_fixture_gap',
+      version: '1.0.0',
+      title: 'Multi-pass creative fixture gap',
+      category: 'testing',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: '*', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      prerequisites: { description: 'needs seeds', controller_seeding: true },
+      fixtures: { products: [{ product_id: 'p-1' }] },
+      context: {
+        format_params: {
+          slots: [{ asset_group_id: 'video_main', asset_type: 'video', required: true }],
+        },
+      },
+      phases: [
+        {
+          id: 'creative',
+          title: 'Creative',
+          steps: [
+            {
+              id: 'sync',
+              title: 'Sync',
+              task: 'sync_creatives',
+              sample_request: {
+                creatives: [
+                  {
+                    creative_id: 'creative-1',
+                    assets: { $build_assets_from_format: '$context.format_params' },
+                  },
+                ],
+              },
+              validations: [],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = await runStoryboard([agentA.url, agentB.url], storyboard, {
+      protocol: 'mcp',
+      allow_http: true,
+      agentTools: tools,
+      _profile: { name: 'fake', tools: tools.map(name => ({ name })) },
+      multi_instance_strategy: 'multi-pass',
+      test_kit: { assets: {} },
+    });
+
+    assert.strictEqual(result.overall_passed, true);
+    assert.strictEqual(result.passes.length, 2);
+    assert.ok(result.passes.every(pass => pass.phases[0].steps[0].skip_reason === 'fixture_unavailable'));
+    const allRequests = [...agentA.requests, ...agentB.requests];
+    assert.deepStrictEqual(
+      allRequests.filter(request => request.tool === 'comply_test_controller' || request.tool === 'sync_creatives'),
+      [],
+      'fixture preflight must run before seeding or creative transport'
     );
   });
 
@@ -593,6 +792,29 @@ describe('runStoryboard: multi-instance multi-pass', () => {
     );
   });
 
+  test('gates replay_webhook_vector before multi-pass discovery when no receiver is configured', async () => {
+    const storyboard = storyboardWith([
+      {
+        id: 'replay_envelope',
+        title: 'Replay a canonical webhook envelope',
+        task: 'replay_webhook_vector',
+        vector_ref: 'static/test-vectors/webhook-receiver-envelope.json#positive/mcp-delivery-report-envelope',
+      },
+    ]);
+
+    const result = await runStoryboard(['http://127.0.0.1:1/mcp', 'http://127.0.0.1:2/mcp'], storyboard, {
+      ...RUN_OPTIONS_BASE,
+      multi_instance_strategy: 'multi-pass',
+    });
+
+    assert.strictEqual(result.overall_passed, true);
+    assert.strictEqual(result.failed_count, 0);
+    assert.strictEqual(result.skipped_count, 1, 'whole-storyboard applicability skip is not multiplied per replica');
+    assert.strictEqual(result.passes, undefined, 'gate returns before multi-pass discovery and aggregation');
+    assert.strictEqual(result.phases[0].steps[0].skip.reason, 'not_applicable');
+    assert.strictEqual(result.phases[0].steps[0].skip.requirement, 'webhook_replay_receiver');
+  });
+
   test('rotates dispatch across 3 replicas with 3 passes', async () => {
     const shared = new Map();
     const agents = await Promise.all([
@@ -705,9 +927,8 @@ describe('runStoryboard: multi-instance through MCP SDK', () => {
   });
 
   test('round-robins a stateless storyboard across two MCP stubs via the SDK', async () => {
-    // check_governance is deterministic per plan_id — both stubs accept it and
-    // return identical responses, so this storyboard doesn't depend on state
-    // sharing. It exists solely to verify that the MCP SDK path (initialize
+    // Each check_governance call is independent, so this storyboard doesn't
+    // depend on state sharing. It exists solely to verify that the MCP SDK path (initialize
     // handshake, tools/call serialization, session handling) works when the
     // runner has two distinct transports rotating per step.
     const storyboard = {
@@ -730,10 +951,10 @@ describe('runStoryboard: multi-instance through MCP SDK', () => {
               task: 'check_governance',
               sample_request: {
                 plan_id: 'plan-mcp-sdk',
-                binding: 'proposed',
-                caller: 'buyer',
+                caller: 'https://buyer.example',
+                target_agent: 'https://seller.example/mcp',
                 tool: 'create_media_buy',
-                payload: { budget: 100 },
+                payload: { total_budget: { amount: 100, currency: 'USD' } },
               },
             },
             {
@@ -742,10 +963,10 @@ describe('runStoryboard: multi-instance through MCP SDK', () => {
               task: 'check_governance',
               sample_request: {
                 plan_id: 'plan-mcp-sdk',
-                binding: 'proposed',
-                caller: 'buyer',
+                caller: 'https://buyer.example',
+                target_agent: 'https://seller.example/mcp',
                 tool: 'create_media_buy',
-                payload: { budget: 200 },
+                payload: { total_budget: { amount: 200, currency: 'USD' } },
               },
             },
             {
@@ -754,10 +975,10 @@ describe('runStoryboard: multi-instance through MCP SDK', () => {
               task: 'check_governance',
               sample_request: {
                 plan_id: 'plan-mcp-sdk',
-                binding: 'proposed',
-                caller: 'buyer',
+                caller: 'https://buyer.example',
+                target_agent: 'https://seller.example/mcp',
                 tool: 'create_media_buy',
-                payload: { budget: 300 },
+                payload: { total_budget: { amount: 300, currency: 'USD' } },
               },
             },
           ],

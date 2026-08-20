@@ -85,6 +85,7 @@ function startReferenceVerifier({ replayCap = 1000 } = {}) {
     revoked_jtis: [],
   });
   const middleware = createExpressVerifier({
+    adcpVersion: '3.1',
     capability: {
       supported: true,
       covers_content_digest: 'either',
@@ -123,6 +124,33 @@ function startReferenceVerifier({ replayCap = 1000 } = {}) {
 }
 
 describe('request-signing: synthesize step expansion', () => {
+  test('compliance loader synthesizes vectors from the selected frozen bundle', () => {
+    const previousComplianceDir = process.env.ADCP_COMPLIANCE_DIR;
+    process.env.ADCP_COMPLIANCE_DIR = path.join('compliance', 'cache', '3.2.0-beta.3');
+    let storyboards;
+    try {
+      storyboards = loadBundleStoryboards({
+        kind: 'universal',
+        id: 'signed-requests',
+        path: path.join('compliance', 'cache', '3.0.24', 'universal', 'signed-requests.yaml'),
+        adcp_version: '3.0.24',
+      });
+    } finally {
+      if (previousComplianceDir === undefined) delete process.env.ADCP_COMPLIANCE_DIR;
+      else process.env.ADCP_COMPLIANCE_DIR = previousComplianceDir;
+    }
+    const sb = storyboards.find(storyboard => storyboard.id === 'signed_requests');
+    assert.ok(sb, '3.0.24 signed_requests storyboard loaded');
+    assert.strictEqual(sb.adcp_version, '3.0.24');
+    assert.strictEqual(sb.compliance_dir, path.join('compliance', 'cache', '3.0.24'));
+    assert.strictEqual(sb.phases.find(phase => phase.id === 'positive_vectors').steps.length, 12);
+    assert.strictEqual(
+      sb.phases.find(phase => phase.id === 'negative_vectors').steps.length,
+      27,
+      '3.0.24 must not synthesize the 28 vectors from the ambient 3.2 cache'
+    );
+  });
+
   test('compliance loader synthesizes per-vector steps for the signed-requests universal storyboard', () => {
     // AdCP 3.0.1 promoted `signed-requests` from a specialism to a universal
     // capability-gated storyboard (lives at `universal/signed-requests.yaml`,
@@ -143,8 +171,8 @@ describe('request-signing: synthesize step expansion', () => {
     const positivePhase = sb.phases.find(p => p.id === 'positive_vectors');
     const negativePhase = sb.phases.find(p => p.id === 'negative_vectors');
     assert.ok(positivePhase && negativePhase, 'vector phases present');
-    assert.strictEqual(positivePhase.steps.length, 12, 'all 12 positive steps synthesized');
-    assert.strictEqual(negativePhase.steps.length, 28, 'all 28 negative steps synthesized');
+    assert.strictEqual(positivePhase.steps.length, 12, 'all 3.1-compatible positive steps synthesized');
+    assert.strictEqual(negativePhase.steps.length, 28, 'all 3.1-compatible negative steps synthesized');
 
     for (const step of positivePhase.steps) {
       assert.ok(step.id.startsWith('positive-'), `positive step id: ${step.id}`);
@@ -202,6 +230,7 @@ describe('request-signing: runner dispatch against reference verifier', () => {
   test('probe dispatch grades a positive vector with 2xx + empty WWW-Authenticate', async () => {
     const result = await probeRequestSigningVector('positive-001-basic-post', instance.url, {
       allow_http: true,
+      request_signing: { transport: 'raw' },
     });
     assert.ok(!result.error, `probe error: ${result.error}`);
     assert.ok(result.status >= 200 && result.status < 300, `status ${result.status}`);
@@ -213,6 +242,7 @@ describe('request-signing: runner dispatch against reference verifier', () => {
     try {
       const result = await probeRequestSigningVector('negative-002-wrong-tag', fresh.url, {
         allow_http: true,
+        request_signing: { transport: 'raw' },
       });
       assert.ok(!result.error, `probe error: ${result.error}`);
       assert.strictEqual(result.status, 401);
@@ -286,6 +316,7 @@ describe('request-signing: runner dispatch against reference verifier', () => {
       const result = await runStoryboardStep(fresh.url, storyboard, 'positive-001-basic-post', {
         allow_http: true,
         _client: {}, // bypass MCP profile discovery — probe tasks don't touch the client
+        request_signing: { transport: 'raw' },
       });
       assert.strictEqual(result.passed, true, `step should pass: ${result.error}`);
       assert.strictEqual(result.response.status, 200);
@@ -341,6 +372,7 @@ describe('request-signing: runner dispatch against reference verifier', () => {
     try {
       const result = await probeRequestSigningVector('negative-007-missing-content-digest', fresh.url, {
         allow_http: true,
+        request_signing: { transport: 'raw' },
       });
       assert.ok(result.error, 'grader mismatch surfaces as probe error');
       assert.ok(/expected 401/.test(result.error), `diagnostic: ${result.error}`);

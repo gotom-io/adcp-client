@@ -12,6 +12,162 @@ describe('Zod Schema Validation', () => {
     assert.ok(schemas, 'Schemas should be importable');
   });
 
+  test('ESM package entry can be imported', async () => {
+    const sdk = await import('../../dist/lib/index.mjs');
+    assert.equal(typeof sdk.ADCP_VERSION, 'string', 'package root should expose its version');
+  });
+
+  test('reference image and carousel fixtures conform to SDK schemas', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+    const { prepareImageCarouselReference, prepareImageReference } =
+      await import('../../packages/reference-renderers/index.js');
+    const imageManifest = {
+      format_kind: 'image',
+      assets: {
+        image_main: {
+          asset_type: 'image',
+          url: 'https://cdn.example/image.png',
+          width: 300,
+          height: 250,
+        },
+      },
+    };
+    const imageDeclaration = {
+      format_kind: 'image',
+      params: { width: 300, height: 250 },
+    };
+    const carouselManifest = {
+      format_kind: 'image_carousel',
+      assets: {
+        cards: ['one', 'two'].map(id => ({
+          asset_type: 'card',
+          media: {
+            asset_type: 'image',
+            url: `https://cdn.example/${id}.png`,
+            width: 600,
+            height: 600,
+          },
+          headline: `Card ${id}`,
+        })),
+      },
+    };
+    const carouselDeclaration = {
+      format_kind: 'image_carousel',
+      params: {
+        min_cards: 2,
+        max_cards: 4,
+        card_aspect_ratio: '1:1',
+        allowed_card_media_asset_types: ['image'],
+      },
+    };
+
+    for (const [manifest, declaration, prepare] of [
+      [imageManifest, imageDeclaration, prepareImageReference],
+      [carouselManifest, carouselDeclaration, prepareImageCarouselReference],
+    ]) {
+      assert.strictEqual(schemas.CreativeManifestSchema.safeParse(manifest).success, true);
+      assert.strictEqual(schemas.ProductFormatDeclarationSchema.safeParse(declaration).success, true);
+      assert.strictEqual(prepare({ manifest, declaration }).ok, true);
+    }
+  });
+
+  test('all canonical-format overlays accept the shared array-valued slots contract', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+    const canonicalSchemas = [
+      schemas.CanonicalFormatDisplayTagSchema,
+      schemas.CanonicalFormatImageCarouselSchema,
+      schemas.CanonicalFormatHostedVideoSchema,
+      schemas.CanonicalFormatVASTVideoSchema,
+      schemas.CanonicalFormatHostedAudioSchema,
+      schemas.CanonicalFormatDAASTAudioSchema,
+      schemas.CanonicalFormatSponsoredPlacementRetailMediaCatalogDrivenSchema,
+      schemas.CanonicalFormatNativeInFeedSchema,
+      schemas.CanonicalFormatResponsiveCreativeSchema,
+      schemas.CanonicalFormatAgentPlacementAISurfaceSponsoredPlacementSchema,
+      schemas.CanonicalFormatHTML5BannerSchema,
+    ];
+    const value = {
+      slots: [{ asset_group_id: 'audio_main', asset_type: 'audio', required: true }],
+    };
+
+    for (const schema of canonicalSchemas) {
+      assert.strictEqual(schema.safeParse(value).success, true);
+    }
+  });
+
+  test('placement presentation documents preserve their closed declarative boundary', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const valid = {
+      schema_version: '1.0',
+      canvas: { width: 300, height: 250, background_color: '#ffffff' },
+      creative_slot: { x: 0, y: 0, width: 300, height: 200, fit: 'contain', clip: true },
+      decorations: [
+        {
+          kind: 'text',
+          layer: 'in_front_of_creative',
+          bounds: { x: 0, y: 200, width: 300, height: 50 },
+          text: 'Sponsored',
+          text_color: '#000000',
+          font_size: 14,
+        },
+      ],
+    };
+    assert.strictEqual(schemas.PlacementPresentationDocumentSchema.safeParse(valid).success, true);
+
+    const invalidDocuments = [
+      { ...valid, html: '<script>alert(1)</script>' },
+      { ...valid, canvas: { ...valid.canvas, width: 300.5 } },
+      { ...valid, creative_slot: { ...valid.creative_slot, x: 1 } },
+      { ...valid, decorations: Array.from({ length: 101 }, () => valid.decorations[0]) },
+      {
+        ...valid,
+        decorations: [{ ...valid.decorations[0], bounds: { x: 0, y: 201, width: 300, height: 50 } }],
+      },
+      {
+        ...valid,
+        decorations: [{ ...valid.decorations[0], event_handler: 'alert(1)' }],
+      },
+    ];
+
+    for (const document of invalidDocuments) {
+      assert.strictEqual(schemas.PlacementPresentationDocumentSchema.safeParse(document).success, false);
+    }
+  });
+
+  test('asset size constraints retain integer and positive-number semantics', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const image = { asset_type: 'image', url: 'https://cdn.example/image.png', width: 300, height: 250 };
+    assert.strictEqual(schemas.ImageAssetSchema.safeParse({ ...image, file_size_bytes: 1 }).success, true);
+    assert.strictEqual(schemas.ImageAssetSchema.safeParse({ ...image, file_size_bytes: 0.5 }).success, false);
+    assert.strictEqual(schemas.CanonicalFormatHostedVideoSchema.safeParse({ max_file_size_mb: 1 }).success, true);
+    assert.strictEqual(schemas.CanonicalFormatHostedVideoSchema.safeParse({ max_file_size_mb: 1.5 }).success, false);
+    assert.strictEqual(schemas.CanonicalFormatHostedAudioSchema.safeParse({ max_file_size_mb: 0.5 }).success, true);
+    assert.strictEqual(schemas.CanonicalFormatHostedAudioSchema.safeParse({ max_file_size_mb: 0 }).success, false);
+  });
+
+  test('CreativeBriefSchema requires at least one required disclosure when present', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const brief = required_disclosures => ({
+      name: 'Launch brief',
+      compliance: { required_disclosures },
+    });
+    assert.strictEqual(schemas.CreativeBriefSchema.safeParse(brief([])).success, false);
+    assert.strictEqual(schemas.CreativeBriefSchema.safeParse(brief([{ text: 'Terms apply.' }])).success, true);
+  });
+
   test('ProductSchema is importable and has parse method', async () => {
     if (!schemas) {
       schemas = await import('../../dist/lib/types/schemas.generated.js');
@@ -24,6 +180,26 @@ describe('Zod Schema Validation', () => {
     assert.equal(typeof schemas.ProductSchema.omit, 'function', 'ProductSchema should support omit');
     assert.equal(typeof schemas.ProductSchema.pick, 'function', 'ProductSchema should support pick');
     assert.ok(schemas.CanonicalFormatImageSchema.shape.image_formats, 'canonical formats should expose object shape');
+  });
+
+  test('PriceBreakdownSchema preserves adjustment XOR and 1..20 bounds', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+    const adjustment = { kind: 'fee', name: 'ad_serving', rate: 0.1 };
+    assert.equal(schemas.PriceBreakdownSchema.safeParse({ list_price: 10, adjustments: [adjustment] }).success, true);
+    assert.equal(schemas.PriceBreakdownSchema.safeParse({ list_price: 10, adjustments: [] }).success, false);
+    assert.equal(
+      schemas.PriceBreakdownSchema.safeParse({ list_price: 10, adjustments: Array(21).fill(adjustment) }).success,
+      false
+    );
+    assert.equal(
+      schemas.PriceBreakdownSchema.safeParse({
+        list_price: 10,
+        adjustments: [{ ...adjustment, amount: 1 }],
+      }).success,
+      false
+    );
   });
 
   test('ProductSchema exposes ZodObject composition helpers', async () => {
@@ -44,6 +220,96 @@ describe('Zod Schema Validation', () => {
       picked.safeParse({ product_id: 'prod_123' }).success,
       'picked ProductSchema should validate picked shape'
     );
+  });
+
+  test('CancellationPolicySchema enforces fee values by fee type', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const policy = cancellation_fee => ({
+      notice_period: { interval: 30, unit: 'days' },
+      cancellation_fee,
+    });
+
+    assert.ok(schemas.CancellationPolicySchema.safeParse(policy({ type: 'percent_remaining', rate: 0.5 })).success);
+    assert.ok(!schemas.CancellationPolicySchema.safeParse(policy({ type: 'percent_remaining' })).success);
+    assert.ok(schemas.CancellationPolicySchema.safeParse(policy({ type: 'fixed_fee', amount: 250 })).success);
+    assert.ok(!schemas.CancellationPolicySchema.safeParse(policy({ type: 'fixed_fee' })).success);
+    assert.ok(schemas.CancellationPolicySchema.safeParse(policy({ type: 'full_commitment' })).success);
+    assert.ok(schemas.CancellationPolicySchema.safeParse(policy({ type: 'none' })).success);
+  });
+
+  test('canonical delivery metrics stay strict while legacy response variants remain tolerant', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const baseMetrics = { impressions: 10, spend: 2.5 };
+    assert.ok(!schemas.CatalogItemDeliveryMetricsSchema.safeParse(baseMetrics).success);
+    assert.ok(schemas.CatalogItemDeliveryMetricsSchema.safeParse({ ...baseMetrics, content_id: 'sku-1' }).success);
+
+    assert.ok(!schemas.KeywordDeliveryMetricsSchema.safeParse({ ...baseMetrics, keyword: 'running shoes' }).success);
+    assert.ok(!schemas.KeywordDeliveryMetricsSchema.safeParse({ ...baseMetrics, match_type: 'exact' }).success);
+    assert.ok(
+      schemas.KeywordDeliveryMetricsSchema.safeParse({
+        ...baseMetrics,
+        keyword: 'running shoes',
+        match_type: 'exact',
+      }).success
+    );
+
+    assert.ok(!schemas.GeoDeliveryMetricsSchema.safeParse({ ...baseMetrics, geo_level: 'country' }).success);
+    assert.ok(!schemas.GeoDeliveryMetricsSchema.safeParse({ ...baseMetrics, geo_code: 'US' }).success);
+    assert.ok(
+      schemas.GeoDeliveryMetricsSchema.safeParse({ ...baseMetrics, geo_level: 'country', geo_code: 'US' }).success
+    );
+
+    assert.ok(schemas.GetMediaBuyDeliveryCatalogItemMetricsSchema.safeParse(baseMetrics).success);
+    assert.ok(schemas.GetMediaBuyDeliveryKeywordMetricsSchema.safeParse(baseMetrics).success);
+    assert.ok(schemas.GetMediaBuyDeliveryGeoMetricsSchema.safeParse(baseMetrics).success);
+
+    const legacyResponse = {
+      status: 'completed',
+      reporting_period: { start: '2026-01-01T00:00:00Z', end: '2026-01-02T00:00:00Z' },
+      media_buy_deliveries: [
+        {
+          media_buy_id: 'buy-1',
+          status: 'active',
+          totals: baseMetrics,
+          by_package: [
+            {
+              package_id: 'package-1',
+              ...baseMetrics,
+              by_catalog_item: [baseMetrics],
+              by_keyword: [baseMetrics],
+              by_geo: [baseMetrics],
+              by_geo_truncated: false,
+              by_device_type: [baseMetrics],
+              by_device_platform: [baseMetrics],
+              by_audience: [baseMetrics],
+              by_placement: [baseMetrics],
+            },
+          ],
+        },
+      ],
+    };
+    assert.ok(
+      schemas.GetMediaBuyDeliveryResponseSchema.safeParse(legacyResponse).success,
+      'full legacy delivery response should remain wired to optional compatibility metrics'
+    );
+  });
+
+  test('PostalCountrySystemSchema requires a valid country and system pair', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    assert.ok(!schemas.PostalCountrySystemSchema.safeParse({}).success);
+    assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ country: 'US' }).success);
+    assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ system: 'zip' }).success);
+    assert.ok(schemas.PostalCountrySystemSchema.safeParse({ country: 'US', system: 'zip' }).success);
+    assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ country: 'US', system: 'outward' }).success);
   });
 
   test('Trusted Match request schemas reject unexpected privacy-boundary fields', async () => {
@@ -93,6 +359,94 @@ describe('Zod Schema Validation', () => {
       ],
     };
     assert.ok(schemas.IdentityMatchRequestSchema.safeParse(identityWithProof).success);
+  });
+
+  test('Trusted Match 3.1.10 schemas enforce hop isolation and TMPX constraints', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const chunk = { slot_id: 'primary', value: 'opaque-value' };
+    const baseResponse = {
+      status: 'completed',
+      type: 'identity_match_response',
+      request_id: 'id-1',
+      eligible_package_ids: ['pkg-1'],
+      serve_window_sec: 60,
+    };
+    const providerResponse = { ...baseResponse, tmpx_chunks: [chunk] };
+    const routerResponse = {
+      ...baseResponse,
+      tmpx_providers: { provider_1: { chunks: [chunk] } },
+    };
+
+    assert.ok(schemas.IdentityMatchResponseProviderRouterSchema.safeParse(providerResponse).success);
+    assert.ok(schemas.IdentityMatchResponseRouterPublisherSchema.safeParse(routerResponse).success);
+    assert.strictEqual(schemas.IdentityMatchResponseSchema, schemas.IdentityMatchResponseRouterPublisherSchema);
+    assert.ok(schemas.TmpxMacroSchema.safeParse({ name: 'LEGACY_SLOT', value: 'opaque' }).success);
+
+    for (const forbidden of [
+      { context: {} },
+      { ext: {} },
+      { tmpx: 'legacy' },
+      { tmpx_providers: { provider_1: { chunks: [chunk] } } },
+    ]) {
+      assert.ok(
+        !schemas.IdentityMatchResponseProviderRouterSchema.safeParse({ ...providerResponse, ...forbidden }).success
+      );
+    }
+    for (const forbidden of [{ context: {} }, { ext: {} }, { tmpx_chunks: [chunk] }, { tmpx_macros: [] }]) {
+      assert.ok(
+        !schemas.IdentityMatchResponseRouterPublisherSchema.safeParse({ ...routerResponse, ...forbidden }).success
+      );
+    }
+
+    assert.ok(!schemas.TMPXChunkSchema.safeParse({ ...chunk, destination: 'PUBLISHER_MACRO' }).success);
+    assert.ok(
+      !schemas.IdentityMatchResponseProviderRouterSchema.safeParse({ ...baseResponse, tmpx_chunks: [] }).success
+    );
+    assert.ok(
+      !schemas.IdentityMatchResponseProviderRouterSchema.safeParse({
+        ...baseResponse,
+        tmpx_chunks: [chunk, { ...chunk, slot_id: 'secondary' }, { ...chunk, slot_id: 'third' }],
+      }).success
+    );
+    assert.ok(
+      !schemas.IdentityMatchResponseRouterPublisherSchema.safeParse({
+        ...baseResponse,
+        tmpx_providers: { 'bad-provider': { chunks: [chunk] } },
+      }).success
+    );
+
+    const registration = {
+      provider_id: 'provider_1',
+      endpoint: 'https://provider.example',
+      identity_match: true,
+      countries: ['US'],
+      uid_types: ['uid2'],
+      tmpx_slots: ['primary', 'secondary'],
+    };
+    assert.ok(schemas.TMPProviderRegistrationSchema.safeParse(registration).success);
+    assert.ok(!schemas.TMPProviderRegistrationSchema.safeParse({ ...registration, countries: undefined }).success);
+    assert.ok(
+      !schemas.TMPProviderRegistrationSchema.safeParse({ ...registration, tmpx_slots: ['primary', 'primary'] }).success
+    );
+    assert.ok(
+      !schemas.TMPProviderRegistrationSchema.safeParse({ ...registration, tmpx_slots: ['a', 'b', 'c'] }).success
+    );
+
+    const mapping = { tmpx_macro_mapping: { provider_1: { primary: 'GAM_KEY' } } };
+    assert.ok(schemas.PublisherTMPXMacroMappingSchema.safeParse(mapping).success);
+    assert.ok(
+      !schemas.PublisherTMPXMacroMappingSchema.safeParse({
+        tmpx_macro_mapping: { 'bad-provider': { primary: 'GAM_KEY' } },
+      }).success
+    );
+    assert.ok(
+      !schemas.PublisherTMPXMacroMappingSchema.safeParse({
+        tmpx_macro_mapping: { provider_1: { a: 'A', b: 'B', c: 'C' } },
+      }).success
+    );
   });
 
   test('generated declarations do not expose record-union object intersections', async () => {
@@ -209,6 +563,160 @@ describe('Zod Schema Validation', () => {
     assert.ok(
       typeof schemas.CreativeAssetSchema.safeParse === 'function',
       'CreativeAssetSchema should have safeParse method'
+    );
+  });
+
+  test('CreativeAssetSchema enforces exclusive identity and a valid legacy agent URL', async () => {
+    const schemas = await import('../../dist/lib/types/schemas.generated.mjs');
+    const base = { creative_id: 'creative_1', name: 'Creative', assets: {} };
+
+    assert.strictEqual(
+      schemas.CreativeAssetSchema.safeParse({
+        ...base,
+        format_kind: 'image',
+        format_id: { agent_url: 'https://legacy.example', id: 'display_image' },
+      }).success,
+      false
+    );
+    assert.strictEqual(
+      schemas.CreativeAssetSchema.safeParse({
+        ...base,
+        format_id: { agent_url: 'bad', id: 'display_image' },
+      }).success,
+      false
+    );
+    assert.doesNotThrow(() =>
+      schemas.CreativeAssetSchema.safeParse({
+        ...base,
+        format_id: { agent_url: ' https://legacy.example ', id: 'display_image' },
+      })
+    );
+    assert.strictEqual(
+      schemas.CreativeAssetSchema.safeParse({
+        ...base,
+        format_id: { agent_url: ' https://legacy.example ', id: 'display_image' },
+      }).success,
+      false
+    );
+    for (const agent_url of [
+      'https://legacy.example/a b',
+      'https://legacy.example/a\tb',
+      'https://legacy.example/%ZZ',
+      'https://münich.example',
+    ]) {
+      assert.strictEqual(
+        schemas.CreativeAssetSchema.safeParse({
+          ...base,
+          format_id: { agent_url, id: 'display_image' },
+        }).success,
+        false,
+        `agent_url must reject whitespace: ${JSON.stringify(agent_url)}`
+      );
+    }
+    for (const forbiddenIdentity of ['capability_id', 'capability_ref']) {
+      assert.strictEqual(
+        schemas.CreativeAssetSchema.safeParse({
+          ...base,
+          format_kind: 'image',
+          [forbiddenIdentity]: 'legacy-capability',
+        }).success,
+        false,
+        `${forbiddenIdentity} is forbidden by the creative schema`
+      );
+    }
+  });
+
+  test('creative schemas validate slot assets and canonical manifest identity', async () => {
+    const schemas = await import('../../dist/lib/types/schemas.generated.mjs');
+
+    assert.strictEqual(
+      schemas.CreativeManifestSchema.safeParse({
+        format_kind: 'display_tag',
+        assets: { tag_url: { asset_type: 'url' } },
+      }).success,
+      false,
+      'URL assets must include url'
+    );
+    assert.strictEqual(
+      schemas.CreativeManifestSchema.safeParse({
+        format_kind: 'display_tag',
+        assets: { tag_url: [] },
+      }).success,
+      false,
+      'multi-value asset slots must be non-empty'
+    );
+    assert.strictEqual(
+      schemas.CreativeManifestSchema.safeParse({
+        format_kind: 'display_tag',
+        assets: {
+          tag_url: { asset_type: 'url', url: 'https://creative.example/tag.js' },
+        },
+      }).success,
+      true
+    );
+    assert.strictEqual(
+      schemas.CreativeManifestSchema.safeParse({ assets: {} }).success,
+      false,
+      'a manifest requires exactly one identity branch'
+    );
+    assert.strictEqual(
+      schemas.CreativeManifestSchema.safeParse({
+        format_kind: 'display_tag',
+        format_id: { agent_url: 'https://legacy.example', id: 'display_tag' },
+        assets: {},
+      }).success,
+      false,
+      'legacy and canonical identities are mutually exclusive'
+    );
+    assert.strictEqual(
+      schemas.CreativeManifestSchema.safeParse({
+        format_kind: 'display_tag',
+        assets: { 'x-vendor-extension': { vendor_payload: true } },
+      }).success,
+      true,
+      'nonmatching extension keys remain allowed by additionalProperties'
+    );
+
+    const assetBase = { creative_id: 'creative_1', name: 'Creative', format_kind: 'display_tag' };
+    assert.strictEqual(
+      schemas.CreativeAssetSchema.safeParse({
+        ...assetBase,
+        assets: { tag_url: { asset_type: 'url' } },
+      }).success,
+      false,
+      'creative library assets apply the same slot validation'
+    );
+    assert.strictEqual(
+      schemas.CreativeAssetSchema.safeParse({
+        ...assetBase,
+        assets: {
+          tag_url: [
+            { asset_type: 'url', url: 'https://creative.example/one.js' },
+            { asset_type: 'url', url: 'https://creative.example/two.js' },
+          ],
+        },
+      }).success,
+      true,
+      'creative library assets accept populated variant arrays'
+    );
+    assert.strictEqual(
+      schemas.CreativeAssetSchema.safeParse({
+        ...assetBase,
+        assets: { 'x-vendor-extension': { vendor_payload: true } },
+      }).success,
+      true,
+      'creative library assets preserve extension keys'
+    );
+  });
+
+  test('creative runtime validation does not inflate MCP JSON schemas', async () => {
+    const schemas = await import('../../dist/lib/types/schemas.generated.mjs');
+    const inputSchema = z.toJSONSchema(schemas.CreativeManifestSchema);
+
+    assert.deepStrictEqual(
+      inputSchema.properties.assets.additionalProperties,
+      {},
+      'runtime-only slot validation must not expand AssetVariant into MCP discovery schemas'
     );
   });
 
@@ -725,6 +1233,7 @@ describe('Zod Schema Validation', () => {
       'IndividualImageAssetSchema',
       'GroupVideoAssetSchema',
       'CreativeVariantSchema',
+      'CanonicalProposalSchema',
     ];
 
     for (const name of schemasToCheck) {
@@ -735,6 +1244,15 @@ describe('Zod Schema Validation', () => {
       assert.strictEqual(typeof schema.omit, 'function', `${name} should expose .omit()`);
       assert.strictEqual(typeof schema.pick, 'function', `${name} should expose .pick()`);
     }
+
+    const proposalSchema = schemas.CanonicalProposalSchema;
+    const picked = proposalSchema.pick({ proposal_id: true });
+    assert.equal(picked.safeParse({ proposal_id: 'proposal-1' }).success, true);
+    assert.equal(picked.safeParse({}).success, false);
+    const omitted = proposalSchema.omit({ description: true });
+    assert.ok(omitted.shape.proposal_id, 'omit() should return an operable object schema');
+    const extended = proposalSchema.extend({ extension_field: z.string() });
+    assert.ok(extended.shape.extension_field, 'extend() should return an operable object schema');
   });
 
   test('every generated tool request schema has an MCP input shape', async () => {
@@ -1026,6 +1544,30 @@ describe('Zod Schema Validation', () => {
     );
   });
 
+  test('activate signal destination/deployment unions preserve platform and agent identities', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const destinations = [
+      { type: 'platform', platform: 'the-trade-desk', account: 'seat_123' },
+      { type: 'agent', agent_url: 'https://signals.example.com/mcp', account: 'agent_account_456' },
+    ];
+    const request = schemas.ActivateSignalRequestSchema.safeParse({
+      signal_agent_segment_id: 'segment_1',
+      destinations,
+      idempotency_key: 'activate-signal-union-0001',
+    });
+    assert.ok(request.success, `Both destination arms should validate: ${JSON.stringify(request.error?.issues)}`);
+
+    const deployments = destinations.map(destination =>
+      destination.type === 'platform' ? { ...destination, is_live: false } : { ...destination, is_live: false }
+    );
+    const response = schemas.ActivateSignalSuccessSchema.safeParse({ deployments });
+    assert.ok(response.success, `Both deployment arms should validate: ${JSON.stringify(response.error?.issues)}`);
+    assert.deepStrictEqual(response.data.deployments, deployments);
+  });
+
   test('record schemas preserve value types after undefined removal', async () => {
     if (!schemas) {
       schemas = await import('../../dist/lib/types/schemas.generated.js');
@@ -1100,5 +1642,379 @@ describe('Zod Schema Validation', () => {
     assert.ok(schemas.AssetRequirementsSchema, 'AssetRequirementsSchema should be exported');
     const bogus = schemas.AssetRequirementsSchema.safeParse('not-an-object');
     assert.ok(!bogus.success, 'AssetRequirementsSchema should reject non-object values');
+  });
+
+  test('RefineProposalsResponseSchema preserves exact canonical and refine-arm requirements', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+    const { proposalTermsDigest } = require('../../dist/lib/negotiation/verification.js');
+    const { getSchemaValidatorByRef } = require('../../dist/lib/validation/schema-loader.js');
+
+    const commercial_terms = {
+      brand: { domain: 'buyer.example' },
+      purchases: [
+        {
+          product_id: 'product-1',
+          pricing_option_id: 'price-1',
+          pricing: {
+            pricing_option_id: 'price-1',
+            pricing_model: 'cpm',
+            currency: 'USD',
+            fixed_price: 8,
+          },
+          impressions: 1_000_000,
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        },
+      ],
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+      total_budget: { amount: 8_000, currency: 'USD' },
+    };
+    const canonicalProposal = (status, suffix) => ({
+      proposal_id: `proposal-${suffix}`,
+      proposal_kind: 'new_media_buy',
+      parent_proposal_id: 'proposal-source',
+      proposal_status: status,
+      name: `Proposal ${suffix}`,
+      commercial_terms,
+      terms_digest: proposalTermsDigest(commercial_terms),
+      ...(status === 'committed' && { expires_at: '2027-01-02T00:00:00Z' }),
+    });
+    const completed = result => ({ status: 'completed', results: [result], products: [] });
+    const dateEdgeProposal = (suffix, expires_at) => ({
+      ...canonicalProposal('draft', suffix),
+      expires_at,
+    });
+    const dateEdges = [
+      ['lowercase-date', '2027-01-02t00:00:00z'],
+      ['leap-second', '2016-12-31T23:59:60Z'],
+      ['space-separator', '2027-01-02 00:00:00Z'],
+      ['compact-offset', '2027-01-02T00:00:00+0100'],
+    ];
+    const exactValidator = getSchemaValidatorByRef('media-buy/refine-proposals-response.json', '3.2.0-beta.3');
+    assert.ok(exactValidator, 'exact refine_proposals response validator should be available');
+    const exactAccepts = payload => exactValidator(payload);
+    const zodAccepts = payload => schemas.RefineProposalsResponseSchema.safeParse(payload).success;
+
+    const valid = [
+      { status: 'submitted', task_id: 'task-refine-1' },
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: [canonicalProposal('draft', 'revised')],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'partial')],
+        reason_code: 'commercially_declined',
+        reason: 'Only part of the request can be offered',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'finalized',
+        proposal: {
+          ...canonicalProposal('committed', 'finalized'),
+          expires_at: '2027-01-02T01:00:00+01:00',
+        },
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: dateEdges.map(([suffix, expiresAt]) => dateEdgeProposal(suffix, expiresAt)),
+      }),
+      ...dateEdges.map(([suffix, expiresAt]) =>
+        completed({
+          source_proposal_id: 'proposal-source',
+          outcome: 'finalized',
+          proposal: {
+            ...canonicalProposal('committed', `finalized-${suffix}`),
+            expires_at: expiresAt,
+          },
+        })
+      ),
+    ];
+    const incomplete = [
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: [{ proposal_status: 'draft', parent_proposal_id: 'proposal-source' }],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [{ proposal_status: 'draft', parent_proposal_id: 'proposal-source' }],
+        reason_code: 'commercially_declined',
+        reason: 'Only part of the request can be offered',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'finalized',
+        proposal: {
+          proposal_status: 'committed',
+          parent_proposal_id: 'proposal-source',
+          expires_at: '2027-01-02T00:00:00Z',
+        },
+      }),
+    ];
+    const missingParentDraft = canonicalProposal('draft', 'missing-parent');
+    delete missingParentDraft.parent_proposal_id;
+    const missingParentCommitted = canonicalProposal('committed', 'missing-parent-finalized');
+    delete missingParentCommitted.parent_proposal_id;
+    const missingExpiry = canonicalProposal('committed', 'missing-expiry');
+    delete missingExpiry.expires_at;
+    const emptyProposalId = canonicalProposal('draft', 'empty-id');
+    emptyProposalId.proposal_id = '';
+    const malformedDigest = canonicalProposal('draft', 'bad-digest');
+    malformedDigest.terms_digest = 'sha256:not-a-digest';
+    const invalidExpiry = canonicalProposal('committed', 'invalid-expiry');
+    invalidExpiry.expires_at = 'tomorrow';
+    const invalidOptionalExpiry = canonicalProposal('draft', 'invalid-optional-expiry');
+    invalidOptionalExpiry.expires_at = 'tomorrow';
+    const invalidOptionalAcceptedAt = canonicalProposal('draft', 'invalid-optional-accepted-at');
+    invalidOptionalAcceptedAt.accepted_at = 'tomorrow';
+    const emptyPurchases = canonicalProposal('draft', 'empty-purchases');
+    emptyPurchases.commercial_terms = { ...commercial_terms, purchases: [] };
+    const missingResolvedPurchase = canonicalProposal('draft', 'missing-resolved-purchase');
+    missingResolvedPurchase.commercial_terms = {
+      ...commercial_terms,
+      purchases: [{ product_id: 'product-1', pricing_option_id: 'price-1' }],
+    };
+    const invalidCommercialFlight = canonicalProposal('draft', 'invalid-commercial-flight');
+    invalidCommercialFlight.commercial_terms = { ...commercial_terms, end_time: 'tomorrow' };
+    const invalidCommercialBudget = canonicalProposal('draft', 'invalid-commercial-budget');
+    invalidCommercialBudget.commercial_terms = {
+      ...commercial_terms,
+      total_budget: { amount: -1, currency: 'usd' },
+    };
+    const proposalWithTargetingOverlay = (suffix, targeting_overlay) => {
+      const proposal = canonicalProposal('draft', suffix);
+      proposal.commercial_terms = {
+        ...commercial_terms,
+        purchases: [{ ...commercial_terms.purchases[0], targeting_overlay }],
+      };
+      return proposal;
+    };
+    const missingFrequencyDependencies = proposalWithTargetingOverlay('frequency-dependencies', {
+      frequency_cap: { max_impressions: 3 },
+    });
+    const missingVerifiedAgeBasis = proposalWithTargetingOverlay('verified-age-basis', {
+      demographics: {
+        age: {
+          min: 18,
+          include_unknown: false,
+          accepted_verification_methods: ['digital_id'],
+          accepted_bases: ['declared'],
+        },
+      },
+    });
+    const emptyBiddingPolicy = canonicalProposal('draft', 'empty-bidding-policy');
+    emptyBiddingPolicy.commercial_terms = {
+      ...commercial_terms,
+      purchases: [{ ...commercial_terms.purchases[0], bidding: {} }],
+    };
+    const incompleteUpdate = {
+      ...canonicalProposal('draft', 'incomplete-update'),
+      proposal_kind: 'media_buy_update',
+    };
+    delete incompleteUpdate.media_buy_id;
+    delete incompleteUpdate.base_media_buy_revision;
+    const missingProducts = completed({
+      source_proposal_id: 'proposal-source',
+      outcome: 'revised',
+      proposals: [canonicalProposal('draft', 'missing-products')],
+    });
+    delete missingProducts.products;
+    const completedWithTaskId = {
+      ...completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: [canonicalProposal('draft', 'completed-task-id')],
+      }),
+      task_id: 'task-not-allowed-on-completed',
+    };
+    incomplete.push(
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [] }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [],
+        reason_code: 'commercially_declined',
+        reason: 'No successor was produced',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: [missingParentDraft],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [missingParentDraft],
+        reason_code: 'commercially_declined',
+        reason: 'Only part of the request can be offered',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'finalized',
+        proposal: missingParentCommitted,
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'finalized',
+        proposal: missingExpiry,
+      }),
+      missingProducts,
+      { status: 'completed', results: [], products: [] },
+      completedWithTaskId,
+      {
+        status: 'completed',
+        results: [
+          {
+            source_proposal_id: 'proposal-source',
+            outcome: 'revised',
+            proposals: [canonicalProposal('draft', 'mixed-revised')],
+          },
+          {
+            source_proposal_id: 'proposal-source-2',
+            outcome: 'finalized',
+            proposal: {
+              ...canonicalProposal('committed', 'mixed-finalized'),
+              parent_proposal_id: 'proposal-source-2',
+            },
+          },
+        ],
+        products: [],
+      },
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: [canonicalProposal('draft', 'forbidden-reason')],
+        reason: 'not allowed on revised',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'partial-forbidden-proposal')],
+        proposal: canonicalProposal('draft', 'partial-singular'),
+        reason_code: 'commercially_declined',
+        reason: 'Partial response',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'finalized',
+        proposal: canonicalProposal('committed', 'finalized-forbidden-proposals'),
+        proposals: [canonicalProposal('draft', 'finalized-draft')],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'unable',
+        reason_code: 'source_unavailable',
+        reason: 'Source unavailable',
+        proposal: canonicalProposal('draft', 'unable-forbidden-proposal'),
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'empty-suggestions')],
+        reason_code: 'commercially_declined',
+        reason: 'Partial response',
+        suggestions: [],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'empty-unsatisfied')],
+        reason_code: 'commercially_declined',
+        reason: 'Partial response',
+        unsatisfied_constraints: [],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'unable',
+        reason_code: 'constraint_unsatisfiable',
+        reason: 'No matching terms',
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'duplicate-constraints')],
+        reason_code: 'constraint_unsatisfiable',
+        reason: 'Repeated constraint keys',
+        unsatisfied_constraints: ['budget', 'budget'],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'empty-constraint-name')],
+        reason_code: 'constraint_unsatisfiable',
+        reason: 'Empty constraint key',
+        unsatisfied_constraints: [''],
+      }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'partial',
+        proposals: [canonicalProposal('draft', 'empty-suggestion')],
+        reason_code: 'commercially_declined',
+        reason: 'Empty suggestion',
+        suggestions: [''],
+      }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [emptyProposalId] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [malformedDigest] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [incompleteUpdate] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'finalized', proposal: invalidExpiry }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [invalidOptionalExpiry] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [invalidOptionalAcceptedAt] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [emptyPurchases] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [missingResolvedPurchase] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [invalidCommercialFlight] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [invalidCommercialBudget] }),
+      completed({
+        source_proposal_id: 'proposal-source',
+        outcome: 'revised',
+        proposals: [missingFrequencyDependencies],
+      }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [missingVerifiedAgeBasis] }),
+      completed({ source_proposal_id: 'proposal-source', outcome: 'revised', proposals: [emptyBiddingPolicy] }),
+      {
+        status: 'submitted',
+        task_id: 'task-mixed-results',
+        results: [
+          {
+            source_proposal_id: 'proposal-source',
+            outcome: 'revised',
+            proposals: [canonicalProposal('draft', 'submitted-revised')],
+          },
+          {
+            source_proposal_id: 'proposal-source-2',
+            outcome: 'finalized',
+            proposal: {
+              ...canonicalProposal('committed', 'submitted-finalized'),
+              parent_proposal_id: 'proposal-source-2',
+            },
+          },
+        ],
+      }
+    );
+
+    for (const [index, payload] of valid.entries()) {
+      assert.equal(exactAccepts(payload), true, 'exact schema should accept a complete canonical proposal');
+      const parsed = schemas.RefineProposalsResponseSchema.safeParse(payload);
+      assert.equal(
+        parsed.success,
+        true,
+        `public Zod schema should accept complete canonical proposal ${index}: ${JSON.stringify(parsed.error?.issues)}`
+      );
+    }
+    for (const [index, payload] of incomplete.entries()) {
+      assert.equal(exactAccepts(payload), false, `exact schema should reject incomplete case ${index}`);
+      assert.equal(
+        zodAccepts(payload),
+        false,
+        `public Zod schema must reject incomplete case ${index}: ${JSON.stringify(payload)}`
+      );
+    }
   });
 });

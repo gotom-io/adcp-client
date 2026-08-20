@@ -13,7 +13,7 @@ const {
   rawMcpProbe,
   rawA2aProbe,
 } = require('../../dist/lib/testing/storyboard/probes');
-const { runStoryboard } = require('../../dist/lib/testing/storyboard/runner');
+const { runStoryboard, runStoryboardStep } = require('../../dist/lib/testing/storyboard/runner');
 const { loadStoryboardFile } = require('../../dist/lib/testing/storyboard/loader');
 const { comply, detectAuthRejection } = require('../../dist/lib/testing/compliance/comply');
 const {
@@ -26,6 +26,7 @@ const {
   CapabilityResolutionError,
 } = require('../../dist/lib/testing/storyboard/compliance');
 const { ADCPError, isADCPError } = require('../../dist/lib/errors');
+const { BrandJsonSchema } = require('../../dist/lib/types/wellknown-schemas.generated');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -101,6 +102,12 @@ describe('isPrivateIp', () => {
     assert.strictEqual(isPrivateIp('100.128.0.0'), false);
   });
 
+  it('flags documentation and benchmarking ranges used by SSRF test vectors', () => {
+    for (const addr of ['192.0.2.1', '198.18.0.1', '198.51.100.1', '203.0.113.1']) {
+      assert.strictEqual(isPrivateIp(addr), true, `${addr} should be flagged`);
+    }
+  });
+
   it('unwraps IPv4-mapped IPv6 (::ffff:a.b.c.d) and flags if v4 is private', () => {
     assert.strictEqual(isPrivateIp('::ffff:10.0.0.1'), true);
     assert.strictEqual(isPrivateIp('::ffff:169.254.169.254'), true);
@@ -111,6 +118,12 @@ describe('isPrivateIp', () => {
   it('flags IPv6 multicast', () => {
     for (const addr of ['ff02::1', 'ff05::1:3']) {
       assert.strictEqual(isPrivateIp(addr), true, `${addr} should be multicast`);
+    }
+  });
+
+  it('flags IPv6 documentation and discard-only ranges', () => {
+    for (const addr of ['2001:db8::1', '100::1']) {
+      assert.strictEqual(isPrivateIp(addr), true, `${addr} should be special-use`);
     }
   });
 });
@@ -275,17 +288,54 @@ describe('resource_equals_agent_url', () => {
     assert.strictEqual(r.passed, true);
   });
 
-  it('passes after normalization (trailing slash, case)', () => {
+  it('normalizes scheme/host case and the default port', () => {
     const [r] = runOne([{ check: 'resource_equals_agent_url', description: 'RFC 9728 resource' }], {
       agentUrl,
       httpResult: {
         url: '',
         status: 200,
         headers: {},
-        body: { resource: 'HTTPS://Agent.Example.com/mcp/' },
+        body: { resource: 'HTTPS://Agent.Example.com:443/mcp' },
       },
     });
     assert.strictEqual(r.passed, true);
+  });
+
+  it('keeps a trailing slash significant', () => {
+    const [r] = runOne([{ check: 'resource_equals_agent_url', description: 'RFC 9728 resource' }], {
+      agentUrl,
+      httpResult: {
+        url: '',
+        status: 200,
+        headers: {},
+        body: { resource: 'https://agent.example.com/mcp/' },
+      },
+    });
+    assert.strictEqual(r.passed, false);
+  });
+
+  it('does not normalize dot segments or an empty path', () => {
+    const [dotSegment] = runOne([{ check: 'resource_equals_agent_url', description: 'RFC 9728 resource' }], {
+      agentUrl,
+      httpResult: {
+        url: '',
+        status: 200,
+        headers: {},
+        body: { resource: 'https://agent.example.com/other/../mcp' },
+      },
+    });
+    assert.strictEqual(dotSegment.passed, false);
+
+    const [emptyPath] = runOne([{ check: 'resource_equals_agent_url', description: 'RFC 9728 resource' }], {
+      agentUrl: 'https://agent.example.com',
+      httpResult: {
+        url: '',
+        status: 200,
+        headers: {},
+        body: { resource: 'https://agent.example.com/' },
+      },
+    });
+    assert.strictEqual(emptyPath.passed, false);
   });
 
   it('fails on mismatch and does NOT echo the advertised value verbatim', () => {
@@ -304,6 +354,27 @@ describe('resource_equals_agent_url', () => {
     // But it SHOULD surface the agent's own URL + the actionable fix.
     assert.match(r.error ?? '', /agent\.example\.com\/mcp/);
     assert.match(r.error ?? '', /Fix:/);
+  });
+
+  it('redacts credentials, query values, and fragments from mismatch diagnostics', () => {
+    const [r] = runOne([{ check: 'resource_equals_agent_url', description: 'RFC 9728 resource' }], {
+      agentUrl: 'https://runner:agent-secret@agent.example.com/mcp?access_token=runner-secret#runner-fragment',
+      httpResult: {
+        url: '',
+        status: 200,
+        headers: {},
+        body: {
+          resource:
+            'https://attacker:resource-secret@auth.example.com/mcp?access_token=resource-secret#resource-fragment',
+        },
+      },
+    });
+    assert.strictEqual(r.passed, false);
+    const serialized = JSON.stringify(r);
+    for (const secret of ['agent-secret', 'runner-secret', 'runner-fragment', 'resource-secret', 'resource-fragment']) {
+      assert.doesNotMatch(serialized, new RegExp(secret));
+    }
+    assert.match(serialized, /REDACTED/);
   });
 
   it('fails when resource field missing', () => {
@@ -1027,6 +1098,173 @@ describe('storyboard runner: auth-override dispatch', () => {
     }
   });
 
+  it('selects an advertised safe auth probe when the configured preference is inapplicable', async () => {
+    let seenTool;
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (maybeHandleMcpHandshake(rpc, res)) return;
+      seenTool = rpc.params.name;
+      res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="x"' });
+      res.end('{}');
+    });
+    await new Promise(r => server.listen(0, r));
+    const agentUrl = `http://127.0.0.1:${server.address().port}/mcp`;
+    try {
+      const storyboard = {
+        id: 'select_safe_probe',
+        version: '1.0.0',
+        title: 'Select safe probe',
+        category: 'security',
+        summary: '',
+        narrative: '',
+        agent: { interaction_model: '*', capabilities: [] },
+        caller: { role: 'buyer_agent' },
+        phases: [
+          {
+            id: 'p',
+            title: 'probe',
+            steps: [
+              {
+                id: 's1',
+                title: 'unauth probe',
+                task: '$test_kit.auth.probe_task',
+                task_default: 'list_creatives',
+                auth: 'none',
+                expect_error: true,
+                validations: [{ check: 'http_status_in', allowed_values: [401, 403], description: 'rejects unauth' }],
+              },
+            ],
+          },
+        ],
+      };
+      const result = await runStoryboard(agentUrl, storyboard, {
+        protocol: 'mcp',
+        allow_http: true,
+        agentTools: ['get_signals'],
+        test_kit: { auth: { api_key: 'sk_test', probe_task: 'list_creatives' } },
+        _profile: { name: 'Test', tools: ['get_signals'] },
+        _client: { getAgentInfo: async () => ({ name: 'Test', tools: [{ name: 'get_signals' }] }) },
+      });
+      assert.strictEqual(seenTool, 'get_signals');
+      assert.strictEqual(result.overall_passed, true);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('standalone steps select an advertised auth probe after discovering tools', async () => {
+    let seenTool;
+    const server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      if (chunks.length === 0) {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (maybeHandleMcpHandshake(rpc, res)) return;
+      if (rpc.method === 'tools/list') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: { tools: [{ name: 'get_signals', inputSchema: { type: 'object' } }] },
+          })
+        );
+        return;
+      }
+      seenTool = rpc.params.name;
+      res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="x"' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, error: { code: -32001, message: 'auth required' } }));
+    });
+    await new Promise(resolve => server.listen(0, resolve));
+    const agentUrl = `http://127.0.0.1:${server.address().port}/mcp`;
+    const storyboard = {
+      id: 'standalone_safe_probe',
+      version: '1.0.0',
+      title: 'Standalone safe probe',
+      category: 'security',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: '*', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      phases: [
+        {
+          id: 'p',
+          title: 'probe',
+          steps: [
+            {
+              id: 's1',
+              title: 'unauth probe',
+              task: '$test_kit.auth.probe_task',
+              task_default: 'list_creatives',
+              auth: 'none',
+              expect_error: true,
+              validations: [{ check: 'http_status_in', allowed_values: [401, 403], description: 'rejects unauth' }],
+            },
+          ],
+        },
+      ],
+    };
+    try {
+      const result = await runStoryboardStep(agentUrl, storyboard, 's1', {
+        protocol: 'mcp',
+        allow_http: true,
+        test_kit: { auth: { api_key: 'sk_test', probe_task: 'list_creatives' } },
+      });
+      assert.strictEqual(seenTool, 'get_signals');
+      assert.strictEqual(result.passed, true, JSON.stringify(result));
+    } finally {
+      server.close();
+    }
+  });
+
+  it('grades SI-only auth probes not_applicable instead of calling a nonexistent session-list tool', async () => {
+    const storyboard = {
+      id: 'si_probe_not_applicable',
+      version: '1.0.0',
+      title: 'SI probe selection',
+      category: 'security',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: '*', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      phases: [
+        {
+          id: 'p',
+          title: 'probe',
+          steps: [
+            {
+              id: 's1',
+              title: 'unauth probe',
+              task: '$test_kit.auth.probe_task',
+              task_default: 'list_creatives',
+              auth: 'none',
+              expect_error: true,
+              validations: [{ check: 'http_status_in', allowed_values: [401, 403], description: 'rejects unauth' }],
+            },
+          ],
+        },
+      ],
+    };
+    const siTools = ['si_get_offering', 'si_initiate_session', 'si_send_message', 'si_terminate_session'];
+    const result = await runStoryboard('https://si.example/mcp', storyboard, {
+      protocol: 'mcp',
+      agentTools: siTools,
+      test_kit: { auth: { api_key: 'sk_test', probe_task: 'list_creatives' } },
+      _profile: { name: 'SI', tools: siTools },
+      _client: { getAgentInfo: async () => ({ name: 'SI', tools: siTools.map(name => ({ name })) }) },
+    });
+    const step = result.phases[0].steps[0];
+    assert.strictEqual(step.passed, true);
+    assert.strictEqual(step.skipped, true);
+    assert.strictEqual(step.skip.reason, 'not_applicable');
+  });
+
   it('auth: none sends no Authorization header; value_strategy: random_invalid sends a random key', async () => {
     const observed = [];
     const server = http.createServer((req, res) => {
@@ -1297,6 +1535,92 @@ describe('storyboard runner: auth-override dispatch', () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe('storyboard runner: portfolio brand JWKS discovery', () => {
+  it('finds jwks_uri under a house portfolio brand agents array', async () => {
+    const brandJsonUrl = 'https://portfolio.example/.well-known/brand.json';
+    const jwksUrl = 'https://keys.example/jwks.json';
+    const fetchedUrls = [];
+    const manifest = {
+      house: {
+        domain: 'portfolio.example',
+        name: 'Publisher House',
+        agents: [
+          {
+            type: 'sales',
+            id: 'other_sales',
+            url: 'https://other-seller.example/mcp',
+            jwks_uri: 'https://other-keys.example/jwks.json',
+          },
+        ],
+      },
+      brands: [
+        {
+          id: 'publisher-brand',
+          names: [{ en: 'Publisher Brand' }],
+          agents: [{ type: 'sales', id: 'publisher_sales', url: 'https://seller.example/mcp', jwks_uri: jwksUrl }],
+        },
+      ],
+    };
+    assert.doesNotThrow(() => BrandJsonSchema.parse(manifest));
+    const fetchFn = async input => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url === brandJsonUrl) {
+        return new Response(JSON.stringify(manifest), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === jwksUrl) {
+        return new Response(JSON.stringify({ keys: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    };
+    const storyboard = {
+      id: 'portfolio_jwks',
+      version: '1.0.0',
+      title: 'Portfolio JWKS',
+      category: 'security',
+      summary: '',
+      narrative: '',
+      agent: { interaction_model: '*', capabilities: [] },
+      caller: { role: 'buyer_agent' },
+      phases: [
+        {
+          id: 'jwks',
+          title: 'JWKS',
+          steps: [
+            {
+              id: 'fetch',
+              title: 'Fetch portfolio JWKS',
+              task: 'fetch_brand_jwks',
+              validations: [{ check: 'http_status', value: 200, description: 'JWKS is reachable' }],
+            },
+          ],
+        },
+      ],
+    };
+    const result = await runStoryboard('https://seller.example/mcp', storyboard, {
+      protocol: 'mcp',
+      agentTools: ['get_adcp_capabilities'],
+      transport: { trustedFetchFn: fetchFn },
+      _profile: {
+        name: 'Portfolio seller',
+        tools: ['get_adcp_capabilities'],
+        raw_capabilities: { identity: { brand_json_url: brandJsonUrl } },
+      },
+      _client: {
+        getAgentInfo: async () => ({ name: 'Portfolio seller', tools: [{ name: 'get_adcp_capabilities' }] }),
+      },
+    });
+    assert.strictEqual(result.overall_passed, true, JSON.stringify(result.phases[0].steps[0]));
+    assert.deepStrictEqual(fetchedUrls, [brandJsonUrl, jwksUrl]);
   });
 });
 
@@ -1694,7 +2018,9 @@ describe('comply() degraded-profile path (security_baseline against 401-on-disco
     });
     await new Promise(r => server.listen(0, r));
     try {
-      const agentUrl = `http://127.0.0.1:${server.address().port}/mcp`;
+      const agentUrl =
+        `http://127.0.0.1:${server.address().port}/mcp` +
+        '?access_token=FAKE_COMPLY_QUERY_SECRET#FAKE_COMPLY_FRAGMENT_SECRET';
       const result = await comply(agentUrl, {
         storyboards: ['security_baseline'],
         allow_http: true,
@@ -1713,6 +2039,43 @@ describe('comply() degraded-profile path (security_baseline against 401-on-disco
       assert.notStrictEqual(result.overall_status, 'unreachable');
       const authObs = result.observations.find(o => o.category === 'auth' && /401|OAuth/.test(o.message));
       assert.ok(authObs, `expected an auth observation noting the 401, got ${JSON.stringify(result.observations)}`);
+      const serialized = JSON.stringify(result);
+      assert.doesNotMatch(serialized, /FAKE_COMPLY_QUERY_SECRET|FAKE_COMPLY_FRAGMENT_SECRET/);
+      assert.match(result.agent_url, /access_token=REDACTED/);
+      for (const failure of result.failures ?? []) {
+        assert.doesNotMatch(failure.fix_command, /FAKE_COMPLY_QUERY_SECRET|FAKE_COMPLY_FRAGMENT_SECRET/);
+      }
+    } finally {
+      server.close();
+    }
+  });
+
+  it('emits reference-only tested_tracks from the degraded-profile constructor', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(401, {
+        'content-type': 'application/json',
+        'www-authenticate': 'Bearer realm="test", error="invalid_token"',
+      });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+    });
+    await new Promise(r => server.listen(0, r));
+    try {
+      const agentUrl = `http://127.0.0.1:${server.address().port}/mcp`;
+      const result = await comply(agentUrl, {
+        storyboards: ['read_tool_idempotency'],
+        allow_http: true,
+        timeout_ms: 30000,
+      });
+
+      assert.ok(result.storyboards_executed?.includes('read_tool_idempotency'));
+      assert.ok(result.tested_tracks.length > 0, 'expected the failed read probe to produce a tested track');
+      for (const track of result.tested_tracks) {
+        assert.strictEqual('scenarios' in track, false, 'tested_tracks entries must omit scenarios');
+        assert.strictEqual('skipped_scenarios' in track, false, 'tested_tracks entries must omit skipped scenarios');
+      }
+      const canonicalScenarioCount = result.tracks.reduce((count, track) => count + track.scenarios.length, 0);
+      const serializedScenarioCount = (JSON.stringify(result).match(/"scenario":/g) ?? []).length;
+      assert.strictEqual(serializedScenarioCount, canonicalScenarioCount);
     } finally {
       server.close();
     }
@@ -2028,7 +2391,6 @@ describe('validateTestKit', () => {
         'get_media_buy_delivery',
         'list_authorized_properties',
         'get_signals',
-        'list_si_sessions',
         'list_property_lists',
         'list_collection_lists',
         'list_content_standards',

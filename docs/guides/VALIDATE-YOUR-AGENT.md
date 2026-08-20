@@ -84,6 +84,7 @@ npx @adcp/sdk@adcp-3.1 storyboard run http://localhost:3001/mcp --json > report.
 - `--storyboards <id1,id2>` — limit to specific storyboard IDs
 - `--compliance-version <version>` — select the compliance cache/spec line used for resolution and request version intent; pass the same flag to `storyboard list`, `show`, and `step` when reproducing a pinned run
 - `--compliance-dir <path>` — use a specific compliance cache directory for local protocol/cache development
+- `--schema-root <path>` — use a matching external schema bundle for request/response validation; pair it with `--compliance-dir` when the two directories are not co-located
 - `--webhook-receiver [loopback|proxy]` — host a webhook sink so async steps grade instead of skip
 - `--webhook-receiver-auto-tunnel` — autodetect `ngrok`/`cloudflared` on `PATH`, spawn and plug into proxy mode
 - `--invariants <mod1,mod2>` — load custom cross-step assertion modules
@@ -92,9 +93,50 @@ npx @adcp/sdk@adcp-3.1 storyboard run http://localhost:3001/mcp --json > report.
 - `--auth <token>` — bearer token (also accepts `$ADCP_AUTH_TOKEN`)
 - `--oauth` — run the browser OAuth flow inline when the saved alias has no valid tokens (MCP only; equivalent to `adcp --save-auth <alias> <url> --oauth` then re-running)
 
-**Hosted compliance bundles.** Programmatic runners that mount compliance
-assets outside the installed SDK can pair the storyboard cache and schema cache
-explicitly:
+**Authoring webhook assertions.** Webhook storyboard pseudo-steps share the
+receiver URL and filter contract. Use `triggered_by` to scope the observation
+to the earlier step's `{{runner.webhook_url:<step_id>}}`; add `filter.body`
+entries for dotted-path payload matching.
+
+`expect_no_webhook` asserts silence: it passes only when zero matching
+deliveries arrive during the observation window (five seconds by default) and
+fails on the first match with `unexpected_webhook_received`. It deliberately
+does not validate a payload schema or require an `idempotency_key` on the
+passing path because no payload exists to inspect.
+
+```yaml
+- id: expect_sync_silence
+  task: expect_no_webhook
+  triggered_by: sync_get_products_with_webhook_config_success
+  filter:
+    body:
+      operation_id: op_sync_get_products_no_webhook
+  timeout_seconds: 5
+```
+
+All `expect_webhook*` steps require `webhook_receiver` runner support. If the
+`triggered_by` step is missing, skipped, or failed, the assertion skips with
+`prerequisite_failed` instead of treating the absence as a passing result.
+
+### Running against pre-publish artifacts
+
+Use a matching compliance bundle and schema root to validate a protocol build
+before its matching SDK package is published:
+
+```bash
+adcp storyboard run https://agent.example.com/mcp \
+  --compliance-dir /app/dist/compliance/latest \
+  --schema-root /app/dist/schemas/latest
+```
+
+The supplied JSON Schema bundle is authoritative for storyboard request and
+response validation. Same-change tools, fields, and controller scenarios do
+not need to exist in the SDK's generated validator snapshot, and the workflow
+does not write into `node_modules/@adcp/sdk`. A `schemas/latest` bundle may
+retain `/schemas/latest/...` IDs when its root `index.json` declares the real
+`adcp_version`; the index preserves cross-version validation fencing.
+
+Programmatic runners can pair the two directories explicitly as well:
 
 ```ts
 import { comply } from '@adcp/sdk/testing';
@@ -233,7 +275,9 @@ The `deterministic_testing` universal storyboard — plus rejection-branch and d
 import { createComplyController, TestControllerError } from '@adcp/sdk/testing';
 
 const controller = createComplyController({
-  sandboxGate: input => input.auth?.sandbox === true,   // fail closed
+  // This is server-controlled deployment state. Every field in `input` is
+  // buyer-supplied and MUST NOT be used as the authority boundary.
+  sandboxGate: () => process.env.ADCP_SANDBOX === '1',
   seed: {
     buyer_agent: (params, ctx) => {
       const seededAccount = ctx.input.account ?? ctx.input.context?.account;
@@ -268,6 +312,19 @@ const controller = createComplyController({
 
 controller.register(server);
 ```
+
+Direct `controller.register(server)` calls without a `sandboxGate` are
+refused. The only escape hatch is for deliberately ungated local harnesses:
+set `NODE_ENV` to `test` or `development` **and** set
+`ADCP_COMPLY_CONTROLLER_UNGATED=1`. `ADCP_SANDBOX=1` alone is not a request
+gate and does not authorize ungated registration.
+
+Migration for direct registrations: pass a `sandboxGate` that closes over
+trusted server-side deployment or authentication state. The callback's
+`input` argument contains buyer-supplied tool arguments, not trusted auth
+context. For per-principal sandbox accounts, use
+`createAdcpServerFromPlatform(platform, { complyTest })`; its framework-owned
+registration resolves the authenticated account before dispatch.
 
 Omit adapters you don't support — they auto-return `UNKNOWN_SCENARIO`. Throw `TestControllerError('INVALID_TRANSITION', msg, currentState)` when the state machine disallows a transition; the helper emits the typed envelope. `controller.register(server)` auto-emits `capabilities.compliance_testing.scenarios` per AdCP 3.0 — don't declare `compliance_testing` in `supported_protocols`.
 
@@ -333,6 +390,11 @@ import { createAdcpServer, bridgeFromSessionStore } from '@adcp/sdk/server';
 
 const server = createAdcpServer({
   // ... usual config + per-adapter handlers ...
+  // Both paths are required: account-bearing tools use resolveAccount;
+  // account-less tools use resolveAccountFromAuth. Resolve mode from trusted
+  // server-side account state, never from the request's sandbox marker.
+  resolveAccount: (ref, ctx) => accounts.resolve(ref, ctx),
+  resolveAccountFromAuth: ctx => accounts.resolve(undefined, ctx),
   testController: bridgeFromSessionStore({
     loadSession: (_input, ctx) => sessionStore.loadForAccount(requireResolvedAccount(ctx.account)),
 
@@ -362,7 +424,7 @@ const server = createAdcpServer({
 
 Bridge contract:
 
-- **Triply gated.** Bridge runs only when the bridge is registered, the request carries a sandbox marker (`account.sandbox === true` or `context.sandbox === true`), and — if `resolveAccount` produced a record — that record is `sandbox: true` too. Production traffic untouched.
+- **Triply gated.** Bridge runs only when the bridge is registered, the request carries a sandbox marker (`account.sandbox === true` or `context.sandbox === true`), and the applicable resolver returns a trusted account with `mode: 'sandbox' | 'mock'` (or legacy `sandbox: true`). Account-bearing tools use `resolveAccount`; account-less tools use `resolveAccountFromAuth`. Missing or null resolution fails closed. Production traffic is untouched.
 - **Post-handler merge.** The adapter's real handler runs first (so a broken `snapClient.getCreatives()` still fails the conformance gate — the bridge supplements, it does not replace adapter behavior). Seeded entries append; on id collision the seeded fixture wins.
 - **Singleton exception.** `get_account_financials` returns one account's envelope, so the bridge picks the seeded fixture whose `account.account_id` matches the request's `account.account_id` and REPLACES the handler envelope for that account. Other accounts pass through unchanged. When `resolveAccount` produces a record, the resolved `account_id` wins over the request's `account_id` — fixtures are interchangeable across `AccountReference` variants. The same pattern applies to `get_property_list` / `get_collection_list` (pick seeded entry by `list_id` matching `request.list_id`, replace the response's `list` field while preserving handler `identifiers` / `pagination` / `resolved_at` / `cache_valid_until` / `coverage_gaps` / `context` / `ext`), `get_content_standards` (pick by `standards_id`, replace the `ContentStandards` body and preserve handler's `context` and `ext`), `get_brand_identity` (pick by `brand_id`, replace the success body and preserve handler `context` / `ext`), and `si_get_offering` (pick by `offering.offering_id` matching `request.offering_id`, replace the response body and preserve handler `context` / `ext`). The seeded fixture array for each governance tool also feeds the matching list tool (`list_property_lists`, `list_collection_lists`, `list_content_standards`) via append-merge with seeded-wins on collision. `get_rights` is a discovery / search tool with an array response — append-merge by `rights_id`, seeded wins on collision (no list / singleton pair).
 - **Delivery merge recomputes aggregated_totals.** `get_media_buy_delivery` is the one append-merge bridge that updates the response envelope: after seeded deliveries merge in (seeded wins on `media_buy_id` collision — matches the precedent set by the other five `getSeeded*` bridges, since storyboards seed deliberately and a seeded fixture for an existing id is an explicit author override), `aggregated_totals` is recomputed from the merged per-delivery `totals`. Required sums (`impressions`, `spend`, `media_buy_count`) always recompute. Optional sums (`clicks`, `completed_views`, `views`, `conversions`, `conversion_value`) only recompute when every merged delivery populates the field — partial population falls back to the handler's value (no silent under-counting). Derived ratios (`roas`, `completion_rate`, `cost_per_acquisition`) recompute only when both inputs were recomputed AND the divisor is non-zero. Pass-through fields (`reach`, `reach_unit`, `frequency`, `new_to_brand_rate`) keep the handler's value verbatim — they aren't derivable from per-delivery `totals`.
@@ -454,6 +516,31 @@ for (const m of matches) {
 ```
 
 Unencoded substitution is a common XSS / scheme-injection vector. `CATALOG_MACRO_VECTORS` exports the seven canonical test bindings (`url-scheme-injection-neutralized`, `reserved-character-breakout`, `nested-expansion-preserved-as-literal`, etc.). For preview-URL fetches, `observer.fetch_and_parse(url)` enforces an SSRF policy — DNS revalidation, bare-IP rejection, cloud-metadata deny — before the HTTP connect.
+
+For pixel URLs that mix AdCP universal macros with a platform's native macro syntax, use `translateUniversalMacros`. Native mappings are inserted verbatim; literal values are RFC 3986 encoded. A native mapping containing U+0000–U+001F or U+007F throws `UnsafeNativeMappingError` before any URL is emitted, even when that mapping is unused. Consent macros frozen through literal `value` mappings remain encoded and are reported in `frozen_consent_macros` for advisory handling:
+
+```typescript
+import { translateUniversalMacros, UnsafeNativeMappingError } from '@adcp/sdk';
+
+try {
+  const translated = translateUniversalMacros(pixelUrl, {
+    '{CACHEBUSTER}': { native: '%%CACHEBUSTER%%' },
+    '{GPP_STRING}': { value: consentSnapshot },
+  });
+  if ((translated.frozen_consent_macros?.length ?? 0) > 0) {
+    auditConsentSnapshot(translated.frozen_consent_macros ?? []);
+  }
+  emitPixel(translated.url);
+} catch (error) {
+  if (error instanceof UnsafeNativeMappingError) {
+    // `message` includes the exact mapping key in a log-safe escaped form.
+    rejectMapping(error.code, error.message);
+  }
+  throw error;
+}
+```
+
+These policies follow the language-neutral fixture ratified in [AdCP #6674](https://github.com/adcontextprotocol/adcp/issues/6674).
 
 ---
 

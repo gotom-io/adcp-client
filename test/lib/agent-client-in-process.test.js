@@ -33,7 +33,7 @@ describe('AgentClient.fromMCPClient — in-process transport', () => {
         success: true,
         adcp: {
           major_versions: [3],
-          idempotency: { replay_ttl_seconds: 86400 },
+          idempotency: { supported: true, replay_ttl_seconds: 86400 },
         },
         supported_protocols: ['media_buy'],
         specialisms: [],
@@ -55,6 +55,7 @@ describe('AgentClient.fromMCPClient — in-process transport', () => {
                 id: 'prod-1',
                 name: 'Display',
                 channels: ['display'],
+                format_options: [{ format_kind: 'image', params: {} }],
                 pricing_options: [
                   { pricing_option_id: 'po_cpm', pricing_model: 'cpm', currency: 'USD', fixed_price: 5 },
                 ],

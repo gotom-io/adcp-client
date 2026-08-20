@@ -387,7 +387,7 @@ describe('runner-output contract: validation_result', () => {
     assert.strictEqual(result.response, undefined);
   });
 
-  test('authored validation id echoes on pass, fail, and not_applicable results', () => {
+  test('authored validation id echoes on pass and failure results, including unknown checks', () => {
     const results = runValidations(
       [
         {
@@ -407,7 +407,7 @@ describe('runner-output contract: validation_result', () => {
         {
           id: 'check_future_rule',
           check: 'future_check_kind',
-          description: 'Future check grades not_applicable',
+          description: 'Unknown check is not applicable on this runner',
         },
       ],
       {
@@ -502,6 +502,15 @@ describe('runner-output contract: secret redaction', () => {
     // The value is an array so the whole array is preserved (we only redact
     // scalar values at matching keys); document that behaviour here.
     assert.deepStrictEqual(out.list, [{ name: 'x' }]);
+  });
+
+  test('redactSecrets preserves own JSON keys named __proto__ without mutating the clone prototype', () => {
+    const input = JSON.parse('{"__proto__":{"value":"kept"},"constructor":{"value":"also-kept"}}');
+    const out = redactSecrets(input);
+    assert.equal(Object.getPrototypeOf(out), Object.prototype);
+    assert.equal(Object.hasOwn(out, '__proto__'), true);
+    assert.deepEqual(out.__proto__, { value: 'kept' });
+    assert.deepEqual(out.constructor, { value: 'also-kept' });
   });
 
   test('filterResponseHeaders allowlists safe headers and drops the rest', () => {

@@ -15,10 +15,18 @@ export {
   formatSignatureParams,
   getHeaderValue,
   type RequestLike,
+  type RequestCanonicalizationProfile,
   type ResponseLike,
   type SignatureParams,
 } from './canonicalize';
-export { computeContentDigest, contentDigestMatches, parseContentDigest } from './content-digest';
+export {
+  computeContentDigest,
+  contentDigestMatches,
+  contentDigestUsesEncoding,
+  parseContentDigest,
+  requestSigningEncodingForVersion,
+  type SfBinaryEncoding,
+} from './content-digest';
 export {
   requestContextFromExpress,
   requestContextFromFetch,

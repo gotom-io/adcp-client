@@ -27,7 +27,8 @@ export type ComplianceTrack =
   | 'si' // Sponsored intelligence sessions
   | 'audiences' // CRM audience sync
   | 'error_handling' // Error response structure and transport compliance
-  | 'brand'; // Brand identity, rights licensing, creative approval
+  | 'brand' // Brand identity, rights licensing, creative approval
+  | 'security_transport'; // OAuth/signing transport security
 
 /**
  * Per-track compliance verdict.
@@ -61,28 +62,30 @@ export interface TrackResult {
   duration_ms: number;
   /** Compliance testing mode: observational (default) or deterministic (test controller available) */
   mode?: 'observational' | 'deterministic';
-  /**
-   * View marker disambiguating the same `TrackResult` appearing in
-   * both `ComplianceResult.tracks` (canonical source of truth) and
-   * `ComplianceResult.tested_tracks` (the filtered subset of passing/
-   * failing/partial/silent tracks). Because `tested_tracks` is built
-   * by filtering `tracks`, every passing track appears in both arrays.
-   * JSON output of a `ComplianceResult` therefore serializes each
-   * scenario twice — triagers grepping the output without this marker
-   * saw spurious "duplicate execution" signals (adcp-client#1674).
-   *
-   * - `'canonical'` — entry appears in `tracks` (the source of truth).
-   * - `'reference'` — entry appears in `tested_tracks` (a filtered view).
-   *
-   * Consumers that want a deduplicated view should iterate `tracks`
-   * and ignore `tested_tracks`, or filter on `_view === 'canonical'`.
-   * CI pipelines that pin on a stable, dedupe-by-design surface should
-   * read `buildComplianceSummary()` / `--summary-output` instead.
-   *
-   * The breaking type-split that fully removes the duplication is
-   * tracked at adcp-client#1791.
-   */
-  _view?: 'canonical' | 'reference';
+  /** Marks entries in `ComplianceResult.tracks` as the canonical source of scenario detail. */
+  _view?: 'canonical';
+}
+
+/**
+ * Reference-only form of a tested track.
+ *
+ * Scenario detail lives exclusively in `ComplianceResult.tracks`. Omitting
+ * `scenarios` and `skipped_scenarios` here prevents full JSON reports from
+ * serializing every executed scenario twice.
+ */
+export interface TestedTrackEntry {
+  track: ComplianceTrack;
+  status: TrackStatus;
+  /** Human-readable label for this track */
+  label: string;
+  /** Advisory observations collected during this track */
+  observations: AdvisoryObservation[];
+  /** Total time for this track */
+  duration_ms: number;
+  /** Compliance testing mode: observational (default) or deterministic (test controller available) */
+  mode?: 'observational' | 'deterministic';
+  /** Marks this entry as a reference to the canonical result in `tracks`. */
+  _view: 'reference';
 }
 
 /**
@@ -130,13 +133,20 @@ export interface ComplianceResult {
   agent_url: string;
   /** AdCP compliance cache version used for this assessment. */
   adcp_version?: string;
+  /**
+   * Whether the run was truncated by its global timeout budget. Additive so
+   * older serialized results remain readable; newly produced results always
+   * populate it. `complete` means the runner reached a terminal outcome
+   * without that timeout, including `unreachable` and `auth_required` outcomes.
+   */
+  completeness?: 'complete' | 'timed_out';
   agent_profile: AgentProfile;
   /** Machine-readable overall status */
   overall_status: OverallStatus;
   /** Per-track results — every applicable track is run */
   tracks: TrackResult[];
-  /** Only tracks that were actually tested (status is pass/fail/partial) */
-  tested_tracks: TrackResult[];
+  /** Reference-only entries for tracks that were tested (status is pass/fail/partial/silent) */
+  tested_tracks: TestedTrackEntry[];
   /** Tracks skipped because no storyboards produced results */
   skipped_tracks: Array<{ track: ComplianceTrack; label: string; reason: string }>;
   /** Quick summary: how many tracks pass/fail/skip */
@@ -170,7 +180,8 @@ export interface ComplianceResult {
   total_duration_ms: number;
   /**
    * Protocol-compliance advisories aggregated across all storyboard runs,
-   * deduplicated by `code`. Always present (default `[]`) — mirrors the
+   * deduplicated by `code`, or (`code`, `capability_pointer`) when present.
+   * Always present (default `[]`) — mirrors the
    * always-present invariant on `StoryboardResult.notices` so adopters
    * can iterate `for (const n of result.notices)` at either level without
    * a defensive `?.`. For per-storyboard notices see `StoryboardResult.notices`.
@@ -200,6 +211,8 @@ export interface ComplianceSummary {
   steps_passed?: number;
   /** Storyboard steps that failed. */
   steps_failed?: number;
+  /** Failed advisory validations, reported separately from failed steps. */
+  validations_advisory_failed?: number;
   /** Storyboard steps that were skipped. */
   steps_skipped?: number;
   /** Storyboard steps excluded before execution by run selection. */
@@ -218,6 +231,8 @@ export interface ComplianceSummary {
    * run_summary optional field.
    */
   validations_not_applicable?: number;
+  /** Semver capability used to evaluate advisory validation expiry gates. */
+  runner_capability_version?: string;
   /**
    * Schemas applied across all storyboards. Implementors can re-validate
    * locally against the same artifacts the runner used.
@@ -271,13 +286,11 @@ export type ObservationSeverity = 'info' | 'suggestion' | 'warning' | 'error';
  *   storyboard pipeline (e.g. auth-failure detection on a 401
  *   discovery response). No storyboard coordinates apply.
  *
- * **`storyboard_id` shape note.** This field is sourced from
- * `TestResult.scenario`, which the storyboard runner constructs as
- * `${storyboard_id}/${phase_id}` (see `storyboard-tracks.ts`). So
- * `source.storyboard_id` is a composite "storyboard/phase" identifier,
- * not the bare storyboard ID. Greppable against the storyboard YAML
- * either way; the composite form gives extra phase-level specificity
- * even when `step_id` is also present.
+ * **`storyboard_id` shape note.** For `storyboard_step` sources this field
+ * is sourced from `TestResult.scenario`, which the storyboard runner
+ * constructs as `${storyboard_id}/${phase_id}` (see
+ * `storyboard-tracks.ts`). For storyboard-wide sources it is the bare
+ * storyboard ID because no single phase owns the finding.
  *
  * **`code` casing note.** `code` is intentionally kebab-case
  * (e.g. `slow-response`, `missing-valid-actions`) to match storyboard

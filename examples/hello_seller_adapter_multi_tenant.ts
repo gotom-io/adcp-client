@@ -145,7 +145,7 @@ interface RightsRecord {
   brand_id: string;
   name: string;
   description: string;
-  available_uses: RightUse[];
+  available_uses: [RightUse, ...RightUse[]];
   pricing_option_id: string;
   price: number;
   currency: string;
@@ -461,6 +461,13 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
    * disabled isolation for credentials lacking a home tenant.
    */
   accounts: AccountStore<TenantMeta> = createTenantStore<TenantState, TenantMeta>({
+    // Required, no default — the safe value depends on whether one credential
+    // is *supposed* to span tenants. Here it is not: each buyer agent_url maps
+    // to exactly one home tenant via BUYER_HOME_TENANT, so a ref naming another
+    // tenant must fail closed rather than resolve. An agency hub whose single
+    // credential legitimately spans tenants would pass 'ref-routed' instead and
+    // layer a `resolve-presets` guard on top.
+    refAccess: 'auth-scoped',
     resolveByRef: ref => {
       const r = narrowAccountRef(ref);
       if (!r.operator) return null;
@@ -602,10 +609,17 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
 
     checkGovernance: async (req: CheckGovernanceRequest, ctx): Promise<CheckGovernanceResponse> => {
       const tenant = getTenant(ctx);
-      const plan = tenant.plans.get(req.plan_id);
+      const planId = req.plan_id ?? tenant.active_plan_id;
+      if (!planId) {
+        throw new AdcpError('PLAN_NOT_FOUND', {
+          message: 'No plan_id was supplied and this tenant has no active governance plan.',
+          field: 'plan_id',
+        });
+      }
+      const plan = tenant.plans.get(planId);
       if (!plan) {
         throw new AdcpError('PLAN_NOT_FOUND', {
-          message: `Unknown plan: ${req.plan_id}`,
+          message: `Unknown plan: ${planId}`,
           field: 'plan_id',
         });
       }
@@ -806,7 +820,7 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
       };
     },
 
-    getRights: async (req: GetRightsRequest, ctx): Promise<GetRightsSuccess> => {
+    getRightsLegacy: async (req: GetRightsRequest, ctx): Promise<GetRightsSuccess> => {
       const tenant = getTenant(ctx);
       const requestedUses = new Set(req.uses);
       const matches = Array.from(tenant.rights.values()).filter(r => {
@@ -833,7 +847,10 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
       };
     },
 
-    acquireRights: async (req: AcquireRightsRequest, ctx): Promise<AcquireRightsAcquired | AcquireRightsRejected> => {
+    acquireRightsLegacy: async (
+      req: AcquireRightsRequest,
+      ctx
+    ): Promise<AcquireRightsAcquired | AcquireRightsRejected> => {
       const tenant = getTenant(ctx);
       const offering = tenant.rights.get(req.rights_id);
       if (!offering) {
@@ -878,8 +895,16 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
       }
       const denial = await this.enforceGovernance(tenant, ctx, offering, req);
       if (denial) return denial;
+      const firstUse = req.campaign.uses[0];
+      if (!firstUse) {
+        throw new AdcpError('INVALID_REQUEST', {
+          message: 'campaign.uses must contain at least one requested right use.',
+          field: 'campaign.uses',
+        });
+      }
+      const grantedUses: [RightUse, ...RightUse[]] = [firstUse, ...req.campaign.uses.slice(1)];
       const offered = new Set(offering.available_uses);
-      const unsupported = req.campaign.uses.filter(u => !offered.has(u));
+      const unsupported = grantedUses.filter(u => !offered.has(u));
       if (unsupported.length > 0) {
         return {
           rights_id: offering.rights_id,
@@ -901,7 +926,7 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
           pricing_option_id: offering.pricing_option_id,
           amount: offering.price,
           currency: offering.currency,
-          uses: req.campaign.uses,
+          uses: grantedUses,
           ...(req.campaign.start_date && { start_date: req.campaign.start_date }),
           ...(req.campaign.end_date && { end_date: req.campaign.end_date }),
         },
@@ -909,14 +934,14 @@ class MultiTenantAdapter implements DecisioningPlatform<Record<string, never>, T
         rights_constraint: {
           rights_id: offering.rights_id,
           rights_agent: { url: `http://127.0.0.1:${PORT}/mcp`, id: 'hello-multi-tenant-adapter' },
-          uses: req.campaign.uses,
+          uses: grantedUses,
           ...(req.campaign.start_date && { valid_from: toDateTime(req.campaign.start_date, 'start') }),
           ...(req.campaign.end_date && { valid_until: toDateTime(req.campaign.end_date, 'end') }),
         },
       };
     },
 
-    updateRights: async (req: UpdateRightsRequest, _ctx): Promise<UpdateRightsSuccess> => {
+    updateRightsLegacy: async (req: UpdateRightsRequest, _ctx): Promise<UpdateRightsSuccess> => {
       // Hello adapter doesn't persist a grant ledger; production adopters
       // hydrate by `req.rights_id`, apply the patch (extend dates, adjust
       // impression cap, change pricing, pause/resume), and re-issue

@@ -23,7 +23,7 @@
  * match the security doc.
  */
 
-import { buildSignatureBase, canonicalTargetUri, getHeaderValue, type RequestLike } from './canonicalize';
+import { buildSignatureBase, canonicalTargetUri, getHeaderValue } from './canonicalize';
 import { contentDigestMatches } from './content-digest';
 import { RequestSignatureError, WebhookSignatureError } from './errors';
 import { parseSignature, parseSignatureInput, type ParsedSignatureInput } from './parser';
@@ -34,6 +34,14 @@ import { InMemoryRevocationStore, type RevocationStore } from './revocation';
 import { ALLOWED_ALGS, CLOCK_SKEW_TOLERANCE_SECONDS, MAX_SIGNATURE_WINDOW_SECONDS } from './types';
 
 export const WEBHOOK_SIGNING_TAG = 'adcp/webhook-signing/v1';
+
+/** Receiver-side request shape; body may be the exact undecoded wire bytes. */
+export interface WebhookRequestLike {
+  method: string;
+  url: string;
+  headers: Record<string, string | string[] | undefined>;
+  body?: string | Uint8Array;
+}
 
 /**
  * Covered-component minimum for webhooks. Unlike request-signing, every
@@ -88,7 +96,7 @@ export interface VerifyWebhookResult {
  * entry, so external traffic can't grow the per-keyid cache.
  */
 export async function verifyWebhookSignature(
-  request: RequestLike,
+  request: WebhookRequestLike,
   options: VerifyWebhookOptions
 ): Promise<VerifyWebhookResult> {
   const now = options.now ? options.now() : Math.floor(Date.now() / 1000);
@@ -151,7 +159,7 @@ export async function verifyWebhookSignature(
   // Signature-Input headers themselves) — this flags the covered URI value
   // that will be fed into the signature base. Non-parseable URLs, non-https
   // schemes, embedded userinfo, and fragments are all rejected.
-  validateTargetUri(request.url);
+  const canonicalWebhookTarget = validateTargetUri(request.url);
 
   // Step 7: resolve keyid.
   const jwk = await options.jwks.resolve(parsedInput.params.keyid);
@@ -220,21 +228,11 @@ export async function verifyWebhookSignature(
   // webhook captured on one receiver path MUST NOT count against the replay
   // budget for a different path under the same keyid. Canonicalize once and
   // reuse for both pre-check and commit.
-  const replayScope = canonicalTargetUri(request.url);
-
-  // Step 9a: per-keyid rate abuse. Distinct code from step 12's replay —
-  // cap exhaustion is a compromised-key / misconfig signal that SHOULD
-  // alert operators, not "same nonce twice."
-  if (await options.replayStore.isCapHit(jwk.kid, replayScope, now)) {
-    throw new WebhookSignatureError(
-      'webhook_signature_rate_abuse',
-      9,
-      `Per-keyid replay cache cap exceeded for keyid=${jwk.kid}.`
-    );
-  }
+  const replayScope = canonicalWebhookTarget;
 
   // Pre-check step 12's replay before crypto so a replayed nonce short-
-  // circuits an expensive Ed25519/ECDSA verify.
+  // circuits an expensive Ed25519/ECDSA verify. Replay precedes the cap
+  // check to match every replay store's atomic insert result precedence.
   if (await options.replayStore.has(jwk.kid, replayScope, parsedInput.params.nonce, now)) {
     throw new WebhookSignatureError(
       'webhook_signature_replayed',
@@ -243,12 +241,33 @@ export async function verifyWebhookSignature(
     );
   }
 
+  // Step 9a: per-keyid rate abuse. Distinct code from step 12's replay —
+  // cap exhaustion is a compromised-key / misconfig signal that SHOULD
+  // alert operators for new nonces.
+  if (await options.replayStore.isCapHit(jwk.kid, replayScope, now)) {
+    // A concurrent request may have committed this nonce after the first
+    // replay probe and filled the cap. Preserve replay-over-cap precedence.
+    if (await options.replayStore.has(jwk.kid, replayScope, parsedInput.params.nonce, now)) {
+      throw new WebhookSignatureError(
+        'webhook_signature_replayed',
+        12,
+        `Replay of (keyid=${jwk.kid}, nonce=${parsedInput.params.nonce}) within signature window.`
+      );
+    }
+    throw new WebhookSignatureError(
+      'webhook_signature_rate_abuse',
+      9,
+      `Per-keyid replay cache cap exceeded for keyid=${jwk.kid}.`
+    );
+  }
+
   // Step 10: cryptographic verify.
   const base = buildSignatureBase(
     parsedInput.components,
-    request,
+    { method: request.method, url: request.url, headers: request.headers },
     parsedInput.params,
-    parsedInput.signatureParamsValue
+    parsedInput.signatureParamsValue,
+    '3.2'
   );
   const publicKey = jwkToPublicKey(jwk);
   const valid = verifySignature(parsedInput.params.alg, publicKey, Buffer.from(base, 'utf8'), parsedSig.bytes);
@@ -363,7 +382,7 @@ function validateCoveredComponents(components: string[]): void {
  * message. Distinct from `webhook_signature_header_malformed`, which flags
  * the Signature / Signature-Input headers themselves.
  */
-function validateTargetUri(rawUrl: string): void {
+function validateTargetUri(rawUrl: string): string {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -374,7 +393,7 @@ function validateTargetUri(rawUrl: string): void {
       `@target-uri "${rawUrl}" is not a parseable URL.`
     );
   }
-  if (url.protocol !== 'https:' && !isLoopbackHost(url.hostname)) {
+  if (url.protocol !== 'https:' && !isWebhookLoopbackHost(url.hostname)) {
     throw new WebhookSignatureError(
       'webhook_target_uri_malformed',
       6,
@@ -387,6 +406,15 @@ function validateTargetUri(rawUrl: string): void {
   if (url.hash) {
     throw new WebhookSignatureError('webhook_target_uri_malformed', 6, '@target-uri must not carry a fragment.');
   }
+  try {
+    return canonicalTargetUri(rawUrl, '3.2');
+  } catch (err) {
+    throw new WebhookSignatureError(
+      'webhook_target_uri_malformed',
+      6,
+      err instanceof Error ? err.message : String(err)
+    );
+  }
 }
 
 /**
@@ -394,13 +422,24 @@ function validateTargetUri(rawUrl: string): void {
  * `loopback_mock` webhook receiver binds to 127.0.0.1 (or the IPv6 [::1])
  * and publishers emit `http://127.0.0.1:<port>/…` URLs for delivery; the
  * signature covers `@target-uri` byte-for-byte, so the verifier sees the
- * http scheme. Production traffic never reaches loopback, so this exemption
- * can't be used to bypass TLS for real webhooks.
+ * http scheme.
+ *
+ * The exemption is restricted to IPv4 literals in 127.0.0.0/8, the IPv6
+ * loopback, and the literal name `localhost`. A prefix test would also match
+ * registered names like `127.example.com`, which resolve to arbitrary public
+ * addresses and would let a real webhook drop TLS.
  */
-function isLoopbackHost(hostname: string): boolean {
+// Only reached with an already-parsed `URL.hostname`, so WHATWG has normalized
+// `127.1` / `0x7f000001` to dotted-quad form and rejected out-of-range octets
+// before this sees them. No octet-range check is needed (or reachable).
+const LOOPBACK_IPV4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+export function isWebhookLoopbackHost(hostname: string): boolean {
   if (!hostname) return false;
-  const normalized = hostname.toLowerCase();
-  return normalized === 'localhost' || normalized === '::1' || normalized.startsWith('127.');
+  // Node's `URL.hostname` keeps IPv6 literals bracketed; a FQDN keeps its dot.
+  const normalized = hostname.toLowerCase().replace(/\.$/, '');
+  if (normalized === 'localhost' || normalized === '::1' || normalized === '[::1]') return true;
+  return LOOPBACK_IPV4.test(normalized);
 }
 
 /**
@@ -451,11 +490,11 @@ export interface CreateWebhookVerifierOptions extends Omit<VerifyWebhookOptions,
  */
 export function createWebhookVerifier(
   options: CreateWebhookVerifierOptions
-): (request: RequestLike) => Promise<VerifyWebhookResult> {
+): (request: WebhookRequestLike) => Promise<VerifyWebhookResult> {
   // Instantiate defaults once at creation time so every request handled by
   // this verifier shares the same replay / revocation state. Per-request
   // construction would defeat replay detection entirely.
   const replayStore = options.replayStore ?? new InMemoryReplayStore();
   const revocationStore = options.revocationStore ?? new InMemoryRevocationStore();
-  return (request: RequestLike) => verifyWebhookSignature(request, { ...options, replayStore, revocationStore });
+  return (request: WebhookRequestLike) => verifyWebhookSignature(request, { ...options, replayStore, revocationStore });
 }

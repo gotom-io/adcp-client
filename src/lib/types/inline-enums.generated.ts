@@ -17,6 +17,23 @@
 // from `enums.generated.ts` instead.
 
 
+// ====== AccountIdentityUpdatesSupported ======
+
+/** array of | AccountIdentityUpdatesSupported.supported_changes */
+export const AccountIdentityUpdatesSupported_SupportedChangesValues = ["operator_unit_name", "operator_unit", "operator"] as const;
+
+// ====== AccountStatusChangedWebhook ======
+
+/** single | AccountStatusChangedWebhook.reason_code */
+export const AccountStatusChangedWebhook_ReasonCodeValues = ["seller_approved", "seller_rejected", "payment_required", "credit_limit_reached", "funds_depleted", "setup_required", "policy_review", "policy_violation", "compliance_hold", "buyer_requested", "seller_closed", "manual_update", "other"] as const;
+
+// ====== AccountTimezoneCapability ======
+
+/** single | AccountTimezoneCapability.account_selection */
+export const AccountTimezoneCapability_AccountSelectionValues = ["seller_assigned", "buyer_selected"] as const;
+/** single | AccountTimezoneCapability.mode */
+export const AccountTimezoneCapability_ModeValues = ["seller_fixed", "account_fixed"] as const;
+
 // ====== ActivateSignalRequest ======
 
 /** single | ActivateSignalRequest.action */
@@ -31,6 +48,32 @@ export const AgentProfilePayload_TypeValues = ["sales", "creative", "signals", "
 
 /** single | AppItem.platform */
 export const AppItem_PlatformValues = ["ios", "android"] as const;
+
+// ====== AttestationEvaluation ======
+
+/** single | AttestationEvaluation.outcome */
+export const AttestationEvaluation_OutcomeValues = ["verified", "not_found", "expired", "revoked", "invalid", "unsupported", "unverifiable", "untrusted_issuer", "untrusted_resolver", "subject_mismatch", "digest_mismatch", "resolution_failed"] as const;
+
+// ====== AudienceEvidence ======
+
+/** single | AudienceEvidence.evidence_type */
+export const AudienceEvidence_EvidenceTypeValues = ["measured", "forecast", "seller_declared"] as const;
+/** single | AudienceEvidence.relationship */
+export const AudienceEvidence_RelationshipValues = ["composition", "index", "reach_estimate"] as const;
+/** single | AudienceEvidence.unit */
+export const AudienceEvidence_UnitValues = ["fraction", "ratio", "count"] as const;
+
+// ====== AudienceEvidenceRequirements ======
+
+/** single | AudienceEvidenceRequirements.evidence_presence */
+export const AudienceEvidenceRequirements_EvidencePresenceValues = ["required", "when_available"] as const;
+/** single | AudienceEvidenceRequirements.requirement_mode */
+export const AudienceEvidenceRequirements_RequirementModeValues = ["required", "preferred"] as const;
+
+// ====== AudienceEvidenceSelection ======
+
+/** single | AudienceEvidenceSelection.decision_use */
+export const AudienceEvidenceSelection_DecisionUseValues = ["recommendation", "eligibility", "package_construction"] as const;
 
 // ====== AudioAssetRequirements ======
 
@@ -140,14 +183,17 @@ export const CanonicalFormatNativeInFeed_AssetSourceValues = ["buyer_uploaded", 
 /** array of | CanonicalFormatNativeInFeed.image_formats */
 export const CanonicalFormatNativeInFeed_ImageFormatsValues = ["jpg", "jpeg", "png", "gif", "webp"] as const;
 
+// ====== CanonicalFormatOption ======
+
+/** single | CanonicalFormatOption.seller_preference */
+export const CanonicalFormatOption_SellerPreferenceValues = ["preferred", "accepted", "discouraged"] as const;
+
 // ====== CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven ======
 
 /** single | CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven.fanout_mode */
 export const CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven_FanoutModeValues = ["per_item", "multi_item_in_creative", "single_item"] as const;
 /** single | CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven.item_production_model */
 export const CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven_ItemProductionModelValues = ["buyer_uploaded", "seller_pre_rendered_from_brief", "seller_human_designed", "agent_synthesized"] as const;
-/** array of | CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven.supported_catalog_types */
-export const CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven_SupportedCatalogTypesValues = ["product", "store", "offering", "hotel", "flight", "vehicle", "real_estate", "education", "destination", "app", "job", "inventory"] as const;
 /** array of | CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven.supported_id_types */
 export const CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven_SupportedIdTypesValues = ["asin", "sku", "gtin", "offering_id", "store_id", "hotel_id", "flight_id", "vehicle_id", "listing_id", "program_id", "destination_id", "app_id", "job_id"] as const;
 
@@ -156,10 +202,63 @@ export const CanonicalFormatSponsoredPlacementRetailMediaCatalogDriven_Supported
 /** single | CanonicalFormatVASTVideo.vpaid_version */
 export const CanonicalFormatVASTVideo_VpaidVersionValues = ["1.0", "2.0"] as const;
 
+// ====== CanonicalProductPlacement ======
+
+/** single | CanonicalProductPlacement.kind */
+export const CanonicalProductPlacement_KindValues = ["publisher_ref", "seller_inline"] as const;
+/** single | CanonicalProductPlacement.mode */
+export const CanonicalProductPlacement_ModeValues = ["targetable", "included"] as const;
+
+// ====== CanonicalProposal ======
+
+/** single | CanonicalProposal.proposal_kind */
+export const CanonicalProposal_ProposalKindValues = ["new_media_buy", "media_buy_update", "media_buy_cancellation"] as const;
+
+// ====== CanonicalReportingCapabilities ======
+
+/** single | CanonicalReportingCapabilities.date_range_support */
+export const CanonicalReportingCapabilities_DateRangeSupportValues = ["date_range", "lifetime_only"] as const;
+
+// ====== CapabilitiesChangedWebhook ======
+
+/** single | CapabilitiesChangedWebhook.reason */
+export const CapabilitiesChangedWebhook_ReasonValues = ["configuration_changed", "deployment_changed", "capability_enabled", "capability_disabled", "protocol_versions_changed", "manual_refresh", "other"] as const;
+
 // ====== CatalogFieldMapping ======
 
 /** single | CatalogFieldMapping.transform */
 export const CatalogFieldMapping_TransformValues = ["date", "divide", "boolean", "split"] as const;
+
+// ====== CatalogItemAvailabilityError ======
+
+/** single | CatalogItemAvailabilityError.recovery */
+export const CatalogItemAvailabilityError_RecoveryValues = ["transient", "correctable", "terminal"] as const;
+/** single | CatalogItemAvailabilityError.source */
+export const CatalogItemAvailabilityError_SourceValues = ["producer", "sdk"] as const;
+
+// ====== CatalogItemAvailabilityState ======
+
+/** single | CatalogItemAvailabilityState.availability */
+export const CatalogItemAvailabilityState_AvailabilityValues = ["active", "suppressed"] as const;
+/** single | CatalogItemAvailabilityState.status */
+export const CatalogItemAvailabilityState_StatusValues = ["found", "failed"] as const;
+
+// ====== CatalogItemAvailabilityUpdate ======
+
+/** single | CatalogItemAvailabilityUpdate.action */
+export const CatalogItemAvailabilityUpdate_ActionValues = ["suppress", "restore"] as const;
+/** single | CatalogItemAvailabilityUpdate.reason */
+export const CatalogItemAvailabilityUpdate_ReasonValues = ["out_of_stock", "back_in_stock", "content_unavailable", "content_available", "promotion_start", "promotion_end", "time_window_started", "time_window_expired", "buyer_request", "other"] as const;
+
+// ====== CatalogItemAvailabilityUpdateResult ======
+
+/** single | CatalogItemAvailabilityUpdateResult.status */
+export const CatalogItemAvailabilityUpdateResult_StatusValues = ["applied", "unchanged", "failed"] as const;
+
+// ====== CheckGovernanceResponse ======
+
+/** single | CheckGovernanceResponse.check_type */
+export const CheckGovernanceResponse_CheckTypeValues = ["intent", "execution"] as const;
 
 // ====== CollectionPayload ======
 
@@ -175,6 +274,21 @@ export const ControllerError_ErrorValues = ["INVALID_TRANSITION", "INVALID_STATE
 
 /** single | CreateMediaBuyAsyncInputRequired.reason */
 export const CreateMediaBuyAsyncInputRequired_ReasonValues = ["APPROVAL_REQUIRED", "BUDGET_EXCEEDS_LIMIT"] as const;
+
+// ====== CreativeAssignment ======
+
+/** single | CreativeAssignment.rotation_mode */
+export const CreativeAssignment_RotationModeValues = ["weighted", "even", "sequential", "random"] as const;
+
+// ====== CreativeAssignmentChangedWebhook ======
+
+/** single | CreativeAssignmentChangedWebhook.change_kind */
+export const CreativeAssignmentChangedWebhook_ChangeKindValues = ["assigned", "unassigned", "approval_changed"] as const;
+
+// ====== CreativeLocalization ======
+
+/** single | CreativeLocalization.unmatched_locale_action */
+export const CreativeLocalization_UnmatchedLocaleActionValues = ["serve_default", "do_not_serve"] as const;
 
 // ====== CreativePurgedWebhook ======
 
@@ -233,13 +347,6 @@ export const EducationItem_LevelValues = ["beginner", "intermediate", "advanced"
 /** single | EducationItem.modality */
 export const EducationItem_ModalityValues = ["online", "in_person", "hybrid"] as const;
 
-// ====== Error ======
-
-/** single | Error.recovery */
-export const Error_RecoveryValues = ["transient", "correctable", "terminal"] as const;
-/** single | Error.source */
-export const Error_SourceValues = ["producer", "sdk"] as const;
-
 // ====== EventSurface ======
 
 /** single | EventSurface.category */
@@ -254,6 +361,16 @@ export const FeatureRequirement_IfNotCoveredValues = ["exclude", "include"] as c
 
 /** single | FlatFeePricing.period */
 export const FlatFeePricing_PeriodValues = ["monthly", "quarterly", "annual", "campaign"] as const;
+
+// ====== GeographicPlaceCatalogEntry ======
+
+/** single | GeographicPlaceCatalogEntry.status */
+export const GeographicPlaceCatalogEntry_StatusValues = ["active", "removal_planned", "deprecated"] as const;
+
+// ====== GeographicPlaceResolver ======
+
+/** single | GeographicPlaceResolver.auth */
+export const GeographicPlaceResolver_AuthValues = ["none", "seller_credentials"] as const;
 
 // ====== GetAccountFinancialsSuccess ======
 
@@ -290,24 +407,24 @@ export const GetMediaBuyDeliveryResponse_NotificationTypeValues = ["scheduled", 
 /** single | GetProductsAsyncInputRequired.reason */
 export const GetProductsAsyncInputRequired_ReasonValues = ["CLARIFICATION_NEEDED", "BUDGET_REQUIRED"] as const;
 
+// ====== GetProductsCompletion ======
+
+/** single | GetProductsCompletion.cache_scope */
+export const GetProductsCompletion_CacheScopeValues = ["public", "account"] as const;
+
 // ====== GetProductsRequest ======
 
 /** single | GetProductsRequest.buying_mode */
 export const GetProductsRequest_BuyingModeValues = ["brief", "wholesale", "refine"] as const;
 /** array of | GetProductsRequest.fields */
-export const GetProductsRequest_FieldsValues = ["product_id", "name", "description", "publisher_properties", "channels", "video_placement_types", "audio_distribution_types", "sponsored_placement_types", "social_placement_surfaces", "format_ids", "format_options", "placements", "delivery_type", "exclusivity", "pricing_options", "forecast", "outcome_measurement", "delivery_measurement", "reporting_capabilities", "creative_policy", "catalog_types", "metric_optimization", "conversion_tracking", "data_provider_signals", "included_signals", "signal_targeting_allowed", "signal_targeting_options", "signal_targeting_rules", "max_optimization_goals", "catalog_match", "collections", "collection_targeting_allowed", "installments", "brief_relevance", "expires_at", "product_card", "product_card_detailed", "enforced_policies", "trusted_match"] as const;
-
-// ====== GetProductsResponse ======
-
-/** single | GetProductsResponse.cache_scope */
-export const GetProductsResponse_CacheScopeValues = ["public", "account"] as const;
+export const GetProductsRequest_FieldsValues = ["product_id", "name", "description", "publisher_properties", "channels", "video_placement_types", "audio_distribution_types", "sponsored_placement_types", "social_placement_surfaces", "format_ids", "format_options", "placements", "delivery_type", "exclusivity", "pricing_options", "forecast", "outcome_measurement", "delivery_measurement", "reporting_capabilities", "creative_policy", "catalog_types", "metric_optimization", "conversion_tracking", "data_provider_signals", "included_signals", "signal_targeting_allowed", "signal_targeting_options", "signal_targeting_rules", "demographic_targeting", "overlay_support", "targeting_resolution", "audience_evidence", "audience_evidence_selections", "max_optimization_goals", "catalog_match", "collections", "collection_targeting_allowed", "installments", "brief_relevance", "is_custom", "expires_at", "product_card", "product_card_detailed", "enforced_policies", "trusted_match"] as const;
 
 // ====== GetSignalsRequest ======
 
 /** single | GetSignalsRequest.discovery_mode */
 export const GetSignalsRequest_DiscoveryModeValues = ["brief", "wholesale"] as const;
 /** array of | GetSignalsRequest.fields */
-export const GetSignalsRequest_FieldsValues = ["signal_ref", "signal_id", "signal_agent_segment_id", "name", "description", "value_type", "categories", "range", "signal_type", "data_provider", "coverage_percentage", "deployments", "pricing_options", "taxonomy", "data_sources", "methodology", "segmentation_criteria", "criteria_url", "refresh_cadence", "lookback_window", "onboarder", "modeling", "audience_expansion", "device_expansion", "countries", "consent_basis", "restricted_attributes", "policy_categories", "art9_basis", "data_subject_rights", "last_updated"] as const;
+export const GetSignalsRequest_FieldsValues = ["signal_ref", "signal_id", "signal_agent_segment_id", "name", "description", "value_type", "categories", "range", "demographic_predicate", "signal_type", "data_provider", "coverage_percentage", "deployments", "pricing_options", "taxonomy", "data_sources", "methodology", "segmentation_criteria", "criteria_url", "refresh_cadence", "lookback_window", "onboarder", "modeling", "audience_expansion", "device_expansion", "countries", "consent_basis", "restricted_attributes", "policy_categories", "art9_basis", "data_subject_rights", "last_updated"] as const;
 
 // ====== HTMLAssetRequirements ======
 
@@ -320,6 +437,18 @@ export const HTMLAssetRequirements_SandboxValues = ["none", "iframe", "safeframe
 export const ImageAssetRequirements_ColorSpaceValues = ["rgb", "cmyk", "grayscale"] as const;
 /** array of | ImageAssetRequirements.formats */
 export const ImageAssetRequirements_FormatsValues = ["jpg", "jpeg", "png", "gif", "webp", "svg", "avif", "tiff", "pdf", "eps"] as const;
+
+// ====== ImageDecoration ======
+
+/** single | ImageDecoration.fit */
+export const ImageDecoration_FitValues = ["contain", "cover", "stretch"] as const;
+
+// ====== Impact ======
+
+/** single | Impact.area */
+export const Impact_AreaValues = ["account_id", "media_buys", "reporting", "approval", "billing", "grants", "other"] as const;
+/** single | Impact.effect */
+export const Impact_EffectValues = ["preserved", "revalidation_required", "revoke_and_regrant", "blocked"] as const;
 
 // ====== Impairment ======
 
@@ -338,11 +467,6 @@ export const JobItem_EmploymentTypeValues = ["full_time", "part_time", "contract
 /** single | JobItem.experience_level */
 export const JobItem_ExperienceLevelValues = ["entry_level", "mid_level", "senior", "director", "executive"] as const;
 
-// ====== ListCreativeFormatsRequestCreativeAgent ======
-
-/** single | ListCreativeFormatsRequestCreativeAgent.type */
-export const ListCreativeFormatsRequestCreativeAgent_TypeValues = ["audio", "video", "display", "dooh"] as const;
-
 // ====== ListCreativeFormatsResponse ======
 
 /** single | ListCreativeFormatsResponse.source */
@@ -350,18 +474,44 @@ export const ListCreativeFormatsResponse_SourceValues = ["publisher", "aao_mirro
 
 // ====== ListCreativesRequest ======
 
+/** single | ListCreativesRequest.assignment_projection */
+export const ListCreativesRequest_AssignmentProjectionValues = ["all", "matching"] as const;
 /** array of | ListCreativesRequest.fields */
-export const ListCreativesRequest_FieldsValues = ["creative_id", "name", "format_id", "status", "created_date", "updated_date", "tags", "assignments", "snapshot", "items", "variables", "concept", "pricing_options"] as const;
+export const ListCreativesRequest_FieldsValues = ["creative_id", "name", "format_id", "format_kind", "format_option_ref", "assets", "status", "created_date", "updated_date", "tags", "rights", "rights_attestation_evaluations", "localization", "localization_unavailable", "assignments", "snapshot", "items", "variables", "concept", "pricing_options"] as const;
+
+// ====== MediaBuyAvailableAction ======
+
+/** single | MediaBuyAvailableAction.task */
+export const MediaBuyAvailableAction_TaskValues = ["control_media_buy", "refine_proposals", "sync_creatives"] as const;
+
+// ====== NotificationConfig ======
+
+/** single | NotificationConfig.product_payload_view */
+export const NotificationConfig_ProductPayloadViewValues = ["canonical", "legacy"] as const;
 
 // ====== OfferPrice ======
 
 /** single | OfferPrice.model */
 export const OfferPrice_ModelValues = ["cpm", "cpc", "cpcv", "cpa", "flat"] as const;
 
+// ====== OpportunityContext ======
+
+/** single | OpportunityContext.close_reason */
+export const OpportunityContext_CloseReasonValues = ["accepted_with_seller", "purchased_elsewhere", "selected_alternative", "not_pursued", "budget_changed", "timing_changed", "other"] as const;
+/** single | OpportunityContext.intent */
+export const OpportunityContext_IntentValues = ["test", "speculative", "planning", "live_rfp"] as const;
+/** single | OpportunityContext.phase */
+export const OpportunityContext_PhaseValues = ["exploratory", "planning", "active_sourcing"] as const;
+
 // ====== PackageSignalTargetingGroup ======
 
 /** single | PackageSignalTargetingGroup.operator */
 export const PackageSignalTargetingGroup_OperatorValues = ["any", "none"] as const;
+
+// ====== PackageStatus ======
+
+/** array of | PackageStatus.indicator_types_evaluated */
+export const PackageStatus_IndicatorTypesEvaluatedValues = ["creative_diversity_low", "audience_saturation", "inventory_shortfall_forecast", "pacing_risk", "budget_constrained"] as const;
 
 // ====== PerformanceFeedback ======
 
@@ -375,41 +525,30 @@ export const PixelTrackerAsset_EventValues = ["impression", "viewable_mrc_50", "
 /** single | PixelTrackerAsset.method */
 export const PixelTrackerAsset_MethodValues = ["img", "js"] as const;
 
-// ====== Placement ======
-
-/** single | Placement.kind */
-export const Placement_KindValues = ["publisher_ref", "seller_inline"] as const;
-/** single | Placement.mode */
-export const Placement_ModeValues = ["targetable", "included"] as const;
-
 // ====== PolicyEntry ======
 
 /** single | PolicyEntry.source */
 export const PolicyEntry_SourceValues = ["registry", "inline"] as const;
-
-// ====== PostalAreaSupport ======
-
-/** array of | PostalAreaSupport.CA */
-export const PostalAreaSupport_CAValues = ["fsa", "full"] as const;
-/** array of | PostalAreaSupport.GB */
-export const PostalAreaSupport_GBValues = ["outward", "full"] as const;
-/** array of | PostalAreaSupport.US */
-export const PostalAreaSupport_USValues = ["zip", "zip_plus_four"] as const;
 
 // ====== PreviewCreativeRequest ======
 
 /** single | PreviewCreativeRequest.request_type */
 export const PreviewCreativeRequest_RequestTypeValues = ["single", "batch", "variant"] as const;
 
+// ====== PreviewRendererMetadata ======
+
+/** single | PreviewRendererMetadata.rendering_origin */
+export const PreviewRendererMetadata_RenderingOriginValues = ["platform_native", "agent_approximation"] as const;
+
 // ====== Price ======
 
 /** single | Price.period */
 export const Price_PeriodValues = ["night", "month", "year", "one_time"] as const;
 
-// ====== ProductSignalTargetingOption ======
+// ====== ProductCardReferenceAsset ======
 
-/** single | ProductSignalTargetingOption.activation_status */
-export const ProductSignalTargetingOption_ActivationStatusValues = ["ready", "requires_activation"] as const;
+/** single | ProductCardReferenceAsset.role */
+export const ProductCardReferenceAsset_RoleValues = ["coverage_map", "sample_render", "environment_photo", "media_kit", "logo", "other"] as const;
 
 // ====== PropertyError ======
 
@@ -430,6 +569,11 @@ export const PropertyFeatureResult_CoverageStatusValues = ["covered", "not_cover
 
 /** single | Provenance.human_oversight */
 export const Provenance_HumanOversightValues = ["none", "prompt_only", "selected", "edited", "directed"] as const;
+
+// ====== ProvidePerformanceFeedbackSuccess ======
+
+/** single | ProvidePerformanceFeedbackSuccess.application_status */
+export const ProvidePerformanceFeedbackSuccess_ApplicationStatusValues = ["accepted", "applied", "not_applied"] as const;
 
 // ====== PublisherEntry ======
 
@@ -460,13 +604,29 @@ export const ReferenceAsset_RoleValues = ["style_reference", "product_shot", "mo
 /** single | RepeatableGroupAsset.selection_mode */
 export const RepeatableGroupAsset_SelectionModeValues = ["sequential", "optimize"] as const;
 
-// ====== ReportingCapabilities ======
+// ====== ReportingWebhook ======
 
-/** single | ReportingCapabilities.date_range_support */
-export const ReportingCapabilities_DateRangeSupportValues = ["date_range", "lifetime_only"] as const;
+/** single | ReportingWebhook.reporting_frequency */
+export const ReportingWebhook_ReportingFrequencyValues = ["hourly", "daily", "monthly"] as const;
+
+// ====== ReportPlanAdjustmentRequest ======
+
+/** single | ReportPlanAdjustmentRequest.action */
+export const ReportPlanAdjustmentRequest_ActionValues = ["report", "review"] as const;
+/** single | ReportPlanAdjustmentRequest.adjustment_type */
+export const ReportPlanAdjustmentRequest_AdjustmentTypeValues = ["decommitment", "refund", "credit", "makegood"] as const;
+/** single | ReportPlanAdjustmentRequest.decision */
+export const ReportPlanAdjustmentRequest_DecisionValues = ["accept", "dispute"] as const;
+
+// ====== ReportPlanAdjustmentResponse ======
+
+/** single | ReportPlanAdjustmentResponse.adjustment_state */
+export const ReportPlanAdjustmentResponse_AdjustmentStateValues = ["reported", "verified", "disputed"] as const;
 
 // ====== ReportPlanOutcomeResponse ======
 
+/** single | ReportPlanOutcomeResponse.delivery_reconciliation_status */
+export const ReportPlanOutcomeResponse_DeliveryReconciliationStatusValues = ["consistent", "measurement_variance", "disputed", "unmatched", "closed_unresolved"] as const;
 /** single | ReportPlanOutcomeResponse.outcome_state */
 export const ReportPlanOutcomeResponse_OutcomeStateValues = ["accepted", "findings"] as const;
 
@@ -479,6 +639,13 @@ export const ResponsePayload_TaskValues = ["verify_brand_claim", "verify_brand_c
 
 /** single | RightsConstraint.approval_status */
 export const RightsConstraint_ApprovalStatusValues = ["pending", "approved", "rejected"] as const;
+/** single | RightsConstraint.grant_status */
+export const RightsConstraint_GrantStatusValues = ["active", "paused", "revoked"] as const;
+
+// ====== SearchBrandResult ======
+
+/** single | SearchBrandResult.relationship_trust */
+export const SearchBrandResult_RelationshipTrustValues = ["inline", "mutual", "leaf_only", "house_only", "standalone", "unverifiable"] as const;
 
 // ====== SIComponentCatalog ======
 
@@ -506,15 +673,6 @@ export const SignalDefinition_IdTypesValues = ["cookie", "mobile_id", "platform_
 export const SignalDefinition_LookbackWindowValues = ["intra_day", "daily", "weekly", "monthly", "bi_monthly", "quarterly", "bi_annually", "annually"] as const;
 /** single | SignalDefinition.methodology */
 export const SignalDefinition_MethodologyValues = ["observed", "declared", "derived", "inferred", "modeled"] as const;
-/** single | SignalDefinition.resolution_method */
-export const SignalDefinition_ResolutionMethodValues = ["deterministic_id", "probabilistic_device", "browser", "geographic", "content_signal", "mixed"] as const;
-/** single | SignalDefinition.subject_type */
-export const SignalDefinition_SubjectTypeValues = ["individual", "household", "business", "contextual", "none"] as const;
-
-// ====== SignalForecastDimension ======
-
-/** single | SignalForecastDimension.presence */
-export const SignalForecastDimension_PresenceValues = ["present", "absent"] as const;
 
 // ====== SignalSelectionGroupRule ======
 
@@ -546,6 +704,11 @@ export const SITerminateSessionRequest_ReasonValues = ["handoff_transaction", "h
 /** single | SIUIElement.type */
 export const SIUIElement_TypeValues = ["text", "link", "image", "product_card", "carousel", "action_button", "app_handoff", "integration_actions"] as const;
 
+// ====== SyncAgentNotificationConfigsResponse ======
+
+/** single | SyncAgentNotificationConfigsResponse.action */
+export const SyncAgentNotificationConfigsResponse_ActionValues = ["updated", "unchanged", "cleared", "failed"] as const;
+
 // ====== SyncCatalogsAsyncInputRequired ======
 
 /** single | SyncCatalogsAsyncInputRequired.reason */
@@ -560,6 +723,11 @@ export const SyncCreativesAsyncInputRequired_ReasonValues = ["APPROVAL_REQUIRED"
 
 /** single | TMPError.code */
 export const TMPError_CodeValues = ["invalid_request", "unknown_package", "seller_not_authorized", "rate_limited", "timeout", "internal_error", "provider_unavailable"] as const;
+
+// ====== TMPProviderRegistration ======
+
+/** single | TMPProviderRegistration.status */
+export const TMPProviderRegistration_StatusValues = ["active", "inactive", "draining"] as const;
 
 // ====== TransformerParam ======
 
@@ -643,12 +811,19 @@ export const WholesaleFeedWebhook_NotificationTypeValues = ["product.created", "
 // imports to the canonical name; aliases remain for one minor
 // version. (adcp-client#941)
 
-// --- BuildCreativeInputRequired ---
-/** @deprecated use `BuildCreativeAsyncInputRequired_ReasonValues` — same literal set, BuildCreativeInputRequired.reason duplicates the canonical export. */
-export const BuildCreativeInputRequired_ReasonValues = BuildCreativeAsyncInputRequired_ReasonValues;
 // --- BuildCreativeVariantSuccess ---
 /** @deprecated use `BuildCreativeRequest_KeepModeValues` — same literal set, BuildCreativeVariantSuccess.keep_mode_applied duplicates the canonical export. */
 export const BuildCreativeVariantSuccess_KeepModeAppliedValues = BuildCreativeRequest_KeepModeValues;
+// --- CanonicalAudienceEvidence ---
+/** @deprecated use `AudienceEvidence_EvidenceTypeValues` — same literal set, CanonicalAudienceEvidence.evidence_type duplicates the canonical export. */
+export const CanonicalAudienceEvidence_EvidenceTypeValues = AudienceEvidence_EvidenceTypeValues;
+/** @deprecated use `AudienceEvidence_RelationshipValues` — same literal set, CanonicalAudienceEvidence.relationship duplicates the canonical export. */
+export const CanonicalAudienceEvidence_RelationshipValues = AudienceEvidence_RelationshipValues;
+/** @deprecated use `AudienceEvidence_UnitValues` — same literal set, CanonicalAudienceEvidence.unit duplicates the canonical export. */
+export const CanonicalAudienceEvidence_UnitValues = AudienceEvidence_UnitValues;
+// --- CanonicalAudienceEvidenceSelection ---
+/** @deprecated use `AudienceEvidenceSelection_DecisionUseValues` — same literal set, CanonicalAudienceEvidenceSelection.decision_use duplicates the canonical export. */
+export const CanonicalAudienceEvidenceSelection_DecisionUseValues = AudienceEvidenceSelection_DecisionUseValues;
 // --- CanonicalFormatBase ---
 /** @deprecated use `CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement_CompositionModelValues` — same literal set, CanonicalFormatBase.composition_model duplicates the canonical export. */
 export const CanonicalFormatBase_CompositionModelValues = CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement_CompositionModelValues;
@@ -728,38 +903,56 @@ export const CanonicalFormatVASTVideo_ReferenceMutabilityValues = CanonicalForma
 // --- CanonicalProjectionReference ---
 /** @deprecated use `CanonicalFormatHostedAudio_AssetSourceValues` — same literal set, CanonicalProjectionReference.asset_source duplicates the canonical export. */
 export const CanonicalProjectionReference_AssetSourceValues = CanonicalFormatHostedAudio_AssetSourceValues;
-// --- CreateMediaBuyInputRequired ---
-/** @deprecated use `CreateMediaBuyAsyncInputRequired_ReasonValues` — same literal set, CreateMediaBuyInputRequired.reason duplicates the canonical export. */
-export const CreateMediaBuyInputRequired_ReasonValues = CreateMediaBuyAsyncInputRequired_ReasonValues;
+// --- CatalogItemAvailabilityUpdateResult ---
+/** @deprecated use `CatalogItemAvailabilityUpdate_ActionValues` — same literal set, CatalogItemAvailabilityUpdateResult.action duplicates the canonical export. */
+export const CatalogItemAvailabilityUpdateResult_ActionValues = CatalogItemAvailabilityUpdate_ActionValues;
+/** @deprecated use `CatalogItemAvailabilityState_AvailabilityValues` — same literal set, CatalogItemAvailabilityUpdateResult.availability duplicates the canonical export. */
+export const CatalogItemAvailabilityUpdateResult_AvailabilityValues = CatalogItemAvailabilityState_AvailabilityValues;
 // --- CreativeBrief ---
 /** @deprecated use `BriefAsset_ObjectiveValues` — same literal set, CreativeBrief.objective duplicates the canonical export. */
 export const CreativeBrief_ObjectiveValues = BriefAsset_ObjectiveValues;
+// --- CreativeLocalizationReadback ---
+/** @deprecated use `CreativeLocalization_UnmatchedLocaleActionValues` — same literal set, CreativeLocalizationReadback.unmatched_locale_action duplicates the canonical export. */
+export const CreativeLocalizationReadback_UnmatchedLocaleActionValues = CreativeLocalization_UnmatchedLocaleActionValues;
 // --- CreativeStatusChangedWebhook ---
 /** @deprecated use `CreativePurgedWebhook_InitiatorValues` — same literal set, CreativeStatusChangedWebhook.initiator duplicates the canonical export. */
 export const CreativeStatusChangedWebhook_InitiatorValues = CreativePurgedWebhook_InitiatorValues;
+// --- Error ---
+/** @deprecated use `CatalogItemAvailabilityError_RecoveryValues` — same literal set, Error.recovery duplicates the canonical export. */
+export const Error_RecoveryValues = CatalogItemAvailabilityError_RecoveryValues;
+/** @deprecated use `CatalogItemAvailabilityError_SourceValues` — same literal set, Error.source duplicates the canonical export. */
+export const Error_SourceValues = CatalogItemAvailabilityError_SourceValues;
 // --- GetBrandIdentitySuccess ---
 /** @deprecated use `GetBrandIdentityRequest_FieldsValues` — same literal set, GetBrandIdentitySuccess.available_fields duplicates the canonical export. */
 export const GetBrandIdentitySuccess_AvailableFieldsValues = GetBrandIdentityRequest_FieldsValues;
-// --- GetProductsInputRequired ---
-/** @deprecated use `GetProductsAsyncInputRequired_ReasonValues` — same literal set, GetProductsInputRequired.reason duplicates the canonical export. */
-export const GetProductsInputRequired_ReasonValues = GetProductsAsyncInputRequired_ReasonValues;
+// --- GetProductsResponse ---
+/** @deprecated use `GetProductsCompletion_CacheScopeValues` — same literal set, GetProductsResponse.cache_scope duplicates the canonical export. */
+export const GetProductsResponse_CacheScopeValues = GetProductsCompletion_CacheScopeValues;
+// --- GetSignalsCompletion ---
+/** @deprecated use `GetProductsCompletion_CacheScopeValues` — same literal set, GetSignalsCompletion.cache_scope duplicates the canonical export. */
+export const GetSignalsCompletion_CacheScopeValues = GetProductsCompletion_CacheScopeValues;
 // --- GetSignalsResponse ---
-/** @deprecated use `GetProductsResponse_CacheScopeValues` — same literal set, GetSignalsResponse.cache_scope duplicates the canonical export. */
-export const GetSignalsResponse_CacheScopeValues = GetProductsResponse_CacheScopeValues;
+/** @deprecated use `GetProductsCompletion_CacheScopeValues` — same literal set, GetSignalsResponse.cache_scope duplicates the canonical export. */
+export const GetSignalsResponse_CacheScopeValues = GetProductsCompletion_CacheScopeValues;
 // --- MediaBuyDeliveryWebhookResult ---
 /** @deprecated use `GetMediaBuyDeliveryResponse_NotificationTypeValues` — same literal set, MediaBuyDeliveryWebhookResult.notification_type duplicates the canonical export. */
 export const MediaBuyDeliveryWebhookResult_NotificationTypeValues = GetMediaBuyDeliveryResponse_NotificationTypeValues;
-// --- PackageSignalTargetingGroup1 ---
-/** @deprecated use `PackageSignalTargetingGroup_OperatorValues` — same literal set, PackageSignalTargetingGroup1.operator duplicates the canonical export. */
-export const PackageSignalTargetingGroup1_OperatorValues = PackageSignalTargetingGroup_OperatorValues;
-// --- ProductSignalTargetingOption ---
-/** @deprecated use `FeatureRequirement_IfNotCoveredValues` — same literal set, ProductSignalTargetingOption.allowed_targeting_modes duplicates the canonical export. */
-export const ProductSignalTargetingOption_AllowedTargetingModesValues = FeatureRequirement_IfNotCoveredValues;
+// --- ProductAudienceEvidenceRequirements ---
+/** @deprecated use `AudienceEvidenceRequirements_EvidencePresenceValues` — same literal set, ProductAudienceEvidenceRequirements.evidence_presence duplicates the canonical export. */
+export const ProductAudienceEvidenceRequirements_EvidencePresenceValues = AudienceEvidenceRequirements_EvidencePresenceValues;
+/** @deprecated use `AudienceEvidenceRequirements_RequirementModeValues` — same literal set, ProductAudienceEvidenceRequirements.requirement_mode duplicates the canonical export. */
+export const ProductAudienceEvidenceRequirements_RequirementModeValues = AudienceEvidenceRequirements_RequirementModeValues;
 // --- RawAttestation ---
 /** @deprecated use `DigestAttestation_MethodValues` — same literal set, RawAttestation.method duplicates the canonical export. */
 export const RawAttestation_MethodValues = DigestAttestation_MethodValues;
 /** @deprecated use `DigestAttestation_PurposeValues` — same literal set, RawAttestation.purpose duplicates the canonical export. */
 export const RawAttestation_PurposeValues = DigestAttestation_PurposeValues;
+// --- ReportingCapabilities ---
+/** @deprecated use `CanonicalReportingCapabilities_DateRangeSupportValues` — same literal set, ReportingCapabilities.date_range_support duplicates the canonical export. */
+export const ReportingCapabilities_DateRangeSupportValues = CanonicalReportingCapabilities_DateRangeSupportValues;
+// --- ReportPlanAdjustmentResponse ---
+/** @deprecated use `ReportPlanAdjustmentRequest_AdjustmentTypeValues` — same literal set, ReportPlanAdjustmentResponse.adjustment_type duplicates the canonical export. */
+export const ReportPlanAdjustmentResponse_AdjustmentTypeValues = ReportPlanAdjustmentRequest_AdjustmentTypeValues;
 // --- SearchBrandResult ---
 /** @deprecated use `GetBrandIdentitySuccess_KellerTypeValues` — same literal set, SearchBrandResult.keller_type duplicates the canonical export. */
 export const SearchBrandResult_KellerTypeValues = GetBrandIdentitySuccess_KellerTypeValues;
@@ -769,8 +962,6 @@ export const SignalDefinition_RefreshCadenceValues = SignalDefinition_LookbackWi
 // --- SignalDefinitionEnrichment ---
 /** @deprecated use `SignalDefinition_Art9BasisValues` — same literal set, SignalDefinitionEnrichment.art9_basis duplicates the canonical export. */
 export const SignalDefinitionEnrichment_Art9BasisValues = SignalDefinition_Art9BasisValues;
-/** @deprecated use `SignalDefinition_DataSourcesValues` — same literal set, SignalDefinitionEnrichment.data_sources duplicates the canonical export. */
-export const SignalDefinitionEnrichment_DataSourcesValues = SignalDefinition_DataSourcesValues;
 /** @deprecated use `SignalDefinition_LookbackWindowValues` — same literal set, SignalDefinitionEnrichment.lookback_window duplicates the canonical export. */
 export const SignalDefinitionEnrichment_LookbackWindowValues = SignalDefinition_LookbackWindowValues;
 /** @deprecated use `SignalDefinition_MethodologyValues` — same literal set, SignalDefinitionEnrichment.methodology duplicates the canonical export. */
@@ -783,15 +974,6 @@ export const SignalSelectionGroupRule_TargetingModeValues = FeatureRequirement_I
 // --- SignalTargetingRules ---
 /** @deprecated use `SignalSelectionGroupRule_SelectionModeValues` — same literal set, SignalTargetingRules.selection_mode duplicates the canonical export. */
 export const SignalTargetingRules_SelectionModeValues = SignalSelectionGroupRule_SelectionModeValues;
-// --- SyncCatalogsInputRequired ---
-/** @deprecated use `SyncCatalogsAsyncInputRequired_ReasonValues` — same literal set, SyncCatalogsInputRequired.reason duplicates the canonical export. */
-export const SyncCatalogsInputRequired_ReasonValues = SyncCatalogsAsyncInputRequired_ReasonValues;
-// --- SyncCreativesInputRequired ---
-/** @deprecated use `SyncCreativesAsyncInputRequired_ReasonValues` — same literal set, SyncCreativesInputRequired.reason duplicates the canonical export. */
-export const SyncCreativesInputRequired_ReasonValues = SyncCreativesAsyncInputRequired_ReasonValues;
-// --- UpdateMediaBuyInputRequired ---
-/** @deprecated use `UpdateMediaBuyAsyncInputRequired_ReasonValues` — same literal set, UpdateMediaBuyInputRequired.reason duplicates the canonical export. */
-export const UpdateMediaBuyInputRequired_ReasonValues = UpdateMediaBuyAsyncInputRequired_ReasonValues;
 // --- VerifyBrandClaimsResultSuccess ---
 /** @deprecated use `SignedSuccessPayload_ClaimTypeValues` — same literal set, VerifyBrandClaimsResultSuccess.claim_type duplicates the canonical export. */
 export const VerifyBrandClaimsResultSuccess_ClaimTypeValues = SignedSuccessPayload_ClaimTypeValues;
@@ -802,5 +984,7 @@ export const VerifyBrandClaimSuccess_ClaimTypeValues = SignedSuccessPayload_Clai
 /** @deprecated use `CanonicalFormatHostedVideo_VideoCodecsValues` — same literal set, VideoAssetRequirements.codecs duplicates the canonical export. */
 export const VideoAssetRequirements_CodecsValues = CanonicalFormatHostedVideo_VideoCodecsValues;
 // --- WholesaleFeedWebhook ---
-/** @deprecated use `GetProductsResponse_CacheScopeValues` — same literal set, WholesaleFeedWebhook.cache_scope duplicates the canonical export. */
-export const WholesaleFeedWebhook_CacheScopeValues = GetProductsResponse_CacheScopeValues;
+/** @deprecated use `GetProductsCompletion_CacheScopeValues` — same literal set, WholesaleFeedWebhook.cache_scope duplicates the canonical export. */
+export const WholesaleFeedWebhook_CacheScopeValues = GetProductsCompletion_CacheScopeValues;
+/** @deprecated use `NotificationConfig_ProductPayloadViewValues` — same literal set, WholesaleFeedWebhook.product_payload_view duplicates the canonical export. */
+export const WholesaleFeedWebhook_ProductPayloadViewValues = NotificationConfig_ProductPayloadViewValues;

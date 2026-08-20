@@ -491,13 +491,32 @@ describe('validateResponseSchema', () => {
       }
     });
 
-    it('registers every generated tool response schema', () => {
-      const generatedToolSchemas = Object.keys(schemas)
-        .filter(name => name.endsWith('ResponseSchema'))
-        .filter(name => !NON_TOOL_RESPONSE_SCHEMAS.has(name));
+    it('routes public identity_match responses through the router-to-publisher boundary', () => {
+      assert.strictEqual(TOOL_RESPONSE_SCHEMAS.identity_match, schemas.IdentityMatchResponseRouterPublisherSchema);
+      const base = {
+        status: 'completed',
+        type: 'identity_match_response',
+        request_id: 'id-1',
+        eligible_package_ids: ['pkg-1'],
+        serve_window_sec: 60,
+      };
+      assert.ok(
+        TOOL_RESPONSE_SCHEMAS.identity_match.safeParse({
+          ...base,
+          tmpx_providers: { provider_1: { chunks: [{ slot_id: 'primary', value: 'opaque' }] } },
+        }).success
+      );
+      assert.ok(
+        !TOOL_RESPONSE_SCHEMAS.identity_match.safeParse({
+          ...base,
+          tmpx_chunks: [{ slot_id: 'primary', value: 'opaque' }],
+        }).success
+      );
+    });
 
-      for (const schemaName of generatedToolSchemas) {
-        const toolName = TOOL_NAME_OVERRIDES.get(schemaName) ?? schemaNameToToolName(schemaName);
+    it('registers every manifest-declared tool response schema', () => {
+      const manifest = require('../../schemas/cache/latest/manifest.json');
+      for (const toolName of Object.keys(manifest.tools)) {
         assert.ok(TOOL_RESPONSE_SCHEMAS[toolName], `Missing schema registration for tool: ${toolName}`);
       }
     });

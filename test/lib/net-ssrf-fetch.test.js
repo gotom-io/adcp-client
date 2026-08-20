@@ -1,6 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
+const dnsPromises = require('dns/promises');
 
 const {
   ssrfSafeFetch,
@@ -59,6 +60,45 @@ describe('ssrfSafeFetch — address guard', () => {
   });
 });
 
+describe('ssrfSafeFetch — DNS deadline and cancellation', () => {
+  it('applies the per-request timeout while DNS lookup is pending', async t => {
+    t.mock.method(dnsPromises, 'lookup', () => new Promise(() => {}));
+    const startedAt = Date.now();
+
+    await assert.rejects(
+      () => ssrfSafeFetch('https://slow-dns.example/', { timeoutMs: 30 }),
+      err => {
+        assert.match(err.message, /ssrf-fetch: timeout/);
+        return true;
+      }
+    );
+
+    assert.ok(Date.now() - startedAt < 1000, 'DNS timeout should release the caller promptly');
+  });
+
+  it('propagates caller abort while DNS lookup is pending', async t => {
+    t.mock.method(dnsPromises, 'lookup', () => new Promise(() => {}));
+    const controller = new AbortController();
+    const reason = new Error('caller-aborted-dns');
+    const startedAt = Date.now();
+    setTimeout(() => controller.abort(reason), 30);
+
+    await assert.rejects(
+      () =>
+        ssrfSafeFetch('https://slow-dns.example/', {
+          signal: controller.signal,
+          timeoutMs: 2000,
+        }),
+      err => {
+        assert.strictEqual(err, reason);
+        return true;
+      }
+    );
+
+    assert.ok(Date.now() - startedAt < 1000, 'caller abort should release a pending DNS lookup promptly');
+  });
+});
+
 describe('ssrfSafeFetch — happy path (allowPrivateIp for localhost)', () => {
   it('performs a GET, returns headers + body, pins to resolved IP', async () => {
     const server = http.createServer((req, res) => {
@@ -73,7 +113,29 @@ describe('ssrfSafeFetch — happy path (allowPrivateIp for localhost)', () => {
       assert.strictEqual(result.headers['x-pin-check'], 'ok');
       assert.strictEqual(result.pinnedAddress, '127.0.0.1');
       assert.strictEqual(result.pinnedFamily, 4);
+      assert.strictEqual(result.connectionPinned, true);
       assert.deepStrictEqual(JSON.parse(Buffer.from(result.body).toString('utf8')), { ok: true, method: 'GET' });
+    } finally {
+      server.close();
+    }
+  });
+
+  it('delegates DNS pinning metadata to trusted custom-fetch connections', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    try {
+      const result = await ssrfSafeFetch(`http://127.0.0.1:${port}/x`, {
+        allowPrivateIp: true,
+        trustedFetchFn: fetch,
+      });
+      assert.strictEqual(result.status, 200);
+      assert.strictEqual(result.pinnedAddress, undefined);
+      assert.strictEqual(result.pinnedFamily, undefined);
+      assert.strictEqual(result.connectionPinned, false);
     } finally {
       server.close();
     }

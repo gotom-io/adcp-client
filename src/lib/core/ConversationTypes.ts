@@ -144,7 +144,11 @@ export type WebhookUrlTemplate =
  * Options for task execution
  */
 export interface TaskOptions {
-  /** Timeout for entire task (ms) */
+  /**
+   * Absolute wall-clock deadline for the entire SDK task call (ms), including
+   * discovery and capability/version preflight. Unlike `workingTimeout`, this
+   * deadline never resets on progress and aborts in-flight protocol work.
+   */
   timeout?: number;
   /**
    * Caller-owned cancellation signal for the read path and in-flight protocol
@@ -214,8 +218,12 @@ export interface TaskState {
   taskId: string;
   /** Task name (tool name) */
   taskName: string;
-  /** Original parameters */
-  params: any;
+  /**
+   * Original parameters while the SDK is actively dispatching or resolving
+   * input. Redacted after a task becomes working, submitted, or terminal so
+   * lifecycle inspection does not retain request assets or credentials.
+   */
+  params?: any;
   /** Current status */
   status: TaskStatus;
   /** Message history */
@@ -581,7 +589,7 @@ export interface ConversationConfig {
   maxHistorySize?: number;
   /** Whether to persist conversations */
   persistConversations?: boolean;
-  /** Timeout for 'working' status (max 120s per PR #78) */
+  /** Resettable idle/progress timeout for protocol work in 'working' status. */
   workingTimeout?: number;
   /** Default max clarifications */
   defaultMaxClarifications?: number;

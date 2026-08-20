@@ -10,9 +10,14 @@ import { createHash, createHmac } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { getOrCreateClientResolution, getOrDiscoverProfile, runStep, type TestClient } from '../client';
-import { closeConnections, type VersionEnvelopeMode } from '../../protocols';
+import {
+  closeScopedConnections,
+  normalizeTransportOptions,
+  withMCPConnectionScope,
+  type VersionEnvelopeMode,
+} from '../../protocols';
 import { getCapturesFromError, withRawResponseCapture, type RawHttpCapture } from '../../protocols/rawResponseCapture';
-import { executeStoryboardTask } from './task-map';
+import { defaultStoryboardResponseProjection, executeStoryboardTask } from './task-map';
 import {
   extractContextWithProvenance,
   injectContext,
@@ -27,6 +32,10 @@ import { detectShapeDriftHints } from './shape-drift-hints';
 import { detectStrictValidationHints } from './strict-validation-hints';
 import {
   runValidations,
+  decorateValidationResult,
+  isExternalResponseSchemaAuthoritative,
+  validationFailsStep,
+  RUNNER_CAPABILITY_VERSION,
   type ValidationContext,
   type CrossResponseSet,
   type UpstreamTrafficValidationContext,
@@ -34,15 +43,26 @@ import {
 } from './validations';
 import { PARALLEL_DISPATCH_CONTRACT, runParallelDispatches, validateParallelDispatchSpec } from './parallel-dispatch';
 import { resolvePath, resolvePortableIdentifierPathAll, toJsonPointer, validatePortableIdentifierPath } from './path';
-import { RateLimitTripObserver, validateRateLimitTripSpec, type RateLimitTripObservation } from './rate-limit-trip';
+import {
+  RATE_LIMIT_TRIP_CONTRACT,
+  RateLimitTripObserver,
+  validateRateLimitTripSpec,
+  type RateLimitTripObservation,
+} from './rate-limit-trip';
 import { redactSecrets } from '../../utils/redact-secrets';
 import { ResponseSchemaValidationError } from '../../utils/response-unwrapper';
 import { injectLegacyEnvelopeStatus, normalizeLegacyMediaBuyStatusForReturn } from '../../utils/envelope-status-compat';
 import { queryUpstreamTraffic, type ControllerScenario, type UpstreamTrafficSuccess } from '../test-controller';
 import { IDENTIFIER_DIGEST_LIMIT } from '../../upstream-recorder/constants';
 import { enrichRequest, hasRequestEnricher } from './request-builder';
+import {
+  BUILD_ASSETS_FROM_FORMAT_DIRECTIVE,
+  expandCreativeAssetDirectivesWithDiagnostics,
+  findUnresolvedCreativeAssetDirectives,
+  type CreativeAssetExpansionFailure,
+} from './creative-assets';
 import { resolveAccount, resolveBrand } from '../client';
-import { isMutatingTask, generateIdempotencyKey } from '../../utils/idempotency';
+import { requestUsesIdempotency, generateIdempotencyKey } from '../../utils/idempotency';
 import {
   getSchemaDefaultByPath,
   getSchemaValidatorByRef,
@@ -50,7 +70,7 @@ import {
   schemaAllowsTopLevelField,
   withExternalSchemaRoot,
 } from '../../validation/schema-loader';
-import { parseAdcpMajorVersion } from '../../version';
+import { ADCP_VERSION, parseAdcpMajorVersion } from '../../version';
 import {
   PROBE_TASKS,
   probeProtectedResourceMetadata,
@@ -61,14 +81,48 @@ import {
   generateRandomInvalidJwt,
 } from './probes';
 import { readBrandJsonUrl } from '../../signing/agent-resolver/capabilities-types';
-import { validateTestKit } from './test-kit';
+import { selectAgentByUrl } from '../../signing/agent-resolver/select-agent';
+import { selectProbeTask, validateTestKit } from './test-kit';
 import { validateStoryboardShape } from './loader';
 import { probeRequestSigningVector } from './request-signing/probe-dispatch';
 import { createWebhookReceiver, type WebhookReceiver, type WebhookWaitResult } from './webhook-receiver';
 import { WEBHOOK_ASSERTION_TASKS, armWebhookAssertions, executeWebhookAssertionStep } from './webhook-assertions';
-import { CONTROLLER_SEEDING_PHASE_ID, runControllerSeeding, type ControllerSeedingResult } from './seeding';
+import { runControllerSeeding, type ControllerSeedingResult } from './seeding';
+import { applyFixtureBindingsToRequest, type FixtureBindingRegistry } from './fixture-resolution';
 import { getComplianceCacheDir } from './compliance';
 import { signWebhook, type RequestLike } from '../../signing/client';
+import { replayTrustedMatchContextVector } from './trusted-match-context-replay';
+import {
+  TRUSTED_MATCH_PUBLISHER_AUTH_TASKS,
+  prepareTrustedMatchPublisherAuthProbes,
+  probeTrustedMatchPublisherAuth,
+  type PreparedTrustedMatchPublisherAuthProbes,
+  type TrustedMatchPublisherAuthTask,
+} from './trusted-match-publisher-auth';
+import {
+  gradeOAuthMetadataGraph,
+  redactOAuthUrlForOutput,
+  redactOAuthUrlsInText,
+  type OAuthMetadataGraphGrade,
+} from './oauth-metadata-graph';
+
+const PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH = Symbol('preparedTrustedMatchPublisherAuth');
+type InternalStoryboardRunOptions = StoryboardRunOptions & {
+  [PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH]?: PreparedTrustedMatchPublisherAuthProbes;
+};
+
+function getPreparedTrustedMatchPublisherAuth(
+  options: StoryboardRunOptions
+): PreparedTrustedMatchPublisherAuthProbes | undefined {
+  return (options as InternalStoryboardRunOptions)[PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH];
+}
+
+function withPreparedTrustedMatchPublisherAuth(
+  options: StoryboardRunOptions,
+  prepared: PreparedTrustedMatchPublisherAuthProbes
+): StoryboardRunOptions {
+  return { ...options, [PREPARED_TRUSTED_MATCH_PUBLISHER_AUTH]: prepared } as InternalStoryboardRunOptions;
+}
 
 /**
  * Pre-computed controller-seeding outcome passed into `executeStoryboardPass`.
@@ -89,6 +143,8 @@ import type {
   AssertionResult,
   BranchSetSpec,
   ContextProvenanceEntry,
+  FixtureResolutionCoverageGap,
+  FixtureResolutionRecord,
   HttpProbeResult,
   RunnerDetailedSkipReason,
   RunnerExtractionRecord,
@@ -145,6 +201,7 @@ const SKIP_DETAILS: Record<RunnerSkipReason, string> = {
   missing_tool: 'Skipped: agent did not advertise the required tool.',
   missing_test_controller:
     'Skipped: deterministic_testing phase requires comply_test_controller, which the agent did not advertise.',
+  fixture_unavailable: 'Skipped: the runner test kit cannot synthesize a valid input for the seller-declared contract.',
   unsatisfied_contract: 'Skipped: test-kit contract is out of scope for this grading run.',
   requirement_unmet:
     'Skipped: a requires: tag named a runtime requirement that is not available on this run (see RunnerSkipResult.requirement).',
@@ -165,7 +222,22 @@ export function applyStoryboardVersionOptions(
   storyboard: Storyboard,
   options: StoryboardRunOptions
 ): StoryboardRunOptions {
-  return applyAdcpVersionRunOptions(storyboard.adcp_version, options);
+  const versioned = applyAdcpVersionRunOptions(storyboard.adcp_version, options);
+  const mayInheritStoryboardDir = options.adcpVersion === undefined || options.adcpVersion === storyboard.adcp_version;
+  const complianceDir = versioned.complianceDir ?? (mayInheritStoryboardDir ? storyboard.compliance_dir : undefined);
+  return complianceDir && versioned.complianceDir !== complianceDir ? { ...versioned, complianceDir } : versioned;
+}
+
+function applyReusableProfileOptions(options: StoryboardRunOptions): StoryboardRunOptions {
+  const profile = options.profile ?? options._profile;
+  if (!profile) return options;
+  const profileTools = options.agents === undefined ? (normalizeAgentToolNames(profile.tools) ?? []) : undefined;
+
+  return {
+    ...options,
+    _profile: profile,
+    ...(options.agentTools === undefined && profileTools !== undefined ? { agentTools: profileTools } : {}),
+  };
 }
 
 export function applyAdcpVersionRunOptions(
@@ -231,7 +303,16 @@ const DETAILED_SKIP_DETAILS: Partial<Record<RunnerDetailedSkipReason, string>> =
   rate_limit_not_triggered: 'No RATE_LIMITED response was observed within the configured max_attempts.',
 };
 
+/**
+ * Machine-readable detail values required by the AdCP report contract.
+ * The probe's human-readable error remains available on the legacy response.
+ */
+const CANONICAL_SKIP_DETAILS: Partial<Record<RunnerDetailedSkipReason, string>> = {
+  rate_limit_not_triggered: 'rate_limit_not_triggered',
+};
+
 const REPLAY_WEBHOOK_VECTOR_TASK = 'replay_webhook_vector';
+const REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK = 'replay_trusted_match_context_vector';
 const WEBHOOK_REPLAY_DEFAULT_TIMEOUT_MS = 10_000;
 
 function selectionForProbeSkip(reason: RunnerDetailedSkipReason, detail: string): RunnerSelectionResult | undefined {
@@ -286,7 +367,7 @@ function resolveCapabilityPathForGate(
   // field never read as absent, silently flipping the gate (e.g. a signals
   // seller that omits `signals.discovery_modes`, default `["brief"]`, would run
   // a `present: true`-gated scenario that should skip). Defaults are resolved
-  // only for the value matchers (`equals` / `contains`), where the default's
+  // only for the value matchers (`equals` / `contains` / `not_contains`), where the default's
   // VALUE is what the gate tests.
   if ('present' in predicate) return undefined;
   if (!schemaDefaultShouldApply(raw, predicate.path)) return undefined;
@@ -312,7 +393,7 @@ function schemaDefaultShouldApply(raw: unknown, dottedPath: string): boolean {
  * predicate is satisfied and a human-readable detail string when the
  * storyboard should be skipped.
  *
- * Three matcher forms — see `Storyboard.requires_capability` for full semantics:
+ * Four matcher forms — see `Storyboard.requires_capability` for full semantics:
  *
  * - `equals: V` — scalar equality. `actual` must be declared and must equal
  *   `V`. Absent fields (`undefined`) skip unless the capabilities schema
@@ -332,9 +413,13 @@ function schemaDefaultShouldApply(raw: unknown, dottedPath: string): boolean {
  *   `resolveCapabilityPathForGate`).
  *
  * - `contains: V` — array-membership. `actual` must be an array that
- *   includes `V` (strict equality, no coercion). Empty arrays, non-arrays,
+ *   includes `V` (structural JSON equality, no coercion). Empty arrays, non-arrays,
  *   and absent fields all skip unless the capabilities schema declares a
  *   default that the gate materialized before predicate evaluation.
+ *
+ * - `not_contains: V` — negative array-membership. `actual` must be an array
+ *   that does not include `V` (structural JSON equality, no coercion). Missing and
+ *   non-array values skip; an empty array satisfies the predicate.
  *
  * Exported for direct testing so the predicate semantics are pinned without
  * needing a full runStoryboard() roundtrip.
@@ -359,9 +444,24 @@ export function evaluateCapabilityPredicate(predicate: RequiresCapabilityPredica
         `agent declared ${actual === undefined ? 'no value' : JSON.stringify(actual)}.`
       );
     }
-    if (!actual.includes(predicate.contains)) {
+    if (!actual.some(value => capabilityValuesEqual(value, predicate.contains))) {
       return (
         `Capability predicate \`${predicate.path}\` must contain ${JSON.stringify(predicate.contains)}: ` +
+        `agent declared ${JSON.stringify(actual)}.`
+      );
+    }
+    return null;
+  }
+  if ('not_contains' in predicate) {
+    if (!Array.isArray(actual)) {
+      return (
+        `Capability predicate \`${predicate.path}\` must not contain ${JSON.stringify(predicate.not_contains)}: ` +
+        `agent declared ${actual === undefined ? 'no value' : JSON.stringify(actual)}.`
+      );
+    }
+    if (actual.some(value => capabilityValuesEqual(value, predicate.not_contains))) {
+      return (
+        `Capability predicate \`${predicate.path}\` must not contain ${JSON.stringify(predicate.not_contains)}: ` +
         `agent declared ${JSON.stringify(actual)}.`
       );
     }
@@ -384,6 +484,25 @@ export function evaluateCapabilityPredicate(predicate: RequiresCapabilityPredica
   return null;
 }
 
+/** Key-order-insensitive equality for JSON-valued capability declarations. */
+function capabilityValuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((value, index) => capabilityValuesEqual(value, b[index]));
+  }
+  if (Array.isArray(b)) return false;
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const aKeys = Object.keys(aRecord).sort();
+  const bKeys = Object.keys(bRecord).sort();
+  return (
+    aKeys.length === bKeys.length &&
+    aKeys.every((key, index) => key === bKeys[index] && capabilityValuesEqual(aRecord[key], bRecord[key]))
+  );
+}
+
 function evaluateRequiresCapabilityGate(
   predicate: RequiresCapabilityPredicate,
   profile: AgentProfile | undefined,
@@ -395,11 +514,87 @@ function evaluateRequiresCapabilityGate(
     const actual = resolveCapabilityPathForGate(rawCaps, predicate, adcpVersion);
     return evaluateCapabilityPredicate(predicate, actual);
   }
+  // OAuth 3.2 grading is opt-in on the raw wire declaration. A normalized
+  // profile or advertised get_adcp_capabilities tool is not evidence that the
+  // agent asserted oauth.supported: true.
+  if ('equals' in predicate && predicate.path === 'oauth.supported' && predicate.equals === true) {
+    return evaluateCapabilityPredicate(predicate, undefined);
+  }
+  // The TMP publisher-auth storyboard is selected only by an explicit
+  // experimental_features declaration. A normalized profile without the raw
+  // capability payload is not evidence of that opt-in.
+  if (
+    'contains' in predicate &&
+    predicate.path === 'experimental_features' &&
+    predicate.contains === 'trusted_match.core'
+  ) {
+    return evaluateCapabilityPredicate(predicate, undefined);
+  }
   const tools = agentTools ?? profile?.tools;
   if ('equals' in predicate && tools !== undefined && !tools.includes('get_adcp_capabilities')) {
     return evaluateCapabilityPredicate(predicate, undefined);
   }
   return null;
+}
+
+function storyboardCapabilityPredicates(storyboard: Storyboard): RequiresCapabilityPredicate[] {
+  return [
+    ...(storyboard.requires_capability ? [storyboard.requires_capability] : []),
+    ...(storyboard.requires_all_capabilities ?? []),
+  ];
+}
+
+export function describeStoryboardCapabilityGates(storyboard: Storyboard): string | null {
+  const predicates = storyboardCapabilityPredicates(storyboard);
+  if (predicates.length === 0) return null;
+  return predicates.map(describeCapabilityPredicate).join(' AND ');
+}
+
+function describeCapabilityPredicate(predicate: RequiresCapabilityPredicate): string {
+  if ('present' in predicate) return `${predicate.path} ${predicate.present ? 'present' : 'absent'}`;
+  if ('contains' in predicate) return `${predicate.path} contains ${JSON.stringify(predicate.contains)}`;
+  if ('not_contains' in predicate) {
+    return `${predicate.path} does not contain ${JSON.stringify(predicate.not_contains)}`;
+  }
+  return `${predicate.path} = ${JSON.stringify(predicate.equals)}`;
+}
+
+function evaluateStoryboardCapabilityGates(
+  storyboard: Storyboard,
+  profile: AgentProfile | undefined,
+  agentTools?: readonly string[],
+  adcpVersion?: string
+): string | null {
+  const predicates = [
+    ...(storyboard.requires_capability ? [{ predicate: storyboard.requires_capability, failClosed: false }] : []),
+    ...(storyboard.requires_all_capabilities ?? []).map(predicate => ({ predicate, failClosed: true })),
+  ];
+  const failures = predicates
+    .map(({ predicate, failClosed }) => {
+      if (!failClosed) return evaluateRequiresCapabilityGate(predicate, profile, agentTools, adcpVersion);
+      const rawCapabilities = profile?.raw_capabilities;
+      if (rawCapabilities === undefined) {
+        return (
+          `Capability predicate \`${describeCapabilityPredicate(predicate)}\` could not be evaluated: ` +
+          'no declared or resolved value (raw capabilities unavailable).'
+        );
+      }
+      const declared = resolveCapabilityPath(rawCapabilities, predicate.path);
+      const resolved = resolveCapabilityPathForGate(rawCapabilities, predicate, adcpVersion);
+      const detail = evaluateCapabilityPredicate(predicate, resolved);
+      if (detail === null) return null;
+      const provenance =
+        declared !== undefined
+          ? `declared value ${JSON.stringify(declared)}`
+          : resolved !== undefined
+            ? `resolved schema default ${JSON.stringify(resolved)}`
+            : 'no declared or resolved value';
+      return `${detail} [${provenance}]`;
+    })
+    .filter((detail): detail is string => detail !== null);
+  if (failures.length === 0) return null;
+  if (failures.length === 1) return failures[0]!;
+  return `Capability predicates not satisfied:\n${failures.map(detail => `- ${detail}`).join('\n')}`;
 }
 
 function collectPhaseCapabilitySkipDetails(
@@ -429,6 +624,37 @@ function allExecutablePhasesCapabilitySkipped(
 
 function buildSkip(reason: RunnerSkipReason, detail?: string): { reason: RunnerSkipReason; detail: string } {
   return { reason, detail: detail ?? SKIP_DETAILS[reason] };
+}
+
+type CreativeAssetFixtureUnavailableFailure = Extract<CreativeAssetExpansionFailure, { reason: 'fixture_unavailable' }>;
+
+function buildCreativeAssetFixtureUnavailableStep(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState,
+  failure: CreativeAssetFixtureUnavailableFailure,
+  task = step.task
+): StoryboardStepResult {
+  const detail =
+    `creative_asset_fixture_unavailable: slot "${failure.slotId}", asset type "${failure.assetType}", ` +
+    `constraint: ${failure.constraint} (${failure.path})`;
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'fixture_unavailable',
+    skip: buildSkip('fixture_unavailable', detail),
+    duration_ms: 0,
+    validations: [],
+    context,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none' },
+  };
 }
 
 interface ResponseDerivedSkip {
@@ -1011,7 +1237,10 @@ function filterResponseHeaders(headers: Record<string, string> | undefined): Rec
   if (!headers) return undefined;
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (RESPONSE_HEADER_ALLOWLIST.has(k.toLowerCase())) out[k] = v;
+    const lower = k.toLowerCase();
+    if (RESPONSE_HEADER_ALLOWLIST.has(lower)) {
+      out[lower] = lower === 'location' ? redactOAuthUrlForOutput(v) : v;
+    }
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -1036,14 +1265,21 @@ export async function runStoryboard(
   storyboard: Storyboard,
   options: StoryboardRunOptions = {}
 ): Promise<StoryboardResult> {
-  options = applyStoryboardVersionOptions(storyboard, options);
-  const schemaRoot = getRunSchemaRoot(options);
-  if (schemaRoot) {
-    return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, () =>
-      runStoryboardBody(agentUrlOrUrls, storyboard, options)
-    );
-  }
-  return await runStoryboardBody(agentUrlOrUrls, storyboard, options);
+  options = applyReusableProfileOptions(options);
+  return withMCPConnectionScope(
+    async () => {
+      options = applyStoryboardVersionOptions(storyboard, options);
+      options = { ...options, transport: normalizeTransportOptions(options.transport) };
+      const schemaRoot = getRunSchemaRoot(options);
+      if (schemaRoot) {
+        return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, () =>
+          runStoryboardBody(agentUrlOrUrls, storyboard, options)
+        );
+      }
+      return await runStoryboardBody(agentUrlOrUrls, storyboard, options);
+    },
+    { isolate: true }
+  );
 }
 
 async function runStoryboardBody(
@@ -1081,6 +1317,52 @@ async function runStoryboardBody(
     );
   }
 
+  // When capabilities are already available, applicability MUST be evaluated
+  // before runtime requirements. Without a profile we defer both gates until
+  // executeStoryboardPass has completed discovery; reporting a missing runner
+  // adapter before learning that the agent never claimed the capability would
+  // incorrectly turn not_applicable into requirement_unmet.
+  const hasCapabilityGate = storyboardCapabilityPredicates(storyboard).length > 0;
+  const deferCapabilityAndRequires = hasCapabilityGate && options._profile === undefined;
+  if (hasCapabilityGate && !deferCapabilityAndRequires) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(
+      storyboard,
+      options._profile,
+      options.agentTools,
+      options.adcpVersion
+    );
+    if (unmetDetail !== null) {
+      const resultAgentUrls = options.agents ? Object.values(options.agents).map(e => e.url) : agentUrls;
+      return {
+        ...buildCapabilityUnsupportedResult(resultAgentUrls, storyboard, unmetDetail),
+        notices: collectCapabilityNotices(storyboard, options._profile),
+      };
+    }
+  }
+
+  // Runtime gates still run before either multi-instance strategy when they
+  // can be evaluated faithfully, so a missing harness remains one whole-
+  // storyboard skip instead of being multiplied across passes.
+  const allRequires = resolveStoryboardRequires(storyboard, options);
+  if (allRequires.length && !deferCapabilityAndRequires) {
+    const requirementCheck = await checkRequires(allRequires, storyboard, options, options._profile);
+    if ('requirement' in requirementCheck) {
+      const resultAgentUrls = options.agents ? Object.values(options.agents).map(e => e.url) : agentUrls;
+      return {
+        ...buildRequirementUnmetResult(
+          resultAgentUrls,
+          storyboard,
+          requirementCheck.requirement,
+          requirementCheck.detail
+        ),
+        notices: collectCapabilityNotices(storyboard, options._profile),
+      };
+    }
+    if (requirementCheck.preparedPublisherAuthProbes) {
+      options = withPreparedTrustedMatchPublisherAuth(options, requirementCheck.preparedPublisherAuthProbes);
+    }
+  }
+
   const requestedStrategy = options.multi_instance_strategy ?? 'round-robin';
   if (requestedStrategy === 'multi-pass' && isMultiInstance) {
     // Webhook receivers bind a fresh ephemeral port per pass. Each pass would
@@ -1097,18 +1379,6 @@ async function runStoryboardBody(
       );
     }
     return runMultiPass(agentUrls, storyboard, options);
-  }
-
-  const allRequires = resolveStoryboardRequires(storyboard, options);
-  if (allRequires.length) {
-    const unmet = checkRequires(allRequires, storyboard, options, options._profile);
-    if (unmet) {
-      const resultAgentUrls = options.agents ? Object.values(options.agents).map(e => e.url) : agentUrls;
-      return {
-        ...buildRequirementUnmetResult(resultAgentUrls, storyboard, unmet.requirement, unmet.detail),
-        notices: collectCapabilityNotices(storyboard, options._profile?.raw_capabilities),
-      };
-    }
   }
 
   if (options.agents) {
@@ -1228,7 +1498,7 @@ function validateAgentsMap(
 
 /**
  * Build a minimal StoryboardResult for a storyboard skipped by a
- * `requires_capability` predicate. The single synthetic step carries
+ * root capability predicate. The single synthetic step carries
  * `skip_reason: 'capability_unsupported'` so CLI reports and JUnit
  * consumers render it as a skip rather than a pass or failure.
  */
@@ -1246,7 +1516,7 @@ function buildCapabilityUnsupportedResult(
     passed: true,
     skipped: true,
     skip_reason: 'capability_unsupported',
-    skip: { reason: 'unsatisfied_contract', detail },
+    skip: { reason: DETAILED_SKIP_TO_CANONICAL.capability_unsupported, detail },
     duration_ms: 0,
     validations: [],
     context: {},
@@ -1256,7 +1526,7 @@ function buildCapabilityUnsupportedResult(
   return {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
     overall_passed: true,
     phases: [
       {
@@ -1276,6 +1546,7 @@ function buildCapabilityUnsupportedResult(
     passed_count: 0,
     failed_count: 0,
     skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     strict_validation_summary: {
       observable: false,
@@ -1331,6 +1602,9 @@ const REQUIREMENT_TO_SKIP_REASON: Record<RequirementName, RunnerSkipReason> = {
   seeded_state: 'requirement_unmet',
   real_wire: 'requirement_unmet',
   webhook_receiver: 'requirement_unmet',
+  webhook_replay_receiver: 'not_applicable',
+  trusted_match_context_router_runner: 'not_applicable',
+  trusted_match_publisher_auth_runner: 'requirement_unmet',
   request_signer: 'not_applicable',
   multi_agent: 'requirement_unmet',
 };
@@ -1373,7 +1647,7 @@ function buildRequirementUnmetResult(
   return {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
     overall_passed: true,
     phases: [
       {
@@ -1392,6 +1666,7 @@ function buildRequirementUnmetResult(
     passed_count: 0,
     failed_count: 0,
     skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     strict_validation_summary: {
       observable: false,
@@ -1428,7 +1703,7 @@ function buildRequiredAnyOfToolsMissingResult(
   return {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
     overall_passed: true,
     phases: [
       {
@@ -1444,6 +1719,7 @@ function buildRequiredAnyOfToolsMissingResult(
     passed_count: 0,
     failed_count: 0,
     skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     strict_validation_summary: {
       observable: false,
@@ -1490,6 +1766,16 @@ function normalizeAgentToolNames(tools: unknown): string[] | undefined {
  *     Autodetected from step `sample_request` token presence (see
  *     `detectImplicitRequires`); authors don't write this tag manually.
  *     Spec: adcp-client#1678.
+ *   - `webhook_replay_receiver` — operator supplied a non-empty
+ *     `options.webhook_replay_receiver.url`. Autodetected from any
+ *     `replay_webhook_vector` step (see `detectImplicitRequires`); authors
+ *     don't write this tag manually. Spec: adcp-client#2356.
+ *   - `trusted_match_context_router_runner` — operator supplied a router URL
+ *     and registration callback for raw `POST /context` replay. Autodetected
+ *     from `replay_trusted_match_context_vector`. Spec: adcp-client#2479.
+ *   - `trusted_match_publisher_auth_runner` — operator supplied exact
+ *     publisher-facing Context/Identity endpoints plus complete declarative
+ *     absent/invalid credential states. Spec: adcp-client#2526.
  *   - `request_signer` — agent advertises `request_signing.supported: true`
  *     in `get_adcp_capabilities`. Autodetected for any storyboard whose
  *     id is `'signed_requests'` or that contains a `request_signing_probe`
@@ -1510,12 +1796,15 @@ function normalizeAgentToolNames(tools: unknown): string[] | undefined {
  *     the topology this storyboard actually routes through.
  *     Spec: adcp-client#2281.
  */
-function checkRequires(
+async function checkRequires(
   requires: readonly string[],
   storyboard: Storyboard,
   options: StoryboardRunOptions,
   profile?: AgentProfile
-): { requirement: string; detail: string } | null {
+): Promise<
+  { requirement: string; detail: string } | { preparedPublisherAuthProbes?: PreparedTrustedMatchPublisherAuthProbes }
+> {
+  let preparedPublisherAuthProbes = getPreparedTrustedMatchPublisherAuth(options);
   for (const requirement of requires) {
     if (!isKnownRequirement(requirement)) {
       return {
@@ -1568,6 +1857,62 @@ function checkRequires(
         }
         break;
       }
+      case 'webhook_replay_receiver': {
+        if (!options.webhook_replay_receiver?.url) {
+          return {
+            requirement,
+            detail:
+              'Storyboard contains a `replay_webhook_vector` step but no webhook replay receiver URL ' +
+              'is configured. Pass `webhook_replay_receiver.url` in StoryboardRunOptions to run ' +
+              'inbound buyer/orchestrator receiver conformance. Seller agents without an inbound ' +
+              'receiver grade not_applicable for this storyboard.',
+          };
+        }
+        break;
+      }
+      case 'trusted_match_context_router_runner': {
+        const runner = options.trusted_match_context_router_runner;
+        if (!runner?.router_url || typeof runner.registerProviders !== 'function') {
+          return {
+            requirement,
+            detail:
+              'Storyboard contains a `replay_trusted_match_context_vector` step but no Trusted Match ' +
+              'Context router harness is configured. Pass `trusted_match_context_router_runner` with ' +
+              '`router_url` and `registerProviders` to run raw POST /context conformance.',
+          };
+        }
+        break;
+      }
+      case 'trusted_match_publisher_auth_runner': {
+        const runner = options.trusted_match_publisher_auth_runner;
+        if (
+          !runner ||
+          typeof runner.contextEndpoint !== 'string' ||
+          typeof runner.identityEndpoint !== 'string' ||
+          typeof runner.preparePublisherAuthProbe !== 'function'
+        ) {
+          return {
+            requirement,
+            detail:
+              'Storyboard requires `trusted_match_publisher_auth_runner`; configure exact HTTPS ' +
+              '`contextEndpoint` and `identityEndpoint` URLs plus `preparePublisherAuthProbe` for ' +
+              'both absent and invalid credential states.',
+          };
+        }
+        if (!preparedPublisherAuthProbes) {
+          try {
+            preparedPublisherAuthProbes = await prepareTrustedMatchPublisherAuthProbes(runner);
+          } catch (error) {
+            return {
+              requirement,
+              detail:
+                'Storyboard requires a complete `trusted_match_publisher_auth_runner` configuration: ' +
+                (error instanceof Error ? error.message : String(error)),
+            };
+          }
+        }
+        break;
+      }
       case 'request_signer': {
         // Gate is a no-op when no profile is threaded through (external
         // `_client` mode). The caller has accepted responsibility for
@@ -1608,7 +1953,7 @@ function checkRequires(
       }
     }
   }
-  return null;
+  return { ...(preparedPublisherAuthProbes && { preparedPublisherAuthProbes }) };
 }
 
 function collectMultiAgentRequirementRouteKeys(storyboard: Storyboard, options: StoryboardRunOptions): string[] {
@@ -1675,7 +2020,20 @@ function valueContainsWebhookToken(value: unknown): boolean {
  *     the runner's webhook receiver cannot run without one — so authors
  *     don't need to remember to add `requires: [webhook_receiver]`
  *     separately. Contract-gated synthetic steps only count when their
- *     `requires_contract` is configured for this run. Spec: adcp-client#1678.
+ *     `requires_contract` is configured for this run. Rate-limit trip probes
+ *     additionally require the exact runner contract and explicit live-side-
+ *     effect authorization before their target request contributes an
+ *     implicit webhook requirement. Spec: adcp-client#1678.
+ *   - `'webhook_replay_receiver'`, autodetected from any
+ *     `replay_webhook_vector` step. These vectors target an inbound
+ *     buyer/orchestrator receiver, so without `webhook_replay_receiver.url`
+ *     the whole storyboard grades not_applicable instead of executing an
+ *     all-skipped phase that fails the required-phase rollup. Spec:
+ *     adcp-client#2356.
+ *   - `'trusted_match_context_router_runner'`, autodetected from any
+ *     `replay_trusted_match_context_vector` step. Without the operator-owned
+ *     registration seam the raw router test grades not_applicable and never
+ *     falls back to an MCP/A2A tool call. Spec: adcp-client#2479.
  *   - `'request_signer'`, autodetected from `storyboard.id ===
  *     'signed_requests'` or any step using the synthesized
  *     `request_signing_probe` task. The signed-requests universal
@@ -1687,20 +2045,28 @@ function valueContainsWebhookToken(value: unknown): boolean {
  */
 function detectImplicitRequires(
   storyboard: Storyboard,
-  options: Pick<StoryboardRunOptions, 'contracts'> = {}
+  options: Pick<StoryboardRunOptions, 'contracts' | 'allowLiveSideEffects'> = {}
 ): RequirementName[] {
   const requires: RequirementName[] = [];
   let needsWebhook = false;
+  let needsWebhookReplayReceiver = false;
+  let needsTrustedMatchContextRouterRunner = false;
   let needsSigner = storyboard.id === 'signed_requests';
   const contractsInScope = new Set(options.contracts ?? []);
   for (const phase of storyboard.phases) {
     for (const step of phase.steps) {
-      const rateLimitTripInScope = !step.requires_contract || contractsInScope.has(step.requires_contract);
+      const stepContractInScope = !step.requires_contract || contractsInScope.has(step.requires_contract);
+      const rateLimitProbeInScope =
+        step.task !== 'expect_rate_limit_not_replayed' ||
+        (stepContractInScope &&
+          contractsInScope.has(RATE_LIMIT_TRIP_CONTRACT) &&
+          options.allowLiveSideEffects === true);
       if (
         !needsWebhook &&
-        ((step.sample_request && valueContainsWebhookToken(step.sample_request)) ||
+        ((step.sample_request && rateLimitProbeInScope && valueContainsWebhookToken(step.sample_request)) ||
           (step.rate_limit_trip?.trip_target_sample_request &&
-            rateLimitTripInScope &&
+            stepContractInScope &&
+            rateLimitProbeInScope &&
             valueContainsWebhookToken(step.rate_limit_trip.trip_target_sample_request)))
       ) {
         needsWebhook = true;
@@ -1708,11 +2074,23 @@ function detectImplicitRequires(
       if (!needsSigner && step.task === 'request_signing_probe') {
         needsSigner = true;
       }
-      if (needsWebhook && needsSigner) break;
+      if (!needsWebhookReplayReceiver && stepContractInScope && step.task === REPLAY_WEBHOOK_VECTOR_TASK) {
+        needsWebhookReplayReceiver = true;
+      }
+      if (
+        !needsTrustedMatchContextRouterRunner &&
+        stepContractInScope &&
+        step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK
+      ) {
+        needsTrustedMatchContextRouterRunner = true;
+      }
+      if (needsWebhook && needsWebhookReplayReceiver && needsTrustedMatchContextRouterRunner && needsSigner) break;
     }
-    if (needsWebhook && needsSigner) break;
+    if (needsWebhook && needsWebhookReplayReceiver && needsTrustedMatchContextRouterRunner && needsSigner) break;
   }
   if (needsWebhook) requires.push('webhook_receiver');
+  if (needsWebhookReplayReceiver) requires.push('webhook_replay_receiver');
+  if (needsTrustedMatchContextRouterRunner) requires.push('trusted_match_context_router_runner');
   if (needsSigner) requires.push('request_signer');
   return requires;
 }
@@ -1751,7 +2129,7 @@ export function buildDiscoveryFailedResult(
   return {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
     overall_passed: false,
     phases: [
       {
@@ -1767,6 +2145,7 @@ export function buildDiscoveryFailedResult(
     passed_count: 0,
     failed_count: 1,
     skipped_count: 0,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     strict_validation_summary: {
       observable: false,
@@ -1798,7 +2177,7 @@ function buildRequiredToolsMissingResult(
   return {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
     overall_passed: true,
     phases: [
       {
@@ -1830,6 +2209,7 @@ function buildRequiredToolsMissingResult(
     passed_count: 0,
     failed_count: 0,
     skipped_count: 1,
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     strict_validation_summary: {
       observable: false,
@@ -1848,7 +2228,10 @@ function buildRequiredToolsMissingResult(
  * agent's declared capabilities. Returns an empty array when rawCaps is
  * absent (standalone runner without pre-fetched profile).
  *
- * Currently emits three spec-grounded notices (adcp-client#1704, #2082):
+ * Currently emits four spec-grounded notices (adcp-client#1704, #2082, #2461):
+ *
+ * - `capabilities_response_schema_invalid`: one informational notice per
+ *   schema issue, identified by its RFC 6901 `capability_pointer`.
  *
  * - `signed_requests_specialism_deprecated`: agent claims deprecated
  *   `specialisms: ['signed-requests']` alongside `request_signing.supported:
@@ -1863,8 +2246,18 @@ function buildRequiredToolsMissingResult(
  *   `webhook_signing.legacy_hmac_fallback: true`, which is removed in
  *   `effective_version: '4.0'`.
  */
-function collectCapabilityNotices(storyboard: Storyboard, rawCaps: unknown): RunnerNotice[] {
-  const notices: RunnerNotice[] = [];
+function collectCapabilityNotices(storyboard: Storyboard, profile: AgentProfile | undefined): RunnerNotice[] {
+  const notices: RunnerNotice[] = (profile?.capabilities_schema_issues ?? []).map(issue => ({
+    severity: 'info',
+    code: 'capabilities_response_schema_invalid',
+    message:
+      `The agent's get_adcp_capabilities response failed schema validation at ${issue.pointer || '/'}: ` +
+      `${issue.message}. Track results may share this root cause; fix it first, then re-read the failures.`,
+    capability_pointer: issue.pointer,
+    docs_url: 'https://github.com/adcontextprotocol/adcp/issues/6254',
+    storyboard_ids: [storyboard.id],
+  }));
+  const rawCaps = profile?.raw_capabilities;
   if (!rawCaps || typeof rawCaps !== 'object') return notices;
   const caps = rawCaps as Record<string, unknown>;
 
@@ -1924,6 +2317,7 @@ function collectCapabilityNotices(storyboard: Storyboard, rawCaps: unknown): Run
   // unless it actually exercises the delivery path.
   const WEBHOOK_STEP_TASKS = new Set([
     'expect_webhook',
+    'expect_no_webhook',
     'expect_webhook_retry_keys_stable',
     'expect_webhook_signature_valid',
   ]);
@@ -1970,9 +2364,9 @@ function collectInputSchemaFieldStripNotices(debugLogs: unknown, storyboardId: s
       severity: 'info',
       code: 'input_schema_field_stripped',
       message:
-        `Runner stripped fields not declared in the agent's tool input schema for ${task}: ` +
-        `${fields.join(', ')}. Fix the tool schema declaration or avoid sending unsupported fields.`,
-      docs_url: 'https://github.com/adcontextprotocol/adcp/issues/5495',
+        `Runner stripped request fields not declared by either the agent's tool input schema or the canonical AdCP ` +
+        `request schema for ${task}: ${fields.join(', ')}. Check the caller or runner payload before changing the agent schema.`,
+      docs_url: 'https://github.com/adcontextprotocol/adcp/issues/6437',
       storyboard_ids: [storyboardId],
     });
   }
@@ -1982,16 +2376,21 @@ function collectInputSchemaFieldStripNotices(debugLogs: unknown, storyboardId: s
 function mergeRunnerNotices(notices: RunnerNotice[]): RunnerNotice[] {
   const byCode = new Map<string, RunnerNotice>();
   for (const notice of notices) {
-    const existing = byCode.get(notice.code);
+    const key = runnerNoticeKey(notice);
+    const existing = byCode.get(key);
     if (existing) {
       for (const sid of notice.storyboard_ids) {
         if (!existing.storyboard_ids.includes(sid)) existing.storyboard_ids.push(sid);
       }
     } else {
-      byCode.set(notice.code, { ...notice, storyboard_ids: [...notice.storyboard_ids] });
+      byCode.set(key, { ...notice, storyboard_ids: [...notice.storyboard_ids] });
     }
   }
   return [...byCode.values()];
+}
+
+function runnerNoticeKey(notice: RunnerNotice): string {
+  return notice.capability_pointer === undefined ? notice.code : `${notice.code}\u0000${notice.capability_pointer}`;
 }
 
 function collectStepNotices(phases: StoryboardPhaseResult[]): RunnerNotice[] {
@@ -2037,7 +2436,7 @@ async function executeStoryboardPass(
         duration_ms: 0,
         error: detail,
       };
-      await closeConnections(options.protocol);
+      await closeScopedConnections(options.protocol);
       return buildDiscoveryFailedResult(agentUrls, storyboard, failedStep);
     }
     clients = [...routingContext.clients.values()];
@@ -2045,11 +2444,11 @@ async function executeStoryboardPass(
     // prevents a stale `pendingTaskId` from a prior storyboard's non-terminal
     // step from auto-threading into this storyboard's first call. (#1585)
     resetClientSessions(clients);
-    // Pick the first agent's profile as the "primary" for downstream code
-    // that reads single-profile fields (library_version on per-step result
-    // records, raw_capabilities for `requires_capability`). Per-step
-    // accuracy across N agents is a follow-up; today's storyboards that
-    // use `requires_capability` are single-tenant authored.
+    // Pick the first agent's profile as the run-level "primary" for gates
+    // that are evaluated before a step is routed (`requires_capability`,
+    // notices). The dispatcher separately attaches the selected agent's
+    // profile to each step assignment for capability-derived execution
+    // behavior and per-step library-version hints.
     profile = [...routingContext.profiles.values()][0];
     // For `required_tools` gating, union every agent's advertised tools so
     // a storyboard that needs ≥1 of [sync_governance, activate_signal]
@@ -2094,7 +2493,7 @@ async function executeStoryboardPass(
       // (auth misconfig, MCP transport-fallback bugs, network policy, etc.).
       // See: https://github.com/adcontextprotocol/adcp-client/issues/...
       if (discovered.step.passed === false) {
-        await closeConnections(options.protocol);
+        await closeScopedConnections(options.protocol);
         return buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step);
       }
       profile = discovered.profile;
@@ -2152,17 +2551,34 @@ async function executeStoryboardPass(
   // early-return results (requirement-unmet, capability-unsupported). In the
   // standalone runner path options._profile may be undefined; notices will be
   // collected again from the fully-fetched profile at result-build time.
-  const preflightNotices = collectCapabilityNotices(storyboard, options._profile?.raw_capabilities);
+  const preflightNotices = collectCapabilityNotices(storyboard, options._profile);
+
+  // Capability applicability is intentionally first. Optional capability
+  // storyboards must grade not_applicable for agents that did not opt in,
+  // without inspecting or reporting any missing operator runtime adapter.
+  if (storyboardCapabilityPredicates(storyboard).length > 0) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(storyboard, profile, options.agentTools, options.adcpVersion);
+    if (unmetDetail !== null) {
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
+      return {
+        ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
+        notices: preflightNotices,
+      };
+    }
+  }
 
   const allRequires = resolveStoryboardRequires(storyboard, options);
   if (allRequires.length) {
-    const unmet = checkRequires(allRequires, storyboard, options, profile);
-    if (unmet) {
-      if (!callerOwnsClients) await closeConnections(options.protocol);
+    const requirementCheck = await checkRequires(allRequires, storyboard, options, profile);
+    if ('requirement' in requirementCheck) {
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
       return {
-        ...buildRequirementUnmetResult(agentUrls, storyboard, unmet.requirement, unmet.detail),
+        ...buildRequirementUnmetResult(agentUrls, storyboard, requirementCheck.requirement, requirementCheck.detail),
         notices: preflightNotices,
       };
+    }
+    if (requirementCheck.preparedPublisherAuthProbes) {
+      options = withPreparedTrustedMatchPublisherAuth(options, requirementCheck.preparedPublisherAuthProbes);
     }
   }
 
@@ -2173,29 +2589,9 @@ async function executeStoryboardPass(
       const detail =
         `missing_required_tool_family: needs ${missing.tools.join(' or ')}` +
         (missing.rationale ? ` (${missing.rationale})` : '');
-      if (!callerOwnsClients) await closeConnections(options.protocol);
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
       return {
         ...buildRequiredAnyOfToolsMissingResult(agentUrls, storyboard, detail),
-        notices: preflightNotices,
-      };
-    }
-  }
-
-  // Evaluate requires_capability predicate before any phase setup.
-  // When the agent explicitly declared it doesn't support what this storyboard
-  // tests (e.g. `adcp.idempotency.supported: false`), skip the whole storyboard
-  // rather than producing a cascade of misleading per-phase failures.
-  if (storyboard.requires_capability) {
-    const unmetDetail = evaluateRequiresCapabilityGate(
-      storyboard.requires_capability,
-      profile,
-      options.agentTools,
-      options.adcpVersion
-    );
-    if (unmetDetail !== null) {
-      if (!callerOwnsClients) await closeConnections(options.protocol);
-      return {
-        ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
         notices: preflightNotices,
       };
     }
@@ -2214,7 +2610,7 @@ async function executeStoryboardPass(
   if (storyboard.required_tools?.length && options.agentTools) {
     const hasAnyRequired = storyboard.required_tools.some(t => options.agentTools!.includes(t));
     if (!hasAnyRequired) {
-      if (!callerOwnsClients) await closeConnections(options.protocol);
+      if (!callerOwnsClients) await closeScopedConnections(options.protocol);
       return {
         ...buildRequiredToolsMissingResult(
           agentUrls,
@@ -2363,7 +2759,7 @@ async function executeStoryboardPass(
   const dispatch =
     routingContext && options.agents
       ? createRoutingDispatcher(routingContext, options, options.agents)
-      : createDispatcher(agentUrls, clients, 'round-robin', dispatchOffset);
+      : createDispatcher(agentUrls, clients, 'round-robin', dispatchOffset, profile);
 
   // Resolve cross-step assertions declared on `storyboard.invariants`.
   // `resolveAssertions` throws on unknown ids — fail fast here rather than
@@ -2405,6 +2801,35 @@ async function executeStoryboardPass(
     storyboard,
     phaseCapabilitySkipDetails
   );
+  const capabilitySkippedPhaseIds = new Set([
+    ...phaseCapabilitySkipDetails.keys(),
+    ...storyboard.phases.filter(phase => shouldSkipPhase(phase, options)).map(phase => phase.id),
+  ]);
+  let creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+    allSteps,
+    -1,
+    context,
+    options,
+    {
+      contributions,
+      priorStepResults,
+      priorProbes,
+      agentUrl: agentUrls[0]!,
+      webhookReceiver,
+      runnerVars,
+      contextProvenance,
+      priorA2aEnvelopes,
+      stepRequestStarts,
+      responseDerivedNotApplicableContextKeys,
+      agentProfile: profile,
+      agentLibraryVersion: profile?.library_version,
+      storyboardRequiresRequestSigner: allRequires.includes('request_signer'),
+      storyboardRequiresPublisherAuthRunner:
+        storyboard.requires?.includes('trusted_match_publisher_auth_runner') === true,
+    },
+    capabilitySkippedPhaseIds
+  );
+  let creativeAssetFixtureGapRecorded = false;
   if (!hasExecutableSteps) {
     const isScenarioComposed = (storyboard.requires_scenarios?.length ?? 0) > 0;
     const detail = isScenarioComposed
@@ -2468,19 +2893,79 @@ async function executeStoryboardPass(
   let seedingFailed = false;
   let seedingMissingController = false;
   let seedingUnsupported = false;
+  let fixtureUnsatisfied = false;
+  let fixtureBindings: FixtureBindingRegistry | undefined;
+  let fixtureResolutionRecords: FixtureResolutionRecord[] | undefined;
+  let fixtureCoverageGap: FixtureResolutionCoverageGap | undefined;
   {
-    const seeding = skipControllerSeedingForPhaseGates
+    let fixtureSeedClient = clients[0]!;
+    let fixtureDiscoveryClient = clients[0]!;
+    if (routingContext && options.agents) {
+      const fixtureStep = (task: string): StoryboardStep => ({
+        id: `__fixture_resolution_${task}__`,
+        title: `Fixture resolution via ${task}`,
+        task,
+      });
+      if (options.agentTools?.includes('comply_test_controller')) {
+        fixtureSeedClient = dispatch.nextFor(fixtureStep('comply_test_controller')).client;
+      }
+      if (options.agentTools?.includes('get_products')) {
+        fixtureDiscoveryClient = dispatch.nextFor(fixtureStep('get_products')).client;
+      }
+    }
+    const seeding = creativeAssetFixtureGap
       ? null
-      : preSeeded !== undefined
-        ? preSeeded.result
-        : await runControllerSeeding(clients[0]!, storyboard, options, context);
+      : skipControllerSeedingForPhaseGates
+        ? null
+        : preSeeded !== undefined
+          ? preSeeded.result
+          : await runControllerSeeding(fixtureSeedClient, storyboard, options, context, fixtureDiscoveryClient);
     if (seeding) {
       const attach = preSeeded === undefined || preSeeded.attach;
       if (attach) {
         seedingPhaseResult = seeding.phase;
         passedCount += seeding.passedCount;
         failedCount += seeding.failedCount;
-        if (seeding.missingController || seeding.seedUnsupported) skippedCount += seeding.phase.steps.length;
+        if (seeding.missingController || seeding.seedUnsupported || seeding.fixtureUnsatisfied) {
+          skippedCount += seeding.phase.steps.filter(step => step.skipped).length;
+        }
+      }
+      fixtureBindings = seeding.bindings;
+      fixtureResolutionRecords = seeding.resolutionRecords;
+      fixtureUnsatisfied = seeding.fixtureUnsatisfied === true && seeding.failedCount === 0;
+      if (fixtureUnsatisfied) {
+        // Fixture coverage is the more specific storyboard-level reason when
+        // an authored placeholder has no executable phases. Do not retain the
+        // generic no_phases sentinel or count both reasons.
+        const noPhasesIndex = phaseResults.findIndex(phase => phase.phase_id === 'no_phases');
+        if (noPhasesIndex >= 0) {
+          skippedCount -= phaseResults[noPhasesIndex]!.steps.filter(step => step.skipped).length;
+          phaseResults.splice(noPhasesIndex, 1);
+        }
+        // Multi-pass attaches/counts pre-flight resolution only on pass one,
+        // so the aggregate contains exactly one storyboard-level skip.
+        if (attach) skippedCount += 1;
+      }
+      const hasUnsatisfiedFixtures = fixtureResolutionRecords?.some(record => record.status === 'unsatisfied') === true;
+      if (hasUnsatisfiedFixtures && fixtureResolutionRecords) {
+        const fixtures = fixtureResolutionRecords
+          .filter(record => record.status === 'unsatisfied')
+          .map(record => ({
+            fixture_type: record.fixture_type,
+            handle: record.handle,
+            ...(record.product_handle && { product_handle: record.product_handle }),
+            requirements: record.requirements,
+          }));
+        const names = fixtures.map(fixture =>
+          fixture.fixture_type === 'pricing_option'
+            ? `pricing_option "${fixture.product_handle}/${fixture.handle}"`
+            : `product "${fixture.handle}"`
+        );
+        fixtureCoverageGap = {
+          reason: 'fixture_unsatisfied',
+          detail: `fixture_unsatisfied: no seller fixture satisfied ${names.join(', ')}`,
+          fixtures,
+        };
       }
       if (seeding.missingController) {
         seedingMissingController = true;
@@ -2492,12 +2977,97 @@ async function executeStoryboardPass(
     }
   }
 
+  const buildExecutionState = (
+    agentUrl = agentUrls[0]!,
+    agentProfile: AgentProfile | undefined = profile
+  ): ExecutionState => ({
+    contributions,
+    priorStepResults,
+    priorProbes,
+    agentUrl,
+    webhookReceiver,
+    runnerVars,
+    contextProvenance,
+    priorA2aEnvelopes,
+    stepRequestStarts,
+    responseDerivedNotApplicableContextKeys,
+    agentProfile,
+    agentLibraryVersion: agentProfile?.library_version,
+    storyboardRequiresRequestSigner: allRequires.includes('request_signer'),
+    storyboardRequiresPublisherAuthRunner:
+      storyboard.requires?.includes('trusted_match_publisher_auth_runner') === true,
+    fixtureBindings,
+  });
+  if (
+    !creativeAssetFixtureGap &&
+    !seedingMissingController &&
+    !seedingUnsupported &&
+    !seedingFailed &&
+    !fixtureUnsatisfied
+  ) {
+    creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+      allSteps,
+      -1,
+      context,
+      options,
+      buildExecutionState(),
+      capabilitySkippedPhaseIds
+    );
+  }
+
   for (const phase of storyboard.phases) {
     // adcp-client#1612: bail at phase boundaries when comply()'s combined
     // timeout/external signal has aborted. Without this the phase loop runs
     // to completion regardless of the outer budget.
     options.signal?.throwIfAborted();
     const phaseStart = Date.now();
+
+    // A pure resolution miss is one storyboard-level skip, not an
+    // ordinary-step skip. Short-circuit before capability and other phase
+    // gates so no ordinary rows or per-step counts are produced for this run.
+    if (fixtureUnsatisfied) {
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: [],
+        duration_ms: 0,
+      });
+      continue;
+    }
+
+    // A captured seller format proved that a future creative directive cannot
+    // be synthesized. Preserve earlier observations, record the directive
+    // step once, and leave every other remaining phase empty: no side effect
+    // or prerequisite cascade may occur after this runner-owned coverage gap.
+    if (creativeAssetFixtureGap) {
+      const gapSteps: StoryboardStepResult[] = [];
+      if (!creativeAssetFixtureGapRecorded && creativeAssetFixtureGap.target.phaseId === phase.id) {
+        const gapStep = buildCreativeAssetFixtureUnavailableStep(
+          creativeAssetFixtureGap.target.step,
+          phase.id,
+          context,
+          allSteps,
+          buildExecutionState(),
+          creativeAssetFixtureGap.failure
+        );
+        gapStep.storyboard_id = storyboard.id;
+        gapSteps.push(gapStep);
+        priorStepResults.set(gapStep.step_id, gapStep);
+        skippedCount++;
+        creativeAssetFixtureGapRecorded = true;
+      }
+      phaseResults.push({
+        phase_id: phase.id,
+        phase_title: phase.title,
+        passed: true,
+        steps: gapSteps,
+        duration_ms: 0,
+      });
+      priorPhaseIds.push(phase.id);
+      continue;
+    }
+
     const phaseCapabilitySkipDetail = phaseCapabilitySkipDetails.get(phase.id);
     if (phaseCapabilitySkipDetail !== undefined) {
       const skippedSteps = buildPhaseCapabilitySkippedSteps(storyboard, phase, phaseCapabilitySkipDetail, context);
@@ -2633,8 +3203,8 @@ async function executeStoryboardPass(
     // Seeding-cascade skip: the pre-flight seed phase can fail as a setup
     // break, or the agent can be out-of-scope for fixture seeding because it
     // lacks either the controller tool or a required seed_* scenario. Emit
-    // full step rows (not an empty phase) so implementors see exactly which
-    // buyer-side operations were elided.
+    // full step rows so implementors see which buyer-side operations were
+    // elided.
     if (seedingMissingController || seedingUnsupported || seedingFailed) {
       const cascadeSkip: Pick<StoryboardStepResult, 'skip_reason' | 'skip'> = seedingMissingController
         ? {
@@ -2646,10 +3216,15 @@ async function executeStoryboardPass(
               skip_reason: 'fixture_seed_unsupported',
               skip: { reason: 'not_applicable', detail: FIXTURE_SEED_UNSUPPORTED_DETAIL },
             }
-          : {
-              skip_reason: 'controller_seeding_failed',
-              skip: { reason: 'prerequisite_failed', detail: CONTROLLER_SEEDING_FAILED_DETAIL },
-            };
+          : seedingFailed
+            ? {
+                skip_reason: 'controller_seeding_failed',
+                skip: { reason: 'prerequisite_failed', detail: CONTROLLER_SEEDING_FAILED_DETAIL },
+              }
+            : {
+                skip_reason: 'controller_seeding_failed',
+                skip: { reason: 'prerequisite_failed', detail: CONTROLLER_SEEDING_FAILED_DETAIL },
+              };
       const cascadeSteps: StoryboardStepResult[] = phase.steps.map(step => ({
         storyboard_id: storyboard.id,
         step_id: step.id,
@@ -2804,6 +3379,7 @@ async function executeStoryboardPass(
         phasePassed = false;
         continue;
       }
+      const stepExecutionState = buildExecutionState(assignment.agentUrl, assignment.profile);
       const rawResult = await executeStep(
         assignment.client,
         step,
@@ -2812,19 +3388,7 @@ async function executeStoryboardPass(
         context,
         allSteps,
         options,
-        {
-          contributions,
-          priorStepResults,
-          priorProbes,
-          agentUrl: assignment.agentUrl,
-          webhookReceiver,
-          runnerVars,
-          contextProvenance,
-          priorA2aEnvelopes,
-          stepRequestStarts,
-          responseDerivedNotApplicableContextKeys,
-          agentLibraryVersion: profile?.library_version,
-        }
+        stepExecutionState
       );
       const result: StoryboardStepResult = { ...rawResult, storyboard_id: storyboard.id };
       if (isMultiInstance || useRouting) {
@@ -2832,7 +3396,7 @@ async function executeStoryboardPass(
         // bug reports show which agent served which tool. In routed mode
         // every step gets the field; in replica round-robin only when
         // there are 2+ URLs.
-        result.agent_url = assignment.agentUrl;
+        result.agent_url = redactOAuthUrlForOutput(assignment.agentUrl);
         result.agent_index = assignment.instanceIndex + 1;
       }
       stepResults.push(result);
@@ -2851,7 +3415,16 @@ async function executeStoryboardPass(
       // invariant pass entirely on this step and emit a single skipped
       // `assertion` entry per invariant so consumers can still see WHICH
       // invariants were skipped and why.
-      const schemaInvalidResponse = result.validations.some(v => v.check === 'response_schema' && !v.passed);
+      const schemaInvalidResponse = result.validations.some(
+        v => v.check === 'response_schema' && validationFailsStep(v)
+      );
+
+      // Rate-limit exhaustion is a contract-defined applicability result,
+      // not a response to grade. Preserve its empty validations array and
+      // passing skip status. Step assertions still run and remain visible on
+      // the storyboard-level assertions surface, but are not mirrored onto
+      // this skipped step or counted as a failed step.
+      const rateLimitTripNotApplicable = result.skipped === true && result.skip_reason === 'rate_limit_not_triggered';
 
       // Fire per-step assertions. Each result is appended to the step's
       // `validations[]` under `check: "assertion"` so existing UI renders
@@ -2881,12 +3454,14 @@ async function executeStoryboardPass(
         for (const r of raw) {
           const full: AssertionResult = { ...r, assertion_id: spec.id, scope: 'step', step_id: step.id };
           assertionResults.push(full);
-          result.validations.push({
-            check: 'assertion',
-            passed: r.passed,
-            description: `${spec.id}: ${r.description}`,
-            ...(r.error !== undefined && { error: r.error }),
-          });
+          if (!rateLimitTripNotApplicable) {
+            result.validations.push({
+              check: 'assertion',
+              passed: r.passed,
+              description: `${spec.id}: ${r.description}`,
+              ...(r.error !== undefined && { error: r.error }),
+            });
+          }
           // Issue #935: assertions can attach a structured hint that the
           // runner mirrors into the owning step's `hints[]`. Producers today
           // include `status.monotonic` (monotonic_violation) and
@@ -2899,7 +3474,7 @@ async function executeStoryboardPass(
             result.hints = [...existing, r.hint];
           }
           if (!r.passed) {
-            result.passed = false;
+            if (!rateLimitTripNotApplicable) result.passed = false;
             assertionsFailed = true;
           }
         }
@@ -3085,6 +3660,40 @@ async function executeStoryboardPass(
           annotateMultiInstanceFailure(result, storyboard, stepResults);
         }
       }
+
+      if (!result.skipped && result.passed) {
+        const currentGlobalIndex = allSteps.find(
+          flat => flat.phaseId === phase.id && flat.step.id === step.id
+        )?.globalIndex;
+        if (currentGlobalIndex !== undefined) {
+          creativeAssetFixtureGap = preflightRemainingCreativeAssetDirectives(
+            allSteps,
+            currentGlobalIndex,
+            context,
+            options,
+            stepExecutionState,
+            capabilitySkippedPhaseIds
+          );
+        }
+        if (creativeAssetFixtureGap) {
+          if (creativeAssetFixtureGap.target.phaseId === phase.id) {
+            const gapStep = buildCreativeAssetFixtureUnavailableStep(
+              creativeAssetFixtureGap.target.step,
+              phase.id,
+              context,
+              allSteps,
+              stepExecutionState,
+              creativeAssetFixtureGap.failure
+            );
+            gapStep.storyboard_id = storyboard.id;
+            stepResults.push(gapStep);
+            priorStepResults.set(gapStep.step_id, gapStep);
+            skippedCount++;
+            creativeAssetFixtureGapRecorded = true;
+          }
+          break;
+        }
+      }
     }
 
     // Phase-end cascade resolution for deferred `not_applicable` triggers.
@@ -3197,34 +3806,38 @@ async function executeStoryboardPass(
   // invariant). `branchSetsByPhaseId` was resolved before the phase loop so
   // the stateful cascade could consult it (branch-set peers don't cascade
   // onto each other); reuse it here.
-  const branchSetDelta = applyBranchSetGrading(
-    storyboard.phases,
-    phaseResults,
-    branchSetsByPhaseId,
-    contributions,
-    contributionSources,
-    countedAsFailed
-  );
+  const branchSetDelta = creativeAssetFixtureGap
+    ? { skippedDelta: 0 }
+    : applyBranchSetGrading(
+        storyboard.phases,
+        phaseResults,
+        branchSetsByPhaseId,
+        contributions,
+        contributionSources,
+        countedAsFailed
+      );
   skippedCount += branchSetDelta.skippedDelta;
 
   // Fire storyboard-scoped assertions. These observe the full run and can
   // emit `scope: "storyboard"` findings that flip `overall_passed` without
   // being attributable to a single step (e.g. "saw >1 acquire for the same
   // replayed idempotency_key across the run").
-  for (const spec of assertions) {
-    if (!spec.onEnd) continue;
-    const raw = await spec.onEnd(assertionContexts.get(spec.id)!);
-    for (const r of raw) {
-      assertionResults.push({ ...r, assertion_id: spec.id, scope: 'storyboard' });
-      if (!r.passed) assertionsFailed = true;
+  if (!creativeAssetFixtureGap) {
+    for (const spec of assertions) {
+      if (!spec.onEnd) continue;
+      const raw = await spec.onEnd(assertionContexts.get(spec.id)!);
+      for (const r of raw) {
+        assertionResults.push({ ...r, assertion_id: spec.id, scope: 'storyboard' });
+        if (!r.passed) assertionsFailed = true;
+      }
     }
   }
 
-  // Overall pass requires (a) no required-phase failures AND (b) at least one
-  // required phase actually passed with at least one non-skipped step AND
-  // (c) no assertion failures. Without (b) a storyboard where every phase is
-  // marked optional and every required phase's steps are individually skipped
-  // (e.g. all steps have requires_tool and none matched) would pass vacuously.
+  // Overall pass requires (a) no required-phase failures, (b) either an
+  // executed pass or every required phase grading canonically not_applicable,
+  // and (c) no assertion failures. Without (b), a storyboard where every phase
+  // is optional or every required step is skipped for another reason (for
+  // example, missing_tool) would pass vacuously.
   // (c) makes assertions gating — a run with all validations green but a
   // cross-step invariant broken is not conformant.
   // When no phases had executable steps the storyboard result is a skip, not a
@@ -3239,6 +3852,17 @@ async function executeStoryboardPass(
     return p.steps.some(s => !s.skipped && s.passed);
   });
   const requiredPhaseDefs = storyboard.phases.filter(phaseDef => !phaseDef.optional);
+  const requiredPhasesNotApplicable =
+    requiredPhaseDefs.length > 0 &&
+    requiredPhaseDefs.every(phaseDef => {
+      const phaseResult = phaseResults.find(p => p.phase_id === phaseDef.id);
+      return (
+        !!phaseResult &&
+        phaseResult.passed &&
+        phaseResult.steps.length > 0 &&
+        phaseResult.steps.every(step => step.skipped && step.skip?.reason === 'not_applicable')
+      );
+    });
   const requiredPhasesCoveredByCapabilityGates =
     phaseCapabilitySkippedIds.size > 0 &&
     requiredPhaseDefs.length > 0 &&
@@ -3250,12 +3874,10 @@ async function executeStoryboardPass(
   const requiredPhasesPassed =
     !hasExecutableSteps ||
     requiredPhaseHasExecutedPass ||
+    requiredPhasesNotApplicable ||
     (failedCount === 0 && requiredPhasesCoveredByCapabilityGates);
-  const storyboardWideFixtureSeedUnsupported =
-    seedingUnsupported &&
-    failedCount === 0 &&
-    phaseResults.some(p => p.steps.some(s => s.skipped && s.skip?.reason === 'not_applicable')) &&
-    phaseResults.every(p => p.steps.every(s => s.skipped && s.skip?.reason === 'not_applicable'));
+  const storyboardWideFixtureUnavailable =
+    (seedingUnsupported || fixtureUnsatisfied || creativeAssetFixtureGap !== undefined) && failedCount === 0;
   // Prepend the pre-flight seeding phase now that every consumer that
   // index-aligns `phaseResults` with `storyboard.phases` has run. Reader
   // order matches execution order.
@@ -3263,57 +3885,62 @@ async function executeStoryboardPass(
   const schemasUsed = collectSchemasUsed(phaseResults);
   const strictSummary = summarizeStrictValidation(phaseResults);
   const validationsNotApplicable = countValidationsNotApplicable(phaseResults);
+  const validationsAdvisoryFailed = countValidationsAdvisoryFailed(phaseResults);
   // Use the fully-fetched profile for notice detection; fall back to pre-flight
   // notices (which used options._profile) when profile was not re-fetched in
   // this pass (standalone runner with options._profile pre-set skips the fetch).
   const notices = mergeRunnerNotices([
-    ...collectCapabilityNotices(storyboard, profile?.raw_capabilities ?? options._profile?.raw_capabilities),
+    ...collectCapabilityNotices(storyboard, profile ?? options._profile),
     ...collectStepNotices(phaseResults),
   ]);
   const result: StoryboardResult = {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
-    ...(isMultiInstance && { agent_urls: [...agentUrls] }),
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    ...(isMultiInstance && { agent_urls: agentUrls.map(redactOAuthUrlForOutput) }),
     // Inner multi-pass passes surface as `round-robin` (that's what they are
     // individually); the aggregating wrapper relabels the top-level result
     // `multi-pass`.
     ...(isMultiInstance && { multi_instance_strategy: 'round-robin' as const }),
-    ...(routingContext && { agent_map: { ...routingContext.agentMap } }),
+    ...(routingContext && {
+      agent_map: Object.fromEntries(
+        Object.entries(routingContext.agentMap).map(([specialism, url]) => [specialism, redactOAuthUrlForOutput(url)])
+      ),
+    }),
     overall_passed:
-      failedCount === 0 && (requiredPhasesPassed || storyboardWideFixtureSeedUnsupported) && !assertionsFailed,
+      failedCount === 0 && (requiredPhasesPassed || storyboardWideFixtureUnavailable) && !assertionsFailed,
     phases: phaseResults,
     context,
     total_duration_ms: Date.now() - start,
     passed_count: passedCount,
     failed_count: failedCount,
     skipped_count: skippedCount,
+    ...(validationsAdvisoryFailed > 0 ? { validations_advisory_failed: validationsAdvisoryFailed } : {}),
     ...(validationsNotApplicable > 0 ? { validations_not_applicable: validationsNotApplicable } : {}),
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     ...(schemasUsed.length > 0 ? { schemas_used: schemasUsed } : {}),
     ...(assertionResults.length > 0 ? { assertions: assertionResults } : {}),
     strict_validation_summary: strictSummary,
     notices,
+    ...(fixtureResolutionRecords && { fixture_resolutions: fixtureResolutionRecords }),
+    ...(fixtureCoverageGap && { coverage_gaps: [fixtureCoverageGap] }),
     ...(routingContext && routingContext.discoveryFailures.length > 0
       ? {
           discovery_failures: routingContext.discoveryFailures.map(f => ({
             agent_key: f.agentKey,
-            // Scrub URL userinfo (`https://user:pass@host/`) before
-            // echoing onto the result — an operator may legitimately
-            // encode credentials in the URL, and the leaderboard /
-            // dashboard surface mustn't carry them.
-            url: f.url.replace(/\/\/[^/@\s]+@/, '//[REDACTED]@'),
-            error: f.underlying,
+            url: redactOAuthUrlForOutput(f.url),
+            error: redactOAuthUrlsInText(f.underlying),
           })),
         }
       : {}),
   };
 
   // Close protocol connections when the runner created its own client. The
-  // connection pool is keyed by URL+auth, so a single closeConnections() call
-  // evicts every instance's transport regardless of how many URLs we used.
+  // The runner scope tracks every URL used by this storyboard, so one scoped
+  // close releases all of its transports without disrupting concurrent runs.
   if (!callerOwnsClients) {
-    await closeConnections(options.protocol);
+    await closeScopedConnections(options.protocol);
   }
 
   if (webhookReceiver) await webhookReceiver.close();
@@ -3365,7 +3992,7 @@ async function runMultiPass(
   if (!preSeedProfile) {
     const discovered = await getOrDiscoverProfile(preSeedClients[0]!, options);
     if (discovered.step.passed === false) {
-      await closeConnections(options.protocol);
+      await closeScopedConnections(options.protocol);
       return buildDiscoveryFailedResult(agentUrls, storyboard, discovered.step);
     }
     preSeedProfile = discovered.profile;
@@ -3377,15 +4004,67 @@ async function runMultiPass(
       ...(options.agentTools ? {} : { agentTools: normalizeAgentToolNames(preSeedProfile.tools) }),
     };
   }
+
+  // runStoryboardBody cannot evaluate capability-gated requirements until
+  // this multi-pass preflight has discovered the profile. Resolve both gates
+  // once here so an optional capability remains not_applicable and a missing
+  // run-scoped harness remains one storyboard skip rather than N pass skips.
+  if (storyboardCapabilityPredicates(storyboard).length > 0) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(
+      storyboard,
+      preSeedProfile,
+      options.agentTools,
+      options.adcpVersion
+    );
+    if (unmetDetail !== null) {
+      await closeScopedConnections(options.protocol);
+      return {
+        ...buildCapabilityUnsupportedResult(agentUrls, storyboard, unmetDetail),
+        notices: collectCapabilityNotices(storyboard, preSeedProfile),
+      };
+    }
+  }
+  const allRequires = resolveStoryboardRequires(storyboard, options);
+  if (allRequires.length > 0) {
+    const requirementCheck = await checkRequires(allRequires, storyboard, options, preSeedProfile);
+    if ('requirement' in requirementCheck) {
+      await closeScopedConnections(options.protocol);
+      return {
+        ...buildRequirementUnmetResult(agentUrls, storyboard, requirementCheck.requirement, requirementCheck.detail),
+        notices: collectCapabilityNotices(storyboard, preSeedProfile),
+      };
+    }
+    if (requirementCheck.preparedPublisherAuthProbes) {
+      options = withPreparedTrustedMatchPublisherAuth(options, requirementCheck.preparedPublisherAuthProbes);
+    }
+  }
   const phaseCapabilitySkipDetails = collectPhaseCapabilitySkipDetails(
     storyboard,
     preSeedProfile,
     options.agentTools,
     options.adcpVersion
   );
-  const preSeededResult = allExecutablePhasesCapabilitySkipped(storyboard, phaseCapabilitySkipDetails)
-    ? null
-    : await runControllerSeeding(preSeedClients[0]!, storyboard, options, preSeedContext);
+  const preSeedExcludedPhaseIds = new Set([
+    ...phaseCapabilitySkipDetails.keys(),
+    ...storyboard.phases.filter(phase => shouldSkipPhase(phase, options)).map(phase => phase.id),
+  ]);
+  const preSeedFixtureGap = preflightRemainingCreativeAssetDirectives(
+    flattenSteps(storyboard),
+    -1,
+    preSeedContext,
+    options,
+    {
+      contributions: new Set(),
+      priorStepResults: new Map(),
+      priorProbes: new Map(),
+      agentUrl: agentUrls[0]!,
+    },
+    preSeedExcludedPhaseIds
+  );
+  const preSeededResult =
+    preSeedFixtureGap || allExecutablePhasesCapabilitySkipped(storyboard, phaseCapabilitySkipDetails)
+      ? null
+      : await runControllerSeeding(preSeedClients[0]!, storyboard, options, preSeedContext);
 
   const passes: StoryboardPassResult[] = [];
   const passResults: StoryboardResult[] = [];
@@ -3401,6 +4080,9 @@ async function runMultiPass(
       passed_count: result.passed_count,
       failed_count: result.failed_count,
       skipped_count: result.skipped_count,
+      ...(result.validations_advisory_failed
+        ? { validations_advisory_failed: result.validations_advisory_failed }
+        : {}),
       ...(result.validations_not_applicable ? { validations_not_applicable: result.validations_not_applicable } : {}),
       duration_ms: result.total_duration_ms,
     });
@@ -3411,6 +4093,7 @@ async function runMultiPass(
   const passed = passes.reduce((sum, p) => sum + p.passed_count, 0);
   const failed = passes.reduce((sum, p) => sum + p.failed_count, 0);
   const skipped = passes.reduce((sum, p) => sum + p.skipped_count, 0);
+  const advisoryFailed = passes.reduce((sum, p) => sum + (p.validations_advisory_failed ?? 0), 0);
   const notApplicable = passes.reduce((sum, p) => sum + (p.validations_not_applicable ?? 0), 0);
   const schemasUsed = passResults.flatMap(r => r.schemas_used ?? []);
   const schemasDedup = [...new Map(schemasUsed.map(s => [s.schema_id, s])).values()];
@@ -3418,15 +4101,18 @@ async function runMultiPass(
   // independently and reported `assertion_id` identically. Concatenate so
   // readers see a per-pass timeline; de-duplicating would hide a real
   // "passed on pass 1, failed on pass 2" divergence.
-  const assertionsAgg = passResults.flatMap(r => r.assertions ?? []);
-  // Notices are identical across passes (same agent, same capabilities); deduplicate by code.
-  const noticesDedup = [...new Map(passResults.flatMap(r => r.notices).map(n => [n.code, n])).values()];
+  const assertionsAgg = passResults.flatMap((r, index) =>
+    (r.assertions ?? []).map(assertion => ({ ...assertion, pass_index: index + 1 }))
+  );
+  // Notices are identical across passes (same agent, same capabilities).
+  // Schema-invalid capabilities notices retain one row per RFC 6901 pointer.
+  const noticesDedup = [...new Map(passResults.flatMap(r => r.notices).map(n => [runnerNoticeKey(n), n])).values()];
 
   return {
     storyboard_id: storyboard.id,
     storyboard_title: storyboard.title,
-    agent_url: agentUrls[0]!,
-    agent_urls: [...agentUrls],
+    agent_url: redactOAuthUrlForOutput(agentUrls[0]!),
+    agent_urls: agentUrls.map(redactOAuthUrlForOutput),
     multi_instance_strategy: 'multi-pass',
     overall_passed: overallPassed,
     phases: first.phases,
@@ -3436,10 +4122,14 @@ async function runMultiPass(
     passed_count: passed,
     failed_count: failed,
     skipped_count: skipped,
+    ...(advisoryFailed > 0 ? { validations_advisory_failed: advisoryFailed } : {}),
     ...(notApplicable > 0 ? { validations_not_applicable: notApplicable } : {}),
+    runner_capability_version: RUNNER_CAPABILITY_VERSION,
     tested_at: new Date().toISOString(),
     ...(schemasDedup.length > 0 ? { schemas_used: schemasDedup } : {}),
     ...(assertionsAgg.length > 0 ? { assertions: assertionsAgg } : {}),
+    ...(first.fixture_resolutions ? { fixture_resolutions: first.fixture_resolutions } : {}),
+    ...(first.coverage_gaps ? { coverage_gaps: first.coverage_gaps } : {}),
     notices: noticesDedup,
   };
 }
@@ -3464,6 +4154,19 @@ function countValidationsNotApplicable(phases: StoryboardPhaseResult[]): number 
     for (const step of phase.steps) {
       for (const v of step.validations) {
         if (v.not_applicable) n++;
+      }
+    }
+  }
+  return n;
+}
+
+/** Count failed, unpromoted advisories without affecting step verdicts. */
+function countValidationsAdvisoryFailed(phases: StoryboardPhaseResult[]): number {
+  let n = 0;
+  for (const phase of phases) {
+    for (const step of phase.steps) {
+      for (const validation of step.validations) {
+        if (!validation.passed && validation.severity === 'advisory') n++;
       }
     }
   }
@@ -3498,6 +4201,7 @@ function collectSchemasUsed(phases: StoryboardPhaseResult[]): Array<{ schema_id:
  * production-readiness gap.
  * `lenient_also_failed` = #(lenient-fail ∧ strict-fail) — step already
  * broken, strict-rejection isn't new signal.
+ * `lenient_unobserved` = #(no packaged Zod comparator ∧ strict-fail).
  *
  * Exported so callers post-processing a `StoryboardResult` (dashboards,
  * CI formatters) can compute the same summary over a subset of phases
@@ -3535,7 +4239,8 @@ export function listStrictOnlyFailures(
         if (v.check !== 'response_schema') continue;
         if (v.strict === undefined) continue;
         if (v.strict.valid) continue;
-        if (!v.passed) continue; // already counted by lenient path
+        const lenientAccepted = v.strict.lenient_valid === true || (v.strict.lenient_valid === undefined && v.passed);
+        if (!lenientAccepted) continue;
         rows.push({
           phase_id: phase.phase_id,
           step_id: step.step_id,
@@ -3553,6 +4258,8 @@ export function summarizeStrictValidation(phases: StoryboardPhaseResult[]): Stri
   let checked = 0;
   let passed = 0;
   let strictOnlyFailures = 0;
+  let lenientAlsoFailed = 0;
+  let lenientUnobserved = 0;
   for (const phase of phases) {
     for (const step of phase.steps) {
       for (const v of step.validations) {
@@ -3560,10 +4267,17 @@ export function summarizeStrictValidation(phases: StoryboardPhaseResult[]): Stri
         checked++;
         if (v.strict.valid) {
           passed++;
-        } else if (v.passed) {
-          // Lenient Zod accepted this response; strict AJV rejected it.
-          // That's the agent's strictness gap — the signal #820 wants.
-          strictOnlyFailures++;
+        } else {
+          const lenientValid = v.strict.lenient_valid;
+          if (lenientValid === true || (lenientValid === undefined && v.passed)) {
+            // Lenient Zod accepted this response; strict AJV rejected it.
+            // That's the agent's strictness gap — the signal #820 wants.
+            strictOnlyFailures++;
+          } else if (lenientValid === false || lenientValid === undefined) {
+            lenientAlsoFailed++;
+          } else {
+            lenientUnobserved++;
+          }
         }
       }
     }
@@ -3575,7 +4289,8 @@ export function summarizeStrictValidation(phases: StoryboardPhaseResult[]): Stri
     passed,
     failed,
     strict_only_failures: strictOnlyFailures,
-    lenient_also_failed: failed - strictOnlyFailures,
+    lenient_also_failed: lenientAlsoFailed,
+    ...(lenientUnobserved > 0 && { lenient_unobserved: lenientUnobserved }),
   };
 }
 
@@ -3595,15 +4310,21 @@ export async function runStoryboardStep(
   stepId: string,
   options: StoryboardRunOptions = {}
 ): Promise<StoryboardStepResult> {
-  validateStoryboardShape(storyboard);
-  options = applyStoryboardVersionOptions(storyboard, options);
-  const schemaRoot = getRunSchemaRoot(options);
-  if (schemaRoot) {
-    return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, () =>
-      runStoryboardStepBody(agentUrl, storyboard, stepId, options)
-    );
-  }
-  return await runStoryboardStepBody(agentUrl, storyboard, stepId, options);
+  options = applyReusableProfileOptions(options);
+  return withMCPConnectionScope(
+    async () => {
+      validateStoryboardShape(storyboard);
+      options = applyStoryboardVersionOptions(storyboard, options);
+      const schemaRoot = getRunSchemaRoot(options);
+      if (schemaRoot) {
+        return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, () =>
+          runStoryboardStepBody(agentUrl, storyboard, stepId, options)
+        );
+      }
+      return await runStoryboardStepBody(agentUrl, storyboard, stepId, options);
+    },
+    { isolate: true }
+  );
 }
 
 async function runStoryboardStepBody(
@@ -3625,8 +4346,12 @@ async function runStoryboardStepBody(
   if (!clientResolution.reusedShared) {
     const discovered = await getOrDiscoverProfile(client, options);
     profile = discovered.profile;
-    if (profile && !options._profile) {
-      options = { ...options, _profile: profile };
+    if (profile && (!options._profile || !options.agentTools)) {
+      options = {
+        ...options,
+        ...(!options._profile && { _profile: profile }),
+        ...(!options.agentTools && { agentTools: normalizeAgentToolNames(profile.tools) }),
+      };
     }
   } else {
     profile = options._profile;
@@ -3636,6 +4361,46 @@ async function runStoryboardStepBody(
   if (storyboard.context) forwardAliasCache(storyboard.context, context);
   if (options.context) forwardAliasCache(options.context, context);
 
+  // Find the step
+  const allSteps = flattenSteps(storyboard);
+  const found = allSteps.find(s => s.step.id === stepId);
+  if (!found) {
+    throw new Error(
+      `Step "${stepId}" not found in storyboard "${storyboard.id}". ` +
+        `Available steps: ${allSteps.map(s => s.step.id).join(', ')}`
+    );
+  }
+
+  // Standalone execution must preserve the whole-storyboard ordering:
+  // capability applicability comes before the operator runtime requirement.
+  // In particular, a non-TMP agent must not be told that it is missing a
+  // publisher-auth adapter for a capability it never declared.
+  if (storyboardCapabilityPredicates(storyboard).length > 0) {
+    const unmetDetail = evaluateStoryboardCapabilityGates(storyboard, profile, options.agentTools, options.adcpVersion);
+    if (unmetDetail !== null) {
+      const result: StoryboardStepResult = {
+        storyboard_id: storyboard.id,
+        step_id: found.step.id,
+        phase_id: found.phaseId,
+        title: found.step.title,
+        task: found.step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: { reason: 'not_applicable', detail: unmetDetail },
+        duration_ms: 0,
+        validations: [],
+        context,
+        error: unmetDetail,
+        extraction: { path: 'none' },
+        contributions: Array.from(options.contributions ?? []),
+      };
+      if (!clientResolution.reusedShared) await closeScopedConnections(options.protocol);
+      return result;
+    }
+  }
+
+  // Construct runtime adapters only after root applicability has passed.
   // `_webhookReceiver` is a test-only injection point; production callers
   // pass `webhook_receiver` and the runner constructs the listener.
   const injectedReceiver = options._webhookReceiver;
@@ -3657,17 +4422,6 @@ async function runStoryboardStepBody(
   });
   if (webhookReceiver) armWebhookAssertions(storyboard, runnerVars, webhookReceiver);
 
-  // Find the step
-  const allSteps = flattenSteps(storyboard);
-  const found = allSteps.find(s => s.step.id === stepId);
-  if (!found) {
-    if (ownsWebhookReceiver && webhookReceiver) await webhookReceiver.close();
-    throw new Error(
-      `Step "${stepId}" not found in storyboard "${storyboard.id}". ` +
-        `Available steps: ${allSteps.map(s => s.step.id).join(', ')}`
-    );
-  }
-
   // Seed provenance from the caller-supplied map (threaded through from a
   // previous step's result). Storyboard-level runs build this internally;
   // here the caller owns accumulation across stateless invocations.
@@ -3687,7 +4441,11 @@ async function runStoryboardStepBody(
     priorA2aEnvelopes: new Map(),
     stepRequestStarts: new Map(),
     responseDerivedNotApplicableContextKeys,
+    agentProfile: profile,
     agentLibraryVersion: profile?.library_version,
+    storyboardRequiresRequestSigner: resolveStoryboardRequires(storyboard, options).includes('request_signer'),
+    storyboardRequiresPublisherAuthRunner:
+      storyboard.requires?.includes('trusted_match_publisher_auth_runner') === true,
   });
 
   if (!result.skipped && result.passed && found.step.contributes_to) {
@@ -3697,7 +4455,7 @@ async function runStoryboardStepBody(
   }
 
   if (!clientResolution.reusedShared) {
-    await closeConnections(options.protocol);
+    await closeScopedConnections(options.protocol);
   }
 
   if (ownsWebhookReceiver && webhookReceiver) await webhookReceiver.close();
@@ -3714,6 +4472,8 @@ interface ExecutionState {
   priorStepResults: Map<string, StoryboardStepResult>;
   priorProbes: Map<string, HttpProbeResult>;
   agentUrl: string;
+  /** Run-scoped seller ids selected for authored fixture handles. */
+  fixtureBindings?: FixtureBindingRegistry;
   /**
    * ISO timestamps captured immediately before each step's AdCP request
    * dispatch. Threaded into `upstream_traffic` validations as the
@@ -3754,6 +4514,11 @@ interface ExecutionState {
    */
   priorA2aEnvelopes?: Map<string, A2ATaskEnvelope>;
   /**
+   * Profile for the agent selected to execute this step. In routed runs this
+   * must be the selected agent's profile, not the run-level primary profile.
+   */
+  agentProfile?: AgentProfile;
+  /**
    * Agent's reported `@adcp/client@X.Y.Z` library version, captured from
    * the `get_adcp_capabilities` discovery probe. Threaded into shape-drift
    * hints so the runner can suffix recommendations with a version-staleness
@@ -3761,6 +4526,14 @@ interface ExecutionState {
    * #850. Undefined when the agent did not advertise `library_version`.
    */
   agentLibraryVersion?: string;
+  /**
+   * Whether the storyboard declares or implicitly requires a request signer.
+   * Unsigned functional storyboards use this to distinguish an expected
+   * signature-required rejection from a failure in a signing test.
+   */
+  storyboardRequiresRequestSigner?: boolean;
+  /** Dedicated TMP raw-HTTP tasks are invalid outside their explicit runner contract. */
+  storyboardRequiresPublisherAuthRunner?: boolean;
 }
 
 async function executeStep(
@@ -3785,6 +4558,15 @@ async function executeStep(
     responseDerivedNotApplicableContextKeys: new Map(),
   };
 
+  // Recognize the dedicated TMP publisher-auth probes before generic auth
+  // overrides, missing-tool checks, or MCP/A2A routing.
+  if (TRUSTED_MATCH_PUBLISHER_AUTH_TASKS.has(step.task)) {
+    if (runState.storyboardRequiresPublisherAuthRunner !== true) {
+      return invalidTrustedMatchPublisherAuthTask(step, phaseId, context, allSteps, runState);
+    }
+    return executeProbeStep(client, step, phaseId, context, allSteps, options, runState);
+  }
+
   // HTTP probe tasks bypass the MCP client entirely.
   if (PROBE_TASKS.has(step.task)) {
     return executeProbeStep(client, step, phaseId, context, allSteps, options, runState);
@@ -3807,6 +4589,26 @@ async function executeStep(
   // When the reference resolves to nothing, fall back to `task_default`.
   const resolvedTask = resolveTaskName(step, options);
   if (!resolvedTask) {
+    if (step.task === '$test_kit.auth.probe_task' && options.agentTools) {
+      const detail =
+        `Agent does not advertise an auth-required, read-only tool that accepts an empty request body; ` +
+        `security auth probes are not applicable to tools [${options.agentTools.join(', ')}].`;
+      return {
+        step_id: step.id,
+        phase_id: phaseId,
+        title: step.title,
+        task: step.task,
+        passed: true,
+        skipped: true,
+        skip_reason: 'not_applicable',
+        skip: buildSkip('not_applicable', detail),
+        duration_ms: 0,
+        validations: [],
+        context,
+        next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+        extraction: { path: 'none' },
+      };
+    }
     return {
       step_id: step.id,
       phase_id: phaseId,
@@ -3963,14 +4765,70 @@ async function executeStep(
   // yamls generally omit it so authors don't have to remember it on every
   // mutating step — mint one here on the runner's behalf, matching how a
   // real buyer would operate. Suppressed when the step expects a missing-key
-  // error (see `testsMissingIdempotencyKey` below) so that compliance
+  // error (see `testsIdempotencyKeyOmission` below) so that compliance
   // surfaces can still exercise the server's required-field check.
   request = applyIdempotencyInvariant(request, effectiveStep.task, step);
 
+  // Fixture handles are replaced only at request-schema fields carrying the
+  // matching x-entity annotation. This applies equally to ordinary AdCP calls
+  // and comply_test_controller force/simulate requests.
+  const fixtureBinding = applyFixtureBindingsSafely(request, effectiveStep.task, options, runState);
+  if (!fixtureBinding.ok) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: effectiveStep.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [
+        {
+          check: 'unresolved_substitution',
+          passed: false,
+          description: `Fixture handle substitution failed: ${fixtureBinding.error}`,
+          json_pointer: null,
+          expected: 'an unambiguous fixture handle binding',
+          actual: fixtureBinding.error,
+          schema_id: null,
+          schema_url: null,
+        },
+      ],
+      context,
+      error: fixtureBinding.error,
+      next,
+      extraction: { path: 'none' },
+    };
+  }
+  request = fixtureBinding.request;
+
+  // Assemble seller-required creative slots from the selected format and
+  // active test kit after all other nested request construction is complete.
+  const creativeAssetExpansion = expandCreativeAssetDirectivesWithDiagnostics(request, context, options.test_kit);
+  request = creativeAssetExpansion.value as Record<string, unknown>;
+  if (!creativeAssetExpansion.ok && creativeAssetExpansion.failure.reason === 'fixture_unavailable') {
+    return buildCreativeAssetFixtureUnavailableStep(
+      step,
+      phaseId,
+      context,
+      allSteps,
+      runState,
+      creativeAssetExpansion.failure,
+      effectiveStep.task
+    );
+  }
+
   // Detect unresolved $context placeholders — a prior step likely failed
   // and didn't produce the expected output. Skip rather than sending garbage.
-  const unresolvedVars = findUnresolvedContextVars(request);
-  if (unresolvedVars.length > 0 && !step.expect_error) {
+  const unresolvedContextVars = findUnresolvedContextVars(request);
+  const unresolvedAssetDirectives = findUnresolvedCreativeAssetDirectives(request).map(path => ({
+    key: path,
+    token: BUILD_ASSETS_FROM_FORMAT_DIRECTIVE,
+  }));
+  const unresolvedVars = [...unresolvedContextVars, ...unresolvedAssetDirectives];
+  // expect_error steps may intentionally preserve invalid $context tokens, but
+  // runner-only creative directives must never cross the wire.
+  if (unresolvedAssetDirectives.length > 0 || (unresolvedContextVars.length > 0 && !step.expect_error)) {
     const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
     const responseDerivedDetails = unresolvedVars
       .map(v => runState.responseDerivedNotApplicableContextKeys?.get(v.key))
@@ -3993,7 +4851,10 @@ async function executeStep(
         synthesized.push({
           check: 'unresolved_substitution',
           passed: false,
-          description: `request token "${v.token}" did not resolve — prior step did not populate context.${v.key}`,
+          description:
+            v.token === BUILD_ASSETS_FROM_FORMAT_DIRECTIVE
+              ? `request directive "${v.token}" did not resolve — the test kit could not populate every seller-required asset at ${v.key}`
+              : `request token "${v.token}" did not resolve — prior step did not populate context.${v.key}`,
           json_pointer: null,
           expected: v.token,
           actual: null,
@@ -4047,7 +4908,7 @@ async function executeStep(
         transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
         operation: effectiveStep.task,
         payload: redactSecrets(request),
-        ...(runState.agentUrl ? { url: runState.agentUrl } : {}),
+        ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
       },
       extraction: { path: 'none' },
     };
@@ -4058,15 +4919,16 @@ async function executeStep(
   // (which the SDK transport doesn't expose), and (b) capture the HTTP status
   // + `WWW-Authenticate` header for http_* validations.
   //
-  // Tests for envelope validation on mutating tasks (e.g., "missing
-  // idempotency_key returns INVALID_REQUEST") set `step.omit_idempotency_key`
-  // to suppress both the runner's `applyIdempotencyInvariant` (above) and the
-  // AdCP client's auto-inject — otherwise the SDK helpfully generates a UUID
-  // and the server never sees a missing-key request. Paired flags so the two
-  // layers agree; see `applyIdempotencyInvariant` for the runner-level skip.
-  const testsMissingIdempotencyKey = step.omit_idempotency_key === true && isMutatingTask(effectiveStep.task);
+  // Idempotency omission scenarios set `step.omit_idempotency_key` to suppress
+  // both the runner's `applyIdempotencyInvariant` (above) and the AdCP client's
+  // auto-inject. This covers statically mutating tasks (where omission tests
+  // rejection) and the request-aware get_products proposal-finalize variant
+  // (where omission verifies the 3.2 compatibility path). Paired flags keep
+  // the two layers aligned; see `applyIdempotencyInvariant` for the runner skip.
+  const testsIdempotencyKeyOmission =
+    step.omit_idempotency_key === true && requestUsesIdempotency(effectiveStep.task, request);
 
-  // Analogous to `testsMissingIdempotencyKey`: when a step sets
+  // Analogous to `testsIdempotencyKeyOmission`: when a step sets
   // `omit_account: true` the runner has already suppressed account synthesis
   // in `applyBrandInvariant` (above — ordering is load-bearing: this must
   // come after `applyBrandInvariant` so the comment "above" stays accurate
@@ -4189,6 +5051,7 @@ async function executeStep(
         args: request,
         headers: rawProbeHeaders,
         allowPrivateIp: options.allow_http === true,
+        fetchFn: options.transport?.trustedFetchFn,
       });
       httpResult = probe.httpResult;
       taskResult = probe.taskResult;
@@ -4245,6 +5108,15 @@ async function executeStep(
         spec: step.parallel_dispatch,
         keyMinter: generateIdempotencyKey,
         correlationPrefix: step.id,
+        taskOptions: {
+          skipIdempotencyAutoInject: testsIdempotencyKeyOmission,
+          skipAccountValidation: testsMissingAccount,
+          responseProjection:
+            effectiveStep.response_projection ??
+            defaultStoryboardResponseProjection(effectiveStep.task, effectiveStep.comply_scenario),
+          mediaBuyLifecycleCompatibility: options.mediaBuyLifecycleCompatibility,
+          signal: options.signal,
+        },
       });
       const durationMs = Date.now() - started;
       // Representative TaskResult is ALWAYS `dispatches[0]` — pinning the
@@ -4283,8 +5155,12 @@ async function executeStep(
     } else {
       const dispatch = () =>
         executeStoryboardTask(client, effectiveStep.task, request, {
-          skipIdempotencyAutoInject: testsMissingIdempotencyKey,
+          skipIdempotencyAutoInject: testsIdempotencyKeyOmission,
           skipAccountValidation: testsMissingAccount,
+          responseProjection:
+            effectiveStep.response_projection ??
+            defaultStoryboardResponseProjection(effectiveStep.task, effectiveStep.comply_scenario),
+          mediaBuyLifecycleCompatibility: options.mediaBuyLifecycleCompatibility,
           signal: options.signal,
         });
       const run = await runStep(step.title, effectiveStep.task, async () => {
@@ -4332,12 +5208,52 @@ async function executeStep(
     transport: useRawProbe ? 'mcp' : options.protocol === 'a2a' ? 'a2a' : 'mcp',
     operation: effectiveStep.task,
     payload: redactSecrets(request),
-    ...(runState.agentUrl ? { url: runState.agentUrl } : {}),
+    ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
   };
   const inputSchemaStripNotices = collectInputSchemaFieldStripNotices(
     (taskResult as { debug_logs?: unknown } | undefined)?.debug_logs,
     storyboardId
   );
+
+  // Until functional storyboards can sign individual mutating requests,
+  // a seller that correctly requires signatures would otherwise receive a
+  // false-negative grade. Convert only the capability-declared rejection:
+  // the response code, dispatched task, and unsigned-storyboard state must
+  // all agree before authored validations are bypassed.
+  const requiredForSigning = resolveCapabilityPath(
+    runState.agentProfile?.raw_capabilities,
+    'request_signing.required_for'
+  );
+  if (
+    taskResult?.adcp_error?.code === 'request_signature_required' &&
+    Array.isArray(requiredForSigning) &&
+    requiredForSigning.includes(effectiveStep.task) &&
+    runState.storyboardRequiresRequestSigner !== true
+  ) {
+    const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+    const detail =
+      `Agent declared request_signing.required_for includes "${effectiveStep.task}" and rejected the unsigned ` +
+      `request with request_signature_required; storyboard "${storyboardId}" does not require request_signer.`;
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: 'not_applicable',
+      skip: buildSkip('not_applicable', detail),
+      duration_ms: stepResult.duration_ms,
+      validations: [],
+      context,
+      response: redactSecrets(taskResult.data),
+      next,
+      request: requestRecord,
+      ...(responseRecord && { response_record: responseRecord }),
+      extraction: extractionFromTaskResult(taskResult),
+      ...(inputSchemaStripNotices.length > 0 && { notices: inputSchemaStripNotices }),
+    };
+  }
 
   // AdCP 3.0.12 runner-output-contract `force_scenario_unsupported`: when a
   // comply_test_controller step calls a force_* scenario that the agent
@@ -4460,8 +5376,13 @@ async function executeStep(
   // Determine pass/fail — inverted when expect_error is set
   let passed: boolean;
   if (step.expect_error) {
-    // Step passes when the task fails (returns an error)
-    passed = !taskResult?.success || !!stepResult.error;
+    // Raw protocol probes can succeed at the transport layer while carrying
+    // a controller-level rejection in their structured payload. Treat the
+    // payload's explicit failure signal as the expected error; authored
+    // validations below still verify that it is the *right* rejection.
+    const responsePayload = taskResult?.data as { success?: unknown } | undefined;
+    const payloadReportsFailure = responsePayload?.success === false;
+    passed = !taskResult?.success || !!stepResult.error || payloadReportsFailure;
   } else if (crossResponses) {
     // Parallel-dispatch step: pass/fail is driven by the cross-response
     // set, not the representative arm. The representative is pinned to
@@ -4473,11 +5394,27 @@ async function executeStep(
     passed = stepResult.passed && (taskResult?.success ?? false);
   }
 
+  const schemaValidationError = caughtError instanceof ResponseSchemaValidationError ? caughtError : undefined;
+  // The response unwrapper preserves the rejected payload on its typed error.
+  // Grade every authored validation against that payload even though no normal
+  // TaskResult was returned; otherwise an advisory response_schema check could
+  // hide a required field validation and false-green the step.
+  const validationTaskResult: TaskResult | undefined =
+    taskResult ??
+    (schemaValidationError
+      ? {
+          // ResponseSchemaValidationError is thrown while validating a
+          // successful response arm. Preserve that terminal state so
+          // status_code/error_code checks retain their authored semantics.
+          success: true,
+          data: schemaValidationError.data,
+        }
+      : undefined);
   let validations: ValidationResult[] = [];
   // Run validations. Resolve `$context.<key>` placeholders in `value` and
   // `allowed_values` fields so expected values can reference prior steps
   // (e.g., replay tests assert `media_buy_id === $context.initial_media_buy_id`).
-  if (step.validations?.length && (taskResult || httpResult)) {
+  if (step.validations?.length && (validationTaskResult || httpResult)) {
     const resolvedValidations = step.validations.map(v => {
       const resolved = { ...v };
       if (resolved.value !== undefined) {
@@ -4512,7 +5449,7 @@ async function executeStep(
       taskName: effectiveStep.task,
       ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
       ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
-      ...(taskResult && { taskResult }),
+      ...(validationTaskResult && { taskResult: validationTaskResult }),
       ...(httpResult && { httpResult }),
       agentUrl: runState.agentUrl,
       contributions: runState.contributions,
@@ -4599,26 +5536,83 @@ async function executeStep(
   // invariant entry. Step-scope invariants downstream of this point will
   // short-circuit on the schema-invalid response (see the invariant
   // dispatch loop in `executeStoryboardPass`).
-  if (caughtError instanceof ResponseSchemaValidationError) {
-    const issues = caughtError.issues
+  let schemaRejectionIsAdvisory = false;
+  if (schemaValidationError) {
+    const issues = schemaValidationError.issues
       .slice(0, 5)
       .map(i => `${i.path.join('.') || '(root)'}: ${i.message}`)
       .join('; ');
-    const firstIssue = caughtError.issues[0];
+    const firstIssue = schemaValidationError.issues[0];
     const jsonPointer = firstIssue ? '/' + firstIssue.path.map(s => String(s)).join('/') : null;
-    const synthSchemaResult: ValidationResult = {
+    const baseSchemaResult: ValidationResult = {
       check: 'response_schema',
       passed: false,
-      description: `Response schema validation for ${caughtError.toolName}`,
+      description: `Response schema validation for ${schemaValidationError.toolName}`,
       error: issues,
       json_pointer: jsonPointer,
-      expected: `response schema for ${caughtError.toolName}`,
-      actual: caughtError.issues,
+      expected: `response schema for ${schemaValidationError.toolName}`,
+      actual: schemaValidationError.issues,
     };
-    // Prepend so extractFailures picks it up before any inline validation
-    // entry that may also be failing (e.g. `field_present` checks that
-    // legitimately can't observe their target against an unparsed payload).
-    validations = [synthSchemaResult, ...validations];
+    const authoredSchemaValidations = (step.validations ?? []).filter(v => v.check === 'response_schema');
+    const schemaValidationContext: ValidationContext = {
+      taskName: effectiveStep.task,
+      ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+      ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+      ...(validationTaskResult && { taskResult: validationTaskResult }),
+      agentUrl: runState.agentUrl,
+      contributions: runState.contributions,
+      ...(effectiveStep.response_schema_ref && { responseSchemaRef: effectiveStep.response_schema_ref }),
+      request: requestRecord,
+      ...(responseRecord && { response: responseRecord }),
+    };
+    if (isExternalResponseSchemaAuthoritative(schemaValidationContext)) {
+      // The installed SDK's generated Zod snapshot can reject a response that
+      // the caller's current-source schemaRoot accepts. Re-grade the raw
+      // payload preserved on ResponseSchemaValidationError through that
+      // authoritative bundle instead of replacing its verdict with the stale
+      // packaged rejection.
+      const authoredExternalResults = validations.filter(result => result.check === 'response_schema');
+      const externalSchemaResults =
+        authoredExternalResults.length > 0
+          ? authoredExternalResults
+          : runValidations(
+              [
+                {
+                  check: 'response_schema',
+                  description: `Response schema validation for ${schemaValidationError.toolName}`,
+                },
+              ],
+              schemaValidationContext
+            );
+      const externalPayloadAccepted =
+        externalSchemaResults.length > 0 && externalSchemaResults.every(result => result.passed);
+      schemaRejectionIsAdvisory = externalSchemaResults.every(result => !validationFailsStep(result));
+      if (externalPayloadAccepted && validationTaskResult) {
+        taskResult = validationTaskResult;
+        passed = !step.expect_error;
+        responseRecord ??= {
+          transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+          payload: redactSecrets(validationTaskResult.data),
+          duration_ms: stepResult.duration_ms,
+        };
+      } else if (schemaRejectionIsAdvisory && !step.expect_error) {
+        passed = true;
+      }
+      validations = [...externalSchemaResults, ...validations.filter(result => result.check !== 'response_schema')];
+    } else {
+      const decoratedCandidates = authoredSchemaValidations.map(validation =>
+        decorateValidationResult(baseSchemaResult, schemaValidationContext, validation)
+      );
+      const schemaResults = decoratedCandidates.length
+        ? decoratedCandidates
+        : [{ ...baseSchemaResult, severity: 'required' } satisfies ValidationResult];
+      schemaRejectionIsAdvisory = schemaResults.every(result => !validationFailsStep(result));
+      if (schemaRejectionIsAdvisory && !step.expect_error) passed = true;
+      // Prepend so extractFailures picks it up before any inline validation
+      // entry that may also be failing (e.g. `field_present` checks that
+      // legitimately can't observe their target against an unparsed payload).
+      validations = [...schemaResults, ...validations.filter(result => result.check !== 'response_schema')];
+    }
   }
 
   // Persist the captured A2A envelope keyed by step id so cross-step
@@ -4641,6 +5635,16 @@ async function executeStep(
   // Convention-based extraction (for non-error steps, or when expect_error succeeded)
   if (passed && hasData && taskResult) {
     const extracted = extractContextWithProvenance(effectiveStep.task, taskResult.data, step.id);
+    for (const group of extracted.clearGroups ?? []) {
+      if (group.when && !group.when.values.includes(updatedContext[group.when.key])) continue;
+      for (const key of group.keys) {
+        const provenance = runState.contextProvenance?.get(key);
+        if (provenance && provenance.source_kind !== 'convention') continue;
+        delete updatedContext[key];
+        runState.responseDerivedNotApplicableContextKeys?.delete(key);
+        runState.contextProvenance?.delete(key);
+      }
+    }
     Object.assign(updatedContext, extracted.values);
     for (const key of Object.keys(extracted.values)) {
       runState.responseDerivedNotApplicableContextKeys?.delete(key);
@@ -4758,7 +5762,7 @@ async function executeStep(
   }
   // Re-evaluate after any synthesized capture-failure validations are
   // appended — the step's overall pass/fail must reflect them.
-  const allValidationsPassedFinal = validations.every(v => v.passed);
+  const allValidationsPassedFinal = validations.every(v => !validationFailsStep(v));
 
   // Emit context-value-rejected hints when the seller's error lists the
   // values it would have accepted and the rejected request value traces
@@ -4843,7 +5847,8 @@ async function executeStep(
         context_provenance: Object.fromEntries(runState.contextProvenance),
       }),
     ...responseDerivedContextResult(runState),
-    error: step.expect_error ? undefined : truncateError(stepResult.error || taskResult?.error),
+    error:
+      step.expect_error || schemaRejectionIsAdvisory ? undefined : truncateError(stepResult.error || taskResult?.error),
     ...(!step.expect_error && taskResult?.adcp_error && { adcp_error: taskResult.adcp_error }),
     next,
     request: requestRecord,
@@ -4858,6 +5863,56 @@ async function executeStep(
 // Probe dispatch (raw HTTP tasks)
 // ────────────────────────────────────────────────────────────
 
+function invalidTrustedMatchPublisherAuthTask(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState
+): StoryboardStepResult {
+  const detail =
+    `Pseudo-task "${step.task}" is valid only in a storyboard declaring ` +
+    '`requires: [trusted_match_publisher_auth_runner]`; it was not dispatched over MCP or A2A.';
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: false,
+    duration_ms: 0,
+    validations: [],
+    context,
+    error: detail,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none' },
+  };
+}
+
+function trustedMatchPublisherAuthRequirementUnmetStep(
+  step: StoryboardStep,
+  phaseId: string,
+  context: StoryboardContext,
+  allSteps: FlatStep[],
+  runState: ExecutionState,
+  detail: string
+): StoryboardStepResult {
+  return {
+    step_id: step.id,
+    phase_id: phaseId,
+    title: step.title,
+    task: step.task,
+    passed: true,
+    skipped: true,
+    skip_reason: 'requirement_unmet',
+    skip: { reason: 'requirement_unmet', requirement: 'trusted_match_publisher_auth_runner', detail },
+    duration_ms: 0,
+    validations: [],
+    context,
+    next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+    extraction: { path: 'none', note: 'publisher-auth runner requirement unavailable' },
+  };
+}
+
 async function executeProbeStep(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- client type varies (TestClient)
   client: any,
@@ -4870,12 +5925,16 @@ async function executeProbeStep(
 ): Promise<StoryboardStepResult> {
   const start = Date.now();
   let httpResult: HttpProbeResult | undefined;
-  const probeOpts = { allowPrivateIp: options.allow_http === true };
+  let oauthMetadataGraph: OAuthMetadataGraphGrade | undefined;
+  const probeOpts = {
+    allowPrivateIp: options.allow_http === true,
+    fetchFn: options.transport?.trustedFetchFn,
+  };
   let requestRecordOverride: RunnerRequestRecord | undefined;
 
+  const contractsInScope = new Set(options.contracts ?? []);
   if (step.requires_contract) {
-    const contracts = new Set(options.contracts ?? []);
-    if (!contracts.has(step.requires_contract)) {
+    if (!contractsInScope.has(step.requires_contract)) {
       httpResult = {
         url: runState.agentUrl,
         status: 0,
@@ -4887,11 +5946,77 @@ async function executeProbeStep(
       };
     }
   }
+  if (
+    !httpResult &&
+    step.task === 'expect_rate_limit_not_replayed' &&
+    !contractsInScope.has(RATE_LIMIT_TRIP_CONTRACT)
+  ) {
+    httpResult = {
+      url: runState.agentUrl,
+      status: 0,
+      headers: {},
+      body: null,
+      skipped: true,
+      skip_reason: 'missing_test_kit_contract',
+      error: `Test-kit contract "${RATE_LIMIT_TRIP_CONTRACT}" is not configured on this runner.`,
+    };
+  }
 
   if (httpResult) {
     // Contract-gated synthetic probes self-skip before doing any network work.
+  } else if (TRUSTED_MATCH_PUBLISHER_AUTH_TASKS.has(step.task)) {
+    const task = step.task as TrustedMatchPublisherAuthTask;
+    let prepared = getPreparedTrustedMatchPublisherAuth(options);
+    if (!prepared) {
+      const runner = options.trusted_match_publisher_auth_runner;
+      if (!runner) {
+        return trustedMatchPublisherAuthRequirementUnmetStep(
+          step,
+          phaseId,
+          context,
+          allSteps,
+          runState,
+          'No trusted_match_publisher_auth_runner is configured.'
+        );
+      }
+      try {
+        prepared = await prepareTrustedMatchPublisherAuthProbes(runner);
+      } catch (error) {
+        return trustedMatchPublisherAuthRequirementUnmetStep(
+          step,
+          phaseId,
+          context,
+          allSteps,
+          runState,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    // These contract-owned raw requests must remain byte-shape faithful to
+    // the storyboard. Generic run-level request overrides are intentionally
+    // ignored; only authored placeholder substitution is allowed.
+    const request = step.sample_request ? injectContext({ ...step.sample_request }, context, runState.runnerVars) : {};
+    httpResult = await probeTrustedMatchPublisherAuth(prepared[task], request, {
+      allowPrivateIp: options.allow_http === true,
+      ...(options.signal && { signal: options.signal }),
+    });
+    requestRecordOverride = {
+      transport: 'http',
+      operation: step.task,
+      payload: redactSecrets(request),
+      url: redactOAuthUrlForOutput(prepared[task].endpoint),
+    };
   } else if (step.task === 'protected_resource_metadata') {
-    httpResult = await probeProtectedResourceMetadata(runState.agentUrl, probeOpts);
+    if (step.validations?.some(validation => validation.check === 'oauth_metadata_graph')) {
+      oauthMetadataGraph = await gradeOAuthMetadataGraph(runState.agentUrl, {
+        allowHttp: options.allow_http === true,
+        signal: options.signal,
+        trustedFetchFn: options.transport?.trustedFetchFn,
+      });
+      httpResult = oauthMetadataGraph.protected_resource_result;
+    } else {
+      httpResult = await probeProtectedResourceMetadata(runState.agentUrl, probeOpts);
+    }
     // RFC 9728 presence semantics (adcp-client#677): a 404 means the agent is
     // honestly not advertising OAuth. Convert to a clean step skip so the
     // phase loop can cascade-skip the rest of oauth_discovery instead of
@@ -4900,7 +6025,7 @@ async function executeProbeStep(
     // it correctly, regardless of whether the test kit also declared an
     // API key. Fetch errors (status 0) fall through to the normal failure
     // path since we can't distinguish "agent down" from "misconfigured".
-    if (!httpResult.error && httpResult.status === 404) {
+    if (!oauthMetadataGraph && !httpResult.error && httpResult.status === 404) {
       httpResult.skipped = true;
       httpResult.skip_reason = 'oauth_not_advertised';
     }
@@ -4913,7 +6038,7 @@ async function executeProbeStep(
   } else if (step.task === 'request_signing_probe') {
     httpResult = await probeRequestSigningVector(step.id, runState.agentUrl, options);
   } else if (step.task === 'fetch_brand_jwks') {
-    httpResult = await probeBrandJwks(options._profile?.raw_capabilities, probeOpts);
+    httpResult = await probeBrandJwks(options._profile?.raw_capabilities, runState.agentUrl, probeOpts);
   } else if (step.task === 'assert_jwks_purpose') {
     // Webhook delivery is signed with the agent's request-signing key; the
     // deprecated webhook-signing purpose is still accepted (adcontextprotocol/adcp#5555).
@@ -4931,6 +6056,18 @@ async function executeProbeStep(
         body: { attempts: 0, error: 'rate_limit_trip_misconfigured' },
         error: specError,
       };
+    } else if (options.allowLiveSideEffects !== true) {
+      httpResult = {
+        url: runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: null,
+        skipped: true,
+        skip_reason: 'live_side_effect_opt_in_required',
+        error:
+          'The rate-limit trip probe can send hundreds of mutating requests. ' +
+          'Pass allowLiveSideEffects: true to authorize it explicitly.',
+      };
     } else {
       const rateLimitTrip = step.rate_limit_trip!;
       const targetStep: StoryboardStep = {
@@ -4939,9 +6076,52 @@ async function executeProbeStep(
         sample_request: rateLimitTrip.trip_target_sample_request,
         omit_idempotency_key: true,
       };
-      const resolvedTargetRequest = buildEffectiveStepRequest(targetStep, context, options, runState);
-      const unresolvedVars = findUnresolvedContextVars(resolvedTargetRequest);
-      if (unresolvedVars.length > 0 && !targetStep.expect_error) {
+      const targetRequestResult = buildEffectiveStepRequest(targetStep, context, options, runState);
+      if (!targetRequestResult.ok) {
+        if ('creativeAssetFailure' in targetRequestResult) {
+          return buildCreativeAssetFixtureUnavailableStep(
+            step,
+            phaseId,
+            context,
+            allSteps,
+            runState,
+            targetRequestResult.creativeAssetFailure
+          );
+        }
+        const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
+        return {
+          step_id: step.id,
+          phase_id: phaseId,
+          title: step.title,
+          task: step.task,
+          passed: false,
+          duration_ms: Date.now() - start,
+          validations: [
+            {
+              check: 'unresolved_substitution',
+              passed: false,
+              description: `Fixture handle substitution failed: ${targetRequestResult.error}`,
+              json_pointer: null,
+              expected: 'an unambiguous fixture handle binding',
+              actual: targetRequestResult.error,
+              schema_id: null,
+              schema_url: null,
+            },
+          ],
+          context,
+          next,
+          extraction: { path: 'none' },
+          error: targetRequestResult.error,
+        };
+      }
+      const resolvedTargetRequest = targetRequestResult.request;
+      const unresolvedContextVars = findUnresolvedContextVars(resolvedTargetRequest);
+      const unresolvedAssetDirectives = findUnresolvedCreativeAssetDirectives(resolvedTargetRequest).map(path => ({
+        key: path,
+        token: BUILD_ASSETS_FROM_FORMAT_DIRECTIVE,
+      }));
+      const unresolvedVars = [...unresolvedContextVars, ...unresolvedAssetDirectives];
+      if (unresolvedAssetDirectives.length > 0 || (unresolvedContextVars.length > 0 && !targetStep.expect_error)) {
         const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
         const detail = `Skipped: unresolved context variables from rate_limit_trip.trip_target_sample_request: ${unresolvedVars
           .map(v => v.key)
@@ -5025,7 +6205,40 @@ async function executeProbeStep(
         transport: targetTransport,
         operation: rateLimitTrip.trip_target_task,
         payload: redactSecrets(observedRequest),
-        ...(runState.agentUrl ? { url: runState.agentUrl } : {}),
+        ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
+      };
+    }
+  } else if (step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK) {
+    const routerRunner = options.trusted_match_context_router_runner;
+    if (!routerRunner?.router_url || typeof routerRunner.registerProviders !== 'function') {
+      httpResult = {
+        url: routerRunner?.router_url ?? runState.agentUrl,
+        status: 0,
+        headers: {},
+        body: null,
+        skipped: true,
+        skip_reason: 'grader_skipped',
+        error:
+          'No Trusted Match Context router harness configured. Pass trusted_match_context_router_runner ' +
+          'with router_url and registerProviders; the runner will not dispatch this pseudo-task over MCP/A2A.',
+      };
+    } else {
+      const requestOverride = options.request
+        ? injectContext({ ...options.request }, context, runState.runnerVars)
+        : step.sample_request
+          ? injectContext({ ...step.sample_request }, context, runState.runnerVars)
+          : undefined;
+      const replay = await replayTrustedMatchContextVector(step, routerRunner, {
+        ...(requestOverride && { requestOverride }),
+        ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
+        ...(options.signal && { signal: options.signal }),
+      });
+      httpResult = replay.httpResult;
+      requestRecordOverride = {
+        transport: 'http',
+        operation: step.task,
+        payload: redactSecrets(replay.request),
+        url: redactOAuthUrlForOutput(replay.httpResult.url),
       };
     }
   }
@@ -5037,7 +6250,11 @@ async function executeProbeStep(
     transport: 'http',
     operation: step.task,
     payload: null,
-    ...(httpResult?.url ? { url: httpResult.url } : runState.agentUrl ? { url: runState.agentUrl } : {}),
+    ...(httpResult?.url
+      ? { url: redactOAuthUrlForOutput(httpResult.url) }
+      : runState.agentUrl
+        ? { url: redactOAuthUrlForOutput(runState.agentUrl) }
+        : {}),
   };
   const filteredProbeHeaders = filterResponseHeaders(httpResult?.headers);
   const responseTransport = requestRecordOverride?.transport ?? 'http';
@@ -5053,7 +6270,10 @@ async function executeProbeStep(
   const redactedHttpResult = httpResult
     ? {
         ...httpResult,
+        url: redactOAuthUrlForOutput(httpResult.url),
+        headers: filteredProbeHeaders ?? {},
         body: redactSecrets(httpResult.body),
+        ...(httpResult.error && { error: redactOAuthUrlsInText(httpResult.error) }),
         ...(responseTransport !== 'http' && { status: undefined }),
       }
     : undefined;
@@ -5066,7 +6286,11 @@ async function executeProbeStep(
   if (httpResult?.skipped) {
     const detailedReason = (httpResult.skip_reason ?? 'probe_skipped') as RunnerDetailedSkipReason;
     const canonicalReason = DETAILED_SKIP_TO_CANONICAL[detailedReason] ?? 'not_applicable';
-    const detail = httpResult.error ?? DETAILED_SKIP_DETAILS[detailedReason] ?? SKIP_DETAILS[canonicalReason];
+    const detail =
+      CANONICAL_SKIP_DETAILS[detailedReason] ??
+      httpResult.error ??
+      DETAILED_SKIP_DETAILS[detailedReason] ??
+      SKIP_DETAILS[canonicalReason];
     const selectionResult = selectionForProbeSkip(detailedReason, detail);
     return {
       step_id: step.id,
@@ -5090,18 +6314,28 @@ async function executeProbeStep(
   }
 
   const vctx: ValidationContext = {
-    taskName: step.task,
+    taskName: step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK ? 'context_match' : step.task,
     ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
     ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
     httpResult: redactedHttpResult,
+    ...(step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK &&
+      redactedHttpResult && {
+        taskResult: {
+          success: !redactedHttpResult.error && redactedHttpResult.status >= 200 && redactedHttpResult.status < 300,
+          data: redactedHttpResult.body,
+          ...(redactedHttpResult.error && { error: redactedHttpResult.error }),
+        },
+      }),
     agentUrl: runState.agentUrl,
     contributions: runState.contributions,
+    ...(step.response_schema_ref && { responseSchemaRef: step.response_schema_ref }),
     request: requestRecord,
     ...(responseRecord && { response: responseRecord }),
     storyboardContext: context,
+    ...(oauthMetadataGraph && { oauthMetadataGraph }),
   };
   const validations = step.validations?.length ? runValidations(step.validations, vctx) : [];
-  const allValidationsPassed = validations.every(v => v.passed);
+  const allValidationsPassed = validations.every(v => !validationFailsStep(v));
 
   // For probes, the "task passed" proxy is: fetch returned without error AND
   // all validations passed. For assert_contribution (no httpResult), we lean
@@ -5133,12 +6367,39 @@ async function executeProbeStep(
   };
 }
 
+type FixtureBindingApplicationResult = { ok: true; request: Record<string, unknown> } | { ok: false; error: string };
+
+type EffectiveStepRequestResult =
+  | FixtureBindingApplicationResult
+  | { ok: false; creativeAssetFailure: CreativeAssetFixtureUnavailableFailure };
+
+function applyFixtureBindingsSafely(
+  request: Record<string, unknown>,
+  task: string,
+  options: StoryboardRunOptions,
+  runState: ExecutionState
+): FixtureBindingApplicationResult {
+  try {
+    return {
+      ok: true,
+      request: applyFixtureBindingsToRequest(
+        request,
+        task,
+        runState.fixtureBindings,
+        options.adcpVersion ?? ADCP_VERSION
+      ),
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function buildEffectiveStepRequest(
   step: StoryboardStep,
   context: StoryboardContext,
   options: StoryboardRunOptions,
   runState: ExecutionState
-): Record<string, unknown> {
+): EffectiveStepRequestResult {
   let request: Record<string, unknown>;
   if (options.request) {
     request = injectContext({ ...options.request }, context, runState.runnerVars);
@@ -5158,7 +6419,82 @@ function buildEffectiveStepRequest(
   if (options.disable_sandbox === true) {
     request = applyDisableSandboxHint(request, step.task);
   }
-  return applyIdempotencyInvariant(request, step.task, step);
+  request = applyIdempotencyInvariant(request, step.task, step);
+  const fixtureBinding = applyFixtureBindingsSafely(request, step.task, options, runState);
+  if (!fixtureBinding.ok) return fixtureBinding;
+  const creativeAssetExpansion = expandCreativeAssetDirectivesWithDiagnostics(
+    fixtureBinding.request,
+    context,
+    options.test_kit
+  );
+  if (!creativeAssetExpansion.ok && creativeAssetExpansion.failure.reason === 'fixture_unavailable') {
+    return { ok: false, creativeAssetFailure: creativeAssetExpansion.failure };
+  }
+  return {
+    ok: true,
+    request: creativeAssetExpansion.value as Record<string, unknown>,
+  };
+}
+
+interface CreativeAssetPreflightGap {
+  target: FlatStep;
+  failure: CreativeAssetFixtureUnavailableFailure;
+}
+
+/**
+ * Preflight future creative directives as soon as their seller format enters
+ * context. Missing context and malformed directives stay on their ordinary
+ * execution paths; only a proven test-kit coverage gap terminates the run.
+ */
+function preflightRemainingCreativeAssetDirectives(
+  allSteps: FlatStep[],
+  afterGlobalIndex: number,
+  context: StoryboardContext,
+  options: StoryboardRunOptions,
+  runState: ExecutionState,
+  excludedPhaseIds: ReadonlySet<string> = new Set()
+): CreativeAssetPreflightGap | undefined {
+  const contractsInScope = new Set(options.contracts ?? []);
+  for (const target of allSteps) {
+    if (target.globalIndex <= afterGlobalIndex) continue;
+    if (excludedPhaseIds.has(target.phaseId)) continue;
+
+    const resolvedTask = resolveTaskName(target.step, options);
+    if (!resolvedTask) continue;
+    if (target.step.requires_tool && options.agentTools && !options.agentTools.includes(target.step.requires_tool)) {
+      continue;
+    }
+    if (target.step.requires_contract && !contractsInScope.has(target.step.requires_contract)) {
+      continue;
+    }
+    if (
+      target.step.task === 'expect_rate_limit_not_replayed' &&
+      (!contractsInScope.has(RATE_LIMIT_TRIP_CONTRACT) || options.allowLiveSideEffects !== true)
+    ) {
+      continue;
+    }
+    if (!PROBE_TASKS.has(target.step.task) && options.agentTools && !options.agentTools.includes(resolvedTask)) {
+      continue;
+    }
+    let requestStep = resolvedTask === target.step.task ? target.step : { ...target.step, task: resolvedTask };
+
+    if (target.step.task === 'expect_rate_limit_not_replayed') {
+      const rateLimitTrip = target.step.rate_limit_trip;
+      if (validateRateLimitTripSpec(rateLimitTrip) || !rateLimitTrip) continue;
+      requestStep = {
+        ...target.step,
+        task: rateLimitTrip.trip_target_task,
+        sample_request: rateLimitTrip.trip_target_sample_request,
+        omit_idempotency_key: true,
+      };
+    }
+
+    const request = buildEffectiveStepRequest(requestStep, context, options, runState);
+    if (!request.ok && 'creativeAssetFailure' in request) {
+      return { target, failure: request.creativeAssetFailure };
+    }
+  }
+  return undefined;
 }
 
 interface ResolvedWebhookReplayVector {
@@ -5180,6 +6516,26 @@ async function executeReplayWebhookVectorStep(
   runState: ExecutionState
 ): Promise<StoryboardStepResult> {
   const start = Date.now();
+  if (step.requires_contract && !new Set(options.contracts ?? []).has(step.requires_contract)) {
+    const detail = `Test-kit contract "${step.requires_contract}" is not configured on this runner.`;
+    const reason: RunnerDetailedSkipReason = 'missing_test_kit_contract';
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: true,
+      skipped: true,
+      skip_reason: reason,
+      skip: buildSkip(DETAILED_SKIP_TO_CANONICAL[reason], detail),
+      duration_ms: Date.now() - start,
+      validations: [],
+      context,
+      next: getNextStepPreview(step.id, allSteps, context, runState.runnerVars),
+      extraction: { path: 'none', note: 'test-kit contract not configured' },
+    };
+  }
+
   const receiver = options.webhook_replay_receiver;
   if (!receiver?.url) {
     const detail =
@@ -5269,7 +6625,7 @@ async function executeReplayWebhookVectorStep(
   };
 
   const validations = buildWebhookReplayValidations(step, vector, allSteps, options, requestRecord, responseRecord);
-  const allValidationsPassed = validations.every(v => v.passed);
+  const allValidationsPassed = validations.every(v => !validationFailsStep(v));
   const fetchOk = !httpResult.error;
   const passed = fetchOk && allValidationsPassed;
 
@@ -5476,7 +6832,7 @@ function webhookVectorFileCandidates(refPath: string, options: StoryboardRunOpti
     candidates.push(join(options.webhook_replay_receiver.vectorsRoot, withoutStatic));
     candidates.push(join(options.webhook_replay_receiver.vectorsRoot, baseName));
   }
-  const complianceDir = getComplianceCacheDir({ version: options.adcpVersion });
+  const complianceDir = getComplianceCacheDir({ version: options.adcpVersion, complianceDir: options.complianceDir });
   candidates.push(join(complianceDir, withoutStatic));
   candidates.push(join(complianceDir, refPath));
   candidates.push(join(process.cwd(), refPath));
@@ -5716,7 +7072,8 @@ function rateLimitTripObservationToProbeResult(
 
 async function probeBrandJwks(
   rawCapabilities: unknown,
-  options: { allowPrivateIp?: boolean }
+  agentUrl: string,
+  options: { allowPrivateIp?: boolean; fetchFn?: typeof fetch }
 ): Promise<HttpProbeResult> {
   const brandJsonUrl = readBrandJsonUrl(rawCapabilities);
   if (!brandJsonUrl) {
@@ -5737,19 +7094,26 @@ async function probeBrandJwks(
     };
   }
 
-  const agents = brand.body && typeof brand.body === 'object' ? (brand.body as { agents?: unknown }).agents : undefined;
-  const jwksUri = Array.isArray(agents)
-    ? agents
-        .map(agent => (agent && typeof agent === 'object' ? (agent as { jwks_uri?: unknown }).jwks_uri : undefined))
-        .find((uri): uri is string => typeof uri === 'string' && uri.length > 0)
-    : undefined;
+  let jwksUri: string | undefined;
+  try {
+    const agent = selectAgentByUrl(brand.body, agentUrl);
+    jwksUri = typeof agent.jwks_uri === 'string' && agent.jwks_uri.length > 0 ? agent.jwks_uri : undefined;
+  } catch {
+    return {
+      url: brandJsonUrl,
+      status: 0,
+      headers: {},
+      body: brand.body,
+      error: 'brand.json agent portfolio did not uniquely match the agent under test',
+    };
+  }
   if (!jwksUri) {
     return {
       url: brandJsonUrl,
       status: 0,
       headers: {},
       body: brand.body,
-      error: 'brand.json agents[] did not contain a jwks_uri',
+      error: 'brand.json agent entry for the agent under test did not contain a jwks_uri',
     };
   }
 
@@ -5945,6 +7309,9 @@ function phaseContainsOauthMetadataProbe(phase: StoryboardPhase): boolean {
 function agentAdvertisesOauth(profile: AgentProfile | undefined): boolean {
   const rawCaps = profile?.raw_capabilities;
   if (rawCaps === undefined) return true;
+  const oauthSupported = resolveCapabilityPath(rawCaps, 'oauth.supported');
+  if (oauthSupported === true) return true;
+  if (oauthSupported === false) return false;
   const endpoint = resolveCapabilityPath(rawCaps, 'account.authorization_endpoint');
   return typeof endpoint === 'string' && endpoint.length > 0;
 }
@@ -5989,8 +7356,11 @@ function resolveTaskName(step: StoryboardStep, options: StoryboardRunOptions): s
     }
     value = (value as Record<string, unknown>)[segment];
   }
-  if (typeof value === 'string' && value.length > 0) return value;
-  return step.task_default;
+  const configured = typeof value === 'string' && value.length > 0 ? value : step.task_default;
+  if (step.task === '$test_kit.auth.probe_task') {
+    return selectProbeTask(configured, options.agentTools);
+  }
+  return configured;
 }
 
 /**
@@ -6257,10 +7627,14 @@ export function applyBrandInvariant(
         result.account = merged;
       }
     }
-  } else if (topAccountOk) {
+  } else if (topAccountOk && taskName !== 'list_accounts') {
     // No account on the request — construct one so tools whose schema
     // declares `account` but not top-level `brand` (e.g. get_media_buys,
     // list_creatives) still carry the run-scoped brand on the wire.
+    // list_accounts is deliberately exempt: without an authored account it
+    // enumerates the caller's visible accounts. Synthesizing the runner's
+    // default natural key would silently narrow pagination and discovery
+    // storyboards to one brand.
     result.account = resolveAccount(options);
   }
   return result;
@@ -6319,7 +7693,7 @@ export function applyDisableSandboxHint(request: Record<string, unknown>, taskNa
  * Skipped when:
  *   - `step.omit_idempotency_key === true` — the scenario is explicitly
  *     exercising the server's missing-key rejection path.
- *   - the task isn't mutating per {@link MUTATING_TASKS}.
+ *   - the concrete request is not state-changing per `requestUsesIdempotency`.
  *   - the request already carries a key — typically a
  *     `$generate:uuid_v4#alias` the context injector has resolved to a
  *     concrete UUID for replay scenarios, or a BYOK key supplied inline.
@@ -6330,7 +7704,7 @@ export function applyIdempotencyInvariant(
   step: StoryboardStep
 ): Record<string, unknown> {
   if (step.omit_idempotency_key === true) return request;
-  if (!isMutatingTask(taskName)) return request;
+  if (!requestUsesIdempotency(taskName, request)) return request;
   if (typeof request.idempotency_key === 'string' && request.idempotency_key.length > 0) return request;
   return { ...request, idempotency_key: generateIdempotencyKey() };
 }
@@ -6446,7 +7820,7 @@ async function prefetchUpstreamTraffic(
       transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
       operation: 'comply_test_controller',
       payload: redactSecrets({ scenario: 'query_upstream_traffic', params }),
-      ...(runState.agentUrl ? { url: runState.agentUrl } : {}),
+      ...(runState.agentUrl ? { url: redactOAuthUrlForOutput(runState.agentUrl) } : {}),
     };
     const startMs = Date.now();
     let payload: UpstreamTrafficSuccess | { error: string; error_kind?: string };
@@ -6635,6 +8009,8 @@ interface StepAssignment {
   agentUrl: string;
   /** 0-based index into the agent URL list */
   instanceIndex: number;
+  /** Profile discovered for the agent selected to execute this step. */
+  profile?: AgentProfile;
 }
 
 interface Dispatcher {
@@ -6657,7 +8033,8 @@ function createDispatcher(
   agentUrls: string[],
   clients: TestClient[],
   _strategy: 'round-robin',
-  startOffset = 0
+  startOffset = 0,
+  profile?: AgentProfile
 ): Dispatcher {
   let counter = startOffset;
   return {
@@ -6668,6 +8045,7 @@ function createDispatcher(
         client: clients[idx]!,
         agentUrl: agentUrls[idx]!,
         instanceIndex: idx,
+        profile,
       };
     },
   };
@@ -6694,6 +8072,7 @@ function createRoutingDispatcher(
     nextFor(step: StoryboardStep): StepAssignment {
       const key = resolveAgentForStep(step, options, ctx);
       const client = ctx.clients.get(key);
+      const profile = ctx.profiles.get(key);
       const url = agents[key]?.url;
       if (!client || !url) {
         throw new RoutingError(
@@ -6707,6 +8086,7 @@ function createRoutingDispatcher(
         client,
         agentUrl: url,
         instanceIndex: keyToIndex.get(key) ?? 0,
+        profile,
       };
     },
   };

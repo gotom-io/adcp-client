@@ -48,6 +48,8 @@ test('transport diagnostics emits sanitized request and response events', async 
         body: JSON.stringify({
           idempotency_key: 'idem-1',
           access_token: 'request-token',
+          governance_context: 'signed-governance-token',
+          consultation_context: 'consultation-handle',
           push_notification_config: {
             token: 'webhook-token',
             authentication: { credentials: 'webhook-secret' },
@@ -84,6 +86,8 @@ test('transport diagnostics emits sanitized request and response events', async 
   });
   assert.equal(JSON.parse(started.requestBody).idempotency_key, '[redacted]');
   assert.equal(JSON.parse(started.requestBody).access_token, '[redacted]');
+  assert.equal(JSON.parse(started.requestBody).governance_context, '[redacted]');
+  assert.equal(JSON.parse(started.requestBody).consultation_context, '[redacted]');
   assert.equal(JSON.parse(started.requestBody).push_notification_config.token, '[redacted]');
   assert.equal(JSON.parse(started.requestBody).push_notification_config.authentication.credentials, '[redacted]');
   assert.equal(started.requestBodyTruncated, false);
@@ -159,6 +163,43 @@ test('transport diagnostics waits for async handlers after the request completes
     events.map(event => event.type),
     ['request_started', 'response_received']
   );
+});
+
+test('transport diagnostics does not deadlock on responses larger than the snippet limit', async () => {
+  const events = [];
+  const largeBody = JSON.stringify({ payload: 'x'.repeat(70 * 1024) });
+  const instrumentedFetch = wrapFetchWithTransportDiagnostics(
+    async () => new Response(largeBody, { headers: { 'content-type': 'application/json' } })
+  );
+
+  let timeout;
+  let consumedBody;
+  try {
+    consumedBody = await Promise.race([
+      withTransportDiagnostics(
+        {
+          agentId: 'large-catalog-agent',
+          protocol: 'mcp',
+          onTransportActivity: event => events.push(event),
+        },
+        async () => {
+          const response = await instrumentedFetch('https://seller.example/mcp', { method: 'POST' });
+          return response.text();
+        }
+      ),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('large diagnostic response timed out')), 5000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  assert.equal(consumedBody, largeBody);
+  assert.equal(events.length, 2);
+  assert.equal(events[1].type, 'response_received');
+  assert.equal(events[1].responseBody.length <= 64 * 1024, true);
+  assert.equal(events[1].responseBodyTruncated, true);
 });
 
 test('transport diagnostics redacts camelCase secrets and strips URL-bearing body fields', async () => {

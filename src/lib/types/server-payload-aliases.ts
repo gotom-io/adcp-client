@@ -15,6 +15,7 @@ import type {
   CheckGovernanceResponse,
   CreateCollectionListResponse,
   CreateContentStandardsResponse,
+  CreateMediaBuyError,
   CreateMediaBuySuccess,
   CreatePropertyListResponse,
   DeleteCollectionListResponse,
@@ -40,6 +41,7 @@ import type {
   ListCreativesResponse,
   ListPropertyListsResponse,
   LogEventSuccess,
+  MediaBuyStatus,
   PreviewCreativeResponse,
   ProvidePerformanceFeedbackSuccess,
   ReportPlanOutcomeResponse,
@@ -78,6 +80,13 @@ import type {
 } from './core.generated';
 import type { RequireCacheScopeWhenProducts, ServerPayload } from './server-payload';
 
+type ExclusivePayload<TLeft, TRight> =
+  | (TLeft & { [K in Exclude<keyof TRight, keyof TLeft>]?: never })
+  | (TRight & { [K in Exclude<keyof TLeft, keyof TRight>]?: never });
+
+/** SDK 13 server handlers used `status` for the domain media-buy status. */
+type LegacyMediaBuyStatusInput<T> = T & { status?: MediaBuyStatus };
+
 export type GetAdCPCapabilitiesPayload = ServerPayload<GetAdCPCapabilitiesResponse>;
 
 export type ListAccountsPayload = ServerPayload<ListAccountsResponse>;
@@ -90,8 +99,11 @@ export type GetAccountFinancialsPayload = ServerPayload<GetAccountFinancialsResp
 export type GetAccountFinancialsSuccessPayload = ServerPayload<GetAccountFinancialsSuccess>;
 
 export type GetProductsPayload = RequireCacheScopeWhenProducts<ServerPayload<GetProductsResponse>>;
-export type CreateMediaBuyPayload = ServerPayload<CreateMediaBuySuccess>;
-export type UpdateMediaBuyPayload = ServerPayload<UpdateMediaBuySuccess>;
+export type CreateMediaBuyPayload = ExclusivePayload<
+  LegacyMediaBuyStatusInput<ServerPayload<CreateMediaBuySuccess>>,
+  ServerPayload<CreateMediaBuyError>
+>;
+export type UpdateMediaBuyPayload = LegacyMediaBuyStatusInput<ServerPayload<UpdateMediaBuySuccess>>;
 export type GetMediaBuysPayload = ServerPayload<GetMediaBuysResponse>;
 export type GetMediaBuyDeliveryPayload = ServerPayload<GetMediaBuyDeliveryResponse>;
 export type ProvidePerformanceFeedbackPayload = ServerPayload<ProvidePerformanceFeedbackSuccess>;

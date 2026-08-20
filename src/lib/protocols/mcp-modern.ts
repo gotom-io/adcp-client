@@ -9,14 +9,25 @@
 
 import {
   Client,
+  SdkError,
+  SdkErrorCode,
   StreamableHTTPClientTransport,
+  type DiscoverResult,
   type OAuthClientProvider as ModernOAuthClientProvider,
+  type PriorDiscovery,
   type Tool,
 } from '@modelcontextprotocol/client';
 import { createHmac } from 'node:crypto';
-import { createMCPAuthHeaders } from '../auth';
+import { createMCPRequestHeaders } from '../auth';
 import { is401Error } from '../errors';
 import { withSpan, injectTraceHeaders } from '../observability/tracing';
+import {
+  currentMCPConnectionScopeKey,
+  isMCPConnectionScopeCacheKeyActive,
+  registerMCPConnectionScopeCleanup,
+  registerMCPConnectionScopePending,
+} from './mcp-scope';
+import { terminateSessionBestEffort } from './session-termination';
 import { buildAgentSigningFetch, signingContextStorage, type AgentSigningContext } from '../signing/client';
 import type { DebugLogEntry } from '../types/adcp';
 import {
@@ -28,6 +39,7 @@ import {
 import { wrapFetchWithCapture } from './rawResponseCapture';
 import { wrapFetchWithSizeLimit } from './responseSizeLimit';
 import { wrapFetchWithTransportDiagnostics } from './transportDiagnostics';
+import { createAgentTransportFetch } from '../net/agent-transport-fetch';
 
 type CallToolResponse = {
   isError?: boolean;
@@ -44,6 +56,7 @@ export interface ModernMCPConnectionOptions {
   signal?: AbortSignal;
   requestTimeoutMs?: number;
   fetchFn?: typeof fetch;
+  allowPrivateIp?: boolean;
   /** Use the v2 SDK's negotiated legacy client instead of handing off to v1. */
   handleLegacy?: boolean;
 }
@@ -58,20 +71,36 @@ interface ModernConnectionOptions {
   signal?: AbortSignal;
   requestTimeoutMs?: number;
   fetchFn?: typeof fetch;
+  allowPrivateIp?: boolean;
   handleLegacy?: boolean;
 }
 
 const modernConnections = new Map<string, Client>();
 const legacyConnectionExpiresAt = new Map<string, number>();
 const pendingModernConnections = new Map<string, Promise<Client>>();
+const modernTransports = new WeakMap<Client, StreamableHTTPClientTransport>();
 const knownLegacyConnections = new Map<string, number>();
+const modernDiscoveries = new Map<string, { discover: DiscoverResult; expiresAt: number }>();
+const clientsUsingCachedDiscovery = new WeakSet<Client>();
 const MAX_CACHED_CONNECTIONS = 20;
 const LEGACY_CLASSIFICATION_TTL_MS = 5 * 60 * 1000;
+const MODERN_DISCOVERY_TTL_MS = 5 * 60 * 1000;
 const modernOAuthProviderIds = new WeakMap<object, string>();
 const modernFetchFnIds = new WeakMap<typeof fetch, string>();
+const modernSignalIds = new WeakMap<AbortSignal, string>();
 let nextModernOAuthProviderId = 0;
 let nextModernFetchFnId = 0;
+let nextModernSignalId = 0;
 let connectionGeneration = 0;
+
+async function closeModernClient(client: Client, terminateSession = true): Promise<void> {
+  const transport = modernTransports.get(client);
+  modernTransports.delete(client);
+  if (terminateSession && transport?.sessionId) {
+    await terminateSessionBestEffort(transport);
+  }
+  await client.close();
+}
 
 function cacheDisambiguator(value: string): string {
   return createHmac('sha256', '').update(value).digest('hex');
@@ -91,10 +120,7 @@ function buildAuthHeaders(
           })
         )
       : customHeaders;
-  return {
-    ...filteredHeaders,
-    ...(!authProvider && authToken ? createMCPAuthHeaders(authToken) : {}),
-  };
+  return createMCPRequestHeaders(filteredHeaders, authProvider ? undefined : authToken);
 }
 
 function oauthProviderCacheKey(provider: object | undefined): string | undefined {
@@ -117,12 +143,26 @@ function fetchFnCacheKey(fetchFn: typeof fetch | undefined): string | undefined 
   return key;
 }
 
+function signalCacheKey(signal: AbortSignal | undefined): string | undefined {
+  if (!signal) return undefined;
+  let key = modernSignalIds.get(signal);
+  if (!key) {
+    key = `signal:${++nextModernSignalId}`;
+    modernSignalIds.set(signal, key);
+  }
+  return key;
+}
+
 function connectionCacheKey(
   agentUrl: string,
   headers: Record<string, string>,
   signingCacheKey?: string,
   authProvider?: object,
-  fetchFn?: typeof fetch
+  fetchFn?: typeof fetch,
+  signal?: AbortSignal,
+  requestTimeoutMs?: number,
+  handleLegacy?: boolean,
+  allowPrivateIp?: boolean
 ): string {
   const normalizedHeaders = Object.entries(headers)
     .map(([key, value]) => [key.toLowerCase(), value] as const)
@@ -133,6 +173,13 @@ function connectionCacheKey(
   if (providerKey) parts.push(providerKey);
   const fetchKey = fetchFnCacheKey(fetchFn);
   if (fetchKey) parts.push(fetchKey);
+  const signalKey = signalCacheKey(signal);
+  if (signalKey) parts.push(signalKey);
+  if (requestTimeoutMs !== undefined) parts.push(`timeout:${requestTimeoutMs}`);
+  if (handleLegacy !== undefined) parts.push(`handle-legacy:${handleLegacy}`);
+  if (allowPrivateIp !== undefined) parts.push(`allow-private-ip:${allowPrivateIp}`);
+  const scopeKey = currentMCPConnectionScopeKey();
+  if (scopeKey) parts.push(scopeKey);
   return parts.join('::');
 }
 
@@ -149,12 +196,38 @@ function isKnownLegacy(cacheKey: string): boolean {
 }
 
 function markKnownLegacy(cacheKey: string): void {
+  modernDiscoveries.delete(cacheKey);
   knownLegacyConnections.delete(cacheKey);
   knownLegacyConnections.set(cacheKey, Date.now());
   while (knownLegacyConnections.size > MAX_CACHED_CONNECTIONS) {
     const oldest = knownLegacyConnections.keys().next().value;
     if (!oldest) break;
     knownLegacyConnections.delete(oldest);
+  }
+}
+
+function getCachedModernDiscovery(cacheKey: string): PriorDiscovery | undefined {
+  const cached = modernDiscoveries.get(cacheKey);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    modernDiscoveries.delete(cacheKey);
+    return undefined;
+  }
+  modernDiscoveries.delete(cacheKey);
+  modernDiscoveries.set(cacheKey, cached);
+  return { kind: 'modern', discover: cached.discover };
+}
+
+function cacheModernDiscovery(cacheKey: string, discover: DiscoverResult): void {
+  modernDiscoveries.delete(cacheKey);
+  modernDiscoveries.set(cacheKey, {
+    discover,
+    expiresAt: Date.now() + MODERN_DISCOVERY_TTL_MS,
+  });
+  while (modernDiscoveries.size > MAX_CACHED_CONNECTIONS) {
+    const oldest = modernDiscoveries.keys().next().value;
+    if (!oldest) break;
+    modernDiscoveries.delete(oldest);
   }
 }
 
@@ -165,6 +238,14 @@ function httpStatusOf(error: unknown, depth = 0): number | undefined {
   if (typeof candidate.response?.status === 'number') return candidate.response.status;
   if (typeof candidate.code === 'number' && candidate.code >= 100 && candidate.code <= 599) return candidate.code;
   return httpStatusOf(candidate.cause, depth + 1);
+}
+
+function isLegacyEraNegotiationFailure(error: unknown, status = httpStatusOf(error)): boolean {
+  // Stable MCP SDK v2 uses EraNegotiationFailed for HTTP 5xx responses so
+  // callers preserve infrastructure failures instead of treating them as
+  // evidence of a legacy endpoint. Only status-less negotiation failures
+  // (for example a malformed legacy response) retain the v1 fallback.
+  return status === undefined && SdkError.isInstance(error) && error.code === SdkErrorCode.EraNegotiationFailed;
 }
 
 function withPerRequestTraceHeaders(fetchImpl: typeof fetch): typeof fetch {
@@ -183,7 +264,7 @@ function getCachedConnection(cacheKey: string): Client | undefined {
     if (legacyExpiry !== undefined && legacyExpiry <= Date.now()) {
       modernConnections.delete(cacheKey);
       legacyConnectionExpiresAt.delete(cacheKey);
-      void client.close().catch(() => {});
+      void closeModernClient(client).catch(() => {});
       return undefined;
     }
     modernConnections.delete(cacheKey);
@@ -194,31 +275,71 @@ function getCachedConnection(cacheKey: string): Client | undefined {
 
 function evictLeastRecentlyUsed(): void {
   if (modernConnections.size <= MAX_CACHED_CONNECTIONS) return;
-  const oldestKey = modernConnections.keys().next().value;
+  const oldestKey = [...modernConnections.keys()].find(key => !isMCPConnectionScopeCacheKeyActive(key));
   if (!oldestKey) return;
   const client = modernConnections.get(oldestKey);
   modernConnections.delete(oldestKey);
   legacyConnectionExpiresAt.delete(oldestKey);
-  void client?.close().catch(() => {});
+  if (client) void closeModernClient(client).catch(() => {});
+}
+
+/**
+ * Did this connect fail because the era-negotiation probe was answered with
+ * `401`/`403`? That is the one probe outcome the MCP client classifies as
+ * terminal instead of falling back to the legacy era.
+ */
+function isNegotiationAuthFailure(error: unknown): boolean {
+  return is401Error(error) || httpStatusOf(error) === 403;
+}
+
+/**
+ * Were we already presenting a static credential on the probe?
+ *
+ * This is the line between "the server is challenging us to authenticate" and
+ * "the server refused this method". With no credential, a `401` is a real
+ * challenge and the caller wants it: `discoverMCPEndpoint` walks the
+ * `WWW-Authenticate` / RFC 9728 chain and reports how to authenticate. With an
+ * OAuth provider, a `401` is the provider's cue to refresh, so it must reach
+ * the OAuth machinery untouched. Only a static token/header credential that the
+ * server rejected *on the probe alone* tells us nothing about the credential,
+ * and that is the case worth retrying on the legacy transport.
+ */
+function presentedStaticCredential(authHeaders: Record<string, string>, authProvider?: object): boolean {
+  if (authProvider) return false;
+  return Object.keys(authHeaders).some(key => {
+    const lower = key.toLowerCase();
+    return lower === 'authorization' || lower === 'x-adcp-auth';
+  });
 }
 
 async function createNegotiatedClient(
+  cacheKey: string,
   options: ModernConnectionOptions,
-  authHeaders: Record<string, string>
+  authHeaders: Record<string, string>,
+  useCachedDiscovery = true,
+  /**
+   * Skip the `server/discover` probe and `initialize` straight into the legacy
+   * era. Set only on the retry after a negotiation-time 401/403 — see the catch
+   * block below.
+   */
+  skipProbe = false
 ): Promise<Client> {
+  const generation = connectionGeneration;
   const requestTimeoutMs = resolveRequestTimeoutMs(options.requestTimeoutMs);
   const clientRequestTimeoutMs = resolveClientRequestTimeoutMs(options.requestTimeoutMs);
-  const rawNetworkFetch: typeof fetch = options.fetchFn ?? ((input, init) => fetch(input, init));
+  const rawNetworkFetch = createAgentTransportFetch(options.agentUrl, {
+    trustedFetchFn: options.fetchFn,
+    allowPrivateIp: options.allowPrivateIp,
+  });
   const networkFetch: typeof fetch = (input, init) =>
-    withAbortSignal<Response>([options.signal, init?.signal], requestTimeoutMs, signal =>
-      rawNetworkFetch(input, { ...init, signal })
-    );
+    withAbortSignal<Response>([init?.signal], requestTimeoutMs, signal => rawNetworkFetch(input, { ...init, signal }));
   const diagnosticFetch = wrapFetchWithTransportDiagnostics(wrapFetchWithSizeLimit(networkFetch));
   const signedFetch: typeof fetch = options.signingContext
     ? (buildAgentSigningFetch({
         upstream: diagnosticFetch,
         signing: options.signingContext.signing,
         getCapability: options.signingContext.getCapability,
+        adcpVersion: options.signingContext.adcpVersion,
       }) as typeof fetch)
     : diagnosticFetch;
   const transport = new StreamableHTTPClientTransport(new URL(options.agentUrl), {
@@ -238,17 +359,68 @@ async function createNegotiatedClient(
     }
   );
 
+  const prior = skipProbe
+    ? ({ kind: 'legacy' } as const)
+    : useCachedDiscovery
+      ? getCachedModernDiscovery(cacheKey)
+      : undefined;
   try {
     await client.connect(transport, {
       ...(options.signal && { signal: options.signal }),
       ...(clientRequestTimeoutMs !== undefined && { timeout: clientRequestTimeoutMs }),
+      ...(prior && { prior }),
     });
+    modernTransports.set(client, transport);
+    if (prior && !skipProbe) clientsUsingCachedDiscovery.add(client);
+    if (!prior) {
+      const discover = client.getDiscoverResult();
+      if (generation === connectionGeneration) {
+        if (client.getProtocolEra() === 'modern' && discover) cacheModernDiscovery(cacheKey, discover);
+        else modernDiscoveries.delete(cacheKey);
+      }
+    }
     return client;
   } catch (error) {
+    if (prior && !skipProbe) modernDiscoveries.delete(cacheKey);
     try {
-      await client.close();
+      await closeModernClient(client, false);
     } catch {
       /* ignore close errors */
+    }
+    // `!skipProbe` keeps the explicit-legacy retry terminal. Re-probing here is
+    // only meaningful when `prior` was a *cached modern* discovery that has gone
+    // stale — dropping the cache and negotiating afresh can then succeed. On the
+    // `skipProbe` retry `prior` is the synthetic `{ kind: 'legacy' }`: there is
+    // no stale cache to discard, and recursing would reset `skipProbe` to its
+    // default and re-enter the probe→legacy retry below a second time.
+    //
+    // Reachability: server-driven failures on this path surface as
+    // `SdkHttpError` (measured: a 5xx legacy `initialize` gives
+    // `CLIENT_HTTP_NOT_IMPLEMENTED`, a malformed body
+    // `CLIENT_HTTP_UNEXPECTED_CONTENT`), so no server can drive the cycle today.
+    // But `EraNegotiationFailed` is not unreachable under `prior`: the client
+    // raises it from `_legacyHandshake` when `supportedProtocolVersions` offers
+    // no pre-2026-07-28 version, and for an unrecognized `prior` shape. Those
+    // depend on client construction and the library's error taxonomy — both of
+    // which moved under us in the 2.0.0-beta.4 -> 2.0.0 bump. The guard makes
+    // the bound independent of them.
+    if (prior && !skipProbe && SdkError.isInstance(error) && error.code === SdkErrorCode.EraNegotiationFailed) {
+      return createNegotiatedClient(cacheKey, options, authHeaders, false);
+    }
+    // Era negotiation is meant to be automatic: `mode: 'auto'` documents that
+    // "definitive legacy signals (and anything unrecognized) fall back to the
+    // plain legacy `initialize` handshake". 401/403 are the sole exception in
+    // the MCP client's classifier (`classifyHttpError`), which is right when we
+    // hold no credential — then a 401 IS the server's challenge and the caller
+    // needs it — and wrong when we already presented one the server accepts on
+    // other methods. In that case the refusal is a verdict on
+    // `server/discover`, not on the credential, and the automatic fallback
+    // should have run. Do it here: skip the probe and `initialize` directly,
+    // the escape hatch the SDK documents for a server known to be legacy. If
+    // the credential really is bad, that connect fails on its own and surfaces
+    // the server's 401.
+    if (isNegotiationAuthFailure(error) && !skipProbe && presentedStaticCredential(authHeaders, options.authProvider)) {
+      return createNegotiatedClient(cacheKey, options, authHeaders, useCachedDiscovery, true);
     }
     throw error;
   }
@@ -266,13 +438,20 @@ async function getOrCreateModernConnection(
   if (pending) return pending;
 
   const generation = connectionGeneration;
-  const promise = createNegotiatedClient(options, authHeaders)
-    .then(client => {
+  const promise = createNegotiatedClient(cacheKey, options, authHeaders)
+    .then(async client => {
       if (
         (client.getProtocolEra() === 'modern' || options.handleLegacy === true) &&
         generation === connectionGeneration
       ) {
         modernConnections.set(cacheKey, client);
+        registerMCPConnectionScopeCleanup('modern', cacheKey, async () => {
+          if (modernConnections.get(cacheKey) !== client) return;
+          modernConnections.delete(cacheKey);
+          legacyConnectionExpiresAt.delete(cacheKey);
+          modernDiscoveries.delete(cacheKey);
+          await closeModernClient(client);
+        });
         if (client.getProtocolEra() === 'legacy') {
           legacyConnectionExpiresAt.set(cacheKey, Date.now() + LEGACY_CLASSIFICATION_TTL_MS);
         } else {
@@ -280,7 +459,8 @@ async function getOrCreateModernConnection(
         }
         evictLeastRecentlyUsed();
       } else if (generation !== connectionGeneration) {
-        void client.close().catch(() => {});
+        await closeModernClient(client).catch(() => {});
+        throw new Error('MCP connection completed after connection teardown');
       }
       return client;
     })
@@ -288,6 +468,7 @@ async function getOrCreateModernConnection(
       if (pendingModernConnections.get(cacheKey) === promise) pendingModernConnections.delete(cacheKey);
     });
   pendingModernConnections.set(cacheKey, promise);
+  registerMCPConnectionScopePending(promise);
   return promise;
 }
 
@@ -319,16 +500,22 @@ async function attemptModernCall(
     authHeaders,
     options.signingContext?.cacheKey,
     options.authProvider,
-    options.fetchFn
+    options.fetchFn,
+    options.signal,
+    options.requestTimeoutMs,
+    options.handleLegacy,
+    options.allowPrivateIp
   );
   if (isKnownLegacy(cacheKey)) return { handled: false };
 
   const guardedConnection =
     options.signal !== undefined || options.requestTimeoutMs !== undefined || options.fetchFn !== undefined;
+  const oneShot = guardedConnection && currentMCPConnectionScopeKey() === undefined;
   let client: Client;
+  let callSucceeded = false;
   try {
-    client = guardedConnection
-      ? await createNegotiatedClient(options, authHeaders)
+    client = oneShot
+      ? await createNegotiatedClient(cacheKey, options, authHeaders)
       : await getOrCreateModernConnection(cacheKey, options, authHeaders);
   } catch (error) {
     const status = httpStatusOf(error);
@@ -337,6 +524,15 @@ async function attemptModernCall(
       options.debugLogs.push({
         type: 'info',
         message: `MCP: Modern Streamable HTTP is unavailable (HTTP ${status}); preserving the v1 transport path`,
+        timestamp: new Date().toISOString(),
+      });
+      return { handled: false };
+    }
+    if (isLegacyEraNegotiationFailure(error, status)) {
+      markKnownLegacy(cacheKey);
+      options.debugLogs.push({
+        type: 'info',
+        message: `MCP: Era negotiation failed for ${toolName}; preserving the v1 transport path`,
         timestamp: new Date().toISOString(),
       });
       return { handled: false };
@@ -354,7 +550,7 @@ async function attemptModernCall(
     } else {
       markKnownLegacy(cacheKey);
       try {
-        await client.close();
+        await closeModernClient(client);
       } catch {
         /* ignore close errors */
       }
@@ -375,6 +571,7 @@ async function attemptModernCall(
 
   try {
     const response = await callOnModernClient(client, toolName, args, options.signal, options.requestTimeoutMs);
+    callSucceeded = true;
     return { handled: true, response };
   } catch (error) {
     // A tool request may have reached the server even when its response was
@@ -382,20 +579,15 @@ async function attemptModernCall(
     // caller's explicit idempotency policy, not transport guesswork.
     modernConnections.delete(cacheKey);
     legacyConnectionExpiresAt.delete(cacheKey);
+    modernDiscoveries.delete(cacheKey);
     try {
-      await client.close();
+      await closeModernClient(client, !isAbortOrTimeoutError(error));
     } catch {
       /* ignore close errors */
     }
     throw error;
   } finally {
-    if (guardedConnection) {
-      try {
-        await client.close();
-      } catch {
-        /* ignore close errors */
-      }
-    }
+    if (oneShot && client && callSucceeded) await closeModernClient(client).catch(() => {});
   }
 }
 
@@ -428,6 +620,7 @@ export async function tryCallModernMCPTool(
           signal: options.signal,
           requestTimeoutMs: options.requestTimeoutMs,
           fetchFn: options.fetchFn,
+          allowPrivateIp: options.allowPrivateIp,
           handleLegacy: options.handleLegacy,
         },
         toolName,
@@ -457,20 +650,34 @@ export async function probeModernMCPConnection(
     signal: options.signal,
     requestTimeoutMs: options.requestTimeoutMs,
     fetchFn: options.fetchFn,
+    allowPrivateIp: options.allowPrivateIp,
     handleLegacy: options.handleLegacy,
   };
   const authHeaders = buildAuthHeaders(authToken, customHeaders, options.authProvider);
+  const cacheKey = connectionCacheKey(
+    agentUrl,
+    authHeaders,
+    options.signingContext?.cacheKey,
+    options.authProvider,
+    options.fetchFn,
+    options.signal,
+    options.requestTimeoutMs,
+    options.handleLegacy,
+    options.allowPrivateIp
+  );
   let client: Client | undefined;
   try {
-    client = await createNegotiatedClient(connectionOptions, authHeaders);
+    client = await createNegotiatedClient(cacheKey, connectionOptions, authHeaders, false);
     return { connected: true, era: client.getProtocolEra() };
   } catch (error) {
+    modernDiscoveries.delete(cacheKey);
     if (is401Error(error) || isAbortOrTimeoutError(error)) throw error;
     const status = httpStatusOf(error);
     if (status === 404 || status === 405) return { connected: false };
+    if (isLegacyEraNegotiationFailure(error, status)) return { connected: false };
     throw error;
   } finally {
-    await client?.close().catch(() => {});
+    if (client) await closeModernClient(client).catch(() => {});
   }
 }
 
@@ -491,25 +698,53 @@ export async function tryListModernMCPTools(
     signal: options.signal,
     requestTimeoutMs: options.requestTimeoutMs,
     fetchFn: options.fetchFn,
+    allowPrivateIp: options.allowPrivateIp,
   };
   const authHeaders = buildAuthHeaders(authToken, customHeaders, options.authProvider);
+  const cacheKey = connectionCacheKey(
+    agentUrl,
+    authHeaders,
+    options.signingContext?.cacheKey,
+    options.authProvider,
+    options.fetchFn,
+    options.signal,
+    options.requestTimeoutMs,
+    options.handleLegacy,
+    options.allowPrivateIp
+  );
   let client: Client | undefined;
-  try {
-    client = await createNegotiatedClient(connectionOptions, authHeaders);
-    if (client.getProtocolEra() !== 'modern') return { handled: false };
+  const listTools = async (connectedClient: Client): Promise<ModernMCPListAttempt> => {
+    if (connectedClient.getProtocolEra() !== 'modern') return { handled: false };
     const resolvedRequestTimeoutMs = resolveClientRequestTimeoutMs(options.requestTimeoutMs);
-    const result = await client.listTools(undefined, {
+    const result = await connectedClient.listTools(undefined, {
       ...(options.signal && { signal: options.signal }),
       ...(resolvedRequestTimeoutMs !== undefined && { timeout: resolvedRequestTimeoutMs }),
     });
     return { handled: true, tools: result.tools };
+  };
+  try {
+    client = await createNegotiatedClient(cacheKey, connectionOptions, authHeaders);
+    return await listTools(client);
   } catch (error) {
-    if (is401Error(error) || isAbortOrTimeoutError(error)) throw error;
-    const status = httpStatusOf(error);
+    let failure = error;
+    modernDiscoveries.delete(cacheKey);
+    if (!is401Error(failure) && !isAbortOrTimeoutError(failure) && client && clientsUsingCachedDiscovery.has(client)) {
+      await closeModernClient(client, false).catch(() => {});
+      try {
+        client = await createNegotiatedClient(cacheKey, connectionOptions, authHeaders, false);
+        return await listTools(client);
+      } catch (retryError) {
+        failure = retryError;
+        modernDiscoveries.delete(cacheKey);
+      }
+    }
+    if (is401Error(failure) || isAbortOrTimeoutError(failure)) throw failure;
+    const status = httpStatusOf(failure);
     if (status === 404 || status === 405) return { handled: false };
-    throw error;
+    if (isLegacyEraNegotiationFailure(failure, status)) return { handled: false };
+    throw failure;
   } finally {
-    await client?.close().catch(() => {});
+    if (client) await closeModernClient(client).catch(() => {});
   }
 }
 
@@ -525,9 +760,10 @@ export async function closeModernMCPConnections(): Promise<void> {
   modernConnections.clear();
   legacyConnectionExpiresAt.clear();
   knownLegacyConnections.clear();
+  modernDiscoveries.clear();
   for (const client of clients) {
     try {
-      await client.close();
+      await closeModernClient(client);
     } catch {
       /* ignore close errors */
     }

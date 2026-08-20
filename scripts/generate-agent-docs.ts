@@ -111,8 +111,14 @@ function loadIndex(): SchemaIndex {
 }
 
 function loadSchema(ref: string): any {
-  // Strip /schemas/{version}/ prefix to get relative path
+  // Indexes may use either root-relative or absolute canonical schema URLs.
+  // Resolve both to a cache-relative path before stripping the version.
   let rel = ref;
+  try {
+    rel = new URL(ref).pathname;
+  } catch {
+    // A relative reference is already suitable for the handling below.
+  }
   if (rel.startsWith('/schemas/')) {
     rel = rel.substring('/schemas/'.length);
     const segments = rel.split('/');
@@ -221,6 +227,12 @@ function collectTools(index: SchemaIndex): ToolInfo[] {
 
       const reqSchema = task.request?.$ref ? loadSchema(task.request.$ref) : null;
       const resSchema = task.response?.$ref ? loadSchema(task.response.$ref) : null;
+      if (task.request?.$ref && !reqSchema) {
+        throw new Error(`Unable to resolve request schema for ${kebab}: ${task.request.$ref}`);
+      }
+      if (task.response?.$ref && !resSchema) {
+        throw new Error(`Unable to resolve response schema for ${kebab}: ${task.response.$ref}`);
+      }
       const { required, optional } = summarizeFields(reqSchema);
       const resFields = summarizeResponseFields(resSchema);
 
@@ -291,6 +303,7 @@ function domainDeepDives(domain: string): string[] {
     governance: ['docs/guides/HANDLER-PATTERNS-GUIDE.md — input handler patterns for governance flows'],
     'sponsored-intelligence': ['docs/guides/ASYNC-DEVELOPER-GUIDE.md — session lifecycle patterns'],
     account: ['docs/getting-started.md — authentication and account setup'],
+    'trusted-match': ['docs/migration-adcp-3.1.8-to-3.1.10.md — TMPX hop split and Retina metadata'],
   };
   return links[domain] || [];
 }
@@ -565,7 +578,7 @@ function generateLlmsTxt(
   ln('```');
   ln();
   ln(
-    `Compile-time enforcement: \`RequiredPlatformsFor<S>\` catches missing specialism methods. Capability projection auto-derives \`get_adcp_capabilities\` blocks (\`audience_targeting\`, \`conversion_tracking\`, \`compliance_testing.scenarios\`, etc.). Idempotency, RFC 9421 signing, async tasks, status normalization, and sync-completion webhook auto-emit are framework-owned.`
+    `Compile-time enforcement: \`RequiredPlatformsFor<S>\` catches missing specialism methods. Capability projection auto-derives \`get_adcp_capabilities\` blocks (\`audience_targeting\`, \`conversion_tracking\`, \`compliance_testing.scenarios\`, etc.). Idempotency, RFC 9421 signing, async tasks, and status normalization are framework-owned. Synchronous terminal responses do not emit completion webhooks by default; \`autoEmitCompletionWebhooks: true\` is available only as a non-conformant compatibility extension.`
   );
   ln();
   ln(
@@ -658,7 +671,7 @@ function generateLlmsTxt(
   ln(`## Canonical Reference Resolver`);
   ln();
   ln(
-    `\`format_schema\` and \`platform_extensions\` references use immutable \`{ uri, digest }\` pointers. Use \`createCanonicalReferenceResolver\` from \`@adcp/sdk/canonical-references\` instead of raw fetches; it applies SSRF-safe DNS-pinned fetches, redirect blocking, timeout/body caps, SHA-256 verification, structured non-throwing statuses, and caller-owned policy-scoped caching.`
+    `\`format_schema\` and \`platform_extensions\` references use immutable \`{ uri, digest }\` pointers. Use \`createCanonicalReferenceResolver\` from \`@adcp/sdk/canonical-references\` instead of raw fetches; it applies SSRF-safe DNS-pinned fetches, redirect blocking, timeout/body caps, SHA-256 verification, structured non-throwing statuses, and bounded policy-scoped LRU caching. The zero-argument cache holds at most 64 entries / 32 MiB estimated retained data; use \`createCanonicalReferenceCache({ maxEntries, maxBytes })\` to tune the per-resolver budget or inject a fully caller-owned cache.`
   );
   ln();
   ln('```typescript');
@@ -787,7 +800,7 @@ function generateLlmsTxt(
   ln('```');
   ln();
   ln(
-    `2. **Agent re-plan vs. network retry.** A network retry (same bytes, socket timeout) reuses the same key — the SDK handles this. An agent re-plan (LLM re-ran its planner and produced a different payload) means a NEW intent — mint a fresh key by calling the method again without passing one. Reusing the prior key with a different payload returns \`IdempotencyConflictError\`.`
+    `2. **Agent re-plan vs. network retry.** A network retry (same bytes, socket timeout) reuses the same key — the SDK handles this. Reusing a key with a different canonical payload returns \`IdempotencyConflictError\`. Treat that as a reconciliation stop: look up the prior operation by your natural key before deciding whether the new payload is a genuinely new intent. This is also safe across SDK upgrades that strengthen replay identity after the original operation may already have succeeded.`
   );
   ln();
   ln(
@@ -798,7 +811,8 @@ function generateLlmsTxt(
   ln("import { IdempotencyConflictError, IdempotencyExpiredError } from '@adcp/sdk';");
   ln();
   ln('if (result.errorInstance instanceof IdempotencyConflictError) {');
-  ln('  // Agent re-planned with different payload. Retry with a fresh key.');
+  ln('  // Reconcile the prior operation by natural key before deciding whether');
+  ln('  // this payload is a genuinely new intent. Do not blindly rotate keys.');
   ln('  // result.errorInstance.idempotencyKey carries the key the server omitted.');
   ln('}');
   ln('if (result.errorInstance instanceof IdempotencyExpiredError) {');
@@ -846,6 +860,9 @@ function generateLlmsTxt(
   ln(`|-----|-----------|---------|`);
   ln(
     `| \`ext.adcp.disable_sandbox\` | \`adcp storyboard run --no-sandbox\` | Hint (value: \`true\`) to bypass internal sandbox routing and exercise real adapter paths. Seller agents that honor this key serve production-shaped responses regardless of internal sandbox heuristics (env-var fallbacks, brand-domain detection, fixture substitutes). |`
+  );
+  ln(
+    `| \`ext.adcp.creative_wire\` | SDK storyboard/conformance tooling | Transitional 3.1 hint (value: \`legacy\` or \`canonical\`) for read requests whose creative dialect is otherwise structurally ambiguous. Application buyer agents do not emit this key; normal SDK methods negotiate from capabilities and payload shape. |`
   );
   ln();
   ln(
@@ -945,6 +962,20 @@ function generateLlmsTxt(
       ln(desc ? `${desc}.` : '');
       ln();
     }
+    ln(`**AdCP 3.1.10 TMPX boundary:**`);
+    ln(
+      `- Public \`identity_match\` calls return \`IdentityMatchResponseRouterPublisher\`: provider chunks are attributed under \`tmpx_providers[provider_id].chunks\`.`
+    );
+    ln(
+      `- Router implementations validate upstream identity providers with \`IdentityMatchResponseProviderRouter\`, whose root field is \`tmpx_chunks\`.`
+    );
+    ln(
+      `- Providers register local \`tmpx_slots\`; publisher-owned \`PublisherTMPXMacroMapping\` resolves each \`(provider_id, slot_id)\` to a local destination. Provider responses never carry publisher macro names.`
+    );
+    ln(
+      `- Both response hops forbid \`context\`/\`ext\` and opposite-hop TMPX fields. Chunk arrays contain one or two strict \`{ slot_id, value }\` entries.`
+    );
+    ln();
   }
 
   // --- Common flows (from storyboards) ---
@@ -1024,7 +1055,7 @@ function generateLlmsTxt(
   );
   ln();
   ln(
-    `- **\`mergeSeedProduct\`** (plus \`mergeSeedPricingOption\`, \`mergeSeedCreative\`, \`mergeSeedPlan\`, \`mergeSeedMediaBuy\`): permissive merge of a sparse storyboard fixture onto the seller's baseline defaults. \`undefined\`/\`null\` keep base; arrays replace by default; well-known id-keyed lists (\`pricing_options\`, \`publisher_properties\`, \`packages\`, \`assets\`, plan \`findings\`) overlay by id so seeding one entry doesn't drop the rest.`
+    `- **\`mergeSeedProduct\`** (plus the raw-wire \`mergeSeedProductLegacy\` migration counterpart, \`mergeSeedPricingOption\`, \`mergeSeedCreative\`, \`mergeSeedPlan\`, \`mergeSeedMediaBuy\`): permissive merge of a sparse storyboard fixture onto the seller's baseline defaults. \`undefined\`/\`null\` keep base; arrays replace by default; well-known id-keyed lists (\`pricing_options\`, \`publisher_properties\`, \`packages\`, \`assets\`, plan \`findings\`) overlay by id so seeding one entry doesn't drop the rest.`
   );
   ln(
     `- **\`bridgeFromTestControllerStore(store, productDefaults)\`**: wires a \`Map<string, unknown>\` seed store into \`get_products\` responses automatically. Sandbox requests merge seeded + handler products (seeded wins collisions); production traffic (no sandbox marker, or a resolved non-sandbox account) skips the bridge.`
@@ -1118,6 +1149,7 @@ function generateLlmsTxt(
     ['Migrating 6.7 → 6.9 (skips deprecated 6.8.0; 13 additive recipes; 2 breaking)', 'migration-6.7-to-6.9.md'],
     ['Migrating 6.6 → 6.7 (15 recipes; 2 breaking)', 'migration-6.6-to-6.7.md'],
     ['Migrating 5.x → 6.x', 'migration-5.x-to-6.x.md'],
+    ['AdCP 3.1.8 → 3.1.10 TMPX and Retina migration', 'migration-adcp-3.1.8-to-3.1.10.md'],
     ['BuyerAgentRegistry adopter migration', 'migration-buyer-agent-registry.md'],
     ['Account resolution: explicit / implicit / derived', 'guides/account-resolution.md'],
     ['ctx_metadata credential safety', 'guides/CTX-METADATA-SAFETY.md'],
@@ -1190,6 +1222,7 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  protocol: 'mcp' | 'a2a';`);
   ln(`  auth_token?: string;           // Bearer token`);
   ln(`  oauth_tokens?: AgentOAuthTokens;`);
+  ln(`  oauth_resource?: string;       // Explicit RFC 8707 override retained for refresh`);
   ln(`  headers?: Record<string, string>;`);
   ln(`}`);
   ln();
@@ -1258,6 +1291,41 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  abort(reason?: string): never;`);
   ln(`}`);
   ln('```');
+  ln();
+
+  ln(`## Trusted Match 3.1.10 Types`);
+  ln();
+  ln('```typescript');
+  ln(`interface TMPXChunk {`);
+  ln(`  slot_id: string; // provider-local, never a publisher macro name`);
+  ln(`  value: string;   // opaque URL-safe value`);
+  ln(`}`);
+  ln();
+  ln(`interface IdentityMatchResponseProviderRouter {`);
+  ln(`  type: 'identity_match_response';`);
+  ln(`  request_id: string;`);
+  ln(`  eligible_package_ids: string[];`);
+  ln(`  serve_window_sec: number;`);
+  ln(`  tmpx_chunks?: TMPXChunk[]; // 1-2 entries when present`);
+  ln(`}`);
+  ln();
+  ln(`interface IdentityMatchResponseRouterPublisher {`);
+  ln(`  type: 'identity_match_response';`);
+  ln(`  request_id: string;`);
+  ln(`  eligible_package_ids: string[];`);
+  ln(`  serve_window_sec: number;`);
+  ln(`  tmpx?: string; // deprecated single-token compatibility field`);
+  ln(`  tmpx_providers?: Record<string, { chunks: TMPXChunk[] }>;`);
+  ln(`}`);
+  ln();
+  ln(`interface PublisherTMPXMacroMapping {`);
+  ln(`  tmpx_macro_mapping: Record<string, Record<string, string>>;`);
+  ln(`}`);
+  ln('```');
+  ln();
+  ln(
+    `The two response hops are mutually exclusive privacy boundaries: neither carries \`context\` or \`ext\`, providers emit only \`tmpx_chunks\`, and publisher-facing responses emit only attributed \`tmpx_providers\`. See \`docs/migration-adcp-3.1.8-to-3.1.10.md\`.`
+  );
   ln();
 
   // --- Tool request/response shapes ---

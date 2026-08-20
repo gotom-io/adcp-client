@@ -53,13 +53,13 @@ export interface MediaBuy {
   /** Total budget amount (currency determined by pricing options) */
   total_budget: number;
   targeting: Targeting;
-  creative_assets: CreativeAsset[];
+  creative_assets: LegacyManagedCreativeAsset[];
   delivery_schedule: DeliverySchedule;
   created_at: string;
   updated_at: string;
 }
 
-export interface CreativeAsset {
+export interface LegacyManagedCreativeAsset {
   id: string;
   name: string;
   type: 'image' | 'video' | 'html' | 'native';
@@ -94,7 +94,7 @@ export interface CreativeSubAsset {
   };
 }
 
-export interface AdvertisingProduct {
+export interface LegacyAdvertisingProduct {
   id: string;
   name: string;
   description: string;
@@ -104,11 +104,11 @@ export interface AdvertisingProduct {
   currency: string;
   minimum_spend?: number;
   targeting_capabilities: string[];
-  creative_formats: CreativeFormat[];
+  creative_formats: LegacyCreativeFormatSummary[];
   inventory_details: InventoryDetails;
 }
 
-export interface CreativeFormat {
+export interface LegacyCreativeFormatSummary {
   format_id: FormatID;
   name: string;
   dimensions: {
@@ -452,6 +452,17 @@ export interface AgentConfig {
   oauth_client?: AgentOAuthClient;
 
   /**
+   * Operator-supplied RFC 8707 resource override for authorization-code
+   * OAuth flows. When present, this takes precedence over protected-resource
+   * metadata and is reused for authorization, code exchange, and refresh.
+   *
+   * Prefer standards-compliant protected-resource metadata. This escape hatch
+   * exists for legacy or non-conformant integrations whose canonical token
+   * audience cannot be discovered from the agent endpoint.
+   */
+  oauth_resource?: string;
+
+  /**
    * OAuth 2.0 client credentials grant configuration (M2M).
    * When present, tokens in `oauth_tokens` are refreshed by re-exchanging
    * these credentials against `token_endpoint` — there is no user-facing
@@ -601,11 +612,11 @@ export interface ManageCreativeAssetsRequest {
   action: 'upload' | 'list' | 'update' | 'assign' | 'unassign' | 'delete';
   adcp_version?: string;
   // Action-specific parameters
-  assets?: CreativeAsset[]; // For upload
-  filters?: CreativeFilters; // For list
+  assets?: LegacyManagedCreativeAsset[]; // For upload
+  filters?: LegacyManagedCreativeFilters; // For list
   pagination?: PaginationOptions; // For list
   creative_id?: string; // For update
-  updates?: Partial<CreativeAsset>; // For update
+  updates?: Partial<LegacyManagedCreativeAsset>; // For update
   creative_ids?: string[]; // For assign/unassign/delete
   media_buy_id?: string; // For assign/unassign
   buyer_ref?: string; // For assign/unassign
@@ -614,16 +625,16 @@ export interface ManageCreativeAssetsRequest {
   archive?: boolean; // For delete (soft vs hard delete)
 }
 
-export interface SyncCreativesRequest {
-  creatives: CreativeAsset[];
+export interface LegacyManageSyncCreativesRequest {
+  creatives: LegacyManagedCreativeAsset[];
   patch?: boolean; // Enable partial updates
   dry_run?: boolean; // Preview changes without applying
   assignments?: { [creative_id: string]: string[] }; // Bulk assign to packages
   validation_mode?: 'strict' | 'lenient';
 }
 
-export interface ListCreativesRequest {
-  filters?: CreativeFilters;
+export interface LegacyManageListCreativesRequest {
+  filters?: LegacyManagedCreativeFilters;
   sort?: {
     field: string;
     direction: 'asc' | 'desc';
@@ -633,7 +644,7 @@ export interface ListCreativesRequest {
   include_performance?: boolean;
 }
 
-export interface CreativeFilters {
+export interface LegacyManagedCreativeFilters {
   format?: FormatID | FormatID[];
   type?: ('image' | 'video' | 'html' | 'native') | ('image' | 'video' | 'html' | 'native')[];
   status?: string | string[];
@@ -703,7 +714,7 @@ export interface ManageCreativeAssetsResponse {
   errors?: ManageCreativeAssetsError[];
 }
 
-export interface ListCreativesResponse {
+export interface LegacyManageListCreativesResponse {
   success: boolean;
   creatives: CreativeLibraryItem[];
   total_count: number;

@@ -21,7 +21,9 @@ interfaces: `SalesCorePlatform` + `SalesIngestionPlatform`,
 `CampaignGovernancePlatform`, `BrandRightsPlatform`, etc.) and the
 framework wires capability projection, idempotency, RFC 9421 signing,
 async tasks, status normalization, lifecycle state, multi-tenant
-routing, and webhook auto-emit on sync mutations. Compile-time
+routing, and async task completion webhooks. Synchronous terminal
+responses stay inline unless an adopter explicitly enables the
+non-conformant `autoEmitCompletionWebhooks` compatibility option. Compile-time
 enforcement via `RequiredPlatformsFor<S>` catches missing methods
 before runtime. The `definePlatform` / `defineSalesCorePlatform` /
 sibling helpers let you write inline platform literals without
@@ -161,7 +163,7 @@ serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', versi
 - **Auto-generates `get_adcp_capabilities`** from registered platform methods — no manual capability declaration.
 - **Auto-applies response builders** — return raw data, the framework wraps them in MCP `CallToolResult` with `structuredContent`.
 - **Resolves accounts** — `accounts.resolve(ref, ctx)` runs before your platform method, the resolved account lands at `ctx.account`. Returns `ACCOUNT_NOT_FOUND` envelope if resolution returns null. `accounts.resolution: 'implicit'` enforces inline-`{account_id}` refusal at the framework boundary (post-6.7 — pre-6.7 the docstring was aspirational).
-- **Idempotency, signing, async tasks, status normalization, lifecycle state** are framework-owned. Adopters write the business decisions.
+- **Idempotency, signing, async tasks, status normalization, lifecycle state** are framework-owned. Synchronous terminal responses do not emit completion webhooks by default; the inline result is authoritative. Adopters write the business decisions.
 - **Catches handler errors** — unhandled exceptions return `SERVICE_UNAVAILABLE` instead of crashing. Throw a typed error class (see § "Returning errors from handlers") to surface a structured envelope.
 
 ### Identity, multi-tenant, and lifecycle helpers (6.7)
@@ -208,7 +210,9 @@ const a2a = createA2AAdapter({
   },
   async authenticate(req) {
     const token = req.headers.authorization?.replace(/^Bearer\s+/, '');
-    return token ? { token, clientId: 'buyer_123', scopes: [] } : null;
+    if (!token) return null;
+    const principal = await tokenStore.lookup(token);
+    return principal ? { token, clientId: principal.id, scopes: principal.scopes } : null;
   },
 });
 
@@ -222,6 +226,9 @@ app.use(express.json());
 a2a.mount(app);
 app.listen(3000);
 ```
+
+`tokenStore.lookup` represents your real credential verifier or identity provider. Returning a fixed principal for any
+non-empty bearer is an authentication bypass, not a safe example simplification.
 
 Both transports share the same `AdcpServer` — handlers, idempotency store, state store, and `resolveAccount` all run the same pipeline regardless of which transport received the request. Changes to handlers are picked up by both at once.
 
@@ -491,7 +498,16 @@ createAdcpServerFromPlatform(platform, {
 
 Modes per side: `'strict' | 'warn' | 'off'`. Default is `'off'` — enable explicitly. `VALIDATION_ERROR` envelopes carry the full issue list (pointer, message, keyword, schema path) at the top level `adcp_error.issues` (and mirrored at `details.issues` for spec-convention compatibility) so buyers can surface each offending field without drilling into nested metadata.
 
-**Note on MCP `tools/list` introspection**: `@adcp/sdk` agents register framework tools with a passthrough input schema by default so the framework AJV validator is authoritative on both MCP and A2A (see [#909](https://github.com/adcontextprotocol/adcp-client/issues/909)). One visible consequence: MCP `tools/list` publishes `{ type: 'object', properties: {}, additionalProperties: {} }` for every framework tool — not the per-tool parameter schema. Generic MCP discovery clients that lean on `tools/list` inputSchema for field-level introspection can opt in with `exposeToolSchemas: true` on `createAdcpServer` / `createAdcpServerFromPlatform`; known AdCP tools then publish shallow top-level key hints derived from `TOOL_INPUT_SHAPES`, while unknown surfaces fall back to passthrough. These hints intentionally use optional unknown fields plus passthrough so MCP keeps call arguments intact and the framework AJV validator remains authoritative. AdCP-native discovery via `get_adcp_capabilities` is unaffected; upstream [adcp#3057](https://github.com/adcontextprotocol/adcp/issues/3057) proposes a `get_schema` capability tool for per-tool shape discovery across transports.
+**Note on MCP `tools/list` introspection**: `@adcp/sdk` agents register framework tools with a passthrough input schema by default so the framework AJV validator is authoritative on both MCP and A2A (see [#909](https://github.com/adcontextprotocol/adcp-client/issues/909)). Outside the active AdCP 3.2 media-buy profile, MCP `tools/list` therefore publishes `{ type: 'object', properties: {}, additionalProperties: {} }` rather than the per-tool parameter schema. Generic MCP discovery clients can opt in with `exposeToolSchemas: true`; known AdCP tools then publish shallow top-level key hints while unknown surfaces fall back to passthrough. Active 3.2 profile discovery is the exception: it projects the exact self-contained draft-2020-12 request schema into `tools/list` without changing the passthrough registration or framework validation path. Output schemas remain framework-validated because current MCP clients also apply a declared success schema to structured error results. AdCP-native discovery via `get_adcp_capabilities` is unaffected; upstream [adcp#3057](https://github.com/adcontextprotocol/adcp/issues/3057) proposes a `get_schema` capability tool for per-tool shape discovery across transports.
+
+For AdCP 3.2 media-buy sellers, `mcpToolProfile: 'auto'` also filters
+discovery to the spec's active role profile as soon as a compact lifecycle
+handler is registered. Deprecated legacy handlers remain callable but are not
+listed. The list response exposes `_meta.adcp_version` and
+`_meta.adcp_profile`; each framework tool exposes `_meta.adcp_version`. Use
+`mcpToolProfile: 'all'` only when you intentionally need to inspect the entire
+registered compatibility surface. See [AdCP 3.2 media-buy lifecycle
+compatibility](MEDIA-BUY-3.2-COMPATIBILITY.md).
 
 The same validator runs on the `AdcpClient` side — storyboards and third-party clients configure it via `validation: { requests, responses }` on the client config. Request default is `warn` (so existing callers that send partial payloads still work); response default is `strict` in dev/test, `warn` in production. Set either side to `'off'` for zero overhead. Protocol feature preflights are separate from schema validation; the client may still reject request controls that are known to be incompatible with the configured AdCP version before dispatch.
 
@@ -686,11 +702,16 @@ For `getProducts`, any response that includes `products` or `unchanged: true` mu
 If you need manual control (e.g., with `createTaskCapableServer`), builders are available:
 
 ```typescript
-import { productsResponse, mediaBuyResponse, deliveryResponse, taskToolResponse } from '@adcp/sdk';
+import {
+  legacyProductsResponse,
+  legacyMediaBuyResponse,
+  legacyDeliveryResponse,
+  taskToolResponse,
+} from '@adcp/sdk';
 // For error envelopes, throw a typed error class — `AuthMissingError`,
 // `PermissionDeniedError`, `RateLimitedError`, etc. — from `@adcp/sdk/server`.
 
-const response = productsResponse({ products, cache_scope: 'public' });
+const response = legacyProductsResponse({ products, cache_scope: 'public' });
 ```
 
 ### Task Statuses (Server-Side Contract)

@@ -12,15 +12,12 @@ docs/
 # load from compliance/cache/ (already ignored) instead of test/fixtures/.
 test/fixtures/webhook-signing-vectors/
 
+# Vendored AdCP 3.2 OAuth metadata-graph storyboard and vectors. Keep these
+# byte-identical to the upstream compliance bundle.
+test/fixtures/oauth-setup/
+
 # AdCP 3.1 v2 projection fixtures — vendored from the spec repo's
 # `static/examples/products/canonical/` + `server/src/creative-agent/`.
 # Byte-identical to upstream so projection tests don't drift on local
 # formatting changes.
 test/lib/v2-projection-fixtures/
-
-# AAO-SECRETARIAT v2 code-review system, forked verbatim from scope3data/actions
-# (aao-secretariat-v2/ tree). Files here are fetched byte-for-byte from upstream so
-# the fork stays diffable against its source; prettier would reformat them
-# and mask real upstream drift. See .secretariat/ai-review/README.md for the pinned
-# SHA and fork rationale.
-.secretariat/ai-review/

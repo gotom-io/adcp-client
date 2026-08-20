@@ -1,6 +1,6 @@
 /**
  * Tests for runner-output-contract.yaml v2.0.0 behaviors:
- *   1. Forward-compat default — unknown check kinds grade `not_applicable`
+ *   1. Unknown check kinds grade not_applicable across runner/spec skew
  *   2. `capture_path_not_resolvable` — failures surfaced for null/""/absent paths
  *   3. `unresolved_substitution` — synthesized when consumer step skips
  *   4. `upstream_traffic` — controller-backed anti-façade assertion
@@ -16,11 +16,11 @@ const { RESOLVE_PATH_ALL_MAX, resolvePortableIdentifierPathAll } = require('../.
 const { isJsonContentType } = require('../../dist/lib/testing/test-controller');
 
 // ────────────────────────────────────────────────────────────
-// 1. Forward-compat default
+// 1. Unknown checks grade not_applicable for runtime forward compatibility
 // ────────────────────────────────────────────────────────────
 
-describe('forward-compat default — unknown check kinds grade not_applicable', () => {
-  test('unknown check kind grades passed: true with not_applicable: true', () => {
+describe('unknown check kinds grade not_applicable', () => {
+  test('unknown check kind is visible without claiming an agent verdict', () => {
     const validations = [{ check: 'some_future_check_added_in_a_later_spec', description: 'future check' }];
     const ctx = {
       taskName: 'get_signals',
@@ -32,14 +32,14 @@ describe('forward-compat default — unknown check kinds grade not_applicable', 
     assert.equal(result.passed, true);
     assert.equal(result.not_applicable, true);
     assert.equal(result.check, 'some_future_check_added_in_a_later_spec');
-    assert.match(result.note, /forward compatibility/);
-    assert.equal(result.json_pointer, null);
+    assert.match(result.note, /does not implement authored check type/);
+    assert.equal(result.error, undefined);
   });
 
-  test('runner does not fail the step on unrecognized check', () => {
+  test('an unrecognized check does not overturn implemented validation results', () => {
     const validations = [
       { check: 'response_schema', description: 'real check that should pass' },
-      { check: 'unknown_check_xyz', description: 'forward-compat path' },
+      { check: 'unknown_check_xyz', description: 'unknown check path' },
     ];
     const ctx = {
       taskName: 'get_signals',

@@ -6,7 +6,7 @@ import type { FormatReferenceStructuredObject as FormatID } from '../types/core.
 import type { ControllerDetection } from './test-controller';
 import type { WebhookReceiver } from './storyboard/webhook-receiver';
 import type { AdcpVersion } from '../version';
-import type { VersionEnvelopeMode } from '../protocols';
+import type { TransportOptions, VersionEnvelopeMode } from '../protocols';
 
 // Test scenarios that can be run
 export type TestScenario =
@@ -78,11 +78,24 @@ export interface TestOptions {
   /** Optional cancellation signal for discovery and storyboard helper calls. */
   signal?: AbortSignal;
   /**
+   * Runtime-only transport configuration for discovery and every storyboard
+   * or compliance tool call. In particular, `fetchFn` lets hosted runners
+   * enforce a request-scoped network policy without replacing global fetch.
+   */
+  transport?: TransportOptions;
+  /**
    * AdCP protocol version the test client should speak. Storyboard runners
    * set this from the compliance cache version instead of relying on the
    * installed package default.
    */
   adcpVersion?: AdcpVersion | (string & {});
+  /**
+   * Route compact media-buy storyboard steps through the SDK compatibility
+   * coordinator. This lets the same compact-first storyboard exercise native
+   * 3.2 sellers and established v2.5–3.2 sellers without task-name branching.
+   * Mutating guarantee losses remain fail-closed unless named here.
+   */
+  mediaBuyLifecycleCompatibility?: import('../media-buy/compatibility').MediaBuyLifecycleCoordinatorOptions;
   /**
    * Optional wire-only AdCP version envelope override. Validation and schema
    * selection continue to use `adcpVersion`; request envelopes use this value.
@@ -99,7 +112,8 @@ export interface TestOptions {
   /**
    * External schema bundle root used for request/response validation during
    * storyboard and compliance runs. The root is registered against
-   * `adcpVersion` (or the storyboard/compliance version when omitted).
+   * `adcpVersion` (or the storyboard/compliance version when omitted) and is
+   * authoritative over the SDK's generated Zod snapshot for the run.
    */
   schemaRoot?: string;
   /** Custom User-Agent string sent with all outbound requests */
@@ -259,7 +273,10 @@ export interface TestOptions {
   };
   /** @internal Pre-created client from comply() — avoids per-scenario MCP reconnection */
   _client?: unknown;
-  /** @internal Pre-discovered profile from comply() — skips per-scenario discovery */
+  /**
+   * @internal Pre-discovered profile from comply() — skips per-scenario discovery.
+   * @deprecated Use `StoryboardRunOptions.profile` for storyboard profile reuse.
+   */
   _profile?: AgentProfile;
   /**
    * @internal Server-declared AdCP version learned during capability discovery.
@@ -360,6 +377,18 @@ export interface AgentProfile {
    * result is due to a broken caps probe, not an agent that lacks v3 support.
    */
   capabilities_probe_error?: string;
+  /**
+   * Schema violations found during the preflight `get_adcp_capabilities`
+   * call. Kept separately from `capabilities_probe_error`: an invalid
+   * response is still available for best-effort storyboard selection, while
+   * the runner surfaces each violation as a structured notice.
+   */
+  capabilities_schema_issues?: Array<{
+    /** RFC 6901 pointer into the capabilities response. */
+    pointer: string;
+    /** Validator-authored explanation of the violation. */
+    message: string;
+  }>;
   /**
    * Raw `get_adcp_capabilities` response body. Used by the storyboard runner to
    * evaluate `requires_capability` predicates (e.g. `adcp.idempotency.supported`)

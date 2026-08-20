@@ -5,10 +5,12 @@
  * shape. Generic `TCtxMeta` lets platforms type their metadata at the call site.
  *
  * Tenant scoping is expressed by what `accounts.resolve()` returns, not via
- * a multi-level type. Note that resolve is NOT an isolation gate by default:
- * `createTenantStore` resolves the ref the buyer supplies regardless of the
- * caller unless `refAccess: 'auth-scoped'` is set (or a `resolve-presets`
- * guard is composed). See `createTenantStore` and `resolve-presets.ts`.
+ * a multi-level type. Note that resolve is an isolation gate only when you make
+ * it one: `createTenantStore` requires an explicit `refAccess`, and under
+ * `'ref-routed'` it resolves the ref the buyer supplies regardless of the caller
+ * (isolation then has to come from a composed `resolve-presets` guard).
+ * `'auth-scoped'` fails closed instead. See `createTenantStore` and
+ * `resolve-presets.ts`.
  *
  * Status: Preview / 6.0.
  *
@@ -24,6 +26,7 @@ import type {
   AccountReference,
   BusinessEntity,
   ExtensionObject,
+  ListAccountsRequest,
   PaymentTerms,
   ListAccountsResponse,
   ReportUsageRequest,
@@ -39,7 +42,8 @@ import type {
 } from '../../types/tools.generated';
 import type { ServerPayload } from '../../types/server-payload';
 import type { NotificationConfig } from '../../types/v3-1-beta';
-import type { CursorPage, CursorRequest } from './pagination';
+import type { CursorPage } from './pagination';
+import type { AccountMode } from '../account-mode';
 import type { AdcpStructuredError } from './async-outcome';
 import type { AdcpCredential, BuyerAgent } from './buyer-agent';
 
@@ -216,6 +220,14 @@ export interface Account<TCtxMeta = Record<string, unknown>> {
    * introspectable account authorization for this caller/account tuple.
    */
   authorization?: AccountAuthorization;
+
+  /**
+   * Operational mode used by framework gates for test-only surfaces.
+   * Defaults to `'live'` when omitted. Unlike the wire-side
+   * `AccountReference.sandbox` selector, this value comes from the trusted
+   * resolved account and is not emitted on account response payloads.
+   */
+  mode?: AccountMode;
 
   /**
    * Sandbox account marker. For implicit accounts the wire schema treats
@@ -632,7 +644,7 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
    * scope the listing per-principal (e.g., return only accounts visible to
    * the calling buyer agent) without re-deriving identity from the request.
    */
-  list?(filter: AccountFilter & CursorRequest, ctx?: ResolveContext): Promise<ListAccountsHandlerResult<TCtxMeta>>;
+  list?(request: ListAccountsRequest, ctx?: ResolveContext): Promise<ListAccountsHandlerResult<TCtxMeta>>;
 
   /**
    * report_usage API surface. Operator-billed platforms accept usage rows
@@ -760,14 +772,11 @@ export class AccountNotFoundError extends Error {
   }
 }
 
-export interface AccountFilter {
-  /** Filter by brand domain across all operators. */
-  brand_domain?: string;
-  /** Filter by operator across all brands. */
-  operator?: string;
-  /** Filter by status. */
-  status?: AdcpAccountStatus[];
-}
+/**
+ * @deprecated Use the wire-accurate `ListAccountsRequest` type. Retained as
+ * an alias so existing imports keep compiling.
+ */
+export type AccountFilter = ListAccountsRequest;
 
 /**
  * Per-account result row returned by an adopter's `accounts.upsert`
@@ -868,8 +877,11 @@ export function toWireAccount<TCtxMeta>(account: Account<TCtxMeta>): WireAccount
   if (account.credit_limit !== undefined) wire.credit_limit = account.credit_limit;
   if (account.setup !== undefined) wire.setup = account.setup;
   if (account.account_scope !== undefined) wire.account_scope = account.account_scope;
-  if (account.governance_agents !== undefined) {
-    wire.governance_agents = account.governance_agents.map(projectGovernanceAgent);
+  if (account.governance_agents !== undefined && account.governance_agents.length > 0) {
+    if (account.governance_agents.length !== 1) {
+      throw new Error('Account.governance_agents must contain exactly one agent when present');
+    }
+    wire.governance_agents = [projectGovernanceAgent(account.governance_agents[0]!)];
   }
   if (account.reporting_bucket !== undefined) wire.reporting_bucket = account.reporting_bucket;
   if (account.notification_configs !== undefined) {

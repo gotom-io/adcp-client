@@ -1,4 +1,4 @@
-import type { CreativeFormat } from '../types';
+import type { LegacyCreativeFormatSummary } from '../types';
 
 // Re-export logger utilities
 export { logger, createLogger, type LogLevel, type LoggerConfig } from './logger';
@@ -7,20 +7,30 @@ import { logger } from './logger';
 // Re-export preview utilities
 export {
   batchPreviewProducts,
-  batchPreviewFormats,
+  batchPreviewFormatsLegacy,
   clearPreviewCache,
   type PreviewResult,
+  type LegacyPreviewResult,
   type BatchPreviewOptions,
   type PreviewCacheBackend,
   type PreviewCacheEntry,
 } from './preview-utils';
+export {
+  resolvePreviewAuthority,
+  type PlacementPreviewCandidate,
+  type PreviewAuthorityInput,
+  type PreviewAuthorityResolution,
+  type PreviewFidelity,
+  type SelectedPreviewAuthority,
+  type SellerPreviewCandidate,
+} from './preview-authority';
 
 // Configuration constants
 export const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '30000'); // 30 seconds
 export const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '5');
 
-// Standard creative formats (hardcoded for now)
-export const STANDARD_FORMATS: CreativeFormat[] = [
+// Legacy named creative formats (hardcoded migration fixtures)
+export const LEGACY_STANDARD_FORMATS: LegacyCreativeFormatSummary[] = [
   {
     format_id: {
       agent_url: 'https://creatives.adcontextprotocol.org',
@@ -130,10 +140,10 @@ export function getCircuitBreaker(agentId: string): CircuitBreaker {
 }
 
 /**
- * Get standard creative formats
+ * Get legacy named creative formats for migration tooling.
  */
-export function getStandardFormats(): CreativeFormat[] {
-  return STANDARD_FORMATS;
+export function getStandardFormatsLegacy(): LegacyCreativeFormatSummary[] {
+  return LEGACY_STANDARD_FORMATS;
 }
 
 // Re-export response unwrapping utilities
@@ -202,6 +212,10 @@ export {
   usesDeprecatedAssetsField,
   getAssetCount,
   hasAssets,
+  type CanonicalFormatAssetSlot,
+  type FormatAssetsInput,
+  type IndividualFormatAssetSlot,
+  type RepeatableFormatAssetGroup,
 } from './format-assets';
 
 // Re-export pricing adapter utilities (v3 pricing field compatibility)
@@ -228,12 +242,14 @@ export {
 export { adaptSyncCreativesRequestForV2 } from './sync-creatives-adapter';
 
 // Re-export creative delivery helpers for package-scoped inline creatives
-export { inlineCreativesForPackages } from './creative-delivery';
+export { inlineCreativesForPackages, inlineCreativesForPackagesLegacy } from './creative-delivery';
 export type {
   InlineCreativeAssignment,
   InlineCreativePackage,
   InlineCreativePackagePatch,
   InlineCreativesForPackagesOptions,
+  InlineCreativesForPackagesLegacyOptions,
+  LegacyInlineCreativePackage,
 } from './creative-delivery';
 
 // Re-export pagination utilities

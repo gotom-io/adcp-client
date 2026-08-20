@@ -27,6 +27,7 @@ const { readFileSync, statSync } = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const net = require('net');
+const { randomBytes } = require('crypto');
 const { spawn } = require('child_process');
 const { AsyncWebhookHandler } = require('./adcp-async-handler.js');
 const {
@@ -46,6 +47,7 @@ const {
   buildStoryboardSummaryMarkdown,
   writeSummaryFile,
   printSoftFailBlock,
+  defaultComplianceTimeoutSeconds,
 } = require('./adcp-storyboard-summary.js');
 const { scheduleVersionCheck } = require('./adcp-version-check.js');
 const { formatStoryboardResultsAsJUnit } = require('../dist/lib/testing/storyboard/junit.js');
@@ -517,7 +519,7 @@ async function displayAgentInfo(agentConfig, jsonOutput) {
       ...info,
       ...(capabilities && { capabilities }),
     };
-    console.log(JSON.stringify(output, null, 2));
+    await writeJsonOutput(output);
   } else {
     console.log(`\n📋 Agent Information\n`);
     console.log(`Name: ${info.name}`);
@@ -731,7 +733,7 @@ async function handleTestCommand(args) {
         if (useOAuth) {
           // Only error on expired tokens if --oauth flag was explicitly passed
           if (jsonOutput) {
-            console.log(
+            await writeJsonOutput(
               JSON.stringify({
                 success: false,
                 error: 'OAuth tokens expired',
@@ -812,7 +814,7 @@ async function handleTestCommand(args) {
     const result = await runAgentTests(agentUrl, scenario, testOptions);
 
     if (jsonOutput) {
-      console.log(formatTestResultsJSON(result));
+      await writeJsonOutput(formatTestResultsJSON(result));
     } else {
       console.log(formatTestResults(result));
     }
@@ -1060,6 +1062,50 @@ function parseAgentOptions(args) {
   // NOT verify the assertion; if state is not actually seeded, scenarios
   // fail naturally on first stateful step. Spec: adcp-client#1626.
   const assertsSeededState = args.includes('--asserts-seeded-state');
+  const mediaBuyCompatibilityLossesIdx = args.indexOf('--media-buy-compat-losses');
+  const mediaBuyCompatibilityLossesEqArg = args.find(arg => arg.startsWith('--media-buy-compat-losses='));
+  const mediaBuyCompatibilityLossesValue =
+    mediaBuyCompatibilityLossesIdx !== -1 &&
+    mediaBuyCompatibilityLossesIdx + 1 < args.length &&
+    !args[mediaBuyCompatibilityLossesIdx + 1].startsWith('--')
+      ? args[mediaBuyCompatibilityLossesIdx + 1]
+      : (mediaBuyCompatibilityLossesEqArg?.slice('--media-buy-compat-losses='.length) ?? null);
+  const forceEstablishedMediaBuyLifecycle = args.includes('--force-established-media-buy-lifecycle');
+  if (
+    (mediaBuyCompatibilityLossesIdx !== -1 || mediaBuyCompatibilityLossesEqArg !== undefined) &&
+    !args.includes('--media-buy-lifecycle-compat') &&
+    !forceEstablishedMediaBuyLifecycle
+  ) {
+    console.error(
+      'Error: --media-buy-compat-losses requires --media-buy-lifecycle-compat or --force-established-media-buy-lifecycle.'
+    );
+    process.exit(2);
+  }
+  const mediaBuyPrincipalScopeIdx = args.indexOf('--media-buy-principal-scope');
+  const mediaBuyPrincipalScopeEqArg = args.find(arg => arg.startsWith('--media-buy-principal-scope='));
+  const mediaBuyPrincipalScopeValue =
+    mediaBuyPrincipalScopeIdx !== -1 &&
+    mediaBuyPrincipalScopeIdx + 1 < args.length &&
+    !args[mediaBuyPrincipalScopeIdx + 1].startsWith('--')
+      ? args[mediaBuyPrincipalScopeIdx + 1]
+      : (mediaBuyPrincipalScopeEqArg?.slice('--media-buy-principal-scope='.length) ?? null);
+  if ((mediaBuyPrincipalScopeIdx !== -1 || mediaBuyPrincipalScopeEqArg !== undefined) && !mediaBuyPrincipalScopeValue) {
+    console.error('Error: --media-buy-principal-scope requires a non-empty value.');
+    process.exit(2);
+  }
+  const mediaBuyLifecycleCompatibility =
+    args.includes('--media-buy-lifecycle-compat') || forceEstablishedMediaBuyLifecycle
+      ? {
+          preferredLifecycle: forceEstablishedMediaBuyLifecycle ? 'established' : 'auto',
+          allowedLosses: mediaBuyCompatibilityLossesValue
+            ? mediaBuyCompatibilityLossesValue
+                .split(',')
+                .map(value => value.trim())
+                .filter(Boolean)
+            : [],
+          principalScope: mediaBuyPrincipalScopeValue || `adcp-cli-run-${randomBytes(16).toString('hex')}`,
+        }
+      : undefined;
 
   // Webhook-receiver flags are captured here solely so their values are excluded
   // from `positionalArgs`. The authoritative parse lives in
@@ -1163,6 +1209,8 @@ function parseAgentOptions(args) {
     localAgentValue,
     formatValue,
     summaryOutputValue,
+    mediaBuyCompatibilityLossesValue,
+    mediaBuyPrincipalScopeValue,
     fileIndex !== -1 ? file : null,
     testKitIndex !== -1 ? testKitPath : null,
     summaryFileFlagValue,
@@ -1186,6 +1234,7 @@ function parseAgentOptions(args) {
     allowHttp,
     noSandbox,
     assertsSeededState,
+    mediaBuyLifecycleCompatibility,
     positionalArgs,
     localAgent: localAgentValue,
     format: formatValue,
@@ -1223,7 +1272,7 @@ async function maybeRunInlineOAuth(agentArg, args, { jsonOutput } = {}) {
     } catch (err) {
       const hint = `Run: adcp --save-auth ${agentArg} ${saved.url} --oauth to re-register`;
       if (jsonOutput) {
-        console.log(
+        await writeJsonOutput(
           JSON.stringify({
             success: false,
             error: 'oauth_flow_failed',
@@ -1248,7 +1297,7 @@ async function maybeRunInlineOAuth(agentArg, args, { jsonOutput } = {}) {
     // non-zero instead of silently running and failing N minutes later on
     // a 401 from the storyboard runner.
     if (jsonOutput) {
-      console.log(
+      await writeJsonOutput(
         JSON.stringify({
           success: false,
           error: 'oauth_requires_alias',
@@ -1447,6 +1496,195 @@ function loadTestKitFile(testKitPath) {
   } catch (err) {
     throw new Error(`failed to parse ${resolved} as YAML: ${err.message}`);
   }
+}
+
+class TestKitComplianceSelectionError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = 'TestKitComplianceSelectionError';
+    this.code = 'TEST_KIT_COMPLIANCE_VERSION_MISMATCH';
+    this.details = details;
+  }
+}
+
+function complianceVersionFromIndex(index, indexPath) {
+  const declared = index?.adcp_version;
+  const published = index?.published_version;
+  const { resolveBundleKey } = require('../dist/lib/validation/schema-loader.js');
+  const isConcreteVersion = value => {
+    if (typeof value !== 'string' || value.length === 0 || value === 'latest') return false;
+    try {
+      resolveBundleKey(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const concreteDeclared = isConcreteVersion(declared);
+  const concretePublished = isConcreteVersion(published);
+  if (concreteDeclared && concretePublished && declared !== published) {
+    throw new TestKitComplianceSelectionError(
+      `Compliance metadata at ${indexPath} disagrees internally: adcp_version is ${declared}, ` +
+        `but published_version is ${published}. Refusing to select an ambiguous compliance line.`,
+      { test_kit_index: indexPath, adcp_version: declared, published_version: published }
+    );
+  }
+  if (concreteDeclared) return declared;
+  if (concretePublished) return published;
+  return null;
+}
+
+function readComplianceMetadata(complianceDir, resolveOptions = {}) {
+  const fs = require('node:fs');
+  const indexPath = path.join(path.resolve(complianceDir), 'index.json');
+  if (!fs.existsSync(indexPath)) return null;
+  let index;
+  try {
+    index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  } catch (err) {
+    throw new TestKitComplianceSelectionError(`Failed to read compliance metadata at ${indexPath}: ${err.message}`, {
+      test_kit_index: indexPath,
+    });
+  }
+  const hasVersionMetadata = index?.adcp_version !== undefined || index?.published_version !== undefined;
+  const looksLikeComplianceIndex =
+    hasVersionMetadata ||
+    index?.generated_at !== undefined ||
+    Array.isArray(index?.universal) ||
+    Array.isArray(index?.protocols) ||
+    Array.isArray(index?.specialisms);
+  if (!hasVersionMetadata) {
+    if (!looksLikeComplianceIndex) return null;
+    throw new TestKitComplianceSelectionError(
+      `Compliance metadata at ${indexPath} is missing adcp_version and published_version. ` +
+        `Refusing to run before the test-kit line is known.`,
+      { test_kit_index: indexPath, adcp_version: null, published_version: null }
+    );
+  }
+  let version = complianceVersionFromIndex(index, indexPath);
+  if (!version) {
+    try {
+      const { loadComplianceIndex } = require('../dist/lib/testing/storyboard/index.js');
+      version = loadComplianceIndex({
+        complianceDir: path.dirname(indexPath),
+        ...(resolveOptions.schemaRoot && { schemaRoot: resolveOptions.schemaRoot }),
+      }).adcp_version;
+    } catch (err) {
+      throw new TestKitComplianceSelectionError(
+        `Unable to resolve a concrete compliance version from ${indexPath}: ${err.message}`,
+        {
+          test_kit_index: indexPath,
+          adcp_version: index?.adcp_version ?? null,
+          published_version: index?.published_version ?? null,
+          ...(resolveOptions.schemaRoot && { schema_root: path.resolve(resolveOptions.schemaRoot) }),
+        }
+      );
+    }
+  }
+  return version ? { version, complianceDir: path.dirname(indexPath), indexPath } : null;
+}
+
+function findTestKitComplianceMetadata(testKitPath, resolveOptions = {}) {
+  const fs = require('node:fs');
+  const resolved = fs.realpathSync(testKitPath);
+  let current = path.dirname(resolved);
+  while (true) {
+    const metadata = readComplianceMetadata(current, resolveOptions);
+    if (metadata) return metadata;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+
+function prepareTestKitComplianceSelection(args, opts) {
+  if (!opts.testKitPath) return { args, opts };
+
+  const resolvedTestKitPath = path.resolve(opts.testKitPath);
+  const loadedTestKit = loadTestKitFile(resolvedTestKitPath);
+  const testKitMetadata = findTestKitComplianceMetadata(resolvedTestKitPath, opts);
+  if (!testKitMetadata) return { args, opts: { ...opts, loadedTestKit } };
+
+  const explicitVersion = opts.complianceVersion;
+  if (explicitVersion && explicitVersion !== testKitMetadata.version) {
+    throw new TestKitComplianceSelectionError(
+      `--test-kit at ${resolvedTestKitPath} targets AdCP ${testKitMetadata.version} ` +
+        `(metadata: ${testKitMetadata.indexPath}), but --compliance-version ${explicitVersion} was specified. ` +
+        `Drop --compliance-version to auto-select the test-kit line, or select matching inputs.`,
+      {
+        test_kit_path: resolvedTestKitPath,
+        test_kit_index: testKitMetadata.indexPath,
+        test_kit_version: testKitMetadata.version,
+        compliance_version: explicitVersion,
+        compliance_version_source: '--compliance-version',
+      }
+    );
+  }
+
+  if (opts.complianceDir) {
+    const selectedMetadata = readComplianceMetadata(opts.complianceDir, opts);
+    if (!selectedMetadata) {
+      throw new TestKitComplianceSelectionError(
+        `--compliance-dir ${path.resolve(opts.complianceDir)} has no index.json with resolvable ` +
+          `adcp_version or published_version metadata. Refusing to run before the active storyboard line is known.`,
+        {
+          test_kit_path: resolvedTestKitPath,
+          test_kit_index: testKitMetadata.indexPath,
+          test_kit_version: testKitMetadata.version,
+          compliance_dir: path.resolve(opts.complianceDir),
+          compliance_version_source: '--compliance-dir',
+        }
+      );
+    }
+    if (selectedMetadata.version !== testKitMetadata.version) {
+      throw new TestKitComplianceSelectionError(
+        `--test-kit at ${resolvedTestKitPath} targets AdCP ${testKitMetadata.version} ` +
+          `(metadata: ${testKitMetadata.indexPath}), but --compliance-dir ${path.resolve(opts.complianceDir)} ` +
+          `targets AdCP ${selectedMetadata.version} (metadata: ${selectedMetadata.indexPath}). ` +
+          `Select a compliance directory from the same published line.`,
+        {
+          test_kit_path: resolvedTestKitPath,
+          test_kit_index: testKitMetadata.indexPath,
+          test_kit_version: testKitMetadata.version,
+          compliance_dir: path.resolve(opts.complianceDir),
+          compliance_index: selectedMetadata.indexPath,
+          compliance_version: selectedMetadata.version,
+          compliance_version_source: '--compliance-dir',
+        }
+      );
+    }
+  }
+
+  const inferredVersion = explicitVersion || testKitMetadata.version;
+  const inferredComplianceDir = opts.complianceDir || testKitMetadata.complianceDir;
+  const resolvedArgs = [...args];
+  if (!explicitVersion) resolvedArgs.push('--compliance-version', inferredVersion);
+  if (!opts.complianceDir) resolvedArgs.push('--compliance-dir', inferredComplianceDir);
+
+  return {
+    args: resolvedArgs,
+    opts: {
+      ...opts,
+      loadedTestKit,
+      complianceVersion: inferredVersion,
+      complianceDir: inferredComplianceDir,
+      testKitComplianceVersion: testKitMetadata.version,
+      testKitComplianceIndex: testKitMetadata.indexPath,
+    },
+  };
+}
+
+async function exitTestKitSelectionError(error, jsonOutput) {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error?.code || 'TEST_KIT_LOAD_FAILED';
+  const details = error?.details || {};
+  if (jsonOutput) {
+    await writeJsonOutput(JSON.stringify({ success: false, error: { code, message, ...details } }));
+  } else {
+    console.error(`ERROR: ${message}`);
+  }
+  process.exit(2);
 }
 
 async function resolveAgent(agentArg, authToken, protocolFlag, jsonOutput, authScheme = null) {
@@ -1778,7 +2016,9 @@ RUN OPTIONS (full assessment):
   --compliance-version VERSION
                       Select a compliance cache version, e.g. 3.0.12 or
                       3.1.0-beta.3. The runner uses this cache for
-                      storyboard resolution and wire-version defaults.
+                      storyboard resolution and wire-version defaults. When
+                      --test-kit points into a compliance cache, its version is
+                      selected automatically; an explicit mismatch is rejected.
   --compliance-dir PATH
                       Use a specific compliance cache directory
   --schema-root PATH  Use a specific schema bundle/root for validation.
@@ -1787,9 +2027,12 @@ RUN OPTIONS (full assessment):
                       Hosted badge mode: allow a stable line (e.g. 3.1)
                       to resolve against a prerelease compliance cache.
   --file PATH         Run an ad-hoc storyboard YAML (spec evolution)
+  --test-kit PATH     Load test-kit YAML. If an ancestor index.json declares
+                      adcp_version or published_version, the same compliance
+                      line is required for storyboard resolution.
   --timeout SECONDS   Soft budget in seconds: stop starting new storyboards
                       after this budget, without aborting an active storyboard
-                      (default: 120)
+                      (default: max(120, 10 × selected storyboard count))
   --brief TEXT        Custom brief for product discovery
   --no-sandbox        Force production-path responses (#841). Sets
                       account.sandbox=false on every request AND stamps
@@ -1807,6 +2050,20 @@ RUN OPTIONS (full assessment):
                       not verify the assertion — scenarios still fail
                       naturally if state isn't actually present
                       (#1626).
+  --media-buy-lifecycle-compat
+                      Route compact media-buy storyboard steps through the
+                      SDK compatibility coordinator so the same storyboard can
+                      exercise established v2.5–3.2 sellers.
+  --media-buy-compat-losses LOSSES
+                      Comma-separated guarantee losses explicitly accepted by
+                      that coordinator (for example feed_version_not_atomic).
+  --media-buy-principal-scope SCOPE
+                      Stable, non-secret principal or tenant identity used to
+                      scope legacy proposal snapshots. A per-run value is
+                      generated when omitted.
+  --force-established-media-buy-lifecycle
+                      Force the coordinator's established lane on a dual-
+                      surface 3.2 seller. Implies --media-buy-lifecycle-compat.
   --summary-output PATH
                       Write a narrow, schema-stable summary artifact
                       to PATH (JSON: { schema_version, passed, failed,
@@ -2216,6 +2473,7 @@ async function handleStoryboardShow(args) {
     listAllComplianceStoryboards,
     loadComplianceIndex,
     resolveStoryboardsForCapabilities,
+    describeStoryboardCapabilityGates,
     PROTOCOL_TO_PATH,
   } = await import('../dist/lib/testing/storyboard/index.js');
   const jsonOutput = args.includes('--json');
@@ -2284,18 +2542,8 @@ async function handleStoryboardShow(args) {
       console.log(`\nSpecialism: ${specialismSlug}  (protocol: ${entry.protocol})`);
       console.log(`Resolves to ${resolved.storyboards.length} storyboard(s):`);
       for (const sb of resolved.storyboards) {
-        const gating = sb.requires_capability
-          ? ' (gated on ' +
-            sb.requires_capability.path +
-            ('present' in sb.requires_capability
-              ? sb.requires_capability.present
-                ? ' present'
-                : ' absent'
-              : 'contains' in sb.requires_capability
-                ? ' contains ' + JSON.stringify(sb.requires_capability.contains)
-                : ' = ' + sb.requires_capability.equals) +
-            ')'
-          : ' (always graded)';
+        const capabilityGateDescription = describeStoryboardCapabilityGates(sb);
+        const gating = capabilityGateDescription ? ` (gated on ${capabilityGateDescription})` : ' (always graded)';
         const trackTag = sb.track ? ` [track: ${sb.track}]` : '';
         console.log(`  - ${sb.id}${trackTag}${gating}`);
       }
@@ -2428,8 +2676,8 @@ function enforceStrictFlags(args, removedFound) {
 }
 
 async function handleStoryboardRun(args) {
-  const opts = parseAgentOptions(args);
-  const {
+  let opts = parseAgentOptions(args);
+  let {
     authToken,
     authScheme,
     protocolFlag,
@@ -2442,6 +2690,26 @@ async function handleStoryboardRun(args) {
   } = opts;
 
   enforceStrictFlags(args, warnRemovedFlags(args));
+
+  try {
+    const prepared = prepareTestKitComplianceSelection(args, opts);
+    args = prepared.args;
+    opts = prepared.opts;
+  } catch (err) {
+    await exitTestKitSelectionError(err, jsonOutput);
+  }
+
+  ({
+    authToken,
+    authScheme,
+    protocolFlag,
+    jsonOutput,
+    dryRun,
+    positionalArgs,
+    file: filePath,
+    localAgent,
+    format,
+  } = opts);
 
   // --local-agent <module>: spin the agent up in-process, seed fixtures,
   // run storyboards, tear down. Collapses the 300-line seller-side
@@ -2605,15 +2873,7 @@ async function handleStoryboardRun(args) {
     ? await resolveWebhookReceiverOptions(args, { jsonOutput })
     : webhookReceiverBase;
 
-  let loadedTestKit = null;
-  if (opts.testKitPath) {
-    try {
-      loadedTestKit = loadTestKitFile(opts.testKitPath);
-    } catch (err) {
-      console.error(`ERROR: ${err.message}`);
-      process.exit(2);
-    }
-  }
+  const loadedTestKit = opts.loadedTestKit ?? null;
 
   const options = {
     protocol,
@@ -2629,6 +2889,9 @@ async function handleStoryboardRun(args) {
     ...(fileSchemaRoot && { schemaRoot: fileSchemaRoot }),
     ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
+    ...(opts.mediaBuyLifecycleCompatibility && {
+      mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
+    }),
     ...(mergedRunHeaders && { headers: mergedRunHeaders }),
     ...(loadedTestKit && { test_kit: loadedTestKit }),
   };
@@ -2657,6 +2920,7 @@ async function handleStoryboardRun(args) {
     // Human-readable output
     console.log(`\n${storyboard.title} (${storyboard.id})`);
     console.log('═'.repeat(50));
+    printFixtureResolution(result.fixture_resolutions, result.coverage_gaps);
     for (const phase of result.phases) {
       console.log(`\n── Phase: ${phase.phase_title} ──────────────────────────────`);
       const SKIP_ICONS = {
@@ -3462,13 +3726,22 @@ async function handleLocalAgentStoryboardRun(modulePath, args, opts) {
       createAgent,
       storyboards: storyboardsSpec,
       compliance: resolveOptions,
-      ...(opts.complianceVersion || opts.schemaRoot || opts.noSandbox || opts.assertsSeededState
+      ...(opts.complianceVersion ||
+      opts.schemaRoot ||
+      opts.noSandbox ||
+      opts.assertsSeededState ||
+      opts.mediaBuyLifecycleCompatibility ||
+      opts.loadedTestKit
         ? {
             runStoryboardOptions: {
               ...(opts.complianceVersion && !opts.complianceDir && { adcpVersion: opts.complianceVersion }),
               ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
               ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
               ...(opts.assertsSeededState && { assertsSeededState: true }),
+              ...(opts.mediaBuyLifecycleCompatibility && {
+                mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
+              }),
+              ...(opts.loadedTestKit && { test_kit: opts.loadedTestKit }),
             },
           }
         : {}),
@@ -3580,6 +3853,32 @@ function printStrictSummary(summary) {
   const icon = strictOnly > 0 ? '⚠️ ' : '✅';
   const tail = strictOnly > 0 ? ` (${strictOnly} lenient-only — strict dispatcher would reject)` : '';
   console.log(`${icon} strict: ${passed}/${checked} passed${tail}`);
+}
+
+/** Render bindings without dumping the (potentially large) discovery evidence. */
+function printFixtureResolution(records, coverageGaps) {
+  if (!Array.isArray(records) || records.length === 0) return;
+  console.log('\nFixture resolution:');
+  for (const record of records) {
+    const scope = record.product_handle ? `${record.product_handle}/` : '';
+    if (record.status === 'resolved') {
+      const ids = record.seller_ids || {};
+      const sellerId = ids.pricing_option_id || ids.product_id || '?';
+      console.log(`  ✅ ${record.fixture_type} ${scope}${record.handle} → ${sellerId} (${record.strategy})`);
+    } else if (record.status === 'unsatisfied') {
+      continue;
+    } else {
+      const failedEvidence = Array.isArray(record.strategies_attempted)
+        ? [...record.strategies_attempted].reverse().find(item => item?.disposition === 'failed')
+        : undefined;
+      const detail = failedEvidence?.detail ? `: ${String(failedEvidence.detail).slice(0, 240)}` : '';
+      console.log(`  ❌ ${record.fixture_type} ${scope}${record.handle} — resolution failed${detail}`);
+    }
+  }
+  const fixtureGap = Array.isArray(coverageGaps)
+    ? coverageGaps.find(gap => gap?.reason === 'fixture_unsatisfied')
+    : undefined;
+  if (fixtureGap) console.log(`  ⏭️  ${fixtureGap.detail}`);
 }
 
 /**
@@ -3859,6 +4158,10 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
     ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
     ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
+    ...(opts.mediaBuyLifecycleCompatibility && {
+      mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
+    }),
+    ...(opts.loadedTestKit && { test_kit: opts.loadedTestKit }),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -3895,6 +4198,7 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
     for (const result of results) {
       console.log(`\n${result.storyboard_title} (${result.storyboard_id})`);
       console.log('═'.repeat(50));
+      printFixtureResolution(result.fixture_resolutions, result.coverage_gaps);
       for (const phase of result.phases) {
         console.log(`\n── Phase: ${phase.phase_title} ──────────────────────────────`);
         for (const step of phase.steps) {
@@ -4121,6 +4425,10 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
     ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
     ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
+    ...(opts.mediaBuyLifecycleCompatibility && {
+      mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
+    }),
+    ...(opts.loadedTestKit && { test_kit: opts.loadedTestKit }),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -4179,6 +4487,7 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
     for (const result of results) {
       console.log(`\n${result.storyboard_title} (${result.storyboard_id})`);
       console.log('═'.repeat(50));
+      printFixtureResolution(result.fixture_resolutions, result.coverage_gaps);
       for (const phase of result.phases) {
         console.log(`\n── Phase: ${phase.phase_title} ──────────────────────────────`);
         for (const step of phase.steps) {
@@ -4265,8 +4574,10 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     storyboards = rawArgs[storyboardsIndex + 1].split(',');
   }
   const complianceResolveOptions = parseComplianceSelection(rawArgs).resolveOptions;
+  const { listAllComplianceStoryboards, listBundles, resolveBundleOrStoryboard } =
+    await import('../dist/lib/testing/storyboard/index.js');
+  let selectedStoryboardCount = listAllComplianceStoryboards(complianceResolveOptions).length;
   if (storyboards?.length) {
-    const { listAllComplianceStoryboards, listBundles } = await import('../dist/lib/testing/storyboard/index.js');
     try {
       const knownStoryboardIds = new Set(listAllComplianceStoryboards(complianceResolveOptions).map(s => s.id));
       const knownBundleIds = new Set(listBundles(complianceResolveOptions).map(b => b.id));
@@ -4276,15 +4587,21 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
         console.error(`Run 'adcp storyboard list' to see all options.\n`);
         process.exit(2);
       }
+      selectedStoryboardCount = new Set(
+        storyboards.flatMap(id =>
+          resolveBundleOrStoryboard(id, complianceResolveOptions).map(storyboard => storyboard.id)
+        )
+      ).size;
     } catch (err) {
       console.error(`ERROR: ${err.message}`);
       process.exit(1);
     }
   }
 
-  // Parse --timeout (seconds, default 120)
+  // Parse --timeout (seconds). The implicit budget scales with the selected
+  // set so spec releases that add storyboards do not silently truncate runs.
   const timeoutFlagIndex = rawArgs.indexOf('--timeout');
-  const DEFAULT_TIMEOUT_S = 120;
+  const DEFAULT_TIMEOUT_S = defaultComplianceTimeoutSeconds(selectedStoryboardCount);
   let timeoutMs = DEFAULT_TIMEOUT_S * 1000;
   if (timeoutFlagIndex !== -1) {
     if (timeoutFlagIndex + 1 >= rawArgs.length || rawArgs[timeoutFlagIndex + 1].startsWith('--')) {
@@ -4311,15 +4628,7 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
 
   await loadInvariantModules(rawArgs);
 
-  let loadedTestKit = null;
-  if (opts.testKitPath) {
-    try {
-      loadedTestKit = loadTestKitFile(opts.testKitPath);
-    } catch (err) {
-      console.error(`ERROR: ${err.message}`);
-      process.exit(2);
-    }
-  }
+  const loadedTestKit = opts.loadedTestKit ?? null;
 
   const testOptions = {
     protocol,
@@ -4333,6 +4642,9 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     ...(webhookReceiverOpts ?? {}),
     ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
+    ...(opts.mediaBuyLifecycleCompatibility && {
+      mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
+    }),
     ...(mergedAssessmentHeaders && { headers: mergedAssessmentHeaders }),
     ...(loadedTestKit && { test_kit: loadedTestKit }),
     ...(opts.complianceVersion && { version: opts.complianceVersion }),
@@ -4478,8 +4790,16 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
 
 async function handleStoryboardStepCmd(args) {
   const { getComplianceStoryboardById, runStoryboardStep } = await import('../dist/lib/testing/storyboard/index.js');
-  const { authToken, authScheme, protocolFlag, jsonOutput, positionalArgs, complianceVersion, schemaRoot } =
-    parseAgentOptions(args);
+  const {
+    authToken,
+    authScheme,
+    protocolFlag,
+    jsonOutput,
+    positionalArgs,
+    complianceVersion,
+    schemaRoot,
+    mediaBuyLifecycleCompatibility,
+  } = parseAgentOptions(args);
   const { resolveOptions } = parseComplianceSelection(args);
 
   enforceStrictFlags(args, warnRemovedFlags(args));
@@ -4535,6 +4855,9 @@ async function handleStoryboardStepCmd(args) {
     request,
     ...(complianceVersion && { adcpVersion: complianceVersion }),
     ...(schemaRoot && { schemaRoot }),
+    ...(mediaBuyLifecycleCompatibility && {
+      mediaBuyLifecycleCompatibility,
+    }),
     ...buildResolvedAuthOption({
       resolvedAuth,
       resolvedAuthScheme,
@@ -4676,7 +4999,7 @@ EXAMPLES:
     const report = await checker.check();
 
     if (jsonOutput) {
-      console.log(JSON.stringify(report, null, 2));
+      await writeJsonOutput(report);
       process.exit(report.summary.totalIssues > 0 ? 1 : 0);
       return;
     }
@@ -4856,7 +5179,7 @@ EXAMPLES:
   });
 
   if (jsonOutput) {
-    console.log(JSON.stringify(report, null, 2));
+    await writeJsonOutput(report);
     process.exit(hasLikelyHypothesis(report) ? 1 : 0);
   }
 
@@ -4984,7 +5307,8 @@ async function main() {
   // Handle subcommands before global --help so their own --help works
   if (args[0] === 'registry') {
     const code = await handleRegistryCommand(args.slice(1));
-    process.exit(code);
+    process.exitCode = code;
+    return;
   }
 
   if (args[0] === 'test') {
@@ -6133,7 +6457,7 @@ credential material — never sync or commit.
         await mcpClient.close();
 
         if (jsonOutput) {
-          console.log(JSON.stringify({ tools: toolsResult.tools, protocol: 'mcp', oauth: true }, null, 2));
+          await writeJsonOutput({ tools: toolsResult.tools, protocol: 'mcp', oauth: true });
         } else {
           console.log(`\n📋 Agent Information (OAuth)\n`);
           console.log(`Protocol: MCP`);
@@ -6157,6 +6481,7 @@ credential material — never sync or commit.
     // Set up webhook handler if --wait flag is used
     let webhookHandler = null;
     let webhookUrl = null;
+    let webhookSecret = null;
 
     if (waitForAsync) {
       const useNgrok = !useLocalWebhook;
@@ -6179,9 +6504,11 @@ credential material — never sync or commit.
         console.error(`DEBUG: Setting up ${useNgrok ? 'ngrok' : 'local'} webhook handler...\n`);
       }
 
+      webhookSecret = randomBytes(32).toString('base64url');
       webhookHandler = new AsyncWebhookHandler({
         timeout: timeout,
         debug: debug,
+        webhookSecret,
       });
 
       try {
@@ -6310,20 +6637,14 @@ credential material — never sync or commit.
         }
 
         if (jsonOutput) {
-          console.log(
-            JSON.stringify(
-              {
-                data: resultData,
-                metadata: {
-                  protocol: 'mcp',
-                  responseTimeMs: responseTime,
-                  oauth: true,
-                },
-              },
-              null,
-              2
-            )
-          );
+          await writeJsonOutput({
+            data: resultData,
+            metadata: {
+              protocol: 'mcp',
+              responseTimeMs: responseTime,
+              oauth: true,
+            },
+          });
         } else {
           console.log('\n✅ SUCCESS\n');
           console.log('Response:');
@@ -6346,7 +6667,12 @@ credential material — never sync or commit.
       debug: debug,
       ...(webhookUrl && {
         webhookUrlTemplate: webhookUrl,
-        webhookSecret: 'cli-webhook-secret',
+        // Per-invocation random secret. A constant here would ship in npm, and
+        // because `push_notification_config.authentication` is a scheme
+        // selector rather than a fallback, registering it would actively
+        // downgrade every `--wait` webhook to legacy HMAC keyed by a value
+        // anyone can read out of the published package.
+        webhookSecret,
       }),
     });
 
@@ -6373,7 +6699,7 @@ credential material — never sync or commit.
 
           // Output webhook response
           if (jsonOutput) {
-            console.log(JSON.stringify(webhookResponse.result || webhookResponse, null, 2));
+            await writeJsonOutput(webhookResponse.result || webhookResponse);
           } else {
             console.log('\n✅ ASYNC RESPONSE RECEIVED\n');
             console.log('Response:');
@@ -6411,26 +6737,20 @@ credential material — never sync or commit.
     if (result.success) {
       if (jsonOutput) {
         // Raw JSON output - include protocol metadata and warnings
-        console.log(
-          JSON.stringify(
-            {
-              data: result.data,
-              metadata: {
-                taskId: result.metadata.taskId,
-                protocol: result.metadata.agent.protocol,
-                responseTimeMs: result.metadata.responseTimeMs,
-                ...(result.conversation &&
-                  result.conversation.length > 0 && {
-                    protocolMessage: extractProtocolMessage(result.conversation, result.metadata.agent.protocol),
-                    contextId: result.metadata.taskId, // Using taskId as context identifier
-                  }),
-              },
-              ...(deprecationWarnings.length > 0 && { warnings: deprecationWarnings }),
-            },
-            null,
-            2
-          )
-        );
+        await writeJsonOutput({
+          data: result.data,
+          metadata: {
+            taskId: result.metadata.taskId,
+            protocol: result.metadata.agent.protocol,
+            responseTimeMs: result.metadata.responseTimeMs,
+            ...(result.conversation &&
+              result.conversation.length > 0 && {
+                protocolMessage: extractProtocolMessage(result.conversation, result.metadata.agent.protocol),
+                contextId: result.metadata.taskId, // Using taskId as context identifier
+              }),
+          },
+          ...(deprecationWarnings.length > 0 && { warnings: deprecationWarnings }),
+        });
       } else {
         // Pretty output
         console.log('\n✅ SUCCESS\n');
@@ -6521,20 +6841,14 @@ credential material — never sync or commit.
 
       if (!canAutoBrowse) {
         if (jsonOutput) {
-          console.log(
-            JSON.stringify(
-              {
-                error: {
-                  code: error.code,
-                  subCode: error.subCode,
-                  message: error.message,
-                  requirements: error.requirements,
-                },
-              },
-              null,
-              2
-            )
-          );
+          await writeJsonOutput({
+            error: {
+              code: error.code,
+              subCode: error.subCode,
+              message: error.message,
+              requirements: error.requirements,
+            },
+          });
         } else {
           console.error('\n🔐 Agent requires OAuth authorization.');
           console.error(`   Authorization server: ${safe(error.requirements.authorizationServer) ?? '(unknown)'}`);
@@ -6656,16 +6970,10 @@ credential material — never sync or commit.
             }
 
             if (jsonOutput) {
-              console.log(
-                JSON.stringify(
-                  {
-                    data: resultData,
-                    metadata: { protocol: 'mcp', responseTimeMs: responseTime, oauth: true },
-                  },
-                  null,
-                  2
-                )
-              );
+              await writeJsonOutput({
+                data: resultData,
+                metadata: { protocol: 'mcp', responseTimeMs: responseTime, oauth: true },
+              });
             } else {
               console.log('\n✅ SUCCESS\n');
               console.log('Response:');
@@ -6682,7 +6990,7 @@ credential material — never sync or commit.
             await mcpClient.close();
 
             if (jsonOutput) {
-              console.log(JSON.stringify({ tools: toolsResult.tools, protocol: 'mcp', oauth: true }, null, 2));
+              await writeJsonOutput({ tools: toolsResult.tools, protocol: 'mcp', oauth: true });
             } else {
               console.log(`\n📋 Agent Information (OAuth)\n`);
               console.log(`Protocol: MCP`);

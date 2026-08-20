@@ -41,6 +41,10 @@ function normalize(address: string): { addr: string; family: 'ipv4' | 'ipv6' } |
 const alwaysBlocked = new BlockList();
 alwaysBlocked.addSubnet('169.254.0.0', 16, 'ipv4');
 alwaysBlocked.addSubnet('fe80::', 10, 'ipv6');
+// Oracle Cloud IMDS lives at 192.0.0.192 (inside RFC 6890's 192.0.0.0/24
+// IETF-protocol assignments) rather than the 169.254.0.0/16 everyone else
+// uses, so it needs its own entry to be refused even under the private opt-in.
+alwaysBlocked.addAddress('192.0.0.192', 'ipv4');
 
 // Private, loopback, multicast, and reserved ranges. Defense-in-depth adds the
 // NAT64 well-known prefix (`64:ff9b::/96`) and 6to4 (`2002::/16`) so a
@@ -57,6 +61,13 @@ privateIp.addSubnet('169.254.0.0', 16, 'ipv4');
 privateIp.addSubnet('172.16.0.0', 12, 'ipv4');
 privateIp.addSubnet('192.168.0.0', 16, 'ipv4');
 privateIp.addSubnet('224.0.0.0', 4, 'ipv4'); // multicast
+privateIp.addSubnet('192.0.0.0', 24, 'ipv4'); // RFC 6890 IETF protocol assignments (incl. Oracle IMDS)
+privateIp.addSubnet('192.88.99.0', 24, 'ipv4'); // 6to4 relay anycast (RFC 7526, deprecated)
+privateIp.addSubnet('192.0.2.0', 24, 'ipv4'); // documentation (TEST-NET-1)
+privateIp.addSubnet('198.18.0.0', 15, 'ipv4'); // benchmarking
+privateIp.addSubnet('198.51.100.0', 24, 'ipv4'); // documentation (TEST-NET-2)
+privateIp.addSubnet('203.0.113.0', 24, 'ipv4'); // documentation (TEST-NET-3)
+privateIp.addSubnet('240.0.0.0', 4, 'ipv4'); // reserved for future use
 privateIp.addAddress('255.255.255.255', 'ipv4'); // limited broadcast
 // v6
 privateIp.addAddress('::', 'ipv6'); // unspecified
@@ -64,6 +75,8 @@ privateIp.addAddress('::1', 'ipv6'); // loopback
 privateIp.addSubnet('fe80::', 10, 'ipv6'); // link-local
 privateIp.addSubnet('fc00::', 7, 'ipv6'); // ULA
 privateIp.addSubnet('ff00::', 8, 'ipv6'); // multicast
+privateIp.addSubnet('100::', 64, 'ipv6'); // discard-only (RFC 6666)
+privateIp.addSubnet('2001:db8::', 32, 'ipv6'); // documentation
 // Wrapper prefixes — refuse unconditionally. Tunnels at the caller's edge can
 // translate these into private targets we can't see; safer to refuse than to
 // hope the gateway is configured the way we expect.
@@ -101,9 +114,9 @@ export function isPrivateIp(address: string): boolean {
 
 /**
  * Best-effort check that a URL targets a development/private host, without
- * doing a DNS lookup. Matches loopback hostnames (`localhost`) and any IP
- * literal that {@link isPrivateIp} would reject. Public domain names always
- * return `false`.
+ * doing a DNS lookup. Matches loopback hostnames (`localhost`), Kubernetes
+ * service DNS names (`.cluster.local` suffix), and any IP literal that
+ * {@link isPrivateIp} would reject. Public domain names always return `false`.
  *
  * Used by higher layers that need to inherit the operator's "private is OK"
  * trust from a primary probe and propagate it to same-origin chain hops —
@@ -115,8 +128,15 @@ export function isPrivateIp(address: string): boolean {
 export function isLikelyPrivateUrl(url: string): boolean {
   try {
     const u = new URL(url);
-    const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    // Strip optional trailing DNS dot from FQDN form (e.g. "foo.svc.cluster.local.")
+    const host = u.hostname
+      .replace(/^\[|\]$/g, '')
+      .replace(/\.$/, '')
+      .toLowerCase();
     if (host === 'localhost') return true;
+    // Kubernetes service DNS names end in .cluster.local and always resolve to
+    // private ClusterIP addresses. Matching by suffix avoids a DNS round-trip.
+    if (host.endsWith('.cluster.local')) return true;
     return isPrivateIp(host);
   } catch {
     return false;

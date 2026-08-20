@@ -78,13 +78,11 @@ test('generated types maintain strict schema enforcement', () => {
   // - CatalogFieldMapping and CatalogFieldBinding are now clean interfaces/unions, not intersections
   // - Remaining ~42 signatures are protocol-mandated context fields + asset metadata
   //
-  // Updated from 50 to 450 for AdCP lifecycle state machine schemas (#1684, #1691):
-  // - Upstream schema sync pulled in additionalProperties: true on many schemas
-  //   due to protocol extensibility requirements (context, ext fields on every request/response)
-  // - New compliance domain (comply_test_controller) adds oneOf variants with extensible params
-  // - Account, SI session, creative, media buy lifecycle schemas added extensible fields
-  //
-  const MAX_ALLOWED = 450;
+  // Reduced from 1050 to 0 after fully regenerating AdCP 3.2 tool types
+  // through enforceStrictSchema. Named open objects remain forward-compatible
+  // at runtime without acquiring source-incompatible TypeScript index
+  // signatures; intentional opaque maps are canonicalized outside this file.
+  const MAX_ALLOWED = 0;
 
   console.log(`📊 Type strictness metrics:`);
   console.log(`   Index signatures found: ${count}`);
@@ -148,7 +146,11 @@ test('core types maintain strict schema enforcement', () => {
   // - Upstream added additionalProperties: true to many core types for extensibility
   // - New enum schemas (account-status, si-session-status) with descriptions
   // - Business entity, price breakdown, adjustment types added
-  const MAX_CORE_ALLOWED = 450;
+  //
+  // Reduced from 950 to 32 after the same recursive regeneration. Leave two
+  // slots of headroom for intentional opaque maps while making a stale or
+  // partially normalized generated surface fail loudly.
+  const MAX_CORE_ALLOWED = 1;
 
   console.log(`📊 Core types strictness:`);
   console.log(`   Index signatures found: ${count}`);
