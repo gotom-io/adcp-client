@@ -222,6 +222,19 @@ export interface ServeOptions {
   publicUrl?: string | ((host: string) => string);
 
   /**
+   * Hostnames allowed to use a plain-http `publicUrl` in addition to the
+   * loopback set (`localhost`, `127.0.0.1`, `[::1]`). For private-network
+   * development topologies where the agent answers on a non-loopback name
+   * that TLS cannot cover — e.g. a docker-compose service alias reached by a
+   * sibling container. Traffic to these hosts is unencrypted and their name
+   * proves nothing: never list a host that is reachable beyond the trusted
+   * network segment, and never use this in production — keep the https
+   * requirement by leaving it unset. Compared case-insensitively against the
+   * URL's WHATWG-canonical hostname (IPv6 in brackets).
+   */
+  allowInsecureHttpHosts?: string[];
+
+  /**
    * Authentication middleware applied to every request. When configured,
    * missing or invalid credentials produce a 401 with a compliant
    * `WWW-Authenticate` header — no request reaches the MCP transport
@@ -459,12 +472,13 @@ export function serve(createAgent: (ctx: ServeContext) => AdcpServer | McpServer
   const publicUrlIsFn = typeof publicUrlOption === 'function';
   const prmIsFn = typeof protectedResourceOption === 'function';
   const authenticationNeedsRawBody = authenticatorNeedsRawBody(options?.authenticate);
+  const insecureHttpHosts = new Set((options?.allowInsecureHttpHosts ?? []).map(h => h.toLowerCase()));
 
   // Static publicUrl — validate once at construction. Function form validates
   // lazily per host so a stale factory for one host can't prevent boot.
   let staticPublicOrigin: string | undefined;
   if (typeof publicUrlOption === 'string') {
-    staticPublicOrigin = validatePublicUrl(publicUrlOption, mountPath);
+    staticPublicOrigin = validatePublicUrl(publicUrlOption, mountPath, insecureHttpHosts);
   }
 
   // Function-form options are pure host → value lookups. Keep their values
@@ -506,7 +520,7 @@ export function serve(createAgent: (ctx: ServeContext) => AdcpServer | McpServer
     const cached = getHostMetadata(host);
     if (cached?.publicUrl !== undefined) return cached.publicUrl;
     const publicUrl = (publicUrlOption as (h: string) => string)(canonicalHostnameForScope(host));
-    const publicOrigin = validatePublicUrl(publicUrl, mountPath);
+    const publicOrigin = validatePublicUrl(publicUrl, mountPath, insecureHttpHosts);
     updateHostMetadata(host, { publicUrl, publicOrigin });
     return publicUrl;
   };
@@ -1087,7 +1101,7 @@ function trimTrailingSlashes(s: string): string {
  * call site and surfaced as a 500 so the operator sees the misconfigured
  * host instead of a silent audience-mismatch on minted tokens.
  */
-function validatePublicUrl(publicUrl: string, mountPath: string): string {
+function validatePublicUrl(publicUrl: string, mountPath: string, insecureHttpHosts?: ReadonlySet<string>): string {
   let parsed: URL;
   try {
     parsed = new URL(publicUrl);
@@ -1097,10 +1111,16 @@ function validatePublicUrl(publicUrl: string, mountPath: string): string {
   if (parsed.username || parsed.password) {
     throw new Error('serve(): `publicUrl` must not include username or password credentials');
   }
-  const loopbackHost =
-    parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
-  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopbackHost)) {
-    throw new Error('serve(): `publicUrl` must use https (http is allowed only for loopback development URLs)');
+  const httpAllowedHost =
+    parsed.hostname === 'localhost' ||
+    parsed.hostname === '127.0.0.1' ||
+    parsed.hostname === '[::1]' ||
+    insecureHttpHosts?.has(parsed.hostname) === true;
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && httpAllowedHost)) {
+    throw new Error(
+      'serve(): `publicUrl` must use https (http is allowed only for loopback development URLs ' +
+        'and `allowInsecureHttpHosts` entries)'
+    );
   }
   if (trimTrailingSlashes(parsed.pathname) !== trimTrailingSlashes(mountPath)) {
     throw new Error(

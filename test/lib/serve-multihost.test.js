@@ -172,6 +172,47 @@ describe('serve() multi-host', () => {
     loopback.close();
   });
 
+  test('allowInsecureHttpHosts permits an http publicUrl for the listed hosts only', () => {
+    const factory = () => new McpServer({ name: 'Test', version: '1.0.0' });
+    const allowed = serve(factory, {
+      port: 0,
+      publicUrl: 'http://seller-agent-local:3007/mcp',
+      allowInsecureHttpHosts: ['seller-agent-local'],
+      onListening: () => {},
+    });
+    allowed.close();
+    // Comparison is against the hostname, case-insensitively; other hosts still throw.
+    const cased = serve(factory, {
+      port: 0,
+      publicUrl: 'http://SELLER-Agent-Local:3007/mcp',
+      allowInsecureHttpHosts: ['seller-agent-local'],
+      onListening: () => {},
+    });
+    cased.close();
+    assert.throws(
+      () => serve(factory, { publicUrl: 'http://other-host/mcp', allowInsecureHttpHosts: ['seller-agent-local'] }),
+      /must use https/
+    );
+  });
+
+  test('allowInsecureHttpHosts applies to the function-form publicUrl resolver', async () => {
+    const factory = () => new McpServer({ name: 'Test', version: '1.0.0' });
+    const server = serve(factory, {
+      port: 0,
+      publicUrl: host => `http://${host}:3007/mcp`,
+      allowInsecureHttpHosts: ['seller-agent-local'],
+      allowedHosts: ['seller-agent-local', 'other-host'],
+      onListening: () => {},
+    });
+    await waitForListening(server);
+    const port = server.address().port;
+    const ok = await request(port, { host: 'seller-agent-local:3007', body: '{}' });
+    assert.notStrictEqual(ok.status, 500, `allowed host must not 500: ${ok.body}`);
+    const rejected = await request(port, { host: 'other-host:3007', body: '{}' });
+    assert.strictEqual(rejected.status, 500, 'unlisted http host must fail publicUrl validation');
+    server.close();
+  });
+
   test('stamps a canonical idempotency scope despite Host port variants', async () => {
     const scopes = [];
     const server = serve(
