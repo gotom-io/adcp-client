@@ -57,10 +57,13 @@ export type BrandJsonResolverErrorCode =
  */
 export class BrandJsonResolverError extends Error {
   readonly code: BrandJsonResolverErrorCode;
-  constructor(code: BrandJsonResolverErrorCode, message: string) {
+  /** HTTP status behind a `fetch_failed`, so callers can tell 404 from 5xx without parsing the message. */
+  readonly httpStatus?: number;
+  constructor(code: BrandJsonResolverErrorCode, message: string, meta?: { httpStatus?: number }) {
     super(message);
     this.name = 'BrandJsonResolverError';
     this.code = code;
+    if (meta?.httpStatus !== undefined) this.httpStatus = meta.httpStatus;
   }
 }
 
@@ -270,7 +273,7 @@ export class BrandJsonJwksResolver implements JwksResolver {
   }
 }
 
-interface FetchedBrandJson {
+export interface FetchedBrandJson {
   status: 'ok' | 'not_modified';
   finalUrl: string;
   data: unknown;
@@ -288,11 +291,14 @@ interface FetchedBrandJson {
  * "http://169.254.169.254/..."}` is rejected at parse time rather than
  * relying on `ssrfSafeFetch` to catch every pathological shape.
  */
-async function fetchBrandJson(args: {
+export async function fetchBrandJson(args: {
   startUrl: string;
   currentEtag?: string;
   maxRedirects: number;
   allowPrivateIp: boolean;
+  /** Override the transport defaults (10 s / 64 KiB) — brand.json portfolios can exceed 64 KiB. */
+  timeoutMs?: number;
+  maxBodyBytes?: number;
 }): Promise<FetchedBrandJson> {
   const seen = new Set<string>();
   let url = canonicalizeUrl(args.startUrl, args.allowPrivateIp);
@@ -315,6 +321,8 @@ async function fetchBrandJson(args: {
       method: 'GET',
       headers,
       allowPrivateIp: args.allowPrivateIp,
+      timeoutMs: args.timeoutMs,
+      maxBodyBytes: args.maxBodyBytes,
     });
 
     if (hop === 0 && res.status === 304) {
@@ -327,7 +335,9 @@ async function fetchBrandJson(args: {
       };
     }
     if (res.status !== 200) {
-      throw new BrandJsonResolverError('fetch_failed', `brand.json fetch returned HTTP ${res.status}`);
+      throw new BrandJsonResolverError('fetch_failed', `brand.json fetch returned HTTP ${res.status}`, {
+        httpStatus: res.status,
+      });
     }
 
     const text = Buffer.from(res.body).toString('utf8');

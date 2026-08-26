@@ -46,9 +46,11 @@ export { HttpsJwksResolver, type HttpsJwksResolverOptions } from './jwks-https';
 export {
   BrandJsonJwksResolver,
   BrandJsonResolverError,
+  fetchBrandJson,
   type BrandAgentType,
   type BrandJsonJwksResolverOptions,
   type BrandJsonResolverErrorCode,
+  type FetchedBrandJson,
 } from './brand-jwks';
 export { parseSignature, parseSignatureInput, type ParsedSignature, type ParsedSignatureInput } from './parser';
 export {
