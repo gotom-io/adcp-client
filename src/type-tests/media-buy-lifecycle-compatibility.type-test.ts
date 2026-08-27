@@ -5,7 +5,21 @@ import type {
   CompatibleRequestProposalsResponse,
   EstablishedProductsWireResponse,
   MediaBuyLifecycleCoordinator,
+  RequestProposalsResponse,
 } from '../lib';
+
+type ProductsAvailableResponse = Extract<RequestProposalsResponse, { outcome: 'products_available' }>;
+type RequestContinuation = RequestProposalsResponse['purchase_continuation'];
+type IsNonEmpty<T> = T extends readonly [unknown, ...unknown[]] ? true : false;
+declare const productsAvailableResponse: ProductsAvailableResponse;
+const projectedProductId: string = productsAvailableResponse.products[0]!.product_id;
+const continuationKind: 'listed_purchase' | 'legacy_create' = productsAvailableResponse.purchase_continuation.kind;
+const productsStayNonEmpty: IsNonEmpty<ProductsAvailableResponse['products']> = true;
+declare const requestContinuation: RequestContinuation;
+void projectedProductId;
+void continuationKind;
+void productsStayNonEmpty;
+void requestContinuation;
 
 declare const products: CompatibleProductsResponse;
 const productId: string | undefined = products.products?.[0]?.product_id;
@@ -18,11 +32,17 @@ declare const establishedProductsSource: EstablishedProductsWireResponse;
 void establishedProductsSource.projection.diagnostics;
 
 declare const requested: CompatibleRequestProposalsResponse;
-const requestOutcome: 'proposed' | 'rejected' | 'legacy_unavailable' = requested.outcome;
+const requestOutcome: 'proposed' | 'products_available' | 'rejected' | 'legacy_unavailable' = requested.outcome;
 const requestedProposalId: string | undefined = requested.proposals?.[0]?.proposal_id;
 void requestOutcome;
 void requestedProposalId;
 void requested.raw.context;
+if (requested.outcome === 'products_available') {
+  const continuation = requested.purchase_continuation;
+  const firstProjectedProductId: string = requested.products[0]!.product_id;
+  void continuation;
+  void firstProjectedProductId;
+}
 
 declare const refined: CompatibleRefineProposalsResponse;
 for (const result of refined.results ?? []) {
@@ -71,7 +91,7 @@ for (const result of declined.results) {
 declare const requestTask: Awaited<ReturnType<MediaBuyLifecycleCoordinator['requestProposals']>>;
 if (requestTask.status === 'completed') {
   const operation: 'request' = requestTask.data.operation;
-  const outcome: 'proposed' | 'rejected' | 'legacy_unavailable' = requestTask.data.outcome;
+  const outcome: 'proposed' | 'products_available' | 'rejected' | 'legacy_unavailable' = requestTask.data.outcome;
   void operation;
   void outcome;
 } else if (requestTask.data !== undefined) {
@@ -90,7 +110,7 @@ async function assertCompatibilityContinuations(
     const compatibility = completed.compatibility.lifecycle;
     void compatibility;
     if (completed.status === 'completed') {
-      const outcome: 'proposed' | 'rejected' | 'legacy_unavailable' = completed.data.outcome;
+      const outcome: 'proposed' | 'products_available' | 'rejected' | 'legacy_unavailable' = completed.data.outcome;
       void outcome;
     }
   }

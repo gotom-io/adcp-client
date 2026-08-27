@@ -80,7 +80,12 @@ function postProcessUndefinedImports(content: string): string {
  * Generated annotations are intentionally verbose; add new TS7056 cases here
  * instead of hand-authoring equivalent schema declarations elsewhere.
  */
-const TS7056_SCHEMAS: Array<{ name: string; tsType?: string; objectShape?: boolean }> = [
+const TS7056_SCHEMAS: Array<{
+  name: string;
+  tsType?: string;
+  objectShape?: boolean;
+  typeSource?: 'tools' | 'core' | 'v2-projection';
+}> = [
   { name: 'AdCPAsyncResponseDataSchema' },
   { name: 'MCPWebhookPayloadSchema' },
   // 3.1.0-beta.2 pin flip — `.and(z.union([...]))` compound patterns push
@@ -93,21 +98,26 @@ const TS7056_SCHEMAS: Array<{ name: string; tsType?: string; objectShape?: boole
   { name: 'SyncEventSourcesResponseSchema', tsType: 'SyncEventSourcesResponse' },
   { name: 'AudienceEvidenceSchema' },
   { name: 'AudienceEvidenceSelectionSchema' },
-  { name: 'ProductSchema', objectShape: true },
+  { name: 'ProductSchema', tsType: 'Product', objectShape: true },
+  {
+    name: 'GetProductsRequestSchema',
+    tsType: 'GetProductsRequest',
+    objectShape: true,
+  },
   { name: 'GetProductsAsyncInputRequiredSchema' },
   { name: 'WholesaleFeedEventSchema' },
-  { name: 'PackageRequestSchema' },
+  { name: 'PackageRequestSchema', tsType: 'PackageRequest', objectShape: true },
   { name: 'ExplicitPackagesWithFixedAllocationSchema' },
-  { name: 'PackageSchema' },
+  { name: 'PackageSchema', tsType: 'Package', objectShape: true },
   { name: 'CreateMediaBuySuccessSchema' },
-  { name: 'PackageUpdateSchema' },
+  { name: 'PackageUpdateSchema', tsType: 'PackageUpdate', objectShape: true, typeSource: 'core' },
   { name: 'UpdateMediaBuySuccessSchema' },
   { name: 'CreativeLocalizationReadbackSchema' },
   { name: 'SyncCreativesSuccessSchema' },
   { name: 'GetProductsCompletionSchema' },
   { name: 'ComplianceTaskCompletionDataSchema' },
   { name: 'MediaBuySchema' },
-  { name: 'GetProductsResponseSchema' },
+  { name: 'GetProductsResponseSchema', tsType: 'GetProductsResponse', objectShape: true },
   { name: 'CreateMediaBuyResponseSchema' },
   { name: 'SyncCreativesResponseSchema' },
   { name: 'ListedCreativeNamedFormatReferenceSchema' },
@@ -119,12 +129,43 @@ const TS7056_SCHEMAS: Array<{ name: string; tsType?: string; objectShape?: boole
   { name: 'WholesaleFeedWebhookSchema' },
   { name: 'ComplyTestControllerRequestSchema', objectShape: true },
   { name: 'ListCreativesResponseSchema' },
+  // 3.2.0-beta.6 expands canonical format declarations and creative-agent
+  // responses enough to exceed declaration serialization limits.
+  { name: 'ProductFormatDeclarationSchema', tsType: 'ProductFormatDeclaration', objectShape: true },
+  { name: 'PlacementSchema', tsType: 'Placement' },
+  { name: 'FormatSchema', tsType: 'Format', objectShape: true, typeSource: 'core' },
+  { name: 'TransformerSchema', tsType: 'Transformer', objectShape: true },
+  { name: 'AvailablePackageSchema', tsType: 'AvailablePackage', objectShape: true, typeSource: 'core' },
+  { name: 'ListCreativeFormatsResponseSchema', tsType: 'ListCreativeFormatsResponse', objectShape: true },
+  { name: 'PackageStatusSchema', tsType: 'PackageStatus', objectShape: true },
+  {
+    name: 'ListTransformersResponseCreativeAgentSchema',
+    tsType: 'ListTransformersResponseCreativeAgent',
+    objectShape: true,
+  },
+  { name: 'GetAdCPCapabilitiesResponseSchema', tsType: 'GetAdCPCapabilitiesResponse', objectShape: true },
+  { name: 'ListTransformersResponseSchema', tsType: 'ListTransformersResponse', objectShape: true },
+  {
+    name: 'CanonicalFormatSellerRenderedStatefulDisplaySchema',
+    tsType: 'CanonicalFormatSellerRenderedStatefulDisplay',
+    objectShape: true,
+  },
+  {
+    name: 'CanonicalFormatCoordinatedPlacementsSchema',
+    tsType: 'CanonicalFormatCoordinatedPlacements',
+    objectShape: true,
+  },
 ];
 
 function postProcessTS7056Annotations(content: string): string {
   let result = content;
-  const typesToImport: string[] = [];
-  for (const { name, tsType, objectShape } of TS7056_SCHEMAS) {
+  const productObjectShapeType = `{ [K in keyof Product]-?: K extends 'publisher_properties' ? z.ZodType<PublisherPropertySelector[], PublisherPropertySelector[]> : undefined extends Product[K] ? z.ZodOptional<z.ZodType<Exclude<Product[K], undefined>, Exclude<Product[K], undefined>>> : z.ZodType<Product[K], Product[K]> }`;
+  const typesToImport = {
+    tools: new Set<string>(),
+    core: new Set<string>(),
+    v2Projection: new Set<string>(),
+  };
+  for (const { name, tsType, objectShape, typeSource = 'tools' } of TS7056_SCHEMAS) {
     const pattern = new RegExp(`export const ${name} = `);
     if (!pattern.test(result)) {
       throw new Error(
@@ -136,7 +177,11 @@ function postProcessTS7056Annotations(content: string): string {
     // annotated as ZodObjects so call sites that use `.shape`, `.extend()`,
     // `.pick()`, or `.omit()` keep working. When a TS type is available,
     // keep the shape keys and field value types tied to that type so
-    // downstream helpers like customToolFor() still infer typed args.
+    // downstream helpers like customToolFor() still infer typed args. Use the
+    // concrete loose-object config: `any` makes every derived schema infer as
+    // `any` in Zod 4. The trailing ZodType keeps exact parse output for
+    // intersection/union-backed TypeScript contracts whose common object keys
+    // alone cannot reconstruct the full public type.
     //
     // Intersection-shaped schemas (`z.object().passthrough().and(z.union(...))`)
     // use the 2-type-param `z.ZodType<Output, Input>` form. `z.input<typeof X>`
@@ -147,12 +192,26 @@ function postProcessTS7056Annotations(content: string): string {
     if (objectShape) {
       if (tsType) {
         const widened = `${tsType} & Record<string, unknown>`;
+        const typedObjectShape = `{ [K in keyof ${tsType}]-?: undefined extends ${tsType}[K] ? z.ZodOptional<z.ZodType<Exclude<${tsType}[K], undefined>, Exclude<${tsType}[K], undefined>>> : z.ZodType<${tsType}[K], ${tsType}[K]> }`;
         const objectShapeType =
           name === 'PreviewCreativeRequestSchema'
             ? `{ request_type: z.ZodType<PreviewCreativeRequest['request_type'], PreviewCreativeRequest['request_type']> } & Record<string, z.ZodType>`
-            : `{ [K in keyof ${tsType}]-?: z.ZodType<${tsType}[K], ${tsType}[K]> }`;
-        annotation = `z.ZodObject<${objectShapeType}, any> & z.ZodType<${widened}, ${widened}>`;
-        typesToImport.push(tsType);
+            : name === 'ProductSchema'
+              ? 'ProductSchemaShape'
+              : typedObjectShape;
+        // Product composition has two deliberate compatibility bridges:
+        // adopters replace publisher selectors with resolved properties and
+        // older placement views with their local output shape. Keep normal
+        // safeExtend compatibility checks for every other existing field and
+        // preserve the bridges across staged composition.
+        const objectType =
+          name === 'ProductSchema'
+            ? `ProductSchemaObject<${objectShapeType}>`
+            : `z.ZodObject<${objectShapeType}, z.core.$loose>`;
+        annotation = `${objectType} & z.ZodType<${widened}, ${widened}>`;
+        const importBucket = typeSource === 'v2-projection' ? typesToImport.v2Projection : typesToImport[typeSource];
+        importBucket.add(tsType);
+        if (name === 'ProductSchema') typesToImport.tools.add('PublisherPropertySelector');
       } else {
         annotation =
           name === 'ProductSchema'
@@ -162,7 +221,8 @@ function postProcessTS7056Annotations(content: string): string {
     } else if (tsType) {
       const widened = `${tsType} & Record<string, unknown>`;
       annotation = `z.ZodType<${widened}, ${widened}>`;
-      typesToImport.push(tsType);
+      const importBucket = typeSource === 'v2-projection' ? typesToImport.v2Projection : typesToImport[typeSource];
+      importBucket.add(tsType);
     } else {
       annotation = 'z.ZodType';
     }
@@ -173,9 +233,44 @@ function postProcessTS7056Annotations(content: string): string {
   }
   // Inject `import type { ... } from './tools.generated'` for the typed-zod
   // entries. The compound schemas reference response types defined there.
-  if (typesToImport.length > 0) {
-    const importStatement = `import type { ${typesToImport.join(', ')} } from './tools.generated';\n`;
-    result = result.replace(/import { z } from "zod";\n/, `import { z } from "zod";\n${importStatement}`);
+  if (typesToImport.tools.size > 0 || typesToImport.core.size > 0 || typesToImport.v2Projection.size > 0) {
+    const importStatements = [
+      typesToImport.tools.size > 0
+        ? `import type { ${[...typesToImport.tools].join(', ')} } from './tools.generated';`
+        : undefined,
+      typesToImport.core.size > 0
+        ? `import type { ${[...typesToImport.core].join(', ')} } from './core.generated';`
+        : undefined,
+      typesToImport.v2Projection.size > 0
+        ? `import type { ${[...typesToImport.v2Projection].join(', ')} } from '../v2/projection/creative-delivery';`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    const productSchemaHelperTypes = `type ProductSchemaShape = ${productObjectShapeType};
+type ProductSchemaSafeExtendShape<
+  Base extends z.core.$ZodShape,
+  U extends z.core.$ZodShape,
+> = {
+  [K in keyof U]: K extends 'publisher_properties' | 'placements'
+    ? U[K]
+    : K extends keyof Base
+      ? z.core.output<U[K]> extends z.core.output<Base[K]>
+        ? z.core.input<U[K]> extends z.core.input<Base[K]>
+          ? U[K]
+          : never
+        : never
+      : U[K];
+};
+type ProductSchemaObject<Shape extends z.core.$ZodShape> = {
+  safeExtend<U extends z.core.$ZodShape>(
+    shape: ProductSchemaSafeExtendShape<Shape, U>
+  ): ProductSchemaObject<Omit<Shape, keyof U> & U>;
+} & z.ZodObject<Shape, z.core.$loose>;`;
+    result = result.replace(
+      /import { z } from "zod";\n/,
+      `import { z } from "zod";\n${importStatements}\n${productSchemaHelperTypes}\n`
+    );
   }
   return result;
 }
@@ -459,6 +554,110 @@ function postProcessPriceBreakdownConstraints(content: string): string {
   return content.slice(0, breakdownStart) + breakdown + content.slice(breakdownEnd);
 }
 
+/** Restore beta.4 constraints that TypeScript cannot fully encode for Zod generation. */
+function postProcessBeta4OfferAndOutcomeConstraints(content: string): string {
+  const replaceBlock = (schemaName: string, transform: (block: string) => string): void => {
+    const start = content.indexOf(`export const ${schemaName}Schema = `);
+    const end = content.indexOf('\n\nexport const ', start + 1);
+    if (start < 0 || end < 0) throw new Error(`Unable to locate ${schemaName}Schema boundary`);
+    const block = content.slice(start, end);
+    const corrected = transform(block);
+    if (corrected === block) throw new Error(`Unable to restore ${schemaName}Schema constraints`);
+    content = content.slice(0, start) + corrected + content.slice(end);
+  };
+
+  replaceBlock('TimeForecastDimension', block =>
+    block
+      .replace('start_time: z.string(),', 'start_time: z.string().refine(adcpJsonSchemaDateTime, "Invalid date-time"),')
+      .replace('end_time: z.string()', 'end_time: z.string().refine(adcpJsonSchemaDateTime, "Invalid date-time")')
+  );
+
+  replaceBlock('ProductOfferFilters', block => {
+    const corrected = block
+      .replace('start_date: z.string().optional(),', 'start_date: z.iso.date().optional(),')
+      .replace('end_date: z.string().optional(),', 'end_date: z.iso.date().optional(),')
+      .replace(
+        'start_time: z.string(),\n        end_time: z.string()',
+        'start_time: z.string().refine(adcpJsonSchemaDateTime, "Invalid date-time"),\n        end_time: z.string().refine(adcpJsonSchemaDateTime, "Invalid date-time")'
+      );
+    return corrected.replace(
+      /;\s*$/,
+      `.superRefine((value, ctx) => {
+    if (value.availability_horizon !== undefined && (value.start_date !== undefined || value.end_date !== undefined)) {
+        ctx.addIssue({ code: "custom", path: ["availability_horizon"], message: "availability_horizon is mutually exclusive with start_date and end_date" });
+    }
+});`
+    );
+  });
+
+  replaceBlock('OutcomeTarget', block => {
+    const corrected = block
+      .replace('custom_event_name: z.string().optional()', 'custom_event_name: z.string().min(1).optional()')
+      .replace('volume: z.number()', 'volume: z.number().gt(0)');
+    return corrected.replace(
+      /;\s*$/,
+      `.superRefine((value, ctx) => {
+    if (value.goal.kind === "event" && value.goal.event_type === "custom" && !value.goal.custom_event_name) {
+        ctx.addIssue({ code: "custom", path: ["goal", "custom_event_name"], message: "custom_event_name is required for a custom event" });
+    }
+});`
+    );
+  });
+
+  return content;
+}
+
+/** Restore preview mode and batch routing constraints that TypeScript cannot encode. */
+function postProcessPreviewCreativeRequestConstraints(content: string): string {
+  const schemaStart = content.indexOf('export const PreviewCreativeRequestSchema');
+  const schemaEnd = content.indexOf('\n\nexport const PreviewCreativeBatchResponseSchema = ', schemaStart);
+  if (schemaStart < 0 || schemaEnd < 0) throw new Error('Could not locate PreviewCreativeRequestSchema.');
+  const block = content.slice(schemaStart, schemaEnd);
+  const suffix = '}).passthrough());';
+  if (!block.endsWith(suffix)) throw new Error('PreviewCreativeRequestSchema has an unexpected generated suffix.');
+  const refined = `${block.slice(0, -suffix.length)}}).passthrough()).superRefine((value, ctx) => {
+    const defined = (field: string): boolean => value[field as keyof typeof value] !== undefined;
+    const rejectPair = (left: string, right: string): void => {
+        if (defined(left) && defined(right)) {
+            ctx.addIssue({ code: "custom", path: [right], message: "the paired fields are mutually exclusive" });
+        }
+    };
+    rejectPair("target_capability_id", "format_id");
+    rejectPair("creative_manifest", "creative_id");
+    if (value.requests !== undefined) {
+        if (value.requests.length < 1 || value.requests.length > 50) {
+            ctx.addIssue({ code: "custom", path: ["requests"], message: "preview requests must contain 1 to 50 items" });
+        }
+        const canonicalRouting = defined("target_capability_id") || value.requests.some(item => item.target_capability_id !== undefined);
+        const legacyRouting = defined("format_id") || value.requests.some(item => item.format_id !== undefined);
+        if (canonicalRouting && legacyRouting) {
+            ctx.addIssue({ code: "custom", path: ["requests"], message: "preview requests cannot mix canonical and legacy routing selectors" });
+        }
+        for (const [index, item] of value.requests.entries()) {
+            const hasManifest = item.creative_manifest !== undefined;
+            const hasCreativeId = item.creative_id !== undefined;
+            if (hasManifest === hasCreativeId) {
+                ctx.addIssue({ code: "custom", path: ["requests", index, "creative_manifest"], message: "each preview request requires exactly one of creative_manifest or creative_id" });
+            }
+        }
+    }
+    if (value.request_type === "single") {
+        const hasManifest = defined("creative_manifest");
+        const hasCreativeId = defined("creative_id");
+        if (hasManifest === hasCreativeId) {
+            ctx.addIssue({ code: "custom", path: ["creative_manifest"], message: "single preview requires exactly one of creative_manifest or creative_id" });
+        }
+    } else if (value.request_type === "batch") {
+        if (value.requests === undefined) {
+            ctx.addIssue({ code: "custom", path: ["requests"], message: "batch preview requires 1 to 50 requests" });
+        }
+    } else if (value.request_type === "variant" && !defined("variant_id")) {
+        ctx.addIssue({ code: "custom", path: ["variant_id"], message: "variant_id is required for variant preview" });
+    }
+});`;
+  return content.slice(0, schemaStart) + refined + content.slice(schemaEnd);
+}
+
 /**
  * Post-process generated Zod schemas to strip .and(z.record(...)) intersections
  * and equivalent record-only union intersections from object schemas that
@@ -588,6 +787,176 @@ function postProcessCreativeBriefRequiredDisclosures(content: string): string {
   return content.slice(0, schemaStart) + correctedBlock + content.slice(schemaEnd);
 }
 
+/** Restore native PostalArea.values minItems: 1 after tuple relaxation. */
+function postProcessPostalAreaValues(content: string): string {
+  const schemaStart = content.indexOf('export const PostalAreaSchema = ');
+  const schemaEnd = content.indexOf('\n\nexport const ', schemaStart + 1);
+  if (schemaStart === -1 || schemaEnd === -1) {
+    throw new Error('postProcessPostalAreaValues: unable to locate PostalAreaSchema.');
+  }
+
+  const block = content.slice(schemaStart, schemaEnd);
+  if (block.includes('native postal values must contain at least one entry')) {
+    return content;
+  }
+  const correctedBlock = block.replace(
+    /;\s*$/,
+    `.superRefine((value, ctx) => {
+  const postal = value as { country?: unknown; values?: unknown };
+  if (typeof postal.country === "string" && (!Array.isArray(postal.values) || postal.values.length === 0)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["values"],
+      message: "native postal values must contain at least one entry",
+    });
+  }
+});`
+  );
+  if (correctedBlock === block) {
+    throw new Error('postProcessPostalAreaValues: unable to append native values refinement.');
+  }
+  return content.slice(0, schemaStart) + correctedBlock + content.slice(schemaEnd);
+}
+
+/** Restore the closed beta.4 SDK-local continuation schema exactly. */
+function postProcessCompatibilityPurchaseCoordinatorInput(content: string): string {
+  const startMarker = 'export const CompatibilityPurchaseCoordinatorInputSchema = ';
+  const endMarker = '\n\nexport const OutcomeTargetSchema = ';
+  const start = content.indexOf(startMarker);
+  if (start < 0) throw new Error('CompatibilityPurchaseCoordinatorInputSchema was not generated.');
+  const end = content.indexOf(endMarker, start);
+  if (end < 0) throw new Error('Could not locate the end of CompatibilityPurchaseCoordinatorInputSchema.');
+  const replacement = `export const CompatibilityPurchaseCoordinatorInputSchema = z.object({
+    idempotency_key: z.uuid(),
+    continuation_token: z.string().min(16),
+    account: AccountReferenceSchema,
+    selected_product_ids: z.array(z.string().min(1)).min(1).superRefine((ids, ctx) => {
+        if (new Set(ids).size !== ids.length) ctx.addIssue({ code: "custom", message: "selected_product_ids must be unique" });
+    }),
+    accepted_losses: z.array(z.union([z.literal("feed_version_not_atomic"), z.literal("pricing_version_not_atomic"), z.literal("mutation_idempotency_not_guaranteed")])).min(2).superRefine((losses, ctx) => {
+        if (new Set(losses).size !== losses.length) ctx.addIssue({ code: "custom", message: "accepted_losses must be unique" });
+        for (const required of ["feed_version_not_atomic", "pricing_version_not_atomic"] as const) {
+            if (!losses.includes(required)) ctx.addIssue({ code: "custom", message: \`accepted_losses must contain \${required}\` });
+        }
+    }),
+    legacy_create_request: z.object({}).passthrough().refine(value => Object.keys(value).length > 0, "legacy_create_request must not be empty")
+}).strict();`;
+  return `${content.slice(0, start)}${replacement}${content.slice(end)}`;
+}
+
+/** Restore beta.4 runtime-only membership constraints on projected legacy continuations. */
+function postProcessLegacyPurchaseContinuationResponse(content: string): string {
+  const schemaStart = content.indexOf('export const RequestProposalsResponseSchema = ');
+  const schemaEnd = content.indexOf('\n\nexport const ', schemaStart + 1);
+  if (schemaStart < 0 || schemaEnd < 0) {
+    throw new Error('Could not locate RequestProposalsResponseSchema.');
+  }
+  const block = content.slice(schemaStart, schemaEnd);
+  const armPattern =
+    /z\.object\(\{\n\s+kind: z\.literal\("legacy_create"\),[\s\S]*?requires_explicit_acceptance: z\.literal\(true\)\n\s+\}\)\.passthrough\(\)/g;
+  const matches = [...block.matchAll(armPattern)];
+  if (matches.length === 0) {
+    throw new Error('Could not locate the legacy_create purchase continuation response arm.');
+  }
+  const refineArm = (arm: string) => `${arm}.superRefine((value, ctx) => {
+            if (value.product_ids.length === 0) {
+                ctx.addIssue({ code: "custom", path: ["product_ids"], message: "product_ids must contain at least one entry" });
+            }
+            if (value.product_ids.some(productId => productId.length === 0)) {
+                ctx.addIssue({ code: "custom", path: ["product_ids"], message: "product_ids must not contain empty IDs" });
+            }
+            if (new Set(value.product_ids).size !== value.product_ids.length) {
+                ctx.addIssue({ code: "custom", path: ["product_ids"], message: "product_ids must be unique" });
+            }
+            if (value.losses.length < 2) {
+                ctx.addIssue({ code: "custom", path: ["losses"], message: "losses must contain at least two entries" });
+            }
+            if (new Set(value.losses).size !== value.losses.length) {
+                ctx.addIssue({ code: "custom", path: ["losses"], message: "losses must be unique" });
+            }
+            for (const required of ["feed_version_not_atomic", "pricing_version_not_atomic"] as const) {
+                if (!value.losses.includes(required)) {
+                    ctx.addIssue({ code: "custom", path: ["losses"], message: \`losses must contain \${required}\` });
+                }
+            }
+            if (value.source_adcp_version === "2.5" && !value.losses.includes("mutation_idempotency_not_guaranteed")) {
+                ctx.addIssue({ code: "custom", path: ["losses"], message: "AdCP 2.5 losses must contain mutation_idempotency_not_guaranteed" });
+            }
+        })`;
+  const corrected = block.replace(armPattern, refineArm);
+  if (!corrected.endsWith(';')) {
+    throw new Error('RequestProposalsResponseSchema has an unexpected generated terminator.');
+  }
+  // Attach the source-schema invariants to whichever top-level expression
+  // ts-to-zod emits. The old lossy type produced union(...).and(object(...));
+  // while the materialized discriminated type correctly produces union(...);
+  // coupling this postprocessor to either suffix makes type generation fragile.
+  const rootRefinement = `.superRefine((value: any, ctx) => {
+    const present = (field: string): boolean => Object.prototype.hasOwnProperty.call(value, field);
+    const requireNonEmptyArray = (field: "products" | "proposals"): void => {
+        if (!Array.isArray(value[field]) || value[field].length === 0) {
+            ctx.addIssue({ code: "custom", path: [field], message: \`\${field} must contain at least one entry\` });
+        }
+    };
+    const forbid = (fields: readonly string[]): void => {
+        for (const field of fields) {
+            if (present(field)) ctx.addIssue({ code: "custom", path: [field], message: \`\${field} is forbidden for this outcome\` });
+        }
+    };
+    forbid(["refinement_applied", "pagination", "unchanged", "wholesale_feed_version"]);
+    if (value.suggestions !== undefined && (value.suggestions.length === 0 || value.suggestions.some((suggestion: string) => suggestion.length === 0))) {
+        ctx.addIssue({ code: "custom", path: ["suggestions"], message: "suggestions must contain non-empty strings" });
+    }
+    if (value.incomplete !== undefined && value.incomplete.length === 0) {
+        ctx.addIssue({ code: "custom", path: ["incomplete"], message: "incomplete must contain at least one entry" });
+    }
+    if (value.outcome === "proposed") {
+        requireNonEmptyArray("proposals");
+        requireNonEmptyArray("products");
+        forbid(["reason", "suggestions", "purchase_continuation", "task_id"]);
+    } else if (value.outcome === "products_available") {
+        requireNonEmptyArray("products");
+        if (!present("purchase_continuation")) {
+            ctx.addIssue({ code: "custom", path: ["purchase_continuation"], message: "purchase_continuation is required" });
+        }
+        forbid(["proposals", "reason", "suggestions", "task_id"]);
+        if (value.purchase_continuation?.kind === "listed_purchase") {
+            const ids = value.purchase_continuation.product_ids;
+            if (ids.length === 0 || ids.some((productId: string) => productId.length === 0)) {
+                ctx.addIssue({ code: "custom", path: ["purchase_continuation", "product_ids"], message: "product_ids must contain non-empty IDs" });
+            }
+            if (new Set(ids).size !== ids.length) {
+                ctx.addIssue({ code: "custom", path: ["purchase_continuation", "product_ids"], message: "product_ids must be unique" });
+            }
+            const returnedIds = (value.products ?? []).map((product: any) => product.product_id);
+            const returnedIdSet = new Set(returnedIds);
+            if (
+                returnedIds.length !== ids.length ||
+                returnedIdSet.size !== returnedIds.length ||
+                ids.some((productId: string) => !returnedIdSet.has(productId))
+            ) {
+                ctx.addIssue({ code: "custom", path: ["purchase_continuation", "product_ids"], message: "listed product_ids must exactly match returned products" });
+            }
+            for (const [index, product] of (value.products ?? []).entries()) {
+                if (!Array.isArray(product.pricing_options) || product.pricing_options.length === 0) {
+                    ctx.addIssue({ code: "custom", path: ["products", index, "pricing_options"], message: "listed products require pricing_options" });
+                }
+            }
+            for (const [index, incomplete] of (value.incomplete ?? []).entries()) {
+                if (["products", "pricing", "wholesale_feed"].includes(incomplete.scope)) {
+                    ctx.addIssue({ code: "custom", path: ["incomplete", index, "scope"], message: "listed purchase cannot report incomplete product or pricing data" });
+                }
+            }
+        }
+    } else if (value.outcome === "rejected") {
+        if (!present("reason")) ctx.addIssue({ code: "custom", path: ["reason"], message: "reason is required" });
+        forbid(["proposals", "products", "incomplete", "purchase_continuation", "task_id"]);
+    }
+});`;
+  const constrained = corrected.slice(0, -1) + rootRefinement;
+  return content.slice(0, schemaStart) + constrained + content.slice(schemaEnd);
+}
+
 /** Replace the lossy TS round-trip with Zod generated from the dereferenced canonical wire schema. */
 function postProcessCanonicalProposalRuntimeConstraints(content: string, exactSchemaExpression: string): string {
   const schemaStart = content.indexOf('export const CanonicalProposalSchema = ');
@@ -606,6 +975,39 @@ function postProcessCanonicalProposalRuntimeConstraints(content: string, exactSc
     'import { z } from "zod";\n',
     `import { z } from "zod";\nimport { fullFormats as adcpJsonSchemaFormats } from "ajv-formats/dist/formats.js";\n\nconst adcpDateTimeFormat = adcpJsonSchemaFormats["date-time"] as { validate: (value: string) => boolean };\nconst adcpJsonSchemaDateTime = (value: string): boolean => adcpDateTimeFormat.validate(value);\n`
   );
+}
+
+/** Replace a generated schema expression with one projected from its authoritative JSON Schema. */
+function postProcessExactSchema(content: string, schemaName: string, exactSchemaExpression: string): string {
+  const target = findSchemaExportExpressions(content).find(entry => entry.name === schemaName);
+  if (!target) throw new Error(`postProcessExactSchema: unable to locate ${schemaName}.`);
+  return content.slice(0, target.expressionStart) + exactSchemaExpression + content.slice(target.expressionEnd);
+}
+
+/** Add a refinement to one property schema inside a generated z.object expression. */
+function refineGeneratedObjectProperty(expression: string, propertyName: string, refinement: string): string {
+  const marker = `"${propertyName}": `;
+  const propertyStart = expression.indexOf(marker);
+  if (propertyStart < 0) throw new Error(`Unable to locate generated property ${propertyName}.`);
+  const valueStart = propertyStart + marker.length;
+  let depth = 0;
+
+  for (let i = valueStart; i < expression.length; i++) {
+    const literalEnd = skipQuotedOrRegexLiteral(expression, i);
+    if (literalEnd !== undefined) {
+      i = literalEnd - 1;
+      continue;
+    }
+    const ch = expression[i];
+    if (ch === '(' || ch === '{' || ch === '[') depth++;
+    else if (ch === ')' || ch === '}' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) {
+      const value = expression.slice(valueStart, i);
+      return expression.slice(0, valueStart) + `${value}.superRefine(${refinement})` + expression.slice(i);
+    }
+  }
+
+  throw new Error(`Unable to locate the end of generated property ${propertyName}.`);
 }
 
 /**
@@ -866,7 +1268,7 @@ function postProcessCreativeRuntimeConstraints(content: string): string {
       // resolving it until parse time to avoid a top-level TDZ reference.
       .replace(
         /assets: z\.record\(z\.string\(\), (?:z\.unknown\(\)|z\.union\(\[AssetVariantSchema, z\.array\(AssetVariantSchema\)\]\))\)/,
-        'assets: CreativeAssetsSchema'
+        'assets: CreativeAssetsRuntimeSchema'
       );
     if (constrainedAssets === schema.block) {
       throw new Error(`Unable to preserve creative asset constraints on ${schemaName}.`);
@@ -897,6 +1299,8 @@ function postProcessCreativeRuntimeConstraints(content: string): string {
   preserveCreativeConstraints('CreativeManifestSchema');
 
   const creativeManifest = schemaBlock('CreativeManifestSchema');
+  // Keep this runtime validator distinct from the public CreativeAssetsSchema
+  // that newer protocol bundles generate for the named TypeScript interface.
   const assetValueSchema = `const CreativeAssetValueSchema: z.ZodType = z.unknown().superRefine((value, ctx) => {
     const variants = Array.isArray(value) ? value : [value];
     if (variants.length === 0 || variants.some(variant => !AssetVariantSchema.safeParse(variant).success)) {
@@ -907,7 +1311,7 @@ function postProcessCreativeRuntimeConstraints(content: string): string {
     }
 });
 
-const CreativeAssetsSchema: z.ZodType<Record<string, unknown>> = z.record(z.string(), z.unknown()).superRefine((assets, ctx) => {
+const CreativeAssetsRuntimeSchema: z.ZodType<Record<string, unknown>> = z.record(z.string(), z.unknown()).superRefine((assets, ctx) => {
     for (const [slotKey, assetValue] of Object.entries(assets)) {
         if (/^[a-z0-9_]+$/.test(slotKey) && !CreativeAssetValueSchema.safeParse(assetValue).success) {
             ctx.addIssue({
@@ -2217,6 +2621,167 @@ function postProcessObjectIntersections(content: string): string {
   }
 }
 
+/**
+ * Keep the beta.6 image-format motion narrowing object-shaped.
+ *
+ * The source type intersects a narrow image-only motion_level with the shared
+ * canonical-format object, whose motion_level enum is broader. A normal Zod
+ * merge would let the broader property overwrite the narrowing, while `.and()`
+ * loses the public ZodObject composition helpers. Remove the broad property
+ * before merging the narrow object so runtime validation and object helpers are
+ * both preserved.
+ */
+function postProcessCanonicalImageMotionNarrowing(content: string): string {
+  const target = findSchemaExportExpressions(content).find(entry => entry.name === 'CanonicalFormatImageSchema');
+  if (!target) throw new Error('postProcessCanonicalImageMotionNarrowing: schema export not found.');
+  const expression = content.slice(target.expressionStart, target.expressionEnd);
+  let depth = 0;
+
+  for (let i = 0; i < expression.length; i++) {
+    const literalEnd = skipQuotedOrRegexLiteral(expression, i);
+    if (literalEnd !== undefined) {
+      i = literalEnd - 1;
+      continue;
+    }
+    const ch = expression[i];
+    if (ch === '(' || ch === '{' || ch === '[') depth++;
+    else if (ch === ')' || ch === '}' || ch === ']') depth--;
+    else if (depth === 0 && expression.startsWith('.and(', i)) {
+      const broad = scanBalanced(expression, i + '.and'.length);
+      if (!broad || expression.slice(broad.end).trim()) break;
+      const narrow = expression.slice(0, i);
+      const rewritten = `${broad.body}.omit({ motion_level: true }).merge(${narrow})`;
+      return content.slice(0, target.expressionStart) + rewritten + content.slice(target.expressionEnd);
+    }
+  }
+
+  throw new Error('postProcessCanonicalImageMotionNarrowing: expected a top-level object intersection.');
+}
+
+/** Restore beta.6 reporting constraints that the general compatibility loosening intentionally drops. */
+function postProcessBeta6ReportingConstraints(content: string): string {
+  let result = content;
+
+  const requestedMetrics = 'requested_metrics: z.array(AvailableMetricSchema).optional(),';
+  if (!result.includes(requestedMetrics)) {
+    throw new Error('postProcessBeta6ReportingConstraints: requested_metrics projection not found.');
+  }
+  result = result.replace(
+    requestedMetrics,
+    `requested_metrics: z.array(AvailableMetricSchema).min(1).refine(
+        values => new Set(values).size === values.length,
+        { message: "requested_metrics must contain unique metrics" }
+    ).optional(),`
+  );
+
+  const delivery = findSchemaExportExpressions(result).find(entry => entry.name === 'DeliveryMetricsSchema');
+  if (!delivery) throw new Error('postProcessBeta6ReportingConstraints: DeliveryMetricsSchema not found.');
+  const deliveryExpression = result.slice(delivery.expressionStart, delivery.expressionEnd);
+  const threshold = 'threshold_seconds: z.number(),';
+  if (!deliveryExpression.includes(threshold)) {
+    throw new Error('postProcessBeta6ReportingConstraints: time-based view threshold not found.');
+  }
+  result =
+    result.slice(0, delivery.expressionStart) +
+    deliveryExpression.replace(threshold, 'threshold_seconds: z.number().gt(0),') +
+    result.slice(delivery.expressionEnd);
+
+  const qualifier = findSchemaExportExpressions(result).find(entry => entry.name === 'CanonicalMetricQualifierSchema');
+  if (!qualifier) throw new Error('postProcessBeta6ReportingConstraints: CanonicalMetricQualifierSchema not found.');
+  const qualifierExpression = result.slice(qualifier.expressionStart, qualifier.expressionEnd);
+  if (!qualifierExpression.endsWith('.passthrough()')) {
+    throw new Error('postProcessBeta6ReportingConstraints: qualifier is no longer a passthrough object.');
+  }
+  result =
+    result.slice(0, qualifier.expressionStart) +
+    qualifierExpression.replace(/\.passthrough\(\)$/, '.strict()') +
+    result.slice(qualifier.expressionEnd);
+
+  const canonicalQualifierBody = `z.object({
+        viewability_standard: ViewabilityStandardSchema.optional(),
+        completion_source: CompletionSourceSchema.optional(),
+        attribution_methodology: AttributionMethodologySchema.optional(),
+        attribution_window: DurationSchema.optional(),
+        lift_dimension: LiftDimensionSchema.optional()
+    }).passthrough()`;
+  const qualifierEnd = findSchemaExportExpressions(result).find(
+    entry => entry.name === 'CanonicalMetricQualifierSchema'
+  )!.expressionEnd;
+  const tail = result.slice(qualifierEnd).replaceAll(canonicalQualifierBody, 'CanonicalMetricQualifierSchema');
+  result = result.slice(0, qualifierEnd) + tail;
+
+  const vendorMetric = findSchemaExportExpressions(result).find(entry => entry.name === 'VendorMetricValueSchema');
+  if (
+    !vendorMetric ||
+    !result
+      .slice(vendorMetric.expressionStart, vendorMetric.expressionEnd)
+      .includes('qualifier: CanonicalMetricQualifierSchema.optional()')
+  ) {
+    throw new Error('postProcessBeta6ReportingConstraints: VendorMetricValue qualifier was not canonicalized.');
+  }
+
+  const deliveryAggregate = findSchemaExportExpressions(result).find(
+    entry => entry.name === 'DeliveryMetricAggregateSchema'
+  );
+  if (!deliveryAggregate) {
+    throw new Error('postProcessBeta6ReportingConstraints: DeliveryMetricAggregateSchema not found.');
+  }
+  let aggregateExpression = result.slice(deliveryAggregate.expressionStart, deliveryAggregate.expressionEnd);
+  const inlineQualifier = `z.object({
+            viewability_standard: ViewabilityStandardSchema.optional(),
+            completion_source: CompletionSourceSchema.optional(),
+            attribution_methodology: AttributionMethodologySchema.optional(),
+            attribution_window: DurationSchema.optional(),
+            lift_dimension: LiftDimensionSchema.optional()
+        }).passthrough()`;
+  const inlineQualifierCount = aggregateExpression.split(inlineQualifier).length - 1;
+  if (inlineQualifierCount !== 2) {
+    throw new Error(
+      `postProcessBeta6ReportingConstraints: expected two aggregate qualifier projections, found ${inlineQualifierCount}.`
+    );
+  }
+  aggregateExpression = aggregateExpression.replaceAll(inlineQualifier, 'CanonicalMetricQualifierSchema');
+  aggregateExpression += `.superRefine((row, ctx) => {
+    if (row.scope !== "standard") return;
+    const requiredComponents: Record<string, string[]> = {
+        viewable_rate: ["measurable_impressions", "viewable_impressions"],
+        completion_rate: ["impressions", "completed_views"],
+        cost_per_acquisition: ["spend", "conversions"],
+        roas: ["spend", "conversion_value"]
+    };
+    for (const field of requiredComponents[row.metric_id] ?? []) {
+        if ((row as unknown as Record<string, unknown>)[field] === undefined) {
+            ctx.addIssue({ code: "custom", path: [field], message: \`\${field} is required for \${row.metric_id}\` });
+        }
+    }
+})`;
+  result =
+    result.slice(0, deliveryAggregate.expressionStart) +
+    aggregateExpression +
+    result.slice(deliveryAggregate.expressionEnd);
+
+  return result;
+}
+
+/** Keep compact product format options aligned with the beta.6 canonical-kind vocabulary. */
+function postProcessBeta6CanonicalFormatOptionKinds(content: string): string {
+  const target = findSchemaExportExpressions(content).find(entry => entry.name === 'CanonicalFormatOptionSchema');
+  if (!target) throw new Error('postProcessBeta6CanonicalFormatOptionKinds: schema export not found.');
+  let expression = content.slice(target.expressionStart, target.expressionEnd);
+  if (expression.includes('z.literal("seller_rendered_stateful_display")')) return content;
+
+  const finalOldKind = 'z.literal("agent_placement"), z.literal("custom")';
+  const occurrences = expression.split(finalOldKind).length - 1;
+  if (occurrences < 1) {
+    throw new Error('postProcessBeta6CanonicalFormatOptionKinds: canonical format-kind union not found.');
+  }
+  expression = expression.replaceAll(
+    finalOldKind,
+    'z.literal("agent_placement"), z.literal("seller_rendered_stateful_display"), z.literal("coordinated_placements"), z.literal("custom")'
+  );
+  return content.slice(0, target.expressionStart) + expression + content.slice(target.expressionEnd);
+}
+
 function postProcessObjectUnionIntersections(content: string): string {
   const schemaExpressions = extractSchemaExports(content);
   const shapeCache = new Map<string, ObjectShape | undefined>();
@@ -2599,6 +3164,8 @@ async function generateZodSchemas() {
     zodSchemas = postProcessUnionStringLengthConstraints(zodSchemas);
     zodSchemas = postProcessForecastRangeConstraint(zodSchemas);
     zodSchemas = postProcessPriceBreakdownConstraints(zodSchemas);
+    zodSchemas = postProcessBeta4OfferAndOutcomeConstraints(zodSchemas);
+    zodSchemas = postProcessPreviewCreativeRequestConstraints(zodSchemas);
 
     // TypeScript cannot retain JSON Schema `format: uri` or root oneOf
     // exclusivity. Restore both for legacy/canonical creative identity.
@@ -2629,6 +3196,9 @@ async function generateZodSchemas() {
     zodSchemas = postProcessCanonicalFormatMarkerIntersections(zodSchemas);
     zodSchemas = postProcessCanonicalFormatSlots(zodSchemas);
     zodSchemas = postProcessCreativeBriefRequiredDisclosures(zodSchemas);
+    zodSchemas = postProcessPostalAreaValues(zodSchemas);
+    zodSchemas = postProcessCompatibilityPurchaseCoordinatorInput(zodSchemas);
+    zodSchemas = postProcessLegacyPurchaseContinuationResponse(zodSchemas);
     const refineResponseSource = JSON.parse(
       readFileSync(
         path.join(__dirname, '../schemas/cache/latest/bundled/media-buy/refine-proposals-response.json'),
@@ -2738,6 +3308,163 @@ async function generateZodSchemas() {
       });
     })()`;
     zodSchemas = postProcessCanonicalProposalRuntimeConstraints(zodSchemas, exactCanonicalProposal);
+
+    // These promoted beta.6 canonical formats contain nested required-only
+    // unions, conditionals, and `contains` constraints that TypeScript cannot
+    // faithfully carry through ts-to-zod. Project their dereferenced wire
+    // schemas directly so public Zod validation fails closed.
+    for (const [schemaName, schemaFile] of [
+      ['CanonicalFormatSellerRenderedStatefulDisplaySchema', 'seller_rendered_stateful_display.json'],
+      ['CanonicalFormatCoordinatedPlacementsSchema', 'coordinated_placements.json'],
+    ] as const) {
+      const source = JSON.parse(
+        readFileSync(path.join(__dirname, '../schemas/cache/latest/formats/canonical', schemaFile), 'utf8')
+      );
+      const dereferenced = (await $RefParser.dereference(source)) as any;
+      removeDiscriminatorHints(dereferenced);
+      // Both promoted formats extend exactly one plain object base. Flatten
+      // that structural allOf before Zod projection so the public export stays
+      // a real ZodObject (and therefore keeps shape/pick/omit/extend) while
+      // local property overrides replace their base declarations cleanly.
+      const baseSchemas = Array.isArray(dereferenced.allOf) ? dereferenced.allOf : [];
+      if (
+        baseSchemas.length !== 1 ||
+        baseSchemas[0]?.type !== 'object' ||
+        typeof baseSchemas[0]?.properties !== 'object'
+      ) {
+        throw new Error(`${schemaFile}: expected one dereferenced object base in allOf.`);
+      }
+      const baseSchema = baseSchemas[0] as Record<string, any>;
+      const localProperties = dereferenced.properties as Record<string, unknown>;
+      dereferenced.type = 'object';
+      dereferenced.properties = { ...baseSchema.properties };
+      for (const [propertyName, localProperty] of Object.entries(localProperties ?? {})) {
+        const baseProperty = baseSchema.properties[propertyName];
+        dereferenced.properties[propertyName] =
+          baseProperty && typeof baseProperty === 'object' && localProperty && typeof localProperty === 'object'
+            ? { ...baseProperty, ...(localProperty as Record<string, unknown>) }
+            : localProperty;
+      }
+      dereferenced.required = [...new Set([...(baseSchema.required ?? []), ...(dereferenced.required ?? [])])];
+      delete dereferenced.allOf;
+      // Defaults in overlapping allOf branches can produce different parsed
+      // values for the same key, which Zod intersections cannot merge. Wire
+      // validation should not mutate caller input, so discard annotation-only
+      // defaults before projecting the authoritative constraints.
+      const seenDefaults = new WeakSet<object>();
+      const removeDefaults = (value: unknown): void => {
+        if (!value || typeof value !== 'object' || seenDefaults.has(value)) return;
+        seenDefaults.add(value);
+        if (!Array.isArray(value)) delete (value as Record<string, unknown>).default;
+        Object.values(value).forEach(removeDefaults);
+      };
+      removeDefaults(dereferenced);
+      let exact = jsonSchemaToZod(dereferenced, converterOptions).replaceAll('.strict()', '.passthrough()');
+      if (schemaName === 'CanonicalFormatSellerRenderedStatefulDisplaySchema') {
+        exact = refineGeneratedObjectProperty(
+          exact,
+          'breakpoints',
+          `(breakpoints, ctx) => {
+            breakpoints.forEach((breakpoint, index) => {
+              const widthKeys = ["width", "width_range", "width_mode"].filter(key => breakpoint[key] !== undefined);
+              const heightKeys = ["height", "height_range", "viewport_height_percent"].filter(key => breakpoint[key] !== undefined);
+              if (widthKeys.length !== 1) ctx.addIssue({ code: "custom", path: [index], message: "breakpoint requires exactly one width mode" });
+              if (heightKeys.length !== 1) ctx.addIssue({ code: "custom", path: [index], message: "breakpoint requires exactly one height mode" });
+            });
+          }`
+        );
+        exact = refineGeneratedObjectProperty(
+          exact,
+          'transitions',
+          `(transitions, ctx) => {
+            if (transitions === undefined) return;
+            const rules: Record<string, { required: string[]; forbidden: string[]; modes: string[] }> = {
+              timer: { required: ["delay_ms"], forbidden: ["input", "media_event", "scroll_reference", "scroll_threshold_percent", "scroll_start_percent", "scroll_end_percent"], modes: ["instant", "animated"] },
+              in_view_timer: { required: ["delay_ms"], forbidden: ["input", "media_event", "scroll_reference", "scroll_threshold_percent", "scroll_start_percent", "scroll_end_percent"], modes: ["instant", "animated"] },
+              scroll_threshold: { required: ["input", "scroll_reference", "scroll_threshold_percent"], forbidden: ["delay_ms", "media_event", "scroll_start_percent", "scroll_end_percent"], modes: ["instant", "animated"] },
+              scroll_progress: { required: ["input", "scroll_reference", "scroll_start_percent", "scroll_end_percent"], forbidden: ["delay_ms", "media_event", "scroll_threshold_percent", "direction"], modes: ["scroll_linked"] },
+              user_action: { required: ["input"], forbidden: ["delay_ms", "media_event", "scroll_reference", "scroll_threshold_percent", "scroll_start_percent", "scroll_end_percent", "direction"], modes: ["instant", "animated"] },
+              media_event: { required: ["media_event"], forbidden: ["input", "delay_ms", "scroll_reference", "scroll_threshold_percent", "scroll_start_percent", "scroll_end_percent", "direction"], modes: ["instant", "animated"] }
+            };
+            transitions.forEach((transition, index) => {
+              const rule = rules[transition.trigger];
+              if (!rule) return;
+              rule.required.forEach((key: string) => {
+                if (transition[key] === undefined) ctx.addIssue({ code: "custom", path: [index, key], message: "transition field is required for this trigger" });
+              });
+              rule.forbidden.forEach((key: string) => {
+                if (transition[key] !== undefined) ctx.addIssue({ code: "custom", path: [index, key], message: "transition field is forbidden for this trigger" });
+              });
+              if (!rule.modes.includes(transition.transition_mode)) ctx.addIssue({ code: "custom", path: [index, "transition_mode"], message: "invalid transition_mode for this trigger" });
+              if ((transition.trigger === "scroll_threshold" || transition.trigger === "scroll_progress") && transition.input !== "scroll") {
+                ctx.addIssue({ code: "custom", path: [index, "input"], message: "scroll transitions require input=scroll" });
+              }
+            });
+          }`
+        );
+        exact = refineGeneratedObjectProperty(
+          exact,
+          'duration_ms_range',
+          `(range, ctx) => {
+            if (range !== undefined && !range.some(value => value !== null)) {
+              ctx.addIssue({ code: "custom", path: [], message: "duration_ms_range requires at least one finite bound" });
+            }
+          }`
+        );
+      }
+      if (schemaName === 'CanonicalFormatCoordinatedPlacementsSchema') {
+        exact = refineGeneratedObjectProperty(
+          exact,
+          'components',
+          `(components, ctx) => {
+            if (!components.some(component => component.required === true)) {
+              ctx.addIssue({ code: "custom", path: [], message: "At least one component must be required" });
+            }
+            components.forEach((component, index) => {
+              const referenced = component.format_option_ref !== undefined;
+              const hasKind = component.format_kind !== undefined;
+              const hasParams = component.params !== undefined;
+              if (referenced === (hasKind || hasParams) || (!referenced && (!hasKind || !hasParams))) {
+                ctx.addIssue({ code: "custom", path: [index], message: "Each component must select exactly one referenced or inline format" });
+                return;
+              }
+              if (!referenced) {
+                const paramsSchema = CoordinatedPlacementInlineParamsRuntimeSchemas[component.format_kind];
+                if (!paramsSchema) {
+                  ctx.addIssue({ code: "custom", path: [index, "format_kind"], message: "Unsupported coordinated placement format_kind" });
+                } else if (!paramsSchema.safeParse(component.params).success) {
+                  ctx.addIssue({ code: "custom", path: [index, "params"], message: "params do not match format_kind" });
+                }
+              }
+            });
+          }`
+        );
+      }
+      zodSchemas = postProcessExactSchema(zodSchemas, schemaName, exact);
+      if (schemaName === 'CanonicalFormatCoordinatedPlacementsSchema') {
+        const exportMarker = `export const ${schemaName}`;
+        const exportStart = zodSchemas.indexOf(exportMarker);
+        if (exportStart < 0) throw new Error(`${schemaFile}: unable to locate coordinated schema export.`);
+        const inlineParamsSchemas = `const CoordinatedPlacementInlineParamsRuntimeSchemas: Record<string, z.ZodType> = {
+    image: CanonicalFormatImageSchema,
+    html5: CanonicalFormatHTML5BannerSchema,
+    display_tag: CanonicalFormatDisplayTagSchema,
+    image_carousel: CanonicalFormatImageCarouselSchema,
+    video_hosted: CanonicalFormatHostedVideoSchema,
+    video_vast: CanonicalFormatVASTVideoSchema,
+    audio_hosted: CanonicalFormatHostedAudioSchema,
+    audio_daast: CanonicalFormatDAASTAudioSchema,
+    sponsored_placement: CanonicalFormatSponsoredPlacementRetailMediaCatalogDrivenSchema,
+    native_in_feed: CanonicalFormatNativeInFeedSchema,
+    responsive_creative: CanonicalFormatResponsiveCreativeSchema,
+    agent_placement: CanonicalFormatAgentPlacementAISurfaceSponsoredPlacementSchema,
+    seller_rendered_stateful_display: CanonicalFormatSellerRenderedStatefulDisplaySchema
+};
+
+`;
+        zodSchemas = zodSchemas.slice(0, exportStart) + inlineParamsSchemas + zodSchemas.slice(exportStart);
+      }
+    }
     zodSchemas = postProcessRefineProposalsRuntimeConstraints(zodSchemas);
 
     // Post-process: Distribute object-envelope intersections over union object arms.
@@ -2753,6 +3480,18 @@ async function generateZodSchemas() {
     // intersected object validation when fields are disjoint or identical, and leaves
     // richer/conflicting intersections alone so future schema changes do not weaken checks.
     zodSchemas = postProcessObjectIntersections(zodSchemas);
+
+    // Preserve the image format's beta.6 motion-level refinement without
+    // regressing its public ZodObject composition surface.
+    zodSchemas = postProcessCanonicalImageMotionNarrowing(zodSchemas);
+
+    // Preserve the non-empty/unique requested metric set, positive view
+    // threshold, and closed canonical qualifier from the beta.6 wire schema.
+    zodSchemas = postProcessBeta6ReportingConstraints(zodSchemas);
+
+    // The beta.6 compact option source missed the two promoted canonical
+    // kinds even though the shared canonical-kind vocabulary includes them.
+    zodSchemas = postProcessBeta6CanonicalFormatOptionKinds(zodSchemas);
 
     // Keep the create-media-buy request's public schema object-shaped while
     // enforcing its lifecycle-mode union as a refinement.

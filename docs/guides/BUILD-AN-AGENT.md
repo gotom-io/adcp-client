@@ -21,9 +21,9 @@ interfaces: `SalesCorePlatform` + `SalesIngestionPlatform`,
 `CampaignGovernancePlatform`, `BrandRightsPlatform`, etc.) and the
 framework wires capability projection, idempotency, RFC 9421 signing,
 async tasks, status normalization, lifecycle state, multi-tenant
-routing, and async task completion webhooks. Synchronous terminal
-responses stay inline unless an adopter explicitly enables the
-non-conformant `autoEmitCompletionWebhooks` compatibility option. Compile-time
+routing, and async task completion webhooks. Under AdCP 3.2 synchronous
+terminal responses remain silent on the task-webhook channel; the deprecated
+`autoEmitCompletionWebhooks` option is ignored. Compile-time
 enforcement via `RequiredPlatformsFor<S>` catches missing methods
 before runtime. The `definePlatform` / `defineSalesCorePlatform` /
 sibling helpers let you write inline platform literals without
@@ -42,9 +42,14 @@ A minimal signals agent using `createAdcpServerFromPlatform` + the
 import { serve } from '@adcp/sdk';
 import {
   createAdcpServerFromPlatform,
+  createIdempotencyStore,
   definePlatform,
   defineSignalsPlatform,
+  memoryBackend,
 } from '@adcp/sdk/server';
+
+// Single-process example. Use pgBackend(pool) or redisBackend(client) in production.
+const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });
 
 const platform = definePlatform({
   capabilities: {
@@ -80,7 +85,7 @@ const platform = definePlatform({
   }),
 });
 
-serve(() => createAdcpServerFromPlatform(platform, { name: 'My Signals Agent', version: '1.0.0' }));
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Signals Agent', version: '1.0.0', idempotency }));
 // listening on http://localhost:3001/mcp
 ```
 
@@ -111,11 +116,16 @@ The declarative path. You declare a typed `DecisioningPlatform` per specialism a
 import { serve } from '@adcp/sdk';
 import {
   createAdcpServerFromPlatform,
+  createIdempotencyStore,
   definePlatform,
   defineSalesCorePlatform,
+  memoryBackend,
   refAccountId,
   AccountNotFoundError,
 } from '@adcp/sdk/server';
+
+// Single-process example. Use pgBackend(pool) or redisBackend(client) in production.
+const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });
 
 const platform = definePlatform({
   capabilities: {
@@ -154,7 +164,7 @@ const platform = definePlatform({
   }),
 });
 
-serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', version: '1.0.0' }));
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', version: '1.0.0', idempotency }));
 ```
 
 **What the framework does for you:**
@@ -165,6 +175,35 @@ serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', versi
 - **Resolves accounts** — `accounts.resolve(ref, ctx)` runs before your platform method, the resolved account lands at `ctx.account`. Returns `ACCOUNT_NOT_FOUND` envelope if resolution returns null. `accounts.resolution: 'implicit'` enforces inline-`{account_id}` refusal at the framework boundary (post-6.7 — pre-6.7 the docstring was aspirational).
 - **Idempotency, signing, async tasks, status normalization, lifecycle state** are framework-owned. Synchronous terminal responses do not emit completion webhooks by default; the inline result is authoritative. Adopters write the business decisions.
 - **Catches handler errors** — unhandled exceptions return `SERVICE_UNAVAILABLE` instead of crashing. Throw a typed error class (see § "Returning errors from handlers") to surface a structured envelope.
+
+### Customizing human-readable MCP response text
+
+Native platform handlers normally return only structured domain payloads, and
+the framework writes a default MCP `content[].text` summary. When a disclosure
+or other adopter-authored explanation must remain visible in text-first MCP
+clients, wrap a synchronous `getProducts` result with
+`withResponseSummary(payload, text)`:
+
+```typescript
+import { withResponseSummary } from '@adcp/sdk/server';
+
+getProducts: async (req, ctx) =>
+  withResponseSummary(
+    {
+      products: await catalog.search(req),
+      cache_scope: 'public',
+      ext: { example_vendor: { demo: true } },
+    },
+    'Synthetic sample data for demonstration only.'
+  ),
+```
+
+The wrapper is not a protocol envelope. The SDK still projects and validates
+the payload, writes only the supplied text to MCP `content[]`, and never copies
+the summary into `structuredContent`. Use it only for synchronous
+`getProducts` payloads and trusted, static disclosures. Summary text is capped
+at 4096 UTF-8 bytes and may be cached; never include credentials, buyer input,
+upstream/LLM output, or other secrets.
 
 ### Identity, multi-tenant, and lifecycle helpers (6.7)
 
@@ -232,22 +271,30 @@ non-empty bearer is an authentication bypass, not a safe example simplification.
 
 Both transports share the same `AdcpServer` — handlers, idempotency store, state store, and `resolveAccount` all run the same pipeline regardless of which transport received the request. Changes to handlers are picked up by both at once.
 
-**Skill addressing.** A2A clients send a `Message` with a single `DataPart`: `{ kind: 'data', data: { skill: 'get_products', input: { brief: '...' } } }`. `skill` matches an AdCP tool name; `input` is the tool arguments. The legacy key `parameters` (shipped by `src/lib/protocols/a2a.ts` before the adapter landed) is accepted as an alias for `input` so same-SDK clients and servers talk cleanly.
+**Skill addressing.** AdCP 3.2 uses A2A 1.0 and requires clients to activate `https://adcontextprotocol.org/extensions/adcp/v3`. Clients send a `Message` with one structured DataPart whose value is `{ skill: 'get_products', input: { brief: '...' } }`. `skill` matches an AdCP tool name; `input` is the tool arguments. The server's A2A 0.3 compatibility path accepts the older `parameters` alias, but 1.0 clients must use `input`.
 
-**Two lifecycles, one response.** A2A's `Task.state` tracks the *transport call* (did the HTTP request complete?). AdCP's `status` inside the artifact tracks the *work* (submitted / completed / failed). Don't conflate them — a `completed` A2A task can carry a `submitted` AdCP response, meaning the call returned but the ad-tech operation is still queued.
+**Two lifecycles, one response.** A2A's `Task.state` tracks the *transport call* (did the request complete?). AdCP's `status` inside the artifact tracks the *work* (submitted / completed / failed). Don't conflate them — a completed A2A task can carry a `submitted`, `input-required`, or `auth-required` AdCP response. The adapter has no durable, principal-bound continuation dispatcher, so handler-produced pause arms are completed, nonresumable artifact results. Leaving the A2A task live would let continuation-only input re-enter the ordinary mutation pipeline as a fresh request.
 
 **Handler return → A2A `Task.state` + artifact:**
 
 | Handler returned… | A2A `Task.state` | Artifact payload |
 |---|---|---|
 | Success arm | `completed` | DataPart with the typed AdCP response |
-| Submitted arm (`status:'submitted'`) | `completed` | DataPart with the AdCP response; `adcp_task_id` on `artifact.metadata` |
-| Error arm (`errors: [...]`) | `failed` | DataPart with the Error arm payload |
+| Submitted arm (`status:'submitted'`) | `completed` | DataPart with the typed AdCP response, including its `task_id` |
+| Pause arm (`status:'input-required'` / `'auth-required'`) | `completed` | DataPart with the nonresumable AdCP pause response |
+| Error arm (`errors: [...]`) | `completed` | DataPart with the Error arm payload |
 | `adcpError('CODE', ...)` | `failed` | DataPart with `adcp_error` |
 
-**A2A `Task.id` vs AdCP `task_id`.** A2A owns its `Task.id` (SDK-generated per `message/send`). The AdCP-level `task_id` — present when the handler returned a Submitted arm — rides on `artifact.metadata.adcp_task_id`, off the DataPart's payload so the `data` still validates cleanly against the AdCP response schema. Buyers resuming the A2A side poll via `tasks/get` using the A2A `Task.id`; buyers reaching for AdCP-side async state use `adcp_task_id`.
+**A2A `Task.id` vs AdCP `task_id`.** A2A owns its transport `Task.id`. The AdCP-level `task_id` is part of the typed Submitted response and identifies the asynchronous ad-tech work. Use A2A `GetTask` only for the A2A transport task; query AdCP work by sending the profile's `get_task_status` invocation with the AdCP `task_id`.
 
-**v0 scope.** `message/send`, `tasks/get`, `tasks/cancel`, `GET /.well-known/agent-card.json`. Streaming (`message/stream`), push notifications, and `input-required` mid-flight interrupts are explicit "not yet" — tracked for v1. Pin a minor version while the surface stabilises.
+**A2A scope.** The adapter exposes A2A 1.0 `SendMessage`, `GetTask`, `CancelTask`, and `GET /.well-known/agent-card.json`. Streaming, push notifications, and resumable mid-flight `input-required` interrupts are not yet implemented by this adapter.
+
+**Production task storage.** Pass `taskStore` when creating the A2A adapter in
+production. The SDK's in-memory A2A store is intentionally limited to
+`NODE_ENV=test` or `NODE_ENV=development`; it is not bounded or durable. The
+adapter redacts secret-shaped fields before every task-store write, including
+credentials carried in request history, but the application-owned store must
+still provide capacity limits, retention, and tenant/owner isolation.
 
 ### Reading tool results (client side)
 
@@ -438,7 +485,7 @@ import {
 // Development — in-process store, resets on restart:
 const idempotency = createIdempotencyStore({
   backend: memoryBackend(),
-  ttlSeconds: 86400, // 1h–7d, clamped to spec bounds
+  ttlSeconds: 86400, // 1h–7d; values outside the spec bounds are rejected
 });
 
 serve(() =>
@@ -479,7 +526,17 @@ The framework auto-handles:
 
 Scoping is per-principal — `resolveSessionKey` doubles as the idempotency principal, so two buyers with different session keys won't share cache entries. Override with `resolveIdempotencyPrincipal` if you need a different scope (e.g., `operator_id`).
 
-**Only successful responses are cached.** Handler errors re-execute on retry rather than replaying — so a transient 5xx doesn't lock a failure into the cache.
+**Successful responses are cached.** Request-validation failures happen before
+the handler and may be retried after correction. Once a mutating handler is
+invoked, however, a thrown exception cannot prove that no upstream side effect
+committed. The framework therefore caches non-transient typed rejections thrown
+directly by the handler as the durable outcome. Transient typed exceptions,
+unknown exceptions, and post-handler response failures become a full-window
+ambiguity fence rather than a misleading retryable response. Exact retries
+never re-enter that handler; reconcile an ambiguous operation by its natural
+key before issuing a new intent. Optional idempotency on non-mutating handlers
+may still release its claim after a thrown error because no mutation was
+admitted.
 
 ### Schema-Driven Validation (opt-in)
 
@@ -558,23 +615,23 @@ serve(
 
 When signature headers are present, only signature auth runs (no fallback to bearer — that prevents bypass attacks). When absent, the credential authenticator runs as normal. `requiredFor` enforces the spec's `request_signature_required` 401 on operations that arrive unsigned without other credentials — start narrow and widen as your counterparties roll out signing. `replayStore` and `revocationStore` default to in-memory implementations — pass shared (e.g. Redis-backed) stores for horizontally scaled fleets. The capability key is `request_signing`; `signed_requests` is silently dropped (the `AdcpCapabilitiesOverrides` shape is what `get_adcp_capabilities` advertises).
 
-For outbound webhook signing, pass a `signerKey` on the server options:
+For outbound webhook signing, pass a signing provider and durable delivery
+store on the server options:
 
 ```typescript
 createAdcpServerFromPlatform(platform, {
   name: 'My Seller',
   version: '1.0.0',
   webhooks: {
-    signerKey: {
-      keyid: 'my-webhook-key-2026',
-      alg: 'ed25519',
-      privateKey: webhookPrivateJwk,
-    },
+    signerProvider: kmsSigningProvider,
+    deliveryStore: durableWebhookDeliveryStore,
+    deliveryRecovery: durableWebhookOutbox,
+    publisherScope: 'my-seller',
   },
 });
 ```
 
-**Production key storage.** For outbound *request* signing (calling other agents' tools), prefer a KMS-backed `SigningProvider` over in-process JWKs — `request_signing` accepts `{ kind: 'provider', provider, agent_url }` for any KMS / HSM / Vault backend. See [SIGNING-GUIDE.md § Production Key Storage](./SIGNING-GUIDE.md#step-35-production-key-storage--kms--hsm--vault) for the full walkthrough including a reference GCP KMS adapter. Server-side `webhooks.signerKey` currently accepts only an in-process `SignerKey`; KMS-backed webhook signing on the server is a follow-up.
+**Production key storage.** For outbound request or webhook signing, prefer a KMS-backed `SigningProvider` over in-process JWKs. See [SIGNING-GUIDE.md § Production Key Storage](./SIGNING-GUIDE.md#step-35-production-key-storage--kms--hsm--vault) for the full walkthrough including a reference GCP KMS adapter. Production webhook servers must provide a shared durable `deliveryStore` plus `deliveryRecovery`, a durable outbox that checkpoints the exact destination, payload/timestamp, authentication reference, and retry policy before delivery and recovers unsettled snapshots after restart. The SDK supplies PostgreSQL and Redis delivery stores, recovery backends, migrations, and a bounded recovery polling API; applications supply the KMS/secret adapter and operational scheduler. Tenant namespaces are derived from trusted resolved request context.
 
 See [SIGNING-GUIDE.md](./SIGNING-GUIDE.md) for the full walkthrough: key generation, JWKS publication, brand.json, conformance testing, and KMS-backed production deployment.
 

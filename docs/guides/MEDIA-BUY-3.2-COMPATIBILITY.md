@@ -5,9 +5,14 @@ routes it can still **call**. A 3.2 seller should make the compact lifecycle the
 obvious path for new buyers without breaking a 3.0 or 3.1 buyer that already
 calls the established names.
 
-The SDK is pinned to the signed `3.2.0-beta.3` bundle. That exact prerelease
-supersedes beta.2, preserves the compact proposal and direct-buy wire contract,
-and clarifies brand-source and mutation-field invariants.
+The SDK is pinned to the signed `3.2.0-beta.6` bundle. That exact prerelease
+supersedes beta.5 and adds delivery metric identities, requested-metric
+narrowing, sortable breakdowns, completeness echoes, coordinated placements,
+seller-rendered stateful display, creative component assets, and A2A 1.0
+request-signing method names. Beta.5 introduced the normative async identity,
+cross-channel convergence, webhook retry-horizon, and continuation-generation
+contract; beta.4 introduced flexible-window availability and the products-only
+legacy purchase-continuation contract.
 
 ## MCP surface comparison
 
@@ -72,7 +77,7 @@ const platform = {
 createAdcpServerFromPlatform(platform, {
   name: 'seller',
   version: '1.0.0',
-  adcpVersion: '3.2.0-beta.3',
+  adcpVersion: '3.2.0-beta.6',
 });
 ```
 
@@ -125,7 +130,7 @@ union, and `CompatibleProposal` is the canonical-or-established proposal union.
 Proposal calls return operation-specific discriminants:
 
 - `requestProposals`: `operation: 'request'` with `outcome: 'proposed' |
-  'rejected' | 'legacy_unavailable'`.
+  'products_available' | 'rejected' | 'legacy_unavailable'`.
 - `refineProposals`: `operation: 'refine'` with native per-refinement
   `results[].outcome` arms, or an explicit `legacy_projected` /
   `legacy_unavailable` top-level outcome.
@@ -154,6 +159,307 @@ a successor. Compact decline
 result arms are runtime-validated and correlated in request order; the coordinator
 accepts both rows that echo `proposal_id` and ordered rows that omit it, while
 rejecting a conflicting echoed ID.
+
+### Durable established proposal state
+
+Established 3.0/3.1 proposal snapshots are process-local unless the coordinator
+is given an `EstablishedProposalStore`. Production buyers that discover and
+mutate proposals in separate HTTP requests should supply the same durable store
+to every worker:
+
+```ts
+const lifecycle = await agent.negotiateMediaBuyLifecycle({
+  principalScope: authenticatedPrincipalId,
+  legacyPurchaseSellerSessionScope: authenticatedSellerSessionId,
+  establishedProposalStore: proposalLedger,
+  allowedLosses: ['proposal_terms_digest_not_enforced'],
+});
+```
+
+The interface is intentionally compatible with an application-owned proposal
+ledger. It stores only the SDK's reduced immutable proposal evidence plus
+principal, seller, account, version, normalized `expiresAt`, digest, mutation reservation, task,
+ambiguity, and terminal-fence fields. It never receives the raw seller response,
+credentials, presigned URLs, timers, listeners, or live coordinator objects.
+
+`legacyPurchaseSellerSessionScope` must be a stable, non-secret identity for the
+authenticated seller session; it prevents proposals from one credential or
+seller account session being reused by another. `reserveMutation()` is an
+atomic multi-record compare-and-swap. Durable SQL or Redis implementations must
+use the backing service's clock in the same transaction to turn `retryTtlMs`
+into the persisted first reservation and retry deadline, compare every supplied
+`snapshotFingerprint` with the stored evidence, admit only one worker, permit
+only an exact same-key retry inside that deadline, and never make a terminal
+record available again. The mutation fence is proposal-wide within the same
+principal, seller session, and protocol version, even when two requests spell
+the account scope differently, but one mutation and its restart reconciliation
+must contain bindings from exactly one normalized account scope.
+`InMemoryEstablishedProposalStore` is bounded;
+it is suitable for tests and local development, including simulating fresh
+`AgentClient` instances, but not for multiple processes.
+
+`completeRefinement()` is also one transaction. It consumes every reserved
+source generation, installs each distinct successor snapshot, and restores
+only bindings named in `retainedBindings` (the seller's authoritative
+`refinement_applied.status: "unable"` sources). A same-ID successor is
+available only when its fingerprint differs from the consumed generation; an
+identical row remains terminal so an ambiguity replay cannot resurrect the
+source. Implementations must retain a bounded completion tombstone keyed by
+`operationKey`, including source, successor, and retained fingerprints. An
+exact repeated completion returns `updated`, while conflicting completion
+evidence fails closed. Stamp each tombstone with the backing store's
+authoritative completion time and retain it for at least
+`ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS` (seven days).
+`findSubmittedTask()` exposes that `completedAt` / `retainUntil` window when a
+tombstone services recovery. Tombstones count toward the configured record and
+byte limits until they expire.
+`putSnapshot(snapshot, expectedSnapshotFingerprint)` may replace a different
+generation only when that exact generation is still available in the same
+atomic transaction; concurrent, reserved, and terminal generations win.
+`discardSnapshot()` must likewise compare the expected fingerprint in the
+delete transaction.
+
+The remaining transitions are equally fail-closed: `recordSubmittedTask()` may
+set a seller task ID once, must conflict on a different ID, and must reject
+reuse of a task ID already held by a live record or completion tombstone in the
+same principal, seller-session, protocol-version, and account scope;
+`releaseMutation()` changes only the exact reserved/retryable claim back to
+available, except that exact seller-task reconciliation may also release a
+terminal `commit-uncertain` claim after an authoritative terminal error;
+`markAmbiguous()` preserves the first store-clock retry deadline and
+otherwise writes a permanent commit-uncertain fence; `completeMutation()` is
+only accept→accepted and compares a hash of the authoritative reduced terminal
+evidence so conflicting successful observations fail closed; and
+`completeDecline()` atomically terminalizes successful
+rows while restoring seller-confirmed unable bindings. Authoritatively settled
+terminal records are permanent authorization fences. Completion tombstones are
+authorization fences through their protocol-owned retention horizon: a bounded
+store must return capacity rather than evict them early and reauthorize a
+proposal. Any `reserveMutation()` reuse of an `operationKey` represented by a
+retained completion tombstone must return `conflict`, even when the new claim
+or binding evidence differs; only an exact repeated completion may return the
+idempotent `updated` outcome. The tombstone must also service the
+scoped `findSubmittedTask(..., sellerTaskId)` lookup so reconciliation remains
+idempotent after the caller loses a completion response. Durable stores should
+implement `pruneCompletionTombstones()` or an equivalent database-owned sweeper
+that uses the database clock. At or after `retainUntil`, pruning may make
+`findSubmittedTask()` return `undefined`; `reserveMutation()` then derives its
+result solely from the remaining source records and may reserve again when all
+sources were restored as available.
+
+After restart, call
+`lifecycle.reconcileEstablishedProposalTask({ account, sellerTaskId })`. The
+coordinator uses `findSubmittedTask()` in buyer-principal, seller-session,
+protocol-version, and account scope, polls through the official client,
+validates the task ID and tool, rebuilds reduced successor evidence, and applies
+the correct accept/refine/decline transition. An already-settled operation is
+reported from its tombstone without polling an evicted or stale seller task.
+Seller-task reconciliation remains available after a redispatch retry deadline
+expires, and a permanent `commit-uncertain` fence is not reported as settled;
+an exact authoritative seller observation may still complete or release it.
+Seller task IDs are not globally
+unique, so a store must never offer an unscoped lookup. When seller success is
+observed but the completion transition cannot be committed,
+the coordinator fails closed. Reconcile the seller mutation through the
+application's natural key and apply the matching accept, decline, or refinement
+completion with the retained claim before allowing another lifecycle request. Submitted seller task
+IDs are retained through `recordSubmittedTask()` so the same ledger can drive
+authoritative completion reconciliation after restart.
+
+### Products-only legacy continuations
+
+An established 2.5, 3.0, or 3.1 seller may answer a brief with products but no
+proposal. Beta.4 projects that honest result as `products_available`; it never
+invents a proposal, terms digest, or feed fence. The returned
+`purchase_continuation` names the exact products and losses that must be
+accepted before the legacy `create_media_buy` mutation:
+
+```ts
+const continuations = createInMemoryLegacyPurchaseContinuationStore();
+const lifecycle = await agent.negotiateMediaBuyLifecycle({
+  principalScope: authenticatedPrincipalId,
+  // Required for established 2.5, 3.0, and 3.1 sellers that provide no server
+  // context ID. Persist this non-secret authenticated session ID across rehydration.
+  legacyPurchaseSellerSessionScope: authenticatedSellerSessionId,
+  legacyPurchaseContinuationStore: continuations,
+});
+
+const discovery = await lifecycle.requestProposals({ account, brand, brief });
+if (discovery.status === 'completed' && discovery.data.outcome === 'products_available') {
+  const continuation = discovery.data.purchase_continuation;
+  if (continuation.kind === 'legacy_create') {
+    await lifecycle.continueLegacyPurchase({
+      idempotency_key: crypto.randomUUID(),
+      continuation_token: continuation.continuation_token,
+      account,
+      selected_product_ids: [continuation.product_ids[0]],
+      accepted_losses: continuation.losses,
+      legacy_create_request: exactLegacyCreateRequest,
+    });
+  } else {
+    // listed_purchase carries seller-issued feed/pricing fences and proceeds
+    // through the native buy_products flow.
+  }
+}
+```
+
+The in-memory store is a single-process reference implementation. Production
+clusters should implement `LegacyPurchaseContinuationStore` with durable,
+atomic issuance, binding verification, operation-wide idempotency indexing,
+and claim operations. To accept mutation callbacks after a restart or on a
+different replica, a custom store must also implement
+`getByCallbackOperationId`, `recordPendingSettlement`,
+`claimPendingSettlementPublication`, `releasePendingSettlementPublication`,
+`acknowledgePendingSettlement`, and `recordDeferredTaskToken`; implementing only
+part of that durable inbox/outbox contract is rejected during coordinator
+negotiation. The pending-settlement write
+must atomically compare exact callback identity and terminal content, and must
+be retained through `operation.replayExpiresAt`. A pending callback task ID and
+the write-once seller task binding must match in either write order.
+`recordDeferredTaskToken` is a compare-and-swap: initial binding expects no
+prior token, a nested pause supplies the exact prior token as its fourth
+argument, stale writers return `false`, and an exact installed-token retry
+returns `true`. That exact token is also the only callback-capable claimed route
+allowed to send seller continuation input; ambiguous, completed, expired,
+stale, unlinked, or coordinator-less routes fail closed.
+When a restarted/public resume pauses again, the SDK first persists the new
+deferred checkpoint, then uses that compare-and-swap to replace the legacy
+operation's exact prior token, and only then consumes the prior SDK checkpoint
+or returns the new token. If the cross-store handoff fails after seller input
+was dispatched, the prior checkpoint stays claimed and the replacement remains
+unauthorized, preventing either generation from redispatching input.
+`acknowledgePendingSettlement` must atomically clear the exact pending entry and
+retain its stable, nonempty `acknowledgedSettlementFingerprint` through
+`operation.replayExpiresAt`. `get` and `getByCallbackOperationId` must return
+that proof, and exact ACK retries must validate it; this is the durable evidence
+that application publication already occurred if a later deferred-checkpoint
+write fails. If the exact terminal result was completed without a pending
+outbox entry, ACK installs the same proof after publication succeeds. Use the
+exported `legacyPurchaseSettlementFingerprint()` helper to compute the enforced
+canonical proof. It binds the operation, seller task, task type, and terminal
+value while intentionally excluding the webhook delivery event key.
+`claimPendingSettlementPublication` and
+`releasePendingSettlementPublication` are an atomic renewable lease over the
+exact outbox entry. A live different owner returns `false`, the same owner may
+renew, an expired owner may be replaced, release removes only the exact owner,
+and pending acknowledgement requires that owner. Publication callbacks must
+remain idempotent across lease loss. Existing stores may omit all six
+methods and continue polling-only operation; the coordinator suppresses push
+notifications for those stores so no callback can be acknowledged only in
+process memory. The default reference store implements callback recovery, so a
+committed A2A pause requires configured `deferredStorage`; without it the pause
+fails closed. A polling-only store that omits all six callback methods can
+still use an in-process pause continuation without deferred storage.
+Sender callback inbox writes stop at `operation.replayExpiresAt`, but an
+already-dispatched seller task may finish later. A pending settlement marked
+`publicationSource: 'sdk'` may therefore be installed after that time and must
+remain retained until exact-owner acknowledgement; cleanup must not delete an
+expired completed record while that SDK outbox is pending. Its successful ACK
+extends completed replay retention by at least seven days so a crash before a
+separate deferred-checkpoint ACK can still recover the publication proof.
+Every accepted sender or SDK terminal outbox also starts a fresh seven-day
+recovery horizon at admission; a callback admitted just before the old deadline
+therefore remains retryable while its handler and cross-store finalization run.
+No pending outbox is cleanup-eligible while its publication lease is
+unexpired. An expired sender-owned outbox may be reclaimed only after both the
+replay deadline and any active lease end.
+
+The reference store is bounded to 256 records / 4 MiB
+and prunes expired unused or completed records; it deliberately does not evict
+ambiguous mutations. Tokens are principal-, account-, seller-session-,
+source-version-, expiry-, product-, discovery-request-, and full
+observed-response-bound. Re-observing the same discovery returns the same
+token. A claim is consumed at the first mutation; exact retries replay the
+recorded terminal `TaskResult` during a replay window of at least seven days.
+`legacyPurchaseOperationTtlMs` configures unresolved-operation monitoring and
+may lengthen, but never shorten, that terminal replay retention.
+
+Custom stores must also implement the terminal CAS outcome precisely:
+`complete()` returns `completed` only when it installs the caller's candidate,
+`pending_completed` with required settlement metadata when it atomically
+promotes an earlier queued callback, `duplicate` for an exact already-installed
+retry, and `conflict` for a different terminal value. This distinction prevents two
+replicas racing inbox drain and callback recovery from publishing completion
+twice. If a pending callback won before `complete()`, the transaction must
+promote and return that pending terminal value (including its settlement
+identity), never discard it in favor of the caller's stale candidate. The SDK
+validates the returned callback operation, seller task, task type, and terminal
+content before accepting `pending_completed`.
+
+`recordSubmittedTask()` is also an atomic, write-once binding: the first seller
+task ID wins, an exact same-ID retry succeeds, and a different ID returns
+`false` without overwriting the stored identity. Callback settlement trusts
+this binding, so a last-writer-wins implementation is unsafe. Binding must also
+return `false` when an already queued callback names a different seller task;
+the inverse pending-settlement write must return `conflict`.
+
+Applications that receive webhooks must negotiate and retain the lifecycle
+coordinator before marking the callback route ready. On process restart, build
+a fresh `AgentClient`, negotiate a coordinator with the same durable store,
+`principalScope`, and `legacyPurchaseSellerSessionScope`, and only then serve
+callbacks. This installs the callback-operation recovery lookup synchronously
+when negotiation completes. The seller-session scope must be stable across
+replicas; do not rely on a newly negotiated in-memory context ID for cold-start
+recovery.
+
+Use that same reconstructed `AgentClient` to redeem a persisted continuation;
+do not construct a separate `SingleAgentClient`, because it would not own the
+coordinator's settlement recoverer and exact-token authorizer:
+
+```ts
+const agent = new AgentClient(agentConfig, { deferredStorage });
+await agent.negotiateMediaBuyLifecycle({
+  legacyPurchaseContinuationStore,
+  principalScope,
+  legacyPurchaseSellerSessionScope,
+});
+
+const resumed = await agent.resumeDeferredTask(deferredToken, humanInput);
+```
+
+The webhook authenticity state is a separate durability boundary. Replicas
+must also share a durable `webhookRegistrationStore`; RFC 9421 deployments
+must share the configured replay store as well. A fresh client with the
+default in-memory registration or replay store intentionally rejects a
+callback before continuation recovery runs.
+
+For any established seller without a server context ID,
+`legacyPurchaseSellerSessionScope` is required before a continuation can be
+issued. It must be a stable, non-secret ID derived by the application from the
+authenticated seller/account session—not a bearer token. Persist and reuse it
+with the continuation store so a restarted coordinator can redeem or replay
+the same operation without making the token portable to another credentialed
+session. This applies to 2.5, 3.0, and 3.1; endpoint identity is not an
+authenticated session identity. URL userinfo and presigned URLs are rejected
+before the discovered payload can enter durable storage.
+
+Every 2.5 continuation declares `mutation_idempotency_not_guaranteed`.
+3.0/3.1 continuations declare the same loss whenever the seller does not
+advertise a usable replay TTL; accepting an idempotency key alone is not treated
+as evidence that a mutation can be replayed safely. Submitted completions are
+accepted only for the exact seller task ID recorded at dispatch. Unstructured
+or SDK-synthetic terminal errors remain ambiguous and retain the durable fence.
+
+A transport crash becomes `LegacyPurchaseContinuationError` with
+`code: 'ambiguous'`. `reconcileLegacyPurchase(record, exactInput)` receives the
+durable, secret-safe mutation descriptor (`sourceMutationKey`, selected product
+IDs, and a submitted seller task ID when available) plus the exact retry input.
+It must return a schema-valid terminal `create_media_buy` result found by an
+application-owned natural key. The SDK never blindly repeats an ambiguous
+legacy create or persists webhook credentials from the request. For a
+callback-capable continuation store, the reconciled result must include the
+authoritative seller identity in `metadata.serverTaskId` unless the claim
+already durably records it; otherwise the SDK cannot fence later callback
+publication against the reconciled winner and fails closed.
+
+Native 3.2 sellers cannot return `products_available`. A dual-surface 3.2
+server can serve older buyers through explicit legacy `sales` handlers: the
+SDK keeps those routes callable while omitting their names from the compact
+`tools/list` profile. The application still owns the real legacy
+discovery/create context. The SDK does not derive a synthetic legacy proposal
+or create payload from compact terms; the signed reverse-compatibility vector
+tests that `get_products` followed by `create_media_buy` stays entirely on the
+explicit legacy facade.
 Because compact proposals are immutable, refinement places every source under
 a shared principal-scoped execution fence before dispatch. Only a verified
 `unable` result restores that exact source snapshot; a validated successor adds
@@ -170,7 +476,7 @@ ambiguous, disposed, and expired refinements leave the source non-executable.
 | `declineProposals` | `decline_proposals` | proposal-scoped legacy omit | Rejected by default because omit is not a terminal decline and cannot carry the required compact reason/detail. Explicit opt-in reports `proposal_decline_not_terminal` and `proposal_decline_reason_not_forwarded`. |
 | `buyProducts` | `buy_products` | `create_media_buy` | Feed/pricing fencing is not atomic. Rejected by default; explicit opt-in names `feed_version_not_atomic` and, when present, `pricing_version_not_atomic`. Shared package fields and nested targeting/reporting enums map against the negotiated schema, including 3.1+ `format_option_refs`; newer targeting, metric, and postal shapes fail closed. v2.5 also rejects non-empty compact targeting and push notification configuration. A direct compact `total_budget` and fields introduced on the 3.2 established surface—including allocation, budget-cap, bidding, governance, opportunity, and newer package controls—map only on a negotiated 3.2 established lane. Compact `catalog_ids` and resolved `pricing` remain typed unsupported. |
 | `acceptProposal` | `accept_proposal` | `create_media_buy(proposal_id=...)` | A compact-shaped proposal retains strict digest, immutable-snapshot, account-scope, kind/status, and expiry checks. Caller values cannot override digest-bound budget, budget-cap, timezone, or purchase-order terms. An honest 3.0/3.1 proposal remains executable with its ordinary `proposal_id` semantics only after explicit opt-in to `proposal_terms_digest_not_enforced`, `proposal_terms_digest_unavailable`, and `proposal_snapshot_not_immutable` (plus `proposal_hold_not_verifiable` when it has no expiry). The caller supplies the original brand/flight as `established_fallback`; the SDK does not claim those values came from the seller or synthesize a digest. |
-| `controlMediaBuy` | `control_media_buy` | `update_media_buy` | Account, media-buy ID, and a positive revision are required. Revision and identically shaped fields present in the negotiated established schema map directly. v2.5 requires explicit `revision_not_atomic` opt-in and rejects cancellation plus v3-only package controls. Pre-3.2 lanes reject the broader compact optimization-goal union and nested targeting/keyword shapes they cannot represent. Compact `catalog_ids` cannot be cast to established `catalogs` objects, so it fails closed in every established lane. |
+| `controlMediaBuy` | `control_media_buy` | `update_media_buy` | Account, media-buy ID, and a positive revision are required. Revision and identically shaped fields present in the negotiated established schema map directly; `name` maps on the 3.2 established surface and fails closed on 3.0/3.1, whose update schemas do not define it. v2.5 requires explicit `revision_not_atomic` opt-in and rejects cancellation plus v3-only package controls. Pre-3.2 lanes reject the broader compact optimization-goal union and nested targeting/keyword shapes they cannot represent. Compact `catalog_ids` cannot be cast to established `catalogs` objects, so it fails closed in every established lane. |
 | Readback | shared tools | `get_media_buys`, `get_media_buy_delivery` | Same public calls and canonical creative projection in every lane. Versioned request additions fail closed: webhook-activity and delivery-window/granularity options require 3.1+, while `indicator_types`, demographic breakdowns, and spot breakdowns require 3.2. Native postal reporting shapes require 3.1+. |
 
 Lossy mutations are fail-closed. An adopter may opt into only the exact named
@@ -328,7 +634,7 @@ never label the weaker mutation as equivalent.
 
 The coordinator test matrix covers SDK 14 compact-first callers against v2.5,
 3.0, 3.1, 3.2 legacy-only, 3.2 dual-surface (compact preferred and established
-forced), and 3.2 compact-only discovery. Honest raw-MCP 3.0.24, 3.1.15, and
+forced), and 3.2 compact-only discovery. Honest raw-MCP 3.0.25, 3.1.18, and
 3.2 legacy-only fixtures execute direct purchase; pause, resume, cancellation,
 and readback; plus request, finalize, decline, accept, post-accept control, and
 readback for ordinary legacy proposals while

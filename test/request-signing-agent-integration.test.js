@@ -333,7 +333,7 @@ test('3.1 covers_content_digest: forbidden → signer omits content-digest cover
       agentFor(stub.url),
       'create_media_buy',
       { plan_id: 'plan_001' },
-      { adcpVersion: '3.1.15' }
+      { adcpVersion: '3.1.18' }
     );
     const cmb = stub.state.toolCallHeaders.filter(r => r.toolName === 'create_media_buy')[0];
     assert.ok(cmb.headers['signature-input'], 'request is still signed');
@@ -451,9 +451,10 @@ test('customHeaders signing-reserved keys are stripped before signing', async ()
       /keyid="attacker"/,
       'attacker-supplied Signature-Input was overwritten'
     );
-    assert.match(
+    assert.match(call.headers['content-digest'], /^sha-256=:[A-Za-z0-9+/]{43}=:/);
+    assert.notStrictEqual(
       call.headers['content-digest'],
-      /sha-256=:[^A]/,
+      'sha-256=:AAAA:',
       'signer recomputed Content-Digest from the real body'
     );
     assert.strictEqual(call.headers['x-benign-header'], 'yes', 'non-reserved customHeaders still pass through');

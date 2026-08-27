@@ -311,6 +311,7 @@ export {
 export {
   MediaBuyLifecycleCoordinator,
   MediaBuyLifecycleCompatibilityError,
+  LegacyPurchaseContinuationError,
   negotiateMediaBuyLifecycle,
   type CompatibleDeclineProposalsResponse,
   type CompatibleDeclineProposalsWireResponse,
@@ -332,12 +333,63 @@ export {
   type CompatibilityTaskResult,
   type EstablishedProductsWireResponse,
   type EstablishedProposalAcceptanceFallback,
+  type EstablishedProposalTaskReconciliationInput,
   type MediaBuyCompatibility,
   type MediaBuyCompatibilityLoss,
   type MediaBuyCompatibilityReport,
   type MediaBuyLifecycle,
   type MediaBuyLifecycleCoordinatorOptions,
+  type LegacyPurchaseContinuationErrorCode,
 } from './media-buy/compatibility';
+export {
+  InMemoryLegacyPurchaseContinuationStore,
+  createInMemoryLegacyPurchaseContinuationStore,
+  LEGACY_PURCHASE_PUBLICATION_PROOF_RETENTION_MS,
+  legacyPurchaseSettlementFingerprint,
+  type InMemoryLegacyPurchaseContinuationStoreOptions,
+  type LegacyPurchaseBinding,
+  type LegacyPurchaseClaim,
+  type LegacyPurchaseClaimRequest,
+  type LegacyPurchaseClaimResult,
+  type LegacyPurchaseCompleteResult,
+  type LegacyPurchaseContinuationRecord,
+  type LegacyPurchaseContinuationStore,
+  type LegacyPurchaseCreateResult,
+  type LegacyPurchaseLoss,
+  type LegacyPurchaseOperation,
+  type LegacyPurchasePendingSettlement,
+  type LegacyPurchasePendingSettlementResult,
+  type LegacyPurchasePublicationLease,
+  type LegacyPurchaseReconciliationResult,
+  type LegacyPurchaseSourceVersion,
+  type LegacyPurchaseTerminalResult,
+  type ReconcileLegacyPurchase,
+} from './media-buy/legacy-purchase-continuation';
+export {
+  InMemoryEstablishedProposalStore,
+  createInMemoryEstablishedProposalStore,
+  ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS,
+  type EstablishedProposalBinding,
+  type EstablishedProposalCompletionWindow,
+  type EstablishedProposalMutationClaim,
+  type EstablishedProposalMutationBinding,
+  type EstablishedProposalMutationIntent,
+  type EstablishedProposalMutationDisposition,
+  type EstablishedProposalMutationKind,
+  type EstablishedProposalOperation,
+  type EstablishedProposalPutResult,
+  type EstablishedProposalRecord,
+  type EstablishedProposalReserveRequest,
+  type EstablishedProposalReserveResult,
+  type EstablishedProposalScope,
+  type EstablishedProposalSourceVersion,
+  type EstablishedProposalStore,
+  type EstablishedProposalSubmittedOperation,
+  type EstablishedProposalTaskScope,
+  type EstablishedProposalTransitionResult,
+  type InMemoryEstablishedProposalStoreOptions,
+  type ProposalSnapshotEntry,
+} from './media-buy/established-proposal-store';
 export {
   ADCPMultiAgentClient,
   createADCPMultiAgentClient,
@@ -543,7 +595,12 @@ export type {
   SyncCreativesStatusChangeHandler,
   GetProductsStatusChangeHandler,
 } from './core/AsyncHandler';
-export { AsyncHandler, createAsyncHandler } from './core/AsyncHandler';
+export {
+  AsyncHandler,
+  WebhookDedupConflictError,
+  WebhookDedupInputError,
+  createAsyncHandler,
+} from './core/AsyncHandler';
 
 // ====== WHOLESALE FEED WEBHOOKS ======
 export {
@@ -566,6 +623,8 @@ export * from './handlers/types';
 // ====== STORAGE INTERFACES ======
 export type {
   Storage,
+  AtomicTakeStorage,
+  DeferredTaskStorage,
   BatchStorage,
   PatternStorage,
   AgentCapabilities,
@@ -999,16 +1058,10 @@ export type FormatID = never;
 export type BuildCreativeRequest = never;
 /** @deprecated Use `LegacyBuildCreativeResponse`. */
 export type BuildCreativeResponse = never;
-/** @deprecated Use `LegacyPreviewCreativeRequest`. */
-export type PreviewCreativeRequest = never;
-/** @deprecated Use `LegacyPreviewCreativeResponse`. */
-export type PreviewCreativeResponse = never;
 /** @deprecated Use `LegacyBuildCreativePayload`. */
 export type BuildCreativePayload = never;
 /** @deprecated Use `LegacyBuildCreativeMultiPayload`. */
 export type BuildCreativeMultiPayload = never;
-/** @deprecated Use `LegacyPreviewCreativePayload`. */
-export type PreviewCreativePayload = never;
 /** @deprecated Use `LegacyListCreativeFormatsRequest`. */
 export type ListCreativeFormatsRequest = never;
 /** @deprecated Use `LegacyListCreativeFormatsResponse`. */
@@ -1096,6 +1149,7 @@ export type {
   // in core.generated, no longer transitively pulled into tools.generated now
   // that BriefAsset merges its allOf[$ref] base inline.
   CreativeBrief,
+  CompatibilityPurchaseCoordinatorInput,
 } from './types/core.generated';
 
 // ====== WELL-KNOWN FILE TYPES ======
@@ -1211,6 +1265,7 @@ export {
   redisBackend,
   createLazyBackend,
   hashPayload,
+  IdempotencyClaimOwnershipError,
   getServeRequestContext,
   ADCP_SERVE_REQUEST_CONTEXT,
   createA2AAdapter,
@@ -1305,8 +1360,12 @@ export type {
   A2AAdapter,
   A2AAdapterOptions,
   A2AAgentCardOverrides,
+  A2AAgentCapabilitiesOverride,
+  A2AAgentSkillOverride,
   A2AMountOptions,
   ExpressAppLike,
+  LegacyHttpSecurityScheme,
+  LegacySecurityScheme,
   AccountMode,
   RequireCacheScopeWhenProducts,
   ServerPayload,
@@ -1317,6 +1376,8 @@ export type {
   GetMediaBuyDeliveryPayload,
   ListCreativesPayload,
   GetCreativeDeliveryPayload,
+  CanonicalPreviewCreativePayload,
+  PreviewCreativePayload,
   LegacyGetProductsPayload,
   LegacyCreateMediaBuyPayload,
   LegacyUpdateMediaBuyPayload,
@@ -1678,6 +1739,8 @@ export {
   CreativeFormatProjectionError,
   type LegacyFormatConversionContext,
   type LegacyFormatConverter,
+  type LegacyFormatResolutionContext,
+  type LegacyFormatResolver,
   legacyFormatConverterFromCatalogSnapshots,
   canonicalFormatLegacyResolverFromCatalogSnapshots,
   canonicalFormatLegacyResolverFromRoutes,
@@ -1723,6 +1786,10 @@ export {
   type CanonicalPackage as Package,
   type CanonicalPlacement,
   type CanonicalPlacement as Placement,
+  type CanonicalPreviewCreativeRequest,
+  type CanonicalPreviewCreativeRequest as PreviewCreativeRequest,
+  type CanonicalPreviewCreativeResponse,
+  type CanonicalPreviewCreativeResponse as PreviewCreativeResponse,
   type CanonicalProduct,
   type CanonicalProduct as Product,
   type CanonicalProjectedCreative,
@@ -1964,7 +2031,7 @@ export {
   VERSION_INFO,
 } from './version';
 export type { AdcpVersion } from './version';
-export { resolveAdcpVersion } from './utils/adcp-version-config';
+export { listBundledAdcpVersions, resolveAdcpVersion } from './utils/adcp-version-config';
 
 // ====== OBSERVABILITY ======
 // OpenTelemetry tracing utilities (no-op if @opentelemetry/api not installed)
@@ -2094,6 +2161,7 @@ export {
   divergenceOffset,
   translateUniversalMacros,
   UnsafeNativeMappingError,
+  compileUniversalMacroTemplate,
 } from './substitution';
 export type {
   ObserverFetchOptions,
@@ -2109,6 +2177,18 @@ export type {
   TrackerUrlRecord,
   MacroMapping,
   TranslateResult,
+  BuiltInSourceMacroSyntax,
+  CompileUniversalMacroTemplateInput,
+  CompileUniversalMacroTemplateResult,
+  CustomSourceMacroSyntax,
+  MacroDocumentationReference,
+  SourceMacroMapping,
+  SourceMacroRequirement,
+  SourceMacroRequirementSatisfaction,
+  SourceMacroSyntax,
+  SourceMacroSyntaxDeclaration,
+  UniversalMacroCompileDiagnostic,
+  UniversalMacroOccurrence,
 } from './substitution';
 
 // ====== TEST HELPERS ======

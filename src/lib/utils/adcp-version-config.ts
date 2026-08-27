@@ -15,6 +15,22 @@
 import { ADCP_VERSION, COMPATIBLE_ADCP_VERSIONS, parseAdcpMajorVersion } from '../version';
 import { ConfigurationError } from '../errors';
 import { hasSchemaBundle, resolveBundleKey, toReleasePrecisionWire } from '../validation/schema-loader';
+import { gte as semverGte, valid as validSemver } from 'semver';
+
+function comparableAdcpSemver(version: string): string | undefined {
+  const match = /^v?(\d+)\.(\d+)(?:\.(\d+))?((?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/.exec(version.trim());
+  if (!match) return undefined;
+  const normalized = `${match[1]}.${match[2]}.${match[3] ?? '0'}${match[4] ?? ''}`;
+  return validSemver(normalized) ?? undefined;
+}
+
+/** Compare full-semver and release-precision AdCP identifiers safely. */
+export function isAdcpVersionAtLeast(version: string | undefined, minimum: string): boolean {
+  if (version === undefined) return false;
+  const comparable = comparableAdcpSemver(version);
+  const comparableMinimum = comparableAdcpSemver(minimum);
+  return comparable !== undefined && comparableMinimum !== undefined && semverGte(comparable, comparableMinimum);
+}
 
 /**
  * Resolve and validate a configured `adcpVersion`. Returns the value to store
@@ -46,7 +62,7 @@ export function resolveAdcpVersion(adcpVersion: string | undefined): string {
     throw new ConfigurationError(
       `adcpVersion ${JSON.stringify(adcpVersion)} is not a valid AdCP version. ` +
         `Expected a semver string (e.g. '3.0.1', '3.1.0-beta.1') or a legacy alias. ` +
-        `Currently bundled: ${listBundledVersions().join(', ')}.`,
+        `Currently bundled: ${listBundledAdcpVersions().join(', ')}.`,
       'adcpVersion'
     );
   }
@@ -64,7 +80,7 @@ export function resolveAdcpVersion(adcpVersion: string | undefined): string {
     throw new ConfigurationError(
       `adcpVersion ${JSON.stringify(adcpVersion)} resolves to bundle key "${resolvedKey}", ` +
         `but no schema bundle for that key ships with this SDK build. ` +
-        `Currently bundled: ${listBundledVersions().join(', ')}. ` +
+        `Currently bundled: ${listBundledAdcpVersions().join(', ')}. ` +
         `If you're testing against a beta that the spec repo has tagged but the SDK hasn't synced yet, ` +
         `run \`npm run sync-schemas\` and \`npm run build:lib\` to populate the cache, ` +
         `then re-construct.`,
@@ -133,6 +149,25 @@ export function isPre31AdcpVersion(version: string | undefined): boolean {
   return Number.isFinite(minor) && minor < 1;
 }
 
+/** Whether a release pin predates the canonical creative identity surface in AdCP 3.2. */
+export function isPre32AdcpVersion(version: string | undefined): boolean {
+  if (version === undefined) return false;
+  const trimmed = version.trim();
+  if (trimmed.length === 0) return false;
+
+  const withoutLegacyPrefix = trimmed.startsWith('v') ? trimmed.slice(1) : trimmed;
+  const match = /^(\d+)(?:\.(\d+))?/.exec(withoutLegacyPrefix);
+  if (!match?.[1]) return false;
+
+  const major = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(major)) return false;
+  if (major < 3) return true;
+  if (major > 3) return false;
+
+  const minor = match[2] === undefined ? 0 : Number.parseInt(match[2], 10);
+  return Number.isFinite(minor) && minor < 2;
+}
+
 /**
  * Does the seller authoritatively advertise AdCP 3.1+ support?
  *
@@ -197,7 +232,7 @@ function prereleaseFamilyAlias(version: string): string | undefined {
  * Always includes `ADCP_VERSION` even when its bundle hasn't been built yet
  * (dev-tree case) so the error remains actionable on first build.
  */
-function listBundledVersions(): string[] {
+export function listBundledAdcpVersions(): string[] {
   const bundled = COMPATIBLE_ADCP_VERSIONS.filter(v => hasSchemaBundle(v));
   if (!bundled.includes(ADCP_VERSION as (typeof COMPATIBLE_ADCP_VERSIONS)[number])) {
     return [ADCP_VERSION, ...bundled];

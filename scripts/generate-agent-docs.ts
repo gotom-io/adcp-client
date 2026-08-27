@@ -190,8 +190,8 @@ function fieldType(prop: any): string {
   if (prop.enum) return prop.enum.map((v: string) => `'${v}'`).join(' | ');
   if (prop.const) return `'${prop.const}'`;
   if (prop.type === 'array') {
-    const itemType = prop.items?.title || prop.items?.type || 'object';
-    return `${itemType}[]`;
+    const itemType = fieldType(prop.items) || 'object';
+    return itemType.includes(' | ') ? `(${itemType})[]` : `${itemType}[]`;
   }
   if (prop.type === 'object' && prop.title) return prop.title;
   if (prop.$ref) {
@@ -553,9 +553,14 @@ function generateLlmsTxt(
   ln(`import { serve } from '@adcp/sdk';`);
   ln(`import {`);
   ln(`  createAdcpServerFromPlatform,`);
+  ln(`  createIdempotencyStore,`);
   ln(`  definePlatform,`);
   ln(`  defineSignalsPlatform,`);
+  ln(`  memoryBackend,`);
   ln(`} from '@adcp/sdk/server';`);
+  ln();
+  ln(`// Single-process example. Use pgBackend(pool) or redisBackend(client) in production.`);
+  ln(`const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });`);
   ln();
   ln(`const platform = definePlatform({`);
   ln(`  capabilities: {`);
@@ -574,11 +579,12 @@ function generateLlmsTxt(
   ln(`serve(() => createAdcpServerFromPlatform(platform, {`);
   ln(`  name: 'My Signals Agent',`);
   ln(`  version: '1.0.0',`);
+  ln(`  idempotency,`);
   ln(`})); // http://localhost:3001/mcp`);
   ln('```');
   ln();
   ln(
-    `Compile-time enforcement: \`RequiredPlatformsFor<S>\` catches missing specialism methods. Capability projection auto-derives \`get_adcp_capabilities\` blocks (\`audience_targeting\`, \`conversion_tracking\`, \`compliance_testing.scenarios\`, etc.). Idempotency, RFC 9421 signing, async tasks, and status normalization are framework-owned. Synchronous terminal responses do not emit completion webhooks by default; \`autoEmitCompletionWebhooks: true\` is available only as a non-conformant compatibility extension.`
+    `Compile-time enforcement: \`RequiredPlatformsFor<S>\` catches missing specialism methods. Capability projection auto-derives \`get_adcp_capabilities\` blocks (\`audience_targeting\`, \`conversion_tracking\`, \`compliance_testing.scenarios\`, etc.). Idempotency, RFC 9421 signing, async tasks, and status normalization are framework-owned. Under AdCP 3.2, synchronous terminal responses remain silent on the task-webhook channel; the deprecated \`autoEmitCompletionWebhooks\` option is ignored.`
   );
   ln();
   ln(
@@ -751,7 +757,7 @@ function generateLlmsTxt(
   ln('```');
   ln();
   ln(
-    `For exhaustive handling across all seven statuses, prefer the \`match()\` dispatcher (fluent method on every result returned from the SDK, or free function import):`
+    `For exhaustive handling across all eight statuses, prefer the \`match()\` dispatcher (fluent method on every result returned from the SDK, or free function import):`
   );
   ln();
   ln('```typescript');
@@ -762,6 +768,7 @@ function generateLlmsTxt(
   ln("  'governance-denied': r => `Denied: ${r.adcpError?.code ?? r.error}`,");
   ln('  working: r => `Running: ${r.metadata.taskId}`,');
   ln("  'input-required': r => `Needs input: ${r.metadata.inputRequest?.question}`,");
+  ln("  'auth-required': r => `Needs authorization: ${r.metadata.taskId}`,");
   ln('  deferred: r => `Deferred: ${r.deferred?.token}`,');
   ln('});');
   ln('// Optional `_` catchall makes every arm optional:');
@@ -1101,6 +1108,16 @@ function generateLlmsTxt(
   ln(`| \`Targeting\` | Audience criteria (geo, demo, behavioral, contextual, device) |`);
   ln(`| \`PricingOption\` | Price model (CPM, vCPM, CPC, CPCV, CPV, CPP, CPA, FlatRate, Time) |`);
   ln(`| \`GovernanceConfig\` | Buyer-side governance middleware config |`);
+  ln(
+    `| \`EstablishedProposalStore\` | Durable 3.0/3.1 proposal snapshots, atomic mutation fences, seven-day completion proofs, pruning, and submitted-task reconciliation |`
+  );
+  ln(
+    `| \`WebhooksConfig.tenantScope\` | Explicit trusted webhook namespace for a genuinely single-tenant server; multi-tenant servers derive scope per request |`
+  );
+  ln();
+  ln(
+    `Production webhook publishers may construct an unbound emitter and call \`forTenantScope(trustedTenant)\` before every delivery. Direct unbound \`emit()\` fails before checkpointing or network access. \`createAdcpServer\` derives scope from trusted request context; configure \`webhooks.tenantScope\` only for a genuinely single-tenant factory.`
+  );
   ln();
 
   // --- Task statuses ---
@@ -1109,7 +1126,12 @@ function generateLlmsTxt(
   ln(`Every tool call returns a \`TaskResult\` with one of these statuses:`);
   ln();
   ln(`- \`completed\` — Success. Data in \`result.data\`.`);
-  ln(`- \`input-required\` — Agent needs clarification. Use \`InputHandler\` or \`result.deferred.resume(answer)\`.`);
+  ln(
+    `- \`input-required\` — Agent needs clarification. On A2A, when the seller returns a task ID, an \`InputHandler\` can continue the exchange and a handler-less call exposes \`result.deferred.resume(answer)\` for that exact task. A2A without a task ID and all MCP pauses return without invoking an input handler or attaching a resume closure; use an application/protocol-specific recovery path.`
+  );
+  ln(
+    `- \`auth-required\` — Agent requires refreshed authorization. Resume only when the returned A2A pause carries an exact-task continuation; otherwise use an application/protocol-specific recovery path.`
+  );
   ln(`- \`submitted\` — Long-running. Poll via \`result.submitted.waitForCompletion()\` or use webhooks.`);
   ln(`- \`working\` — In progress (intermediate, usually not seen by callers).`);
   ln(`- \`deferred\` — Requires human decision. Token in \`result.deferred.token\`.`);
@@ -1229,7 +1251,7 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`interface TaskResult<T = any> {`);
   ln(`  success: boolean;`);
   ln(`  status: 'completed' | 'deferred' | 'submitted' | 'input-required'`);
-  ln(`        | 'working' | 'governance-denied';`);
+  ln(`        | 'auth-required' | 'working' | 'failed' | 'governance-denied';`);
   ln(`  data?: T;`);
   ln(`  error?: string;`);
   ln(`  deferred?: DeferredContinuation<T>;`);
@@ -1237,12 +1259,17 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  governance?: GovernanceCheckResult;`);
   ln(`  metadata: {`);
   ln(`    taskId: string;`);
+  ln(`    contextId?: string;         // Seller conversation identity`);
+  ln(`    serverTaskId?: string;      // AdCP tasks/get work handle`);
+  ln(`    a2aTaskId?: string;         // Live A2A transport Task.id for threading`);
   ln(`    taskName: string;`);
   ln(`    agent: { id: string; name: string; protocol: string };`);
   ln(`    responseTimeMs: number;`);
   ln(`    timestamp: string;`);
   ln(`    clarificationRounds: number;`);
   ln(`    adcpVersion?: string;        // Seller-served release-precision response adcp_version`);
+  ln(`    serverVersion?: 'v2' | 'v3'; // Seller wire generation selected by capability discovery`);
+  ln(`    serverVersionSynthetic?: boolean; // True when generation came from the SDK fallback`);
   ln(`  };`);
   ln(`  conversation?: Message[];`);
   ln(`}`);
@@ -1290,6 +1317,120 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  deferToHuman(): Promise<{ defer: true; token: string }>;`);
   ln(`  abort(reason?: string): never;`);
   ln(`}`);
+  ln();
+  ln(
+    `interface EstablishedProposalScope { principalScope: string; sellerScope: string; sourceAdcpVersion: '3.0' | '3.1'; }`
+  );
+  ln(`interface EstablishedProposalTaskScope extends EstablishedProposalScope { accountScope: string; }`);
+  ln(`interface EstablishedProposalBinding extends EstablishedProposalTaskScope { proposalId: string; }`);
+  ln(
+    `interface EstablishedProposalMutationBinding extends EstablishedProposalBinding { snapshotFingerprint: string; }`
+  );
+  ln(
+    `interface ProposalSnapshotEntry extends EstablishedProposalBinding { proposal: Record<string, unknown>; expiresAt?: string; canonicalTermsDigest?: string; snapshotFingerprint: string; capturedAt: string; }`
+  );
+  ln(
+    `type EstablishedProposalOperation = { state: 'available' } | { state: 'reserved' | 'retryable'; operation: 'accept' | 'refine' | 'decline'; operationKey: string; requestFingerprint: string; idempotencyKey?: string; reservedAt: string; retryExpiresAt?: string; sellerTaskId?: string; ambiguity?: 'paused' | 'commit-uncertain' } | { state: 'terminal'; disposition: 'accepted' | 'refined' | 'declined' | 'commit-uncertain'; terminalResultFingerprint?: string; operation: 'accept' | 'refine' | 'decline'; operationKey: string; requestFingerprint: string; idempotencyKey?: string; reservedAt: string; retryExpiresAt?: string; sellerTaskId?: string; };`
+  );
+  ln(
+    `interface EstablishedProposalRecord { snapshot: ProposalSnapshotEntry; operation: EstablishedProposalOperation; }`
+  );
+  ln(
+    `interface EstablishedProposalReserveRequest { bindings: readonly EstablishedProposalMutationBinding[]; claim: { operation: 'accept' | 'refine' | 'decline'; operationKey: string; requestFingerprint: string; idempotencyKey?: string; retryTtlMs?: number; }; }`
+  );
+  ln(
+    `type EstablishedProposalPutResult = { outcome: 'stored' | 'unchanged' | 'fenced'; record: EstablishedProposalRecord } | { outcome: 'missing' | 'capacity' };`
+  );
+  ln(
+    `type EstablishedProposalReserveResult = { outcome: 'reserved'; records: EstablishedProposalRecord[]; retry: boolean } | { outcome: 'missing' | 'expired' | 'in_flight' | 'ambiguous' | 'terminal' | 'conflict' | 'capacity'; records: EstablishedProposalRecord[] };`
+  );
+  ln(
+    `type EstablishedProposalTransitionResult = { outcome: 'updated'; records: EstablishedProposalRecord[] } | { outcome: 'missing' | 'conflict' | 'capacity'; records: EstablishedProposalRecord[] };`
+  );
+  ln(`const ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS = 604800000;`);
+  ln(`interface EstablishedProposalCompletionWindow { completedAt: string; retainUntil: string; }`);
+  ln(
+    `interface EstablishedProposalSubmittedOperation { request: EstablishedProposalReserveRequest; records: EstablishedProposalRecord[]; sellerTaskId: string; settled?: boolean; completion?: EstablishedProposalCompletionWindow; }`
+  );
+  ln();
+  ln(`interface EstablishedProposalStore {`);
+  ln(
+    `  putSnapshot(snapshot: ProposalSnapshotEntry, expectedSnapshotFingerprint?: string): Promise<EstablishedProposalPutResult>;`
+  );
+  ln(
+    `  discardSnapshot(binding: EstablishedProposalBinding, expectedSnapshotFingerprint: string): Promise<'discarded' | 'missing' | 'fenced'>;`
+  );
+  ln(`  get(binding: EstablishedProposalBinding): Promise<EstablishedProposalRecord | undefined>;`);
+  ln(`  find(scope: EstablishedProposalScope, proposalIds: readonly string[]): Promise<EstablishedProposalRecord[]>;`);
+  ln(
+    `  findSubmittedTask(scope: EstablishedProposalTaskScope, sellerTaskId: string): Promise<EstablishedProposalSubmittedOperation | undefined>;`
+  );
+  ln(
+    `  /** Any retained tombstone with this operationKey returns conflict, even if claim or binding evidence differs. */`
+  );
+  ln(`  reserveMutation(request: EstablishedProposalReserveRequest): Promise<EstablishedProposalReserveResult>;`);
+  ln(
+    `  completeMutation(request: EstablishedProposalReserveRequest, disposition: 'accepted', terminalResultFingerprint: string): Promise<EstablishedProposalTransitionResult>;`
+  );
+  ln(
+    `  completeRefinement(request: EstablishedProposalReserveRequest, replacements: readonly ProposalSnapshotEntry[], retainedBindings?: readonly EstablishedProposalMutationBinding[]): Promise<EstablishedProposalTransitionResult>;`
+  );
+  ln(
+    `  completeDecline(request: EstablishedProposalReserveRequest, retainedBindings?: readonly EstablishedProposalMutationBinding[]): Promise<EstablishedProposalTransitionResult>;`
+  );
+  ln(`  pruneCompletionTombstones?(limit?: number): Promise<number>;`);
+  ln(`  releaseMutation(request: EstablishedProposalReserveRequest): Promise<EstablishedProposalTransitionResult>;`);
+  ln(
+    `  recordSubmittedTask(request: EstablishedProposalReserveRequest, sellerTaskId: string): Promise<EstablishedProposalTransitionResult>;`
+  );
+  ln(
+    `  markAmbiguous(request: EstablishedProposalReserveRequest, ambiguity: 'paused' | 'commit-uncertain'): Promise<EstablishedProposalTransitionResult>;`
+  );
+  ln(`}`);
+  ln();
+  ln(`// After restart: lifecycle.reconcileEstablishedProposalTask({ account, sellerTaskId })`);
+  ln('```');
+  ln();
+
+  ln(`## Production Webhook Tenant Binding`);
+  ln();
+  ln(
+    `An unbound production \`WebhookEmitter\` is safe to construct with a stable \`publisherScope\`, durable delivery store, and durable recovery outbox. It refuses direct emission until trusted tenant scope is bound:`
+  );
+  ln();
+  ln('```typescript');
+  ln(`interface WebhookEmitter {`);
+  ln(`  emit(params: WebhookEmitParams): Promise<WebhookEmitResult>;`);
+  ln(`  forTenantScope(tenantScope: string): WebhookEmitter;`);
+  ln(`}`);
+  ln(`interface RecoverableWebhookEmitter extends WebhookEmitter {`);
+  ln(`  emitRecovered(delivery: WebhookRecoveredDelivery): Promise<WebhookEmitResult>;`);
+  ln(`  forTenantScope(tenantScope: string): RecoverableWebhookEmitter;`);
+  ln(`}`);
+  ln();
+  ln(`// Relevant WebhooksConfig fields (other signing and delivery fields omitted):`);
+  ln(`interface WebhooksConfig {`);
+  ln(`  publisherScope?: string; // defaults to the trusted server name`);
+  ln(`  tenantScope?: string;    // explicit trusted single-tenant fallback only`);
+  ln(`}`);
+  ln();
+  ln(
+    `const publisher = createWebhookEmitter({ publisherScope: 'publisher', deliveryStore, deliveryRecovery, signerKey });`
+  );
+  ln(`await publisher.forTenantScope(authenticatedTenant).emit(params);`);
+  ln();
+  ln(`createAdcpServer({`);
+  ln(`  name: 'publisher',`);
+  ln(`  version: '1.0.0',`);
+  ln(`  // Multi-tenant: omit tenantScope; trusted request context is required.`);
+  ln(`  webhooks: { signerKey, deliveryStore, deliveryRecovery },`);
+  ln(`});`);
+  ln(`createAdcpServer({`);
+  ln(`  name: 'publisher',`);
+  ln(`  version: '1.0.0',`);
+  ln(`  // Genuinely single-tenant: configure the trusted fallback explicitly.`);
+  ln(`  webhooks: { signerKey, deliveryStore, deliveryRecovery, tenantScope: 'tenant-a' },`);
+  ln(`});`);
   ln('```');
   ln();
 

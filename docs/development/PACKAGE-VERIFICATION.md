@@ -92,8 +92,10 @@ façade contract becomes unsafe.
 
 ## `npm run verify:package` — clean-room dual-format smoke
 
-`scripts/verify-package.mjs` packs a tarball, installs it plus its **required**
-peers pinned to their **range floors** into a throwaway dir under `os.tmpdir()`
+`scripts/verify-package.mjs` packs a tarball and first installs it with pnpm's
+seven-day `minimumReleaseAge` policy in a throwaway project. It then installs
+the tarball plus its **required** peers pinned to their **range floors** and
+`tldts@7.0.0` into another throwaway dir under `os.tmpdir()`
 (outside the workspace, so npm resolution is honest and not monorepo-deduped),
 then loads the main, enums, server, testing, and schemas entry points through
 both a real ESM `import` and a real CJS `require`, asserting each loads and
@@ -102,9 +104,10 @@ surface from `.mts` and `.cts` consumers. `server` is included so the
 `@a2a-js/sdk` peer gets real ESM/CJS load coverage through a dedicated
 entrypoint. Optional peers
 (`peerDependenciesMeta`) are **not** installed — no tested subpath loads them,
-so pinning them would add only install weight and registry-flake surface. It
-uses `npm install` in the temp dir (never workspace pnpm/catalog) and cleans up
-on exit. Requires a prior `npm run build:lib`.
+so pinning them would add only install weight and registry-flake surface. The
+floor/load smoke uses `npm install` (never workspace pnpm/catalog), and both
+temporary projects are cleaned up on exit. Requires pnpm 10.19 or newer, plus a
+prior `npm run build:lib`.
 
 This is what catches a peer floor that is declared lower than the code needs:
 CJS named-import interop can mask a too-low pin, but a real ESM import surfaces
@@ -118,12 +121,12 @@ listed for completeness but the smoke does not install them.)
 
 | Peer | Floor | How the SDK uses it | Why the floor |
 | --- | --- | --- | --- |
-| `@a2a-js/sdk` | `^0.3.13` | `@adcp/sdk/server` imports `agentCardHandler` from `@a2a-js/sdk/server/express` | That subpath first exists in 0.3.13 (see the #2344 changeset). |
+| `@a2a-js/sdk` | `^1.0.1` | Client and server use the official 1.0 Agent Card, JSON-RPC transport, extension activation, and compatibility APIs | AdCP 3.2 normatively profiles A2A 1.0 and requires the `https://adcontextprotocol.org/extensions/adcp/v3` extension. |
 | `@modelcontextprotocol/sdk` | `^1.24.0` | `src/lib/server/{serve,tasks,postgres-task-store}.ts` import `@modelcontextprotocol/sdk/experimental/tasks/*` | `experimental/tasks/stores/in-memory.js` first ships in **1.24.0** (absent in 1.23.1). The main entry eagerly loads `server/tasks`, so any consumer importing `@adcp/sdk` on `< 1.24.0` hits `ERR_MODULE_NOT_FOUND`. Corrected from an earlier `^1.17.5`. |
-| `zod` | `^4.1.5` | Bare `import … from 'zod'` only (no `zod/v4` subpaths); top-level v4 API | v4 top-level surface; loads at floor. Dev pin `^4.1.12` is a patch-level gap. |
+| `zod` | `^4.1.5` | Bare `import … from 'zod'` only (no `zod/v4` subpaths); top-level v4 API | v4 top-level surface; loads at the supported peer floor while development tracks the current compatible 4.x release. |
 | `@opentelemetry/api` | `^1.0.0` (optional) | Metrics/tracing | Stable 1.x API. Not installed by the smoke. |
 | `pg` | `^8.0.0` (optional) | `postgres-task-store` | Stable 8.x `Pool`/`Client` API. Not installed by the smoke. |
-| `redis` | `^4.6.0 \|\| ^5.0.0` (optional) | Redis-backed stores | Both major lines supported. Not installed by the smoke. |
+| `redis` | `^4.6.0 \|\| ^5.0.0 \|\| ^6.0.0` (optional) | Redis-backed stores | All three supported major lines use the async client APIs consumed by the SDK. Not installed by the smoke. |
 
 When a floor changes, update both `package.json#peerDependencies` and this
 table, then rerun `verify:package` to confirm the new floor loads.

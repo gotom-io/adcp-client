@@ -18,6 +18,7 @@ import {
 } from '../../protocols';
 import { getCapturesFromError, withRawResponseCapture, type RawHttpCapture } from '../../protocols/rawResponseCapture';
 import { defaultStoryboardResponseProjection, executeStoryboardTask } from './task-map';
+import { applyFunctionalRequestSigning } from './request-signing/functional-dispatch';
 import {
   extractContextWithProvenance,
   injectContext,
@@ -82,8 +83,9 @@ import {
 } from './probes';
 import { readBrandJsonUrl } from '../../signing/agent-resolver/capabilities-types';
 import { selectAgentByUrl } from '../../signing/agent-resolver/select-agent';
-import { selectProbeTask, validateTestKit } from './test-kit';
+import { resolveDeclaredTestKit, selectProbeTask, validateTestKit } from './test-kit';
 import { validateStoryboardShape } from './loader';
+import { trustedStoryboardComplianceRoot } from './provenance';
 import { probeRequestSigningVector } from './request-signing/probe-dispatch';
 import { createWebhookReceiver, type WebhookReceiver, type WebhookWaitResult } from './webhook-receiver';
 import { WEBHOOK_ASSERTION_TASKS, armWebhookAssertions, executeWebhookAssertionStep } from './webhook-assertions';
@@ -224,7 +226,8 @@ export function applyStoryboardVersionOptions(
 ): StoryboardRunOptions {
   const versioned = applyAdcpVersionRunOptions(storyboard.adcp_version, options);
   const mayInheritStoryboardDir = options.adcpVersion === undefined || options.adcpVersion === storyboard.adcp_version;
-  const complianceDir = versioned.complianceDir ?? (mayInheritStoryboardDir ? storyboard.compliance_dir : undefined);
+  const complianceDir =
+    versioned.complianceDir ?? (mayInheritStoryboardDir ? trustedStoryboardComplianceRoot(storyboard) : undefined);
   return complianceDir && versioned.complianceDir !== complianceDir ? { ...versioned, complianceDir } : versioned;
 }
 
@@ -1269,6 +1272,15 @@ export async function runStoryboard(
   return withMCPConnectionScope(
     async () => {
       options = applyStoryboardVersionOptions(storyboard, options);
+      options = applyFunctionalRequestSigning(options, {
+        ...(options.complianceDir && { complianceDir: options.complianceDir }),
+        ...(options.adcpVersion && { version: options.adcpVersion }),
+      });
+      // adcp#6735 — a declared prerequisites.test_kit is a loading directive,
+      // not decoration: resolve it into options.test_kit (caller-supplied
+      // kits win) so from_test_kit / $test_kit.* references get the
+      // credential the storyboard was authored against.
+      options = resolveDeclaredTestKit(storyboard, options);
       options = { ...options, transport: normalizeTransportOptions(options.transport) };
       const schemaRoot = getRunSchemaRoot(options);
       if (schemaRoot) {
@@ -4315,6 +4327,13 @@ export async function runStoryboardStep(
     async () => {
       validateStoryboardShape(storyboard);
       options = applyStoryboardVersionOptions(storyboard, options);
+      options = applyFunctionalRequestSigning(options, {
+        ...(options.complianceDir && { complianceDir: options.complianceDir }),
+        ...(options.adcpVersion && { version: options.adcpVersion }),
+      });
+      // adcp#6735 — same declared-kit resolution as runStoryboard, so the
+      // printed fix_command path exercises the step with its real credential.
+      options = resolveDeclaredTestKit(storyboard, options);
       const schemaRoot = getRunSchemaRoot(options);
       if (schemaRoot) {
         return await withExternalSchemaRoot(schemaRoot.adcpVersion, schemaRoot.schemaRoot, () =>
@@ -4940,8 +4959,26 @@ async function executeStep(
   // Missing-field vectors stay on the SDK transport with the skip flags below
   // so Streamable HTTP session setup completes before the malformed tool call
   // reaches the seller handler.
-  const rawProbeHeaders: Record<string, string> | undefined =
-    step.auth !== undefined ? authHeadersForStep(step.auth, options) : undefined;
+  let rawProbeHeaders: Record<string, string> | undefined;
+  try {
+    rawProbeHeaders = step.auth !== undefined ? authHeadersForStep(step.auth, options) : undefined;
+  } catch (err) {
+    // adcp#6735 — an unresolvable from_test_kit credential is a step-level
+    // configuration failure with an explicit message, never a silent
+    // unauthenticated probe (and never a whole-run crash).
+    return {
+      step_id: step.id,
+      phase_id: phaseId,
+      title: step.title,
+      task: step.task,
+      passed: false,
+      duration_ms: 0,
+      validations: [],
+      context,
+      error: `Step auth configuration error: ${err instanceof Error ? err.message : String(err)}`,
+      extraction: { path: 'none' },
+    };
+  }
   const useRawProbe = rawProbeHeaders !== undefined;
 
   let taskResult: TaskResult | undefined;
@@ -5228,6 +5265,7 @@ async function executeStep(
     taskResult?.adcp_error?.code === 'request_signature_required' &&
     Array.isArray(requiredForSigning) &&
     requiredForSigning.includes(effectiveStep.task) &&
+    options.functional_request_signing === undefined &&
     runState.storyboardRequiresRequestSigner !== true
   ) {
     const next = getNextStepPreview(step.id, allSteps, context, runState.runnerVars);
@@ -5449,6 +5487,7 @@ async function executeStep(
       taskName: effectiveStep.task,
       ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
       ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+      strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
       ...(validationTaskResult && { taskResult: validationTaskResult }),
       ...(httpResult && { httpResult }),
       agentUrl: runState.agentUrl,
@@ -5558,6 +5597,7 @@ async function executeStep(
       taskName: effectiveStep.task,
       ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
       ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+      strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
       ...(validationTaskResult && { taskResult: validationTaskResult }),
       agentUrl: runState.agentUrl,
       contributions: runState.contributions,
@@ -6317,6 +6357,7 @@ async function executeProbeStep(
     taskName: step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK ? 'context_match' : step.task,
     ...(options.adcpVersion && { adcpVersion: options.adcpVersion }),
     ...(options._serverAdcpVersion && { responseAdcpVersion: options._serverAdcpVersion }),
+    strictResponseSchemaValidation: options.strictResponseSchemaValidation !== false,
     httpResult: redactedHttpResult,
     ...(step.task === REPLAY_TRUSTED_MATCH_CONTEXT_VECTOR_TASK &&
       redactedHttpResult && {
@@ -7189,10 +7230,9 @@ function findPriorProbe(priorStepResults: Map<string, StoryboardStepResult>): Ht
  * Reduce the captured fetch traffic for an A2A step into the
  * `A2ATaskEnvelope` validations consume. The A2A SDK fires multiple
  * requests per call (`/.well-known/agent-card.json` discovery on
- * fresh clients, then a `message/send` POST), and a single dispatch
- * may also poll `tasks/get` afterwards. We pick the capture whose
- * REQUEST body declares `method: 'message/send'`; if no capture
- * declares the method we fall back to the last POST with a
+ * fresh clients, then a `SendMessage` POST), and a single dispatch
+ * may also poll `GetTask` afterwards. We prefer a response carrying
+ * an A2A Task; if none does, we fall back to the last POST with a
  * JSON-RPC-shaped body. GET captures and non-JSON bodies are
  * skipped — `undefined` here surfaces as `not_applicable` in the
  * validator, which is more useful than a garbage envelope.
@@ -7217,11 +7257,11 @@ function parseLastA2aMessageSendCapture(captures: readonly RawHttpCapture[]): A2
     if (lastPostIdx === -1) lastPostIdx = i;
     // The fetch wrapper doesn't capture the request body, so disambiguate
     // by parsing the response and checking for an A2A `Task` shape on
-    // the result. `tasks/get` and `message/send` both return tasks, but
-    // only `message/send` is the immediate response we want to assert
+    // the result. `GetTask` and `SendMessage` both return tasks, but
+    // only `SendMessage` is the immediate response we want to assert
     // on for submitted-arm shape checks. When the runner adds polling,
-    // we'd need request-body capture to distinguish reliably; for v0
-    // the last POST is `message/send` because the SDK doesn't poll
+    // we'd need request-body capture to distinguish reliably; currently
+    // the last POST is `SendMessage` because the SDK doesn't poll
     // synchronously after a Task with terminal state.
     if (messageSendIdx === -1) {
       const env = tryParseJsonRpcEnvelope(cap.body);
@@ -7243,13 +7283,14 @@ function parseLastA2aMessageSendCapture(captures: readonly RawHttpCapture[]): A2
   // `envelope.result` keeps presence-of-key fidelity for validators
   // that need to distinguish "result was null" from "result was
   // omitted". Both paths run through `redactSecrets`.
-  const redactedResult = envelope.result !== undefined ? redactSecrets(envelope.result) : null;
+  const redactedWireResult = envelope.result !== undefined ? redactSecrets(envelope.result) : null;
+  const redactedResult = normalizeCapturedA2AResult(redactedWireResult);
   return {
     result: redactedResult,
     envelope: {
       ...(envelope.jsonrpc !== undefined && { jsonrpc: envelope.jsonrpc }),
       ...(envelope.id !== undefined && { id: envelope.id }),
-      ...(envelope.result !== undefined && { result: redactedResult }),
+      ...(envelope.result !== undefined && { result: redactedWireResult }),
       ...(envelope.error !== undefined && { error: redactSecrets(envelope.error) }),
     },
     http_status: cap.status,
@@ -7273,12 +7314,17 @@ function tryParseJsonRpcEnvelope(
 }
 
 function isTaskShape(result: unknown): boolean {
-  return (
-    result != null &&
-    typeof result === 'object' &&
-    !Array.isArray(result) &&
-    (result as { kind?: unknown }).kind === 'task'
-  );
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return false;
+  const record = result as Record<string, unknown>;
+  if (record.kind === 'task') return true;
+  if (record.task != null && typeof record.task === 'object' && !Array.isArray(record.task)) return true;
+  return typeof record.id === 'string' && record.status != null && typeof record.status === 'object';
+}
+
+function normalizeCapturedA2AResult(result: unknown): unknown {
+  if (result == null || typeof result !== 'object' || Array.isArray(result)) return result;
+  const record = result as Record<string, unknown>;
+  return record.task != null && typeof record.task === 'object' && !Array.isArray(record.task) ? record.task : result;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -7413,6 +7459,18 @@ function authHeadersForStep(directive: StepAuthDirective, options: StoryboardRun
     value = directive.value;
   } else if ('from_test_kit' in directive && directive.from_test_kit) {
     value = options.test_kit?.auth?.api_key;
+    if (!value) {
+      // adcp#6735 — hard-fail instead of silently degrading to an
+      // unauthenticated probe: a probe with no credential cannot test a
+      // credential-keyed contract, and the resulting 401 grades a
+      // conformant agent FAIL.
+      throw new Error(
+        'step declares auth.from_test_kit but no test kit with auth.api_key is configured — ' +
+          'declare prerequisites.test_kit and authorize its cache with options.complianceDir ' +
+          '(CLI: --compliance-dir), ' +
+          'or pass options.test_kit (CLI: --test-kit).'
+      );
+    }
   } else if ('value_strategy' in directive && directive.value_strategy) {
     if (directive.value_strategy === 'random_invalid') value = generateRandomInvalidApiKey();
     else if (directive.value_strategy === 'random_invalid_jwt') value = generateRandomInvalidJwt();
@@ -7445,13 +7503,27 @@ function basicAuthHeadersForStep(
     };
   }
 
-  const source =
-    directive.from_test_kit !== undefined
-      ? resolveStepBasicFromTestKit(directive.from_test_kit, options)
-      : directive.basic !== undefined
-        ? directive.basic
-        : directive;
-  if (source === undefined) return {};
+  const usesTestKit =
+    directive.from_test_kit === true ||
+    (typeof directive.from_test_kit === 'string' && directive.from_test_kit.length > 0);
+  const source = usesTestKit
+    ? resolveStepBasicFromTestKit(directive.from_test_kit!, options)
+    : directive.basic !== undefined
+      ? directive.basic
+      : directive;
+  if (source === undefined) {
+    if (usesTestKit) {
+      // adcp#6735 — same hard-fail as the api_key arm: never send an
+      // unauthenticated probe in place of a declared kit credential.
+      throw new Error(
+        'step declares auth.from_test_kit (basic) but no test kit with matching credentials is configured — ' +
+          'declare prerequisites.test_kit and authorize its cache with options.complianceDir ' +
+          '(CLI: --compliance-dir), ' +
+          'or pass options.test_kit (CLI: --test-kit).'
+      );
+    }
+    return {};
+  }
   return { authorization: encodeBasicAuthHeader(source, 'step.auth.basic') };
 }
 
@@ -7614,15 +7686,26 @@ export function applyBrandInvariant(
       const acct = existingAccount as Record<string, unknown>;
       const isNaturalKeyVariant = 'brand' in acct || 'operator' in acct;
       if (isNaturalKeyVariant) {
-        const merged: Record<string, unknown> = { ...acct, brand };
+        // Wholesale cache-scope storyboards deliberately address a different
+        // natural-key account to prove public/account token isolation. Keep
+        // that explicitly authored account identity while still enforcing the
+        // run-scoped top-level brand. Other tools and buying modes retain the
+        // cross-step account-brand invariant from #579.
+        const preserveWholesaleAccountBrand =
+          taskName === 'get_products' && request.buying_mode === 'wholesale' && acct.brand !== undefined;
+        const merged: Record<string, unknown> = {
+          ...acct,
+          brand: preserveWholesaleAccountBrand ? acct.brand : brand,
+        };
         // The natural-key arm of AccountReference requires `operator` (per
         // schemas/cache/{version}/core/account-ref.json). A fixture or earlier
         // context-extraction step that produced `{brand, sandbox}` without
         // operator would otherwise be passed through and rejected by a
         // strict-validating seller. Default operator to brand.domain — same
         // convention `resolveAccount` uses for synthetic refs.
-        if (typeof merged.operator !== 'string' && typeof brand.domain === 'string') {
-          merged.operator = brand.domain;
+        const accountBrand = merged.brand as { domain?: unknown } | undefined;
+        if (typeof merged.operator !== 'string' && typeof accountBrand?.domain === 'string') {
+          merged.operator = accountBrand.domain;
         }
         result.account = merged;
       }

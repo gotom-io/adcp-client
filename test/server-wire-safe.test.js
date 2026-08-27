@@ -83,12 +83,34 @@ describe('WIRE_SPEC_FIELDS — codegen output', () => {
 });
 
 describe('pickWireSpecFields', () => {
+  it('preserves beta.6 delivery metric narrowing for grading and fan-out', () => {
+    const fields = WIRE_SPEC_FIELDS.GetMediaBuyDeliveryRequest.fields;
+    assert.ok(fields.includes('requested_metrics'));
+
+    const safe = pickWireSpecFields(
+      {
+        media_buy_ids: ['mb_1'],
+        requested_metrics: ['viewable_rate', 'quartile_100'],
+        reporting_dimensions: {
+          format: { sort_by: 'viewable_rate', sort_direction: 'asc' },
+        },
+        attacker_field: 'drop-me',
+      },
+      'GetMediaBuyDeliveryRequest'
+    );
+    assert.deepStrictEqual(safe.requested_metrics, ['viewable_rate', 'quartile_100']);
+    assert.deepStrictEqual(safe.reporting_dimensions, {
+      format: { sort_by: 'viewable_rate', sort_direction: 'asc' },
+    });
+    assert.ok(!('attacker_field' in safe));
+  });
+
   it('preserves flattened protocol-envelope fields from MCP request projections', () => {
     assert.ok(WIRE_SPEC_FIELDS.ReportUsageRequest.fields.includes('adcp_version'));
     assert.ok(WIRE_SPEC_FIELDS.ReportUsageRequest.fields.includes('adcp_major_version'));
     const safe = pickWireSpecFields(
       {
-        adcp_version: '3.2.0-beta.3',
+        adcp_version: '3.2.0-beta.5',
         adcp_major_version: 3,
         idempotency_key: 'usage-envelope-0001',
         reporting_period: {
@@ -100,7 +122,7 @@ describe('pickWireSpecFields', () => {
       },
       'ReportUsageRequest'
     );
-    assert.equal(safe.adcp_version, '3.2.0-beta.3');
+    assert.equal(safe.adcp_version, '3.2.0-beta.5');
     assert.equal(safe.adcp_major_version, 3);
     assert.ok(!('attacker_field' in safe));
   });

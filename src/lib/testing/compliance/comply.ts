@@ -8,7 +8,7 @@
  * Resolution priority: explicit storyboards > capability-driven.
  */
 
-import { createTestClient, discoverAgentProfile } from '../client';
+import { createTestClient, discoverAgentProfile, seedTestClientSigningCapability } from '../client';
 import type { TestOptions, TestResult, AgentProfile, TestStepResult } from '../types';
 import { collectDetachedAssertionFailures, mapStoryboardResultsToTrackResult, TRACK_LABELS } from './storyboard-tracks';
 import { applyAdcpVersionRunOptions, runStoryboard } from '../storyboard/runner';
@@ -64,6 +64,7 @@ import { redactOAuthUrlForOutput, redactOAuthUrlsInText } from '../storyboard/oa
 import { LIBRARY_VERSION } from '../../version';
 import { validationFailsStep } from '../storyboard/validations';
 import { isLikelyPrivateUrl } from '../../net/address-guards';
+import { applyFunctionalRequestSigning } from '../storyboard/request-signing/functional-dispatch';
 
 /**
  * All compliance tracks in display order.
@@ -545,6 +546,17 @@ export interface ComplyOptions extends TestOptions {
   tracks?: ComplianceTrack[];
   /** Timeout in milliseconds — stops new storyboards from starting when exceeded. */
   timeout_ms?: number;
+  /**
+   * Rotate the runnable storyboard list to start at this offset (modulo the
+   * list length) before sequential execution. Ordering is otherwise
+   * unchanged: the list wraps, so every storyboard still runs when the
+   * budget allows. Intended for budget-limited runs (`timeout_ms`): without
+   * rotation, consecutive truncated runs re-grade the same prefix and the
+   * tail storyboards are never exercised (adcontextprotocol/adcp#6632).
+   * Callers distribute coverage by varying the offset between runs (e.g.,
+   * a persisted per-agent run counter). Non-negative integer; default 0.
+   */
+  storyboard_start_offset?: number;
   /** AbortSignal for external cancellation (e.g., graceful shutdown). */
   signal?: AbortSignal;
   /** Original agent alias or identifier (used in fix_command instead of resolved URL). */
@@ -587,6 +599,8 @@ export interface ComplyOptions extends TestOptions {
   complianceDir?: string;
   /** Explicit schema bundle root to pair with the selected compliance cache. */
   schemaRoot?: string;
+  /** CLI source path for an explicit test kit, preserved in generated fix commands. */
+  testKitPath?: string;
   /** Scoped hosted stable-line alias for prerelease-backed compliance caches. */
   hostedStableLineAlias?: string;
 }
@@ -1029,6 +1043,7 @@ export function extractFailures(
     complianceDir?: string;
     schemaRoot?: string;
     hostedStableLineAlias?: string;
+    testKitPath?: string;
   } = {}
 ): ComplianceFailure[] {
   const failures: ComplianceFailure[] = [];
@@ -1123,6 +1138,7 @@ function buildFixCommand(
     complianceDir?: string;
     schemaRoot?: string;
     hostedStableLineAlias?: string;
+    testKitPath?: string;
   }
 ): string {
   const parts = ['adcp', 'storyboard', 'step', agentRef, storyboardId, stepId, '--json'];
@@ -1130,6 +1146,7 @@ function buildFixCommand(
   if (options.complianceDir) parts.push('--compliance-dir', options.complianceDir);
   if (options.schemaRoot) parts.push('--schema-root', options.schemaRoot);
   if (options.hostedStableLineAlias) parts.push('--hosted-stable-line-alias', options.hostedStableLineAlias);
+  if (options.testKitPath) parts.push('--test-kit', options.testKitPath);
   return parts.map(shellArg).join(' ');
 }
 
@@ -1147,6 +1164,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     storyboards: explicitStoryboards,
     tracks: trackFilter,
     timeout_ms,
+    storyboard_start_offset,
     signal: externalSignal,
     webhook_receiver,
     webhook_replay_receiver,
@@ -1176,6 +1194,17 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     }
   }
 
+  // Validate storyboard_start_offset
+  if (storyboard_start_offset !== undefined) {
+    if (
+      typeof storyboard_start_offset !== 'number' ||
+      !Number.isInteger(storyboard_start_offset) ||
+      storyboard_start_offset < 0
+    ) {
+      throw new TypeError(`storyboard_start_offset must be a non-negative integer, got: ${storyboard_start_offset}`);
+    }
+  }
+
   // Fail fast on malformed test kits before we spin up any agent connection.
   validateTestKit(testOptions.test_kit);
 
@@ -1189,6 +1218,10 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       ...testOptions,
       sandbox: testOptions.sandbox !== false,
       test_session_id: testOptions.test_session_id || `comply-${Date.now()}`,
+    });
+    effectiveOptions = applyFunctionalRequestSigning(effectiveOptions, {
+      ...(complianceDir !== undefined && { complianceDir }),
+      version: complianceIndex.adcp_version,
     });
 
     // Check for abort before starting
@@ -1214,7 +1247,8 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     if (
       testOptions.versionEnvelope === undefined &&
       profile.tools.includes('get_adcp_capabilities') &&
-      profile.raw_capabilities === undefined
+      profile.raw_capabilities === undefined &&
+      !profileStep.error?.startsWith('VERSION_UNSUPPORTED:')
     ) {
       const legacyDiscoveryOptions = { ...effectiveOptions, versionEnvelope: 'major-only' as const };
       const legacyDiscoveryClient = createTestClient(
@@ -1240,6 +1274,11 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       discoveryOptions === effectiveOptions
         ? discoveryClient
         : createTestClient(agentUrl, effectiveOptions.protocol ?? 'mcp', effectiveOptions);
+    // Negotiation may replace the discovery client with one configured for a
+    // different wire version. Seed that selected client from the capability
+    // response we already trust so its first functional dispatch cannot be
+    // downgraded by a redundant, transiently failing discovery probe.
+    seedTestClientSigningCapability(client, profile, complianceIndex.adcp_version);
     effectiveOptions._client = client;
     effectiveOptions._profile = profile;
 
@@ -1311,12 +1350,10 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       // universal/security_baseline, which is designed precisely to diagnose
       // agents that mishandle auth. Fall back to the unreachable result only
       // when no such storyboards are available.
-      const authCheck = await detectAuthRejection(
-        agentUrl,
-        profileStep.error,
-        signal,
-        effectiveOptions.transport?.trustedFetchFn
-      );
+      const isVersionUnsupported = profileStep.error?.startsWith('VERSION_UNSUPPORTED:') === true;
+      const authCheck = isVersionUnsupported
+        ? { isAuth: false, observations: [] }
+        : await detectAuthRejection(agentUrl, profileStep.error, signal, effectiveOptions.transport?.trustedFetchFn);
       if (authCheck.isAuth) {
         const degraded: AgentProfile = { name: profile.name || 'Unknown (auth required)', tools: [] };
         const candidate = explicitStoryboards?.length
@@ -1382,6 +1419,15 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       missingToolStoryboards.push(...applicability.missing);
     }
 
+    // Distribute coverage across budget-limited runs: rotate the execution
+    // starting point so consecutive `timeout_ms`-truncated runs don't
+    // re-grade the same prefix while the tail is never exercised
+    // (adcontextprotocol/adcp#6632). Rotation preserves relative order and
+    // is a no-op at offset 0 / when unset.
+    if (storyboard_start_offset !== undefined && storyboard_start_offset > 0) {
+      runnableStoryboards = rotateStoryboardsForOffset(runnableStoryboards, storyboard_start_offset);
+    }
+
     // Run storyboards
     const storyboardResults: StoryboardResult[] = [];
     const executedStoryboards: Storyboard[] = [];
@@ -1416,7 +1462,12 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     }
     if (stoppedForTimeoutBudget) {
       allObservations.push(
-        buildComplyTimeoutBudgetObservation(timeout_ms!, storyboardResults.length, runnableStoryboards.length)
+        buildComplyTimeoutBudgetObservation(
+          timeout_ms!,
+          storyboardResults.length,
+          runnableStoryboards.length,
+          runnableStoryboards.slice(storyboardResults.length).map(sb => sb.id)
+        )
       );
     }
 
@@ -1512,6 +1563,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       ...(complianceDir !== undefined && { complianceDir }),
       ...(schemaRoot !== undefined && { schemaRoot }),
       ...(hostedStableLineAlias !== undefined && { hostedStableLineAlias }),
+      ...(options.testKitPath !== undefined && { testKitPath: options.testKitPath }),
     });
 
     // Aggregate notices from all storyboard runs. Dedup is by `code`, or by
@@ -1569,10 +1621,24 @@ function hasComplyTimeoutBudgetExpired(start: number, timeout_ms: number | undef
   return timeout_ms !== undefined && now - start >= timeout_ms;
 }
 
+/**
+ * Rotate a storyboard list to start at `offset % length`, preserving relative
+ * order (the head wraps to the tail). Pure and deterministic: offset 0, an
+ * offset that is a multiple of the length, or an empty list all return the
+ * input order. See `ComplyOptions.storyboard_start_offset`.
+ */
+export function rotateStoryboardsForOffset<T>(items: readonly T[], offset: number): T[] {
+  if (items.length === 0) return [...items];
+  const shift = offset % items.length;
+  if (shift === 0) return [...items];
+  return [...items.slice(shift), ...items.slice(0, shift)];
+}
+
 function buildComplyTimeoutBudgetObservation(
   timeout_ms: number,
   storyboardsExecuted: number,
-  storyboardsSelected: number
+  storyboardsSelected: number,
+  storyboardsNotStarted: readonly string[] = []
 ): AdvisoryObservation {
   return {
     category: 'performance',
@@ -1585,6 +1651,9 @@ function buildComplyTimeoutBudgetObservation(
       storyboards_executed: storyboardsExecuted,
       storyboards_selected: storyboardsSelected,
       storyboards_remaining: Math.max(0, storyboardsSelected - storyboardsExecuted),
+      // Which storyboards never started — so budget-limited coverage gaps
+      // are inspectable per-run instead of only countable (adcp#6632).
+      storyboards_not_started: [...storyboardsNotStarted],
     },
     source: { kind: 'profile', code: 'timeout-budget-exceeded' },
   };
@@ -1800,6 +1869,7 @@ async function runWithDegradedProfile(
     ...(options.complianceDir !== undefined && { complianceDir: options.complianceDir }),
     ...(options.schemaRoot !== undefined && { schemaRoot: options.schemaRoot }),
     ...(options.hostedStableLineAlias !== undefined && { hostedStableLineAlias: options.hostedStableLineAlias }),
+    ...(options.testKitPath !== undefined && { testKitPath: options.testKitPath }),
   });
 
   // Scenario detail is canonical under `tracks`; `tested_tracks` is a
@@ -1851,12 +1921,10 @@ async function buildUnreachableResult(
   adcpVersion: string,
   signal?: AbortSignal
 ): Promise<ComplianceResult> {
-  const { isAuth, observations } = await detectAuthRejection(
-    agentUrl,
-    errorMsg,
-    signal,
-    effectiveOptions.transport?.trustedFetchFn
-  );
+  const isVersionUnsupported = errorMsg?.startsWith('VERSION_UNSUPPORTED:') === true;
+  const { isAuth, observations } = isVersionUnsupported
+    ? { isAuth: false, observations: [] }
+    : await detectAuthRejection(agentUrl, errorMsg, signal, effectiveOptions.transport?.trustedFetchFn);
   const err = redactOAuthUrlsInText(errorMsg || 'Unknown error');
   const headline = isAuth ? `Authentication required` : `Agent unreachable — ${err}`;
   return {

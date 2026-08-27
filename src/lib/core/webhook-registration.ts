@@ -19,6 +19,10 @@ export interface WebhookRegistration {
   callbackUrl: string;
   method: 'POST';
   mode: WebhookAuthenticationMode;
+  /** Originating preview API, persisted so async routing survives races and restarts. */
+  previewMode?: 'canonical' | 'legacy';
+  /** Callback must fail closed unless a durable mutation-settlement route is recoverable. */
+  requiresDurableSettlement?: boolean;
   /** Epoch milliseconds. */
   createdAt: number;
   /** Epoch milliseconds. */
@@ -33,6 +37,8 @@ export interface WebhookRegistrationStore {
    * conflicting live registration for the same key MUST reject.
    */
   putIfAbsent(registration: WebhookRegistration): Promise<void>;
+  /** Atomically mark a live registration as requiring durable mutation settlement. */
+  markRequiresDurableSettlement?(agentId: string, operationId: string): Promise<void>;
   /** Remove provenance after a definitively synchronous terminal response. */
   delete?(agentId: string, operationId: string): Promise<void>;
 }
@@ -94,6 +100,16 @@ export class InMemoryWebhookRegistrationStore implements WebhookRegistrationStor
     this.entries.delete(registrationKey(agentId, operationId));
   }
 
+  async markRequiresDurableSettlement(agentId: string, operationId: string): Promise<void> {
+    const key = registrationKey(agentId, operationId);
+    const registration = this.entries.get(key);
+    if (!registration || registration.expiresAt <= this.now()) {
+      this.entries.delete(key);
+      throw new Error('Cannot mark a missing or expired webhook registration for durable settlement.');
+    }
+    this.entries.set(key, Object.freeze({ ...registration, requiresDurableSettlement: true }));
+  }
+
   private pruneExpired(): void {
     const now = this.now();
     for (const [key, registration] of this.entries) {
@@ -117,12 +133,19 @@ function validateRegistration(registration: WebhookRegistration): void {
   ) {
     throw new TypeError('Webhook registration identifiers cannot contain NUL characters.');
   }
+  if (registration.previewMode !== undefined && !['canonical', 'legacy'].includes(registration.previewMode)) {
+    throw new TypeError('Webhook registration previewMode must be canonical or legacy.');
+  }
   const callback = new URL(registration.callbackUrl);
   if (callback.username || callback.password || callback.hash) {
     throw new TypeError('Webhook callbackUrl cannot contain userinfo or a fragment.');
   }
   if (callback.protocol !== 'https:' && !isWebhookLoopbackHost(callback.hostname)) {
     throw new TypeError('Webhook callbackUrl must use HTTPS (except loopback development URLs).');
+  }
+  const agent = new URL(registration.agentUrl);
+  if (agent.username || agent.password) {
+    throw new TypeError('Webhook agentUrl cannot contain userinfo credentials.');
   }
   if (registration.expiresAt <= registration.createdAt) {
     throw new TypeError('Webhook registration expiresAt must be later than createdAt.');
@@ -138,6 +161,7 @@ function sameRegistration(a: Readonly<WebhookRegistration>, b: WebhookRegistrati
     a.taskType === b.taskType &&
     a.callbackUrl === b.callbackUrl &&
     a.method === b.method &&
-    a.mode === b.mode
+    a.mode === b.mode &&
+    a.previewMode === b.previewMode
   );
 }

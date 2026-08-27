@@ -1,15 +1,59 @@
 # Migrating from 13.x to 14 beta
 
-SDK 14 adopts AdCP `3.2.0-beta.3` while preserving the canonical creative boundary introduced in SDK 13. Most SDK 13 applications can install the beta and continue using the established 3.x tools unchanged; adopt the compact 3.2 lifecycle only after the remote agent advertises it.
+SDK 14 adopts AdCP `3.2.0-beta.6` while preserving the canonical creative boundary introduced in SDK 13. Most SDK 13 applications can install the beta and continue using the established 3.x tools unchanged; adopt the compact 3.2 lifecycle only after the remote agent advertises it.
 
-AdCP 3.2 prereleases are exact protocol pins: beta.3 replaces beta.2 in the
+AdCP 3.2 prereleases are exact protocol pins: beta.6 replaces beta.5 in the
 SDK's compatible-version list rather than extending a rolling 3.2-beta range.
 Beta.1 restored `adcp_major_version` on `buy_products`,
 `accept_proposal`, and `control_media_buy`; the SDK now sends that field again
 for beta.1 and later while retaining its omission only for an explicitly
 configured beta.0 peer. Beta.2 added canonical compact proposal and direct-buy
-storyboards through operational control and MediaBuy readback; beta.3 preserves
-that wire contract and clarifies request invariants.
+storyboards through operational control and MediaBuy readback; beta.4 adds
+flexible-window availability and durable products-only legacy purchase
+continuations. Beta.5 defines stable async identity, cross-channel terminal
+convergence, webhook retry horizons, and crash-safe continuation generation
+replacement. Beta.6 adds coordinated placements, seller-rendered stateful
+display, creative component assets, and A2A 1.0 request-signing method names.
+
+### A2A 1.0 peer upgrade
+
+SDK 14's AdCP 3.2 transport requires `@a2a-js/sdk` 1.x. Upgrade the peer
+alongside the AdCP SDK:
+
+```bash
+npm install @adcp/sdk@beta @a2a-js/sdk@^1.0.1
+```
+
+The client and server use the official 1.0 Agent Card and JSON-RPC APIs and
+activate the required `https://adcontextprotocol.org/extensions/adcp/v3`
+profile. Wire interoperability with 0.3 agents remains available through the
+1.x SDK's compatibility layer; applications should not keep the 0.3 package
+installed. Existing `createA2AAdapter()` card options remain accepted, but
+`preferredTransport` and `protocolVersion` are deprecated because the adapter
+now advertises JSON-RPC 1.0 plus its 0.3 compatibility interface.
+
+### Beta.5 task webhook registration and polling
+
+`push_notification_config` is now an AdCP application-layer field across MCP,
+A2A, and REST. On A2A it is carried in skill parameters and remains distinct
+from native `TaskPushNotificationConfig`. Every beta.5-or-later registration must carry
+a buyer `operation_id`; SDK clients generate and reuse one identity across the
+authorized request, registration provenance, route, and webhook envelope.
+Beta.5-or-later sellers return `INVALID_REQUEST` before handler dispatch when the field
+is missing or malformed. Explicitly negotiated older bundles keep their prior
+wire behavior.
+
+Receivers continue to fence exact delivery retries by seller plus
+`idempotency_key`, and additionally fence terminal publication by authenticated
+seller, buyer `operation_id`, and seller `task_id`. This prevents a beta.5
+terminal re-emission under a new delivery key from running handlers twice while
+keeping seller task IDs that are scoped per buyer operation isolated. Configure
+shared durable `webhookDedup` storage for multi-replica receivers.
+
+When polling with `include_result: true`, `get_task_status`/`tasks_get` now
+returns a stored canonical artifact for `completed`, `failed`, and `rejected`
+tasks. A failed response may carry both the top-level summary `error` and a
+canonical `result.errors[]`; they describe the same failure.
 
 ```bash
 npm install @adcp/sdk@beta
@@ -52,6 +96,211 @@ loading; keep using `requires_capability` for a singular predicate.
 5. Add handlers only for the 3.2 tools your server actually implements and advertise the same set in capability discovery.
 6. Re-run TypeScript against generated schema imports. Prefer per-tool type slices if the complete schema barrel exhausts the default Node heap.
 7. Exercise mixed-version tests before rollout: 14→3.0, 14→3.1, 14→3.2 beta, and older buyer→14 server where applicable.
+8. If a legacy brief may return products without a proposal, configure a durable `LegacyPurchaseContinuationStore`, stable `principalScope`, and application-owned `reconcileLegacyPurchase(record, exactInput)` callback before offering `continueLegacyPurchase()`. Keep reverse compact-seller → older-buyer handlers application-owned.
+9. If established 3.0/3.1 proposal discovery and mutation can land on different processes, configure the same durable `EstablishedProposalStore`, stable `principalScope`, and stable non-secret `legacyPurchaseSellerSessionScope` on every coordinator. Add store-clock `completedAt` and `retainUntil` fields to refinement/decline completion tombstones, index `retainUntil`, and retain each proof for at least `ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS`. Conservatively backfill pre-upgrade tombstones to a future seven-day horizon, then run a database-clock sweeper that atomically prunes only expired rows. Recover submitted work with `reconcileEstablishedProposalTask({ account, sellerTaskId })`; see [Media-buy compatibility: durable established proposal state](./guides/MEDIA-BUY-3.2-COMPATIBILITY.md#durable-established-proposal-state). The bundled in-memory store is a non-durable reference implementation.
+10. Upgrade durable idempotency storage before application traffic: add the nullable PostgreSQL `retain_until` column/index, preserve `IdempotencyCacheEntry.retainUntil`, and add atomic `putIfAbsent()`, `replaceIfPayloadHash()`, `replaceIfPayloadHashAndExpired()`, and `deleteIfPayloadHash()` to every custom backend.
+11. Upgrade custom deferred-task storage with `putForSettlementOperationIfAbsent()`, `getBySettlementOperationId()`, and `replaceForSettlementOperationIfVersion()`. The initial token/index write and nested A→B index move must each be atomic.
+12. Replace webhook emitter `operation_id` arguments with SDK-local `delivery_id` values and upgrade custom stores to `WebhookDeliveryStore`. One delivery ID binds one canonical payload and key; use a fresh delivery ID for each changed status observation while retaining the AdCP `operation_id` inside the payload.
+13. Ensure custom 3.2 buyers include `push_notification_config.operation_id`, and update A2A integrations to keep the AdCP registration in skill parameters even when native A2A push configuration is also present.
+14. Treat failed/rejected task results as canonical terminal artifacts when `include_result` is requested; do not discard them while preserving only the summary error.
+
+### Webhook delivery identity and retry horizons
+
+SDK 14 separates the emitter's local delivery identity from the AdCP
+operation correlation carried on the wire. Exact retries use the same
+`delivery_id`, complete payload (including its original `timestamp`), and
+`idempotency_key`. A changed payload or later lifecycle observation uses a
+fresh `delivery_id` and therefore a fresh delivery key even when its payload
+retains the same AdCP `operation_id` and `task_id`.
+
+```ts
+await ctx.emitWebhook({
+  url: pushNotificationConfig.url,
+  payload: {
+    operation_id: pushNotificationConfig.operation_id,
+    task_id: sellerTaskId,
+    task_type: 'create_media_buy',
+    status: 'completed',
+    timestamp: terminalObservedAt,
+    result,
+  },
+  delivery_id: `create_media_buy:${sellerTaskId}:completed`,
+});
+```
+
+The old `operation_id` emitter argument incorrectly combined these namespaces
+and is no longer accepted. `WebhookDeliveryStore.claim()` must atomically
+return either the winning immutable `{ status: 'bound', idempotencyKey,
+payloadFingerprint, firstAttemptAtMs, retainUntilMs }` binding or a permanent
+`{ status: 'retired' }` tombstone. The backend uses its authoritative clock,
+retains the full binding through the advertised horizon, and MUST NOT make a
+previously claimed delivery ID look unused after expiry. Store keys include
+trusted publisher and tenant scopes in addition to the delivery ID.
+Multi-replica publishers must provide a shared durable implementation; the bundled
+`memoryWebhookDeliveryStore()` is single-process only. The deprecated
+`WebhookIdempotencyKeyStore` and `memoryWebhookKeyStore()` names remain aliases
+for source discovery, but custom implementations must adopt the new binding
+contract.
+
+Production publishers must also implement `WebhookDeliveryRecovery`. Its
+`checkpoint()` durably stores the exact destination, canonical payload values
+(including the original body timestamp), authentication reference, and retry
+policy before the binding claim or first POST; it rejects conflicting reuse and
+arranges replay of unsettled entries after restart. Its `settle()` removes or
+terminalizes the outbox entry only after 2xx delivery or a non-retryable
+outcome. Retryable exhaustion stays pending. Encrypt authentication material at
+rest. Without this outbox, the agent cannot truthfully advertise a webhook
+delivery retry horizon after a process crash.
+
+SDK 14 now provides the durable building blocks directly. Use
+`pgWebhookDeliveryStore()` or `redisWebhookDeliveryStore()` for immutable
+delivery bindings. Pair it with `pgWebhookDeliveryRecoveryBackend()` or
+`redisWebhookDeliveryRecoveryBackend()` through
+`createWebhookDeliveryRecovery()`. PostgreSQL deployments must run both
+`getWebhookDeliveryMigration()` and
+`getWebhookDeliveryRecoveryMigration()`. Production PostgreSQL deployments
+must configure deployment-unique table names (or explicitly acknowledge a
+dedicated database). Redis deployments have the same requirement for key
+prefixes.
+
+The recovery backends checkpoint the first exact snapshot, reject conflicting
+reuse, atomically lease the initial live send, use backend-authoritative clocks, and expose version-fenced lease,
+renewal, release, and settlement primitives. `pollWebhookDeliveryRecovery()`
+runs one bounded recovery pass and leaves scheduling, retry policy, and
+observability to the application. Use `errorRetryAfterMs` for thrown callback
+backoff and `onError` for callback or lease-renewal telemetry; retired or
+out-of-horizon deliveries are terminalized automatically. Supply a
+`WebhookAuthenticationAdapter` for
+bearer or HMAC deliveries; it stores ciphertext or an opaque secret reference
+plus a stable non-secret equality fingerprint. The adapter must authenticate
+the supplied tenant/destination/snapshot context. Settled records redact payload
+and protected secret references. The application still owns KMS
+keys, secret management, tenant authorization/RBAC, and management APIs or UI.
+
+`deliveryRetryHorizonSeconds` defaults to 86,400 seconds and accepts 86,400
+through 604,800. `createAdcpServer()` advertises the configured value under
+`webhook_signing.delivery_retry_horizon_seconds`, rejects a changed payload
+under an existing delivery ID, and refuses the retained key after that
+horizon. Do not mint a new delivery ID merely to extend a failed delivery; a
+fresh ID is only for a protocol-defined re-emission or genuinely distinct
+observation.
+
+Production direct `createWebhookEmitter()` callers must provide a stable
+`publisherScope`. A production publisher may omit `tenantScope`; the resulting
+unbound emitter refuses direct `emit()` calls, so bind every authenticated
+request or durable job with `forTenantScope(trustedTenant)` first. Callers that
+provide `tenantScope` at construction retain the existing directly usable
+behavior. `createAdcpServer()` uses its trusted server name for the publisher
+scope and derives tenant scope only from resolved account/session/authentication
+context. A genuinely single-tenant server may configure
+`webhooks.tenantScope`; otherwise production emission without trusted scope
+fails before durable checkpointing or delivery. Request and payload fields
+never select this namespace.
+
+### Legacy continuation store upgrade
+
+SDK 14 tightens the durable continuation contract. Custom stores must make
+`recordSubmittedTask()` an atomic first-writer-wins bind: the first seller task
+ID and exact same-ID retries return `true`; a different ID returns `false` and
+never overwrites it. The seller task ID and any pending callback task ID must
+also match regardless of which is written first. `complete()` now distinguishes
+the installing `completed` writer from an exact `duplicate` and a divergent
+`conflict`; when a pending callback already exists, it atomically promotes and
+returns that earlier terminal winner as `pending_completed` with required
+settlement metadata instead of the caller's stale candidate.
+
+Replica-safe callback recovery requires implementing
+`getByCallbackOperationId()`, `recordPendingSettlement()`,
+`claimPendingSettlementPublication()`, `releasePendingSettlementPublication()`,
+`acknowledgePendingSettlement()`, and `recordDeferredTaskToken()` together;
+partial implementations are rejected. The token binding links the purchase
+record to the SDK's distinct deferred-state token so a callback can advance the
+correct terminal checkpoint after restart. Its fourth argument is the expected
+prior deferred token: initial binding expects no prior token, nested pauses
+compare-and-swap the exact prior token, stale writers return `false`, and an
+exact already-installed retry returns `true` without overwriting it.
+The deferred store independently indexes the current token by committed
+operation ID. That index is the recovery source of truth if a process exits
+after persisting an initial or nested pause but before this continuation-store
+binding completes. An exact operation retry reconciles the continuation-store
+token to the indexed generation and returns the current pause without
+redispatching already-consumed input.
+New atomically indexed records carry
+`settlementOperationRouteRequired: true`. Custom stores and serializers must
+preserve that discriminator on every replacement so routed same-key updates
+renew and fence the operation index together with the token. Records written by
+earlier prereleases without the marker remain readable through the legacy
+exact-token path.
+For callback-capable operations, only the exact current deferred token on an
+unexpired claimed operation can dispatch seller continuation input. Ambiguous,
+completed, expired, stale, unlinked, or coordinator-less routes fail closed;
+pending and terminal checkpoints can still be recovered without redispatch.
+The default reference store implements callback recovery, so a committed A2A
+pause requires `SingleAgentClient.deferredStorage`. Without deferred storage,
+the SDK fails that pause closed rather than exposing an in-process continuation
+that could race a callback. To retain in-process pause behavior without durable
+storage, use a polling-only continuation store that omits all six callback
+methods.
+The publication claim is an atomic renewable lease over the exact pending
+settlement. A live different owner returns `false`, the same owner may renew,
+an expired owner may be replaced, and release removes only the exact owner.
+Acknowledgement of a pending entry requires that exact owner. This lets a
+replica reclaim an SDK polling-completion outbox after a crash without racing a
+healthy publisher. Publication handlers remain idempotent because a stalled or
+partitioned owner cannot revoke side effects after lease expiry.
+Sender callback inbox writes still stop at `replayExpiresAt`. An already
+dispatched seller task may finish later, so an SDK-owned polling/inline
+publication fence may be installed after that time and must remain retained
+until exact-owner acknowledgement; expired completed records with a pending
+SDK outbox are not cleanup-eligible.
+Every accepted sender- or SDK-owned terminal outbox extends `replayExpiresAt`
+by at least `LEGACY_PURCHASE_PUBLICATION_PROOF_RETENTION_MS` from admission.
+This keeps a callback admitted near the former deadline retryable through
+handler execution and cross-store finalization.
+Acknowledging an SDK-owned outbox must extend `replayExpiresAt` by at least
+`LEGACY_PURCHASE_PUBLICATION_PROOF_RETENTION_MS` from acknowledgement. The SDK
+verifies that extension through both primary and callback lookups so a crash
+before deferred-checkpoint finalization remains recoverable.
+Cleanup also must not remove any pending outbox while its publication lease is
+unexpired; an expired sender-owned outbox becomes reclaimable only after both
+its replay deadline and active lease end.
+The acknowledgement atomically replaces the outbox entry after application
+handler dispatch: it clears `pendingSettlement` and retains a stable, nonempty
+`acknowledgedSettlementFingerprint` for that exact settlement through
+`replayExpiresAt`. Both lookup methods must return that proof, and exact ACK
+retries must validate it. This publication proof prevents a handler from being
+invoked again if the legacy-store ACK succeeds but deferred-checkpoint ACK
+fails. When the exact completed result has no pending outbox entry, ACK installs
+the same proof after successful publication. Implementers should call the
+exported `legacyPurchaseSettlementFingerprint()` helper rather than reproduce
+its canonicalization. The proof binds the operation, seller task, task type,
+and terminal value; it intentionally excludes the webhook delivery event key
+so authenticated redelivery may rotate that identity. A transient handler failure remains retryable. Stores that implement none of
+these methods remain polling-only, and the
+SDK suppresses task webhooks for those operations. Share the durable webhook
+registration store between replicas (and the replay store for RFC 9421).
+Completed-operation replay retention is at least seven days.
+`legacyPurchaseOperationTtlMs` configures unresolved-operation monitoring and
+may lengthen, but never shorten, that replay retention.
+
+SDK 14 also moves new webhook dedup claims and completion markers to a distinct
+v2 hashed-sender namespace while read-only probing unexpired SDK 13 v1
+raw-sender markers. This preserves completed fences across the upgrade, but it
+does not make mixed-version receivers safe: SDK 13 and SDK 14 claim different
+keys and can dispatch the same callback once each. Stop accepting webhook
+traffic, drain in-flight handlers, upgrade all webhook receiver replicas
+together, and then restart webhook traffic. Mixed SDK 13/14 webhook receivers
+are unsupported.
+
+Seller pauses are now protocol-specific. A2A can invoke an input handler or
+return a resume closure only for a live `input-required`/`auth-required` A2A
+Task, using its transport `Task.id`; the separate AdCP task handle remains for
+`tasks/get` polling. Completed A2A Tasks with artifact-level pauses and MCP
+responses expose `input-required` or `auth-required`
+without invoking the handler and without `deferred`; use an
+application/protocol-specific recovery path.
+Pre-upgrade persisted A2A deferred records that lack an A2A transport task ID are
+rejected and removed on resume rather than replayed as a fresh mutation.
 
 ## Existing 3.x calls remain valid
 
@@ -102,6 +351,53 @@ a retry against an SDK 13 entry returns `IDEMPOTENCY_CONFLICT` instead of the
 old cached body; reconcile by natural key rather than minting a replacement
 key until the original replay TTL expires. New entries cannot replay a body
 across tenants or tools.
+
+### Upgrade durable idempotency backends before application code
+
+SDK 14 adds an absolute physical-retention fence to every idempotency entry.
+Apply the PostgreSQL table migration before starting an SDK 14 server:
+
+```sql
+ALTER TABLE adcp_idempotency
+  ADD COLUMN IF NOT EXISTS retain_until TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_adcp_idempotency_retain_until
+  ON adcp_idempotency(retain_until, expires_at);
+```
+
+Use the table name configured for each agent. `getIdempotencyMigration()` emits
+the complete current schema for new installs; readiness now probes
+`retain_until`, so starting application traffic against the old shape fails
+closed. The column remains nullable for a rolling database migration, while
+reads and cleanup conservatively retain old-writer rows through the configured
+legacy grace.
+
+Custom `IdempotencyBackend` implementations must preserve the entry's
+`retainUntil` value and implement atomic `putIfAbsent()`,
+`replaceIfPayloadHash()`, `replaceIfPayloadHashAndExpired()`, and
+`deleteIfPayloadHash()`. Upgrade all custom
+adapters before passing them to `createIdempotencyStore()` or `webhookDedup`;
+SDK 14 rejects incomplete backends at construction. Redis adapters must derive
+relative expiry from the absolute horizon using Redis server time, not an
+application-process clock, so clock skew cannot evict the fence early.
+`replaceIfPayloadHashAndExpired()` must test the expected payload hash and
+logical expiry in the same database operation, using backend time and treating
+an entry expiring in the current second as live. A read followed by ordinary
+payload-hash replacement is not equivalent: renewal can preserve the hash and
+create an ABA takeover window.
+`putIfAbsent()` is strictly absent-only in SDK 14; it must return `false` for
+every retained record, including a logically expired one. All expiry reclaim
+uses the exact-generation method above so an earlier absent read cannot erase a
+newer claim that appears and expires while the caller is awaiting another
+store operation.
+
+Audit every Redis-backed SDK store during the upgrade. Outside development and
+test, the idempotency backend, `RedisReplayStore`, and
+`redisCtxMetadataStore` now require a deployment-unique `keyPrefix` when a
+database is shared. An omitted, blank, or SDK-default prefix fails startup.
+For a Redis database operationally dedicated to one deployment, pass
+`acknowledgeIsolatedDatabase: true`; `suppressDefaultPrefixWarning` only
+controls development/test warnings and is not a production acknowledgement.
 
 ## Adopt one compact-first lifecycle
 
@@ -409,6 +705,65 @@ The outer `status` remains the asynchronous task state (`completed`, `working`, 
 ## Type and schema changes
 
 Regenerated 3.2 types include new tools, error codes, canonical formats, measurement surfaces, and more exact intersections/tuples. If application code imported broad generated types or runtime schemas, expect TypeScript to reveal newly exhaustive unions.
+
+Tool JSON Schema discovery is now version-aware. Use the schema subpath when
+an agent or gateway must publish the exact bundled contract for a negotiated
+release:
+
+```ts
+import { getToolInputSchema, getToolResponseSchema } from '@adcp/sdk/schemas';
+
+const request = getToolInputSchema('create_media_buy', { adcpVersion: '3.0' });
+const response = getToolResponseSchema('create_media_buy', {
+  adcpVersion: '3.2.0-beta.6',
+  variant: 'sync',
+});
+
+if (!request || !response) throw new Error('Tool schema is not present in the selected bundle');
+console.log(request.resolvedVersion, request.schema);
+```
+
+The returned record reports the requested version, selected bundle key, and
+exact release recorded by that bundle. A missing bundle throws an actionable
+configuration error; a tool or response variant absent from an installed
+bundle returns `undefined`. Neither case silently falls back to the current
+schema.
+
+Every `TaskResult.metadata` now exposes the selected seller wire generation as
+`serverVersion: 'v2' | 'v3'`. `serverVersionSynthetic` distinguishes an
+authoritative capability declaration (`false`) from the SDK's compatibility
+fallback (`true`). Both fields survive submitted/deferred continuations and
+durable restart recovery. `adcpVersion` remains the distinct, release-precision
+value echoed by a seller response.
+
+The v2.5 `get_products` response adapter also accepts explicitly zoned legacy
+forecast timestamps, including offset variants and single `$date`/`value`
+wrappers. It converts them to UTC RFC 3339 without losing fractional precision;
+ambiguous or unzoned values remain untouched, and the preserved seller wire
+object is not mutated.
+
+SDK 14 also adds semantic refinements to public object schemas. Behavior when
+composing a refined schema varies across supported Zod 4 releases: `.extend()`
+may throw during module initialization or may succeed with version-specific
+semantics. When adding application-owned fields to an SDK schema, use
+`.safeExtend()` consistently:
+
+```ts
+import { z } from 'zod';
+import { BiddingPolicySchema } from '@adcp/sdk/schemas';
+
+const ApplicationBiddingPolicySchema = BiddingPolicySchema.safeExtend({
+  application_policy_id: z.string(),
+});
+```
+
+Keep the SDK refinements in place: they enforce protocol rules that structural
+object validation alone cannot express. `.partial()` is also version-dependent:
+it may reject a refined object or return a structural partial without the
+original checks. Define application patch schemas separately, merge the patch
+with a complete object, and parse that result through the full SDK schema before
+using it. Do not rebuild from `.shape`, because doing so silently discards the
+protocol checks.
 
 The media-buy compatibility coordinator does not expose `unknown[]` rows or a
 `Record<string, unknown>` escape hatch. Product and proposal collections use

@@ -41,7 +41,7 @@ function installA2AStub() {
     },
   };
 
-  const { A2AClient } = require('@a2a-js/sdk/client');
+  const { legacyA2AClientTestShim: A2AClient } = require('../../dist/lib/protocols/a2a');
   const originalFromCardUrl = A2AClient.fromCardUrl;
   A2AClient.fromCardUrl = async () => stubClient;
 
@@ -58,7 +58,7 @@ function installA2AStub() {
 }
 
 /** Build an A2A Task-shaped response with a given status + ids. */
-function taskResponse({ status, taskId = 'task-xyz', contextId = 'ctx-xyz', data = {} }) {
+function taskResponse({ status, taskId = 'task-xyz', contextId = 'ctx-xyz', adcpTaskId, data = {} }) {
   return {
     jsonrpc: '2.0',
     id: 'rpc-id',
@@ -82,7 +82,7 @@ function taskResponse({ status, taskId = 'task-xyz', contextId = 'ctx-xyz', data
       artifacts: [
         {
           artifactId: 'a1',
-          parts: [{ kind: 'data', data }],
+          parts: [{ kind: 'data', data: { ...data, ...(adcpTaskId !== undefined && { task_id: adcpTaskId }) } }],
         },
       ],
     },
@@ -97,8 +97,8 @@ describe('A2A wire envelope carries contextId/taskId when a session is supplied'
 
       assert.strictEqual(stub.captured.length, 1);
       const msg = stub.captured[0].message;
-      assert.strictEqual(msg.contextId, undefined, 'no contextId on first send');
-      assert.strictEqual(msg.taskId, undefined, 'no taskId on first send');
+      assert.strictEqual(msg.contextId, '', 'A2A 1.0 uses the empty string when no contextId is supplied');
+      assert.strictEqual(msg.taskId, '', 'A2A 1.0 uses the empty string when no taskId is supplied');
     } finally {
       stub.restore();
     }
@@ -121,7 +121,7 @@ describe('A2A wire envelope carries contextId/taskId when a session is supplied'
 
       assert.strictEqual(stub.captured.length, 1);
       assert.strictEqual(stub.captured[0].message.contextId, 'ctx-resume-42');
-      assert.strictEqual(stub.captured[0].message.taskId, undefined);
+      assert.strictEqual(stub.captured[0].message.taskId, '');
     } finally {
       stub.restore();
     }
@@ -167,8 +167,8 @@ describe('AgentClient auto-retains contextId/taskId across sends', () => {
    * request schemas — the contract under test is the session-id retention,
    * not request-shape validation.
    */
-  function newClient() {
-    return new AgentClient(agentConfig, { validateFeatures: false });
+  function newClient(options = {}) {
+    return new AgentClient(agentConfig, { validateFeatures: false, ...options });
   }
 
   test('adopts server contextId on the first completed response, sends it on the next call', async () => {
@@ -188,7 +188,7 @@ describe('AgentClient auto-retains contextId/taskId across sends', () => {
       await client.executeTask('probe', {});
 
       assert.strictEqual(stub.captured.length, 2);
-      assert.strictEqual(stub.captured[0].message.contextId, undefined, 'first send has no session');
+      assert.strictEqual(stub.captured[0].message.contextId, '', 'first send has no session');
       assert.strictEqual(stub.captured[1].message.contextId, 'ctx-server-1', 'second send uses server contextId');
     } finally {
       stub.restore();
@@ -198,7 +198,14 @@ describe('AgentClient auto-retains contextId/taskId across sends', () => {
   test('retains pendingTaskId on input-required, sends it on resume', async () => {
     const stub = installA2AStub();
     try {
-      stub.enqueue(taskResponse({ status: 'input-required', contextId: 'ctx-hitl', taskId: 'task-hitl' }));
+      stub.enqueue(
+        taskResponse({
+          status: 'input-required',
+          contextId: 'ctx-hitl',
+          taskId: 'a2a-task-hitl',
+          adcpTaskId: 'adcp-work-handle-hitl',
+        })
+      );
       stub.enqueue(taskResponse({ status: 'completed', contextId: 'ctx-hitl', taskId: 'task-hitl' }));
 
       const client = newClient();
@@ -206,13 +213,89 @@ describe('AgentClient auto-retains contextId/taskId across sends', () => {
 
       assert.strictEqual(r1.status, 'input-required');
       assert.strictEqual(client.getContextId(), 'ctx-hitl');
-      assert.strictEqual(client.getPendingTaskId(), 'task-hitl', 'non-terminal retains taskId');
+      assert.strictEqual(r1.metadata.serverTaskId, 'adcp-work-handle-hitl');
+      assert.strictEqual(r1.metadata.a2aTaskId, 'a2a-task-hitl');
+      assert.strictEqual(client.getPendingTaskId(), 'a2a-task-hitl', 'non-terminal retains A2A transport Task.id');
 
       await client.executeTask('probe', {});
 
       assert.strictEqual(stub.captured[1].message.contextId, 'ctx-hitl');
-      assert.strictEqual(stub.captured[1].message.taskId, 'task-hitl', 'resume sends server taskId');
+      assert.strictEqual(stub.captured[1].message.taskId, 'a2a-task-hitl', 'resume sends A2A transport Task.id');
       assert.strictEqual(client.getPendingTaskId(), undefined, 'terminal response clears pending task');
+    } finally {
+      stub.restore();
+    }
+  });
+
+  test('clears the retained A2A task after a deferred resume completes', async () => {
+    const stub = installA2AStub();
+    try {
+      stub.enqueue(
+        taskResponse({
+          status: 'input-required',
+          contextId: 'ctx-deferred-resume',
+          taskId: 'a2a-deferred-resume',
+          adcpTaskId: 'work-deferred-resume',
+        })
+      );
+      stub.enqueue(
+        taskResponse({ status: 'completed', contextId: 'ctx-deferred-resume', taskId: 'a2a-deferred-resume' })
+      );
+      stub.enqueue(taskResponse({ status: 'completed', contextId: 'ctx-deferred-resume', taskId: 'a2a-fresh-task' }));
+
+      const client = newClient();
+      const paused = await client.executeTask('probe', {});
+      assert.strictEqual(paused.status, 'input-required');
+      assert.strictEqual(client.getPendingTaskId(), 'a2a-deferred-resume');
+
+      const resumed = await paused.deferred.resume('approved');
+      assert.strictEqual(resumed.status, 'completed');
+      assert.strictEqual(client.getPendingTaskId(), undefined);
+
+      await client.executeTask('probe', {});
+      assert.strictEqual(stub.captured[1].message.taskId, 'a2a-deferred-resume');
+      assert.strictEqual(stub.captured[2].message.taskId, '', 'completed task must not be rethreaded');
+    } finally {
+      stub.restore();
+    }
+  });
+
+  test('completed transport task with submitted artifact clears the prior A2A task ID', async () => {
+    const stub = installA2AStub();
+    try {
+      stub.enqueue(
+        taskResponse({
+          status: 'input-required',
+          contextId: 'ctx-two-lifecycle',
+          taskId: 'a2a-live-A',
+          adcpTaskId: 'work-A',
+        })
+      );
+      stub.enqueue(
+        taskResponse({
+          status: 'completed',
+          contextId: 'ctx-two-lifecycle',
+          taskId: 'a2a-live-A',
+          adcpTaskId: 'work-B',
+          data: { status: 'submitted' },
+        })
+      );
+      stub.enqueue(taskResponse({ status: 'completed', contextId: 'ctx-two-lifecycle', taskId: 'a2a-new-C' }));
+
+      const client = newClient();
+      await client.executeTask('probe', {});
+      assert.strictEqual(client.getPendingTaskId(), 'a2a-live-A');
+
+      const submitted = await client.executeTask('probe', {});
+      assert.strictEqual(stub.captured[1].message.taskId, 'a2a-live-A');
+      assert.strictEqual(submitted.status, 'submitted');
+      assert.strictEqual(submitted.metadata.serverTaskId, 'work-B');
+      assert.strictEqual(submitted.metadata.a2aTaskId, undefined);
+      assert.strictEqual(client.getPendingTaskId(), undefined);
+
+      await client.executeTask('probe', {});
+      assert.strictEqual(stub.captured[2].message.contextId, 'ctx-two-lifecycle');
+      assert.strictEqual(stub.captured[2].message.taskId, '');
     } finally {
       stub.restore();
     }
@@ -234,8 +317,8 @@ describe('AgentClient auto-retains contextId/taskId across sends', () => {
       assert.strictEqual(client.getPendingTaskId(), undefined);
 
       await client.executeTask('probe', {});
-      assert.strictEqual(stub.captured[1].message.contextId, undefined, 'post-reset send opens fresh session');
-      assert.strictEqual(stub.captured[1].message.taskId, undefined);
+      assert.strictEqual(stub.captured[1].message.contextId, '', 'post-reset send opens fresh session');
+      assert.strictEqual(stub.captured[1].message.taskId, '');
     } finally {
       stub.restore();
     }
@@ -315,7 +398,7 @@ describe('AgentClient auto-retains contextId/taskId across sends', () => {
       assert.strictEqual(stub.captured[1].message.contextId, 'ctx-B');
       assert.strictEqual(
         stub.captured[1].message.taskId,
-        undefined,
+        '',
         'stale pendingTaskId from conversation A must not leak into conversation B'
       );
     } finally {
@@ -377,7 +460,7 @@ describe('AgentClient.withSession narrows pendingTaskId auto-thread (regression 
       assert.strictEqual(stub.captured[1].message.contextId, 'ctx-shared', 'context continuity preserved');
       assert.strictEqual(
         stub.captured[1].message.taskId,
-        undefined,
+        '',
         'different skill MUST NOT auto-thread the prior task handle'
       );
     } finally {

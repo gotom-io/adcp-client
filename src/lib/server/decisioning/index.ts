@@ -22,6 +22,8 @@
 // `*Task` method in the background.
 export { type AdcpStructuredError, type ErrorCode, AdcpError } from './async-outcome';
 export type { TaskHandoffOptions } from './async-outcome';
+export { withResponseSummary } from './response-summary';
+export type { ResponseWithSummary } from './response-summary';
 export type { ServerPayload } from '../../types/server-payload';
 
 // Typed `AdcpError` subclasses — adopter convenience for the highest-traffic
@@ -177,6 +179,7 @@ export type {
   LegacyBuildCreativeReturn,
   LegacyBuildCreativePayload,
   LegacyBuildCreativeMultiPayload,
+  PreviewCreativePayload,
   LegacyPreviewCreativePayload,
   LegacyListCreativeFormatsPayload,
   // Deprecated aliases — kept for one-release source compat. Both
@@ -192,6 +195,7 @@ export type {
   LegacyBuildCreativeReturn as CreativeAdServerLegacyBuildCreativeReturn,
   LegacyBuildCreativePayload as CreativeAdServerLegacyBuildCreativePayload,
   LegacyBuildCreativeMultiPayload as CreativeAdServerLegacyBuildCreativeMultiPayload,
+  PreviewCreativePayload as CreativeAdServerPreviewCreativePayload,
   LegacyPreviewCreativePayload as CreativeAdServerLegacyPreviewCreativePayload,
   LegacyListCreativeFormatsPayload as CreativeAdServerLegacyListCreativeFormatsPayload,
   ListCreativesPayload as CreativeAdServerListCreativesPayload,
@@ -243,6 +247,7 @@ export type {
   MediaBuyLifecycleCorePlatform,
   MediaBuyLifecycleProposalPlatform,
   GetProductsPayload,
+  GetProductsProjectionInput,
   LegacyGetProductsPayload,
   GetProductsHandlerResult,
   CreateMediaBuyPayload,
@@ -339,6 +344,7 @@ export type {
 // new shape. Subject to change before 6.0 GA.
 export {
   createAdcpServerFromPlatform,
+  getHydratedLegacyFormatIds,
   getAllAdcpMigrations,
   type CreateAdcpServerFromPlatformOptions,
   type LegacyDecisioningHandlerGroups,

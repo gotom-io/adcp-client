@@ -17,6 +17,270 @@ describe('Zod Schema Validation', () => {
     assert.equal(typeof sdk.ADCP_VERSION, 'string', 'package root should expose its version');
   });
 
+  test('get_products schemas split canonical and legacy field selection', async () => {
+    const publicSchemas = await import('../../dist/lib/schemas/index.js');
+    const request = {
+      buying_mode: 'wholesale',
+      fields: ['format_ids'],
+      brand: {
+        domain: 'buyer.example',
+        brand_kit_override: {
+          logo: {
+            asset_type: 'image',
+            url: 'https://buyer.example/logo.png',
+            width: 100,
+            height: 100,
+            provenance: {
+              disclosure: {
+                required: true,
+                jurisdictions: [
+                  {
+                    country: 'US',
+                    regulation: 'example_rule',
+                    render_guidance: { positions: [] },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+    const parsed = publicSchemas.LegacyGetProductsRequestSchema.parse(request);
+
+    assert.deepEqual(parsed.fields, ['format_ids']);
+    assert.equal(publicSchemas.GetProductsRequestSchema.safeParse(request).success, false);
+    const canonicalJsonSchema = z.toJSONSchema(publicSchemas.GetProductsRequestSchema);
+    const canonicalFieldsJson = JSON.stringify(canonicalJsonSchema.properties.fields);
+    assert.doesNotMatch(canonicalFieldsJson, /format_ids/);
+    assert.match(canonicalFieldsJson, /format_options/);
+    assert.deepEqual(
+      parsed.brand.brand_kit_override.logo.provenance.disclosure.jurisdictions[0].render_guidance.positions,
+      []
+    );
+  });
+
+  test('beta.4 enforces flexible-window and outcome-target constraints', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+    assert.equal(
+      schemas.ForecastPointDimensionsSchema.safeParse([
+        { kind: 'time', start_time: '2027-01-01T00:00:00Z', end_time: '2027-01-02T00:00:00Z' },
+      ]).success,
+      true
+    );
+    assert.equal(
+      schemas.TimeForecastDimensionSchema.safeParse({
+        kind: 'time',
+        start_time: 'not-a-date-time',
+        end_time: 'also-invalid',
+      }).success,
+      false
+    );
+    const horizon = {
+      start_time: '2027-01-01T00:00:00Z',
+      end_time: '2027-02-01T00:00:00Z',
+    };
+    assert.equal(schemas.ProductOfferFiltersSchema.safeParse({ availability_horizon: horizon }).success, true);
+    assert.equal(
+      schemas.ProductOfferFiltersSchema.safeParse({
+        availability_horizon: { ...horizon, start_time: 'not-a-date-time' },
+      }).success,
+      false
+    );
+    assert.equal(
+      schemas.ProductOfferFiltersSchema.safeParse({ availability_horizon: horizon, start_date: '2027-01-01' }).success,
+      false
+    );
+    assert.equal(
+      schemas.OutcomeTargetSchema.safeParse({ goal: { kind: 'metric', metric: 'impressions' }, volume: 0 }).success,
+      false
+    );
+    assert.equal(
+      schemas.OutcomeTargetSchema.safeParse({ goal: { kind: 'event', event_type: 'custom' }, volume: 1 }).success,
+      false
+    );
+    assert.equal(
+      schemas.OutcomeTargetSchema.safeParse({
+        goal: { kind: 'event', event_type: 'custom', custom_event_name: '' },
+        volume: 1,
+      }).success,
+      false
+    );
+    assert.equal(schemas.AvailabilityStatusSchema.safeParse('available').success, true);
+  });
+
+  test('beta.5 validates canonical proposal budget guidance and forecast', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+    const proposal = {
+      proposal_id: 'proposal-outcome-target',
+      proposal_kind: 'new_media_buy',
+      proposal_status: 'draft',
+      expires_at: '2027-01-02T00:00:00Z',
+      name: 'Outcome target proposal',
+      commercial_terms: {
+        brand: { domain: 'buyer.example' },
+        purchases: [
+          {
+            product_id: 'product-1',
+            pricing_option_id: 'price-1',
+            pricing: {
+              pricing_option_id: 'price-1',
+              pricing_model: 'cpm',
+              currency: 'USD',
+              fixed_price: 8,
+            },
+            start_time: '2027-01-01T00:00:00Z',
+            end_time: '2027-02-01T00:00:00Z',
+          },
+        ],
+        start_time: '2027-01-01T00:00:00Z',
+        end_time: '2027-02-01T00:00:00Z',
+        total_budget: { amount: 8_000, currency: 'USD' },
+      },
+      terms_digest: `sha256:${'A'.repeat(43)}`,
+      total_budget_guidance: { recommended: 8_000, currency: 'USD' },
+      forecast: {
+        points: [{ metrics: { clicks: { mid: 10_000 } } }],
+        forecast_range_unit: 'clicks',
+        method: 'modeled',
+        currency: 'USD',
+      },
+    };
+
+    assert.equal(schemas.CanonicalProposalSchema.safeParse(proposal).success, true);
+    assert.equal(
+      schemas.CanonicalProposalSchema.safeParse({
+        ...proposal,
+        total_budget_guidance: { recommended: 8_000 },
+      }).success,
+      false
+    );
+    assert.equal(
+      schemas.CanonicalProposalSchema.safeParse({
+        ...proposal,
+        total_budget_guidance: { currency: 'USD' },
+      }).success,
+      false
+    );
+    assert.equal(
+      schemas.CanonicalProposalSchema.safeParse({ ...proposal, forecast: { method: 'modeled', currency: 'USD' } })
+        .success,
+      false
+    );
+  });
+
+  test('beta.4 continuation input schema accepts signed vectors and preserves closed loss consent', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+    const vectors = JSON.parse(
+      readFileSync(
+        path.resolve(
+          __dirname,
+          '../../compliance/cache/latest/test-vectors/products-only-brief-compatibility/vectors.json'
+        ),
+        'utf8'
+      )
+    );
+    for (const vector of vectors.cases) {
+      assert.equal(
+        schemas.CompatibilityPurchaseCoordinatorInputSchema.safeParse(vector.continuation_input).success,
+        true
+      );
+    }
+    const valid = vectors.cases[1].continuation_input;
+    for (const invalid of [
+      { ...valid, accepted_losses: ['feed_version_not_atomic'] },
+      { ...valid, accepted_losses: [...valid.accepted_losses, valid.accepted_losses[0]] },
+      { ...valid, selected_product_ids: [...valid.selected_product_ids, valid.selected_product_ids[0]] },
+      { ...valid, unexpected: true },
+    ]) {
+      assert.equal(schemas.CompatibilityPurchaseCoordinatorInputSchema.safeParse(invalid).success, false);
+    }
+  });
+
+  test('beta.4 request-proposals response schema enforces every legacy continuation loss', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+    const vectors = JSON.parse(
+      readFileSync(
+        path.resolve(
+          __dirname,
+          '../../compliance/cache/latest/test-vectors/products-only-brief-compatibility/vectors.json'
+        ),
+        'utf8'
+      )
+    );
+    for (const vector of vectors.cases) {
+      assert.equal(schemas.RequestProposalsResponseSchema.safeParse(vector.compact_projection).success, true);
+    }
+    const listed = vectors.listed_purchase_cases[0].compact_projection;
+    assert.equal(schemas.RequestProposalsResponseSchema.safeParse(listed).success, true);
+    const v25 = vectors.cases[0].compact_projection;
+    const invalidResponses = [
+      { outcome: 'products_available', status: 'completed' },
+      { outcome: 'products_available', status: 'completed', products: [] },
+      { outcome: 'rejected', status: 'completed', reason: 'no', purchase_continuation: v25.purchase_continuation },
+      {
+        ...v25,
+        purchase_continuation: {
+          ...v25.purchase_continuation,
+          losses: ['mutation_idempotency_not_guaranteed'],
+        },
+      },
+      {
+        ...v25,
+        purchase_continuation: {
+          ...v25.purchase_continuation,
+          losses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+        },
+      },
+      {
+        ...v25,
+        purchase_continuation: {
+          ...v25.purchase_continuation,
+          losses: ['feed_version_not_atomic', 'feed_version_not_atomic', 'pricing_version_not_atomic'],
+        },
+      },
+      {
+        ...v25,
+        purchase_continuation: { ...v25.purchase_continuation, product_ids: [''] },
+      },
+      {
+        ...listed,
+        purchase_continuation: { ...listed.purchase_continuation, product_ids: ['', ''] },
+      },
+      {
+        ...listed,
+        purchase_continuation: { ...listed.purchase_continuation, product_ids: ['different-product'] },
+      },
+      {
+        ...listed,
+        purchase_continuation: {
+          ...listed.purchase_continuation,
+          product_ids: [listed.products[0].product_id, 'missing-product'],
+        },
+        products: [listed.products[0], { ...listed.products[0] }],
+      },
+      {
+        ...listed,
+        products: [...listed.products, { ...listed.products[0], product_id: 'extra-product' }],
+      },
+      {
+        ...listed,
+        products: listed.products.map(({ pricing_options: _pricing, ...product }) => product),
+      },
+      {
+        ...listed,
+        products: listed.products.map(product => ({ ...product, pricing_options: [] })),
+      },
+      {
+        ...listed,
+        incomplete: [{ scope: 'pricing', description: 'missing' }],
+      },
+    ];
+    for (const invalid of invalidResponses) {
+      assert.equal(schemas.RequestProposalsResponseSchema.safeParse(invalid).success, false);
+    }
+  });
+
   test('reference image and carousel fixtures conform to SDK schemas', async () => {
     if (!schemas) {
       schemas = await import('../../dist/lib/types/schemas.generated.js');
@@ -70,6 +334,40 @@ describe('Zod Schema Validation', () => {
       assert.strictEqual(schemas.CreativeManifestSchema.safeParse(manifest).success, true);
       assert.strictEqual(schemas.ProductFormatDeclarationSchema.safeParse(declaration).success, true);
       assert.strictEqual(prepare({ manifest, declaration }).ok, true);
+    }
+  });
+
+  test('PreviewCreativeRequestSchema enforces mode and one-generation batch routing', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+    const legacyFormat = { agent_url: 'https://creative.example', id: 'display' };
+    const validBatch = {
+      request_type: 'batch',
+      target_capability_id: 'preview_capability',
+      requests: [{ creative_id: 'creative-1' }, { target_capability_id: 'item_capability', creative_id: 'creative-2' }],
+    };
+    assert.equal(schemas.PreviewCreativeRequestSchema.safeParse(validBatch).success, true);
+    for (const invalid of [
+      { request_type: 'single' },
+      { request_type: 'single', creative_id: 'one', creative_manifest: {} },
+      { request_type: 'single', creative_id: 'one', requests: [] },
+      { request_type: 'single', creative_id: 'one', requests: [{}] },
+      { request_type: 'variant' },
+      { request_type: 'variant', variant_id: undefined },
+      { request_type: 'batch' },
+      { request_type: 'batch', requests: [] },
+      { request_type: 'batch', requests: Array.from({ length: 51 }, (_, index) => ({ creative_id: `c-${index}` })) },
+      { request_type: 'batch', requests: [{}] },
+      { request_type: 'batch', requests: [{ creative_id: 'one', creative_manifest: {} }] },
+      { ...validBatch, format_id: legacyFormat },
+      {
+        request_type: 'batch',
+        requests: [
+          { target_capability_id: 'canonical', creative_id: 'one' },
+          { format_id: legacyFormat, creative_id: 'two' },
+        ],
+      },
+    ]) {
+      assert.equal(schemas.PreviewCreativeRequestSchema.safeParse(invalid).success, false);
     }
   });
 
@@ -180,6 +478,8 @@ describe('Zod Schema Validation', () => {
     assert.equal(typeof schemas.ProductSchema.omit, 'function', 'ProductSchema should support omit');
     assert.equal(typeof schemas.ProductSchema.pick, 'function', 'ProductSchema should support pick');
     assert.ok(schemas.CanonicalFormatImageSchema.shape.image_formats, 'canonical formats should expose object shape');
+    assert.equal(schemas.CanonicalFormatImageSchema.safeParse({ motion_level: 'limited_motion' }).success, true);
+    assert.equal(schemas.CanonicalFormatImageSchema.safeParse({ motion_level: 'full_motion' }).success, false);
   });
 
   test('PriceBreakdownSchema preserves adjustment XOR and 1..20 bounds', async () => {
@@ -298,6 +598,344 @@ describe('Zod Schema Validation', () => {
       schemas.GetMediaBuyDeliveryResponseSchema.safeParse(legacyResponse).success,
       'full legacy delivery response should remain wired to optional compatibility metrics'
     );
+  });
+
+  test('beta.6 reporting request and delivery identities round-trip', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const request = {
+      requested_metrics: ['viewable_rate', 'quartile_100', 'time_based_views'],
+      reporting_dimensions: {
+        creative: { limit: 5, sort_by: 'quartile_100', sort_direction: 'asc' },
+        keyword: { sort_by: 'viewable_rate', sort_direction: 'desc' },
+        catalog_item: {},
+        format: { limit: 3, sort_by: 'cpm', sort_direction: 'desc' },
+      },
+    };
+    assert.ok(
+      schemas.GetMediaBuyDeliveryRequestSchema.safeParse(request).success,
+      'requested metric leaves and negotiated breakdown controls should validate'
+    );
+    assert.ok(
+      !schemas.GetMediaBuyDeliveryRequestSchema.safeParse({ requested_metrics: [] }).success,
+      'requested metrics must not be empty'
+    );
+    assert.ok(
+      !schemas.GetMediaBuyDeliveryRequestSchema.safeParse({ requested_metrics: ['clicks', 'clicks'] }).success,
+      'requested metrics must be unique'
+    );
+
+    const deliveryMetrics = {
+      impressions: 100,
+      spend: 25,
+      time_based_views: [
+        { threshold_seconds: 2, basis: 'play_time', views: 80 },
+        { threshold_seconds: 2, basis: 'in_view', views: 60, standard: 'mrc' },
+      ],
+      vendor_metric_values: [
+        {
+          vendor: { domain: 'measurement.example' },
+          metric_id: 'incremental_outcomes',
+          value: 12,
+          qualifier: { attribution_window: { interval: 7, unit: 'days' } },
+        },
+        {
+          vendor: { domain: 'measurement.example' },
+          metric_id: 'incremental_outcomes',
+          value: 18,
+          qualifier: { attribution_window: { interval: 30, unit: 'days' } },
+        },
+      ],
+    };
+    assert.ok(
+      schemas.DeliveryMetricsSchema.safeParse(deliveryMetrics).success,
+      'time-based views and qualifier-distinct vendor rows should validate'
+    );
+    assert.ok(
+      !schemas.DeliveryMetricsSchema.safeParse({
+        time_based_views: [{ threshold_seconds: 0, basis: 'play_time', views: 1 }],
+      }).success,
+      'time-based view thresholds must be positive'
+    );
+    assert.ok(
+      !schemas.VendorMetricValueSchema.safeParse({
+        vendor: { domain: 'measurement.example' },
+        metric_id: 'incremental_outcomes',
+        value: 1,
+        qualifier: { unrecognized_identity: 'poison' },
+      }).success,
+      'vendor metric identity qualifiers must reject unknown keys'
+    );
+
+    const aggregateRows = [
+      {
+        scope: 'standard',
+        metric_id: 'viewable_rate',
+        value: 0.75,
+        measurable_impressions: 80,
+        viewable_impressions: 60,
+        qualifier: { viewability_standard: 'mrc' },
+      },
+      {
+        scope: 'standard',
+        metric_id: 'completion_rate',
+        value: 0.5,
+        impressions: 100,
+        completed_views: 50,
+      },
+      { scope: 'standard', metric_id: 'cost_per_acquisition', value: 4, spend: 20, conversions: 5 },
+      { scope: 'standard', metric_id: 'roas', value: 3, spend: 20, conversion_value: 60 },
+    ];
+    for (const aggregate of aggregateRows) {
+      assert.ok(schemas.DeliveryMetricAggregateSchema.safeParse(aggregate).success);
+      for (const requiredComponent of Object.keys(aggregate).filter(
+        key => !['scope', 'metric_id', 'value', 'qualifier'].includes(key)
+      )) {
+        const incomplete = { ...aggregate };
+        delete incomplete[requiredComponent];
+        assert.ok(
+          !schemas.DeliveryMetricAggregateSchema.safeParse(incomplete).success,
+          `${aggregate.metric_id} must require ${requiredComponent}`
+        );
+      }
+    }
+    assert.ok(
+      !schemas.DeliveryMetricAggregateSchema.safeParse({
+        scope: 'standard',
+        metric_id: 'clicks',
+        value: 1,
+        qualifier: { unrecognized_identity: 'poison' },
+      }).success,
+      'standard delivery aggregate qualifiers must reject unknown identity keys'
+    );
+    assert.ok(
+      !schemas.DeliveryMetricAggregateSchema.safeParse({
+        scope: 'vendor',
+        vendor: { domain: 'measurement.example' },
+        metric_id: 'incremental_outcomes',
+        value: 1,
+        qualifier: { unrecognized_identity: 'poison' },
+      }).success,
+      'delivery aggregate qualifiers must reject unknown identity keys'
+    );
+
+    const response = {
+      status: 'completed',
+      reporting_period: { start: '2026-08-01T00:00:00Z', end: '2026-08-02T00:00:00Z' },
+      currency: 'USD',
+      media_buy_deliveries: [
+        {
+          media_buy_id: 'buy-1',
+          status: 'active',
+          totals: deliveryMetrics,
+          by_package: [
+            {
+              package_id: 'package-1',
+              impressions: 100,
+              spend: 25,
+              by_format: [{ format_kind: 'video_vast', impressions: 100, spend: 25 }],
+              by_format_truncated: false,
+              by_format_sorted_by: 'cpm',
+              by_format_sort_direction: 'desc',
+            },
+          ],
+        },
+      ],
+    };
+    assert.ok(
+      schemas.GetMediaBuyDeliveryResponseSchema.safeParse(response).success,
+      'format breakdown completeness and applied-sort echoes should validate'
+    );
+  });
+
+  test('beta.6 promoted canonical formats preserve nested wire constraints', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    for (const format_kind of ['seller_rendered_stateful_display', 'coordinated_placements']) {
+      const option = { format_kind, params: {} };
+      assert.ok(
+        schemas.CanonicalFormatOptionSchema.safeParse(option).success,
+        `${format_kind} must be accepted by compact format options`
+      );
+      assert.ok(
+        schemas.CanonicalProductSchema.safeParse({
+          product_id: `product-${format_kind}`,
+          name: format_kind,
+          format_options: [option],
+        }).success,
+        `${format_kind} must be accepted in canonical products`
+      );
+    }
+
+    const stateful = {
+      states: [
+        {
+          state_id: 'default',
+          anchoring: 'inline',
+          breakpoints: [{ breakpoint_id: 'desktop', width: 300, height: 250 }],
+          close_affordance: false,
+        },
+      ],
+      initial_state_id: 'default',
+      user_controls: { dismissible: false, user_collapsible: false },
+    };
+    assert.ok(schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.shape);
+    assert.ok(schemas.CanonicalFormatCoordinatedPlacementsSchema.shape);
+    assert.ok(schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse(stateful).success);
+    for (const invalid of [
+      { ...stateful, experimental: 'wrong' },
+      { ...stateful, v1_translatable: 42 },
+      { ...stateful, composition_model: { bad: true } },
+      { ...stateful, slots: { not: 'an array' } },
+      {
+        ...stateful,
+        states: [
+          {
+            ...stateful.states[0],
+            breakpoints: [{ breakpoint_id: 'desktop', width: 300, width_range: [250, 350], height: 250 }],
+          },
+        ],
+      },
+      {
+        ...stateful,
+        states: [
+          {
+            ...stateful.states[0],
+            breakpoints: [{ breakpoint_id: 'desktop', width: 300, height: 250, height_range: [200, 300] }],
+          },
+        ],
+      },
+      {
+        ...stateful,
+        states: [{ ...stateful.states[0], breakpoints: [{ breakpoint_id: 'desktop', width: 300 }] }],
+      },
+      { ...stateful, duration_ms_range: [null, null] },
+      { ...stateful, duration_ms_range: [0, 100, 200] },
+      { ...stateful, containers: ['mp4', 'mp4'] },
+    ]) {
+      assert.ok(
+        !schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse(invalid).success,
+        `stateful-display must reject ${JSON.stringify(invalid)}`
+      );
+    }
+    assert.ok(
+      !schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse({
+        ...stateful,
+        states: [{ ...stateful.states[0], breakpoints: [{}] }],
+      }).success,
+      'stateful-display breakpoints must retain required identity and geometry'
+    );
+    assert.ok(
+      !schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse({
+        ...stateful,
+        transitions: [{ trigger: 'timer' }],
+      }).success,
+      'stateful-display transitions must retain common and arm-specific required fields'
+    );
+    const transitionBase = {
+      transition_id: 'expand',
+      from_state_id: 'default',
+      to_state_id: 'expanded',
+      trigger: 'timer',
+      transition_mode: 'animated',
+      delay_ms: 250,
+    };
+    assert.ok(
+      schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse({
+        ...stateful,
+        transitions: [transitionBase],
+      }).success
+    );
+    assert.ok(
+      !schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse({
+        ...stateful,
+        transitions: [{ ...transitionBase, input: 'tap' }],
+      }).success,
+      'timer transitions reject user input'
+    );
+    assert.ok(
+      !schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse({
+        ...stateful,
+        transitions: [
+          {
+            ...transitionBase,
+            trigger: 'scroll_progress',
+            input: 'scroll',
+            scroll_reference: 'page',
+            scroll_start_percent: 0,
+            scroll_end_percent: 100,
+          },
+        ],
+      }).success,
+      'scroll-progress transitions require scroll-linked mode and forbid timer fields'
+    );
+
+    const coordinated = {
+      components: [
+        {
+          component_id: 'hero',
+          placement_ref: { placement_id: 'hero-placement' },
+          required: true,
+          format_kind: 'image',
+          params: {},
+        },
+        {
+          component_id: 'rail',
+          placement_ref: { placement_id: 'rail-placement' },
+          required: false,
+          format_option_ref: { scope: 'product', format_option_id: 'rail-option' },
+        },
+      ],
+    };
+    assert.ok(schemas.CanonicalFormatCoordinatedPlacementsSchema.safeParse(coordinated).success);
+    assert.ok(
+      !schemas.CanonicalFormatCoordinatedPlacementsSchema.safeParse({ components: [{}, {}] }).success,
+      'coordinated components must retain required identity, placement, and format selection'
+    );
+    assert.ok(
+      !schemas.CanonicalFormatCoordinatedPlacementsSchema.safeParse({
+        components: coordinated.components.map(component => ({ ...component, required: false })),
+      }).success,
+      'at least one coordinated component must be required'
+    );
+    assert.ok(
+      !schemas.CanonicalFormatCoordinatedPlacementsSchema.safeParse({
+        components: [
+          {
+            ...coordinated.components[0],
+            format_option_ref: { scope: 'product', format_option_id: 'also-a-reference' },
+          },
+          coordinated.components[1],
+        ],
+      }).success,
+      'inline and referenced component formats are mutually exclusive'
+    );
+    for (const firstComponent of [
+      { ...coordinated.components[0], params: undefined },
+      { ...coordinated.components[0], format_kind: 'custom' },
+      { ...coordinated.components[0], format_kind: 'coordinated_placements' },
+      { ...coordinated.components[0], params: { width: 0 } },
+    ]) {
+      assert.ok(
+        !schemas.CanonicalFormatCoordinatedPlacementsSchema.safeParse({
+          components: [firstComponent, coordinated.components[1]],
+        }).success,
+        `coordinated inline format must reject ${JSON.stringify(firstComponent)}`
+      );
+    }
+    for (const consumed_by of [[], ['hero', 'hero']]) {
+      assert.ok(
+        !schemas.CanonicalFormatCoordinatedPlacementsSchema.safeParse({
+          ...coordinated,
+          shared_slots: [{ asset_group_id: 'logo', asset_type: 'image', consumed_by }],
+        }).success,
+        `shared-slot consumers must reject ${JSON.stringify(consumed_by)}`
+      );
+    }
   });
 
   test('PostalCountrySystemSchema requires a valid country and system pair', async () => {
@@ -818,6 +1456,44 @@ describe('Zod Schema Validation', () => {
     assert.ok(
       result.success,
       `GetMediaBuysResponse validation should succeed: ${JSON.stringify(result.error?.issues)}`
+    );
+  });
+
+  test('GetMediaBuysResponseSchema rejects creative approvals missing creative_id', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const responseWithApproval = approval => ({
+      status: 'completed',
+      media_buys: [
+        {
+          media_buy_id: 'mb_123',
+          status: 'active',
+          currency: 'USD',
+          total_budget: 50000,
+          confirmed_at: '2026-01-15T10:00:00Z',
+          revision: 1,
+          packages: [{ package_id: 'pkg_1', creative_approvals: [approval] }],
+        },
+      ],
+    });
+
+    assert.equal(
+      schemas.GetMediaBuysResponseSchema.safeParse(responseWithApproval({ approval_status: 'approved' })).success,
+      false
+    );
+    assert.equal(
+      schemas.GetMediaBuysResponseSchema.safeParse(
+        responseWithApproval({ indicator_types_evaluated: ['creative_fatigue'] })
+      ).success,
+      false
+    );
+    assert.equal(
+      schemas.GetMediaBuysResponseSchema.safeParse(
+        responseWithApproval({ creative_id: 'creative-1', approval_status: 'approved' })
+      ).success,
+      true
     );
   });
 
@@ -1609,6 +2285,16 @@ describe('Zod Schema Validation', () => {
     );
   });
 
+  test('PostalAreaSchema requires a non-empty native values list', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    assert.equal(schemas.PostalAreaSchema.safeParse({ country: 'US', system: 'zip' }).success, false);
+    assert.equal(schemas.PostalAreaSchema.safeParse({ country: 'US', system: 'zip', values: [] }).success, false);
+    assert.equal(schemas.PostalAreaSchema.safeParse({ country: 'US', system: 'zip', values: ['10001'] }).success, true);
+  });
+
   test('per-asset-type requirements schemas are typed (not z.any)', async () => {
     if (!schemas) {
       schemas = await import('../../dist/lib/types/schemas.generated.js');
@@ -1693,7 +2379,7 @@ describe('Zod Schema Validation', () => {
       ['space-separator', '2027-01-02 00:00:00Z'],
       ['compact-offset', '2027-01-02T00:00:00+0100'],
     ];
-    const exactValidator = getSchemaValidatorByRef('media-buy/refine-proposals-response.json', '3.2.0-beta.3');
+    const exactValidator = getSchemaValidatorByRef('media-buy/refine-proposals-response.json');
     assert.ok(exactValidator, 'exact refine_proposals response validator should be available');
     const exactAccepts = payload => exactValidator(payload);
     const zodAccepts = payload => schemas.RefineProposalsResponseSchema.safeParse(payload).success;

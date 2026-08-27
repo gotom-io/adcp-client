@@ -32,9 +32,9 @@
  * deterministic for that single format_id.
  *
  * **Scope (prototype)**:
- *   - AAO catalog only — seller-specific catalogs (publisher's own
- *     `list_creative_formats`) require an AgentClient hook the auto-
- *     negotiation surface will provide in the full 8.0 enablement.
+ *   - AAO catalog plus explicit adopter resolvers for seller-specific
+ *     formats. Network-backed resolution remains outside this pure module;
+ *     server integrations can use `LegacyFormatResolver` before projection.
  *   - Param extraction is dimensions-only (`width`, `height`,
  *     `duration_ms`). Full canonical-specific params (slots, codecs,
  *     char limits, platform_extensions) are not constructed. A v2
@@ -48,6 +48,7 @@
 
 import type {
   V1Product,
+  V1ProductInput,
   V1FormatId,
   V2Product,
   V2ProductFormatDeclaration,
@@ -125,6 +126,24 @@ export interface LegacyFormatConversionContext {
 export type LegacyFormatConverter = (
   context: LegacyFormatConversionContext
 ) => V2ProductFormatDeclaration | null | undefined;
+
+/** Safe request context supplied to an asynchronous seller-specific resolver. */
+export interface LegacyFormatResolutionContext extends LegacyFormatConversionContext {
+  operation: 'get_products';
+  servedAdcpVersion?: string;
+  accountId?: string;
+  /** Aborts when the request is cancelled or the SDK resolver deadline expires. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Asynchronous counterpart to {@link LegacyFormatConverter}. Intended for
+ * catalog/database lookups that must complete before a server projects a
+ * legacy `get_products` result onto its canonical wire boundary.
+ */
+export type LegacyFormatResolver = (
+  context: LegacyFormatResolutionContext
+) => PromiseLike<V2ProductFormatDeclaration | null | undefined> | V2ProductFormatDeclaration | null | undefined;
 
 export interface V1ToV2ProjectionOptions {
   legacyFormatConverter?: LegacyFormatConverter;
@@ -549,12 +568,13 @@ function projectFormatId(
  * @see canonicalDeclarationFromBareId — resolve a single bare format-id
  * string (no surrounding Product) to a declaration or `format_kind`.
  */
-export function projectV1ProductToV2(v1: V1Product, options?: V1ToV2ProjectionOptions): V1ToV2Result {
+export function projectV1ProductToV2(v1: V1ProductInput, options?: V1ToV2ProjectionOptions): V1ToV2Result {
   const format_options: V2ProductFormatDeclaration[] = [];
   const diagnostics: ProjectionDiagnostic[] = [];
 
-  for (let i = 0; i < v1.format_ids.length; i++) {
-    const fid = v1.format_ids[i]!;
+  const inputFormatIds = v1.format_ids ?? [];
+  for (let i = 0; i < inputFormatIds.length; i++) {
+    const fid = inputFormatIds[i]! as V1FormatId;
     const field = `products[${v1.product_id}].format_ids[${i}]`;
     const { decl, diagnostic } = projectFormatId(fid, v1.product_id, field, options);
     if (decl) {
@@ -570,7 +590,7 @@ export function projectV1ProductToV2(v1: V1Product, options?: V1ToV2ProjectionOp
   const { format_ids: _drop, ...rest } = v1;
   void _drop;
   const v2Product: V2Product = {
-    ...(rest as Omit<V1Product, 'format_ids'>),
+    ...(rest as Omit<V1ProductInput, 'format_ids'>),
     format_options,
   } as V2Product;
 

@@ -47,6 +47,8 @@ export type {
   BareFormatIdResolveOptions,
   LegacyFormatConversionContext,
   LegacyFormatConverter,
+  LegacyFormatResolutionContext,
+  LegacyFormatResolver,
 } from './v1-to-v2';
 
 export { projectV2ProductToV1 } from './v2-to-v1';
@@ -96,7 +98,9 @@ export {
   productCard,
   productCardDetailed,
   responsiveCreativeFormatDeclaration,
+  sellerRenderedStatefulDisplayFormatDeclaration,
   sponsoredPlacementFormatDeclaration,
+  coordinatedPlacementsFormatDeclaration,
   videoHostedFormatDeclaration,
   videoVastFormatDeclaration,
   type CanonicalFormatDeclaration,
@@ -131,7 +135,17 @@ export {
   type PackageFormatSelectorDimensionDiagnostic,
 } from './write-side';
 
-export type { V1FormatId, V2ProductFormatDeclaration, V2Product, V1Product, ProjectionDiagnostic } from './types';
+export type {
+  V1FormatId,
+  V2ProductFormatDeclaration,
+  V2ProductInput,
+  V2Product,
+  V1ProductInput,
+  V1Product,
+  ProjectionProductInput,
+  ProjectionDiagnostic,
+} from './types';
+export { isProjectionProductInput } from './types';
 export {
   legacyFormatConverterFromCatalogSnapshots,
   canonicalFormatLegacyResolverFromCatalogSnapshots,
@@ -152,6 +166,9 @@ export {
 } from './catalog';
 
 export { isCanonicalV1Translatable } from './canonical-properties';
+
+export { normalizeLegacyGetProductsResponse } from './legacy-normalization';
+export type { LegacyProductNormalizationInput, NormalizedLegacyProduct } from './legacy-normalization';
 
 export {
   CreativeFormatProjectionError,
@@ -182,6 +199,8 @@ export {
   type CanonicalPackageUpdate,
   type CanonicalPackage,
   type CanonicalPlacement,
+  type CanonicalPreviewCreativeRequest,
+  type CanonicalPreviewCreativeResponse,
   type CanonicalProduct,
   type CanonicalProjectedCreative,
   type CanonicalSyncCreativesRequest,

@@ -89,6 +89,29 @@ describe('creative format delivery projection', () => {
     assert.equal(safe.format_id, undefined);
   });
 
+  test('preserves beta.6 canonical format kinds in diagnostics and canonical delivery', () => {
+    for (const formatKind of ['seller_rendered_stateful_display', 'coordinated_placements']) {
+      const safe = stripLegacyCreativeIdentity({
+        format_kind: formatKind,
+        message: `${formatKind} accepted`,
+      });
+      assert.equal(safe.format_kind, formatKind);
+      assert.equal(safe.message, `${formatKind} accepted`);
+
+      const canonical = projectCreativeForDelivery(
+        {
+          creative_id: `creative-${formatKind}`,
+          name: formatKind,
+          format_kind: formatKind,
+          assets: {},
+        },
+        {},
+        'canonical'
+      );
+      assert.equal(canonical.format_kind, formatKind);
+    }
+  });
+
   test('sanitizes class-instance own fields and fails closed on neutral tuples and accessors', () => {
     class LegacyCarrier {
       constructor() {
@@ -615,14 +638,14 @@ describe('creative format delivery projection', () => {
       },
       'legacy'
     ).packages[0].creatives[0];
-    registerExternalSchemaRoot('3.0.24', path.resolve('schemas/cache/3.0.24'));
+    registerExternalSchemaRoot('3.0.25', path.resolve('schemas/cache/3.0.25'));
     try {
-      const validate = getSchemaValidatorByRef('core/creative-asset.json', '3.0.24');
+      const validate = getSchemaValidatorByRef('core/creative-asset.json', '3.0.25');
       assert.equal(typeof validate, 'function');
       assert.equal(validate(canonical), false);
       assert.equal(validate(projected), true);
     } finally {
-      unregisterExternalSchemaRoot('3.0.24');
+      unregisterExternalSchemaRoot('3.0.25');
     }
   });
 

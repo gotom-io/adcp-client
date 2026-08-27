@@ -1,17 +1,27 @@
 # Migrating from 12.x to 14 beta
 
-This is the direct upgrade path for applications skipping SDK 13. SDK 14 includes both SDK 13's canonical-creative and security boundary changes and the AdCP `3.2.0-beta.3` preview surface. Treat it as two review checkpoints even if you deploy one package update.
+This is the direct upgrade path for applications skipping SDK 13. SDK 14 includes both SDK 13's canonical-creative and security boundary changes and the AdCP `3.2.0-beta.6` preview surface. Treat it as two review checkpoints even if you deploy one package update.
 
-AdCP prerelease pins are exact: beta.3 supersedes beta.2. Beta.2 added canonical
+AdCP prerelease pins are exact: beta.6 supersedes beta.5. Beta.2 added canonical
 compact proposal and direct-buy lifecycle storyboards through operational
-control and MediaBuy readback; beta.3 preserves that wire contract and
-clarifies request invariants.
+control and MediaBuy readback; beta.4 adds flexible-window availability and
+durable products-only legacy purchase continuations. Beta.5 defines stable
+async identity, cross-channel terminal convergence, webhook retry horizons,
+and crash-safe continuation generation replacement. Beta.6 adds coordinated
+placements, seller-rendered stateful display, creative component assets, and
+A2A 1.0 request-signing method names.
 
 Install the beta explicitly:
 
 ```bash
 npm install @adcp/sdk@beta
 ```
+
+If a pre-3.2 brief can return products without a proposal, configure a durable
+`LegacyPurchaseContinuationStore`, a stable non-secret `principalScope`, and an
+authoritative `reconcileLegacyPurchase(record, exactInput)` callback before
+offering `continueLegacyPurchase()`. Reverse compact-seller support for older
+buyers remains application-owned through explicit legacy sales handlers.
 
 The npm `latest` tag remains on SDK 13, the maintained AdCP 3.1 stable line. If you do not need AdCP 3.2 yet, upgrading 12→13 first is the lower-risk production move.
 
@@ -26,7 +36,7 @@ Before deploying SDK 14 from SDK 12:
 5. Preserve and validate OAuth `state`; allow only HTTP(S) authorization redirects.
 6. Narrow the structured error arm of `CreateMediaBuyPayload`, add all new `AssetInstance` variants to exhaustive switches, and read compliance scenario detail from `tracks` rather than `tested_tracks`.
 7. Update server platform and legacy utility names that became explicit in SDK 13.
-8. Make synchronous completion-webhook behavior explicit if you temporarily depend on duplicate inline and webhook delivery.
+8. Remove any dependence on duplicate inline and task-webhook delivery; synchronous terminal responses are webhook-silent under AdCP 3.2.
 9. Add AdCP 3.2 tools only behind capability checks; retain established 3.0/3.1 lifecycle fallbacks.
 10. Update request signing for the versioned 3.2 profile and return media-buy business state as `media_buy_status`.
 11. Before the endpoint-scoped idempotency key rollout, stop mutations, drain in-flight work, and wait a full replay TTL (or migrate/dual-read old keys); do not mix old and new server binaries.
@@ -83,8 +93,8 @@ OAuth flow handlers must preserve `state`, verify callback binding, and pass an 
 - Narrow `CreateMediaBuyPayload` with `'errors' in payload` before reading success fields.
 - Add `zip`, `published_post`, `card`, `pixel_tracker`, `vast_tracker`, and `daast_tracker` to exhaustive `AssetInstance` handling.
 - Read canonical compliance scenarios from `ComplianceResult.tracks`; `tested_tracks` contains compact reference entries.
-- `createAdcpServerFromPlatform()` does not emit a completion webhook for an inline terminal result by default. `autoEmitCompletionWebhooks: true` is a temporary non-conformant bridge.
-- Rename raw platform hooks to explicit forms such as `buildCreativeLegacy`, `previewCreativeLegacy`, `listCreativeFormatsLegacy`, and the corresponding content-standard and brand-rights names.
+- `createAdcpServerFromPlatform()` never emits a task webhook for an inline terminal result. The deprecated `autoEmitCompletionWebhooks` option is ignored under AdCP 3.2.
+- Rename raw platform hooks to explicit forms such as `buildCreativeLegacy`, `previewCreativeLegacy`, `listCreativeFormatsLegacy`, and the corresponding content-standard and brand-rights names. Canonical AdCP 3.2 previews now use `previewCreative` with `target_capability_id`, `creative_id`, or `creative_manifest`; retain `previewCreativeLegacy` only for `format_id` callers. Custom `WebhookRegistrationStore` implementations must round-trip the optional `previewMode` field so callback routing survives restarts.
 - Put incrementally migrated raw handler groups under `legacyHandlers`.
 - Replace removed registry hierarchy calls with `lookupBrand()`/`lookupBrands()` and inspect relationship evidence; use `{ fresh: true }` when a live origin check is required.
 - Use `PayloadDigestOptions` for `computePayloadDigestSha256()` rather than the removed bare `RegExp` or `false` overloads.

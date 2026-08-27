@@ -9,6 +9,8 @@ process.env.NODE_ENV = 'test';
 
 const { describe, it, beforeEach } = require('node:test');
 const assert = require('node:assert');
+const { readFileSync } = require('node:fs');
+const path = require('node:path');
 const { createAdcpServerFromPlatform } = require('../dist/lib/server/decisioning/runtime/from-platform');
 const { PlatformConfigError, validatePlatform } = require('../dist/lib/server/decisioning/runtime/validate-platform');
 const { AccountNotFoundError } = require('../dist/lib/server/decisioning/account');
@@ -18,6 +20,13 @@ const { StaticJwksResolver, InMemoryReplayStore, InMemoryRevocationStore } = req
 const { getSchemaValidatorByRef } = require('../dist/lib/validation/schema-loader');
 const { toCanonicalOnlyResponse } = require('../dist/lib/v2/projection');
 const { createIdempotencyStore, memoryBackend } = require('../dist/lib/server/idempotency');
+
+const PRODUCTS_ONLY_BRIEF_VECTORS = JSON.parse(
+  readFileSync(
+    path.resolve(__dirname, '../compliance/cache/latest/test-vectors/products-only-brief-compatibility/vectors.json'),
+    'utf8'
+  )
+);
 
 const validateMcpWebhookPayload = getSchemaValidatorByRef('core/mcp-webhook-payload.json');
 assert.ok(validateMcpWebhookPayload, 'MCP webhook payload schema must compile');
@@ -83,6 +92,62 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     assert.strictEqual(typeof server.dispatchTestRequest, 'function');
   });
 
+  it('projects standard extension capabilities without overriding derived protocols (#2671)', async () => {
+    const platform = buildPlatform();
+    const extensionsSupported = ['example'];
+    const ext = { example: { feature: true } };
+    platform.capabilities.extensions_supported = extensionsSupported;
+    platform.capabilities.ext = ext;
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'extension-capabilities',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'strict' },
+    });
+
+    extensionsSupported.push('caller_mutation');
+    ext.example.feature = false;
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'get_adcp_capabilities', arguments: {} },
+    });
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.deepStrictEqual(result.structuredContent.extensions_supported, ['example']);
+    assert.deepStrictEqual(result.structuredContent.ext, { example: { feature: true } });
+    assert.ok(result.structuredContent.supported_protocols.includes('media_buy'));
+
+    result.structuredContent.extensions_supported.push('response_mutation');
+    result.structuredContent.ext.example.feature = false;
+    const secondResult = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'get_adcp_capabilities', arguments: {} },
+    });
+    assert.notStrictEqual(secondResult.isError, true, JSON.stringify(secondResult.structuredContent));
+    assert.deepStrictEqual(secondResult.structuredContent.extensions_supported, ['example']);
+    assert.deepStrictEqual(secondResult.structuredContent.ext, { example: { feature: true } });
+  });
+
+  it('strictly validates extension capability declarations (#2671)', async () => {
+    for (const invalidCapabilities of [
+      { extensions_supported: ['Invalid-Namespace'] },
+      { extensions_supported: ['example', 'example'] },
+      { ext: [] },
+    ]) {
+      const platform = buildPlatform();
+      Object.assign(platform.capabilities, invalidCapabilities);
+      const server = createAdcpServerFromPlatform(platform, {
+        name: 'invalid-extension-capabilities',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'strict' },
+      });
+      const result = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'get_adcp_capabilities', arguments: {} },
+      });
+      assert.strictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+      assert.strictEqual(result.structuredContent.adcp_error.code, 'VALIDATION_ERROR');
+    }
+  });
+
   it('makes the compact 3.2 lifecycle primary while preserving legacy seller routes', async () => {
     const calls = [];
     const base = buildPlatform();
@@ -116,8 +181,8 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'compact-and-legacy',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.3',
-      capabilities: { supported_versions: ['3.0.24', '3.1.15', '3.2.0-beta.3'] },
+      adcpVersion: '3.2.0-beta.6',
+      capabilities: { supported_versions: ['3.0.25', '3.1.18', '3.2.0-beta.6'] },
       validation: { requests: 'off', responses: 'off' },
     });
 
@@ -143,13 +208,13 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
       method: 'tools/call',
       params: {
         name: 'list_products',
-        arguments: { adcp_version: '3.2.0-beta.3', account: { account_id: 'acc-modern' } },
+        arguments: { adcp_version: '3.2.0-beta.6', account: { account_id: 'acc-modern' } },
       },
     });
     assert.notStrictEqual(compact.isError, true, JSON.stringify(compact.structuredContent));
     assert.strictEqual(compact.structuredContent.feed_version, 'feed-3.2');
 
-    for (const adcp_version of ['3.1.15', '3.0.24']) {
+    for (const adcp_version of ['3.1.18', '3.0.25']) {
       const legacy = await server.dispatchTestRequest({
         method: 'tools/call',
         params: {
@@ -160,10 +225,91 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
       assert.notStrictEqual(legacy.isError, true, JSON.stringify(legacy.structuredContent));
     }
     assert.deepStrictEqual(calls, [
-      ['list_products', '3.2.0-beta.3', 'acc-modern'],
-      ['get_products', '3.1.15', 'acc-3.1.15'],
-      ['get_products', '3.0.24', 'acc-3.0.24'],
+      ['list_products', '3.2.0-beta.6', 'acc-modern'],
+      ['get_products', '3.1.18', 'acc-3.1.18'],
+      ['get_products', '3.0.25', 'acc-3.0.25'],
     ]);
+  });
+
+  it('executes the signed reverse 3.2-seller to 3.1-buyer products-only facade without crossing lifecycles', async () => {
+    const reverse = PRODUCTS_ONLY_BRIEF_VECTORS.reverse_compatibility_cases[0];
+    const vector = PRODUCTS_ONLY_BRIEF_VECTORS.cases[reverse.source_case_index];
+    const calls = [];
+    let retainedSelection;
+    const base = buildPlatform();
+    const platform = buildPlatform({
+      sales: {
+        ...base.sales,
+        getProducts: async request => {
+          calls.push('get_products');
+          assert.strictEqual(request.buying_mode, vector.legacy_request.buying_mode);
+          assert.strictEqual(request.brief, vector.legacy_request.brief);
+          retainedSelection = {
+            productId: vector.legacy_response.products[0].product_id,
+            pricingOptionId: vector.legacy_response.products[0].pricing_options[0].pricing_option_id,
+          };
+          return vector.legacy_response;
+        },
+        createMediaBuy: async request => {
+          calls.push('create_media_buy');
+          assert.ok(retainedSelection, 'legacy discovery context must precede create');
+          assert.strictEqual(request.packages[0].product_id, retainedSelection.productId);
+          assert.strictEqual(request.packages[0].pricing_option_id, retainedSelection.pricingOptionId);
+          return { media_buy_id: 'reverse-vector-buy', packages: [] };
+        },
+      },
+      mediaBuyLifecycle: {
+        proposalRefinement: { supported_dimensions: [] },
+        listProducts: async () => assert.fail('compact list_products must not run'),
+        requestProposals: async () => assert.fail('compact request_proposals must not run'),
+        refineProposals: async () => assert.fail('compact refine_proposals must not run'),
+        declineProposals: async () => assert.fail('compact decline_proposals must not run'),
+        buyProducts: async () => assert.fail('compact buy_products must not run'),
+        acceptProposal: async () => assert.fail('compact accept_proposal must not run'),
+        controlMediaBuy: async () => assert.fail('compact control_media_buy must not run'),
+      },
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'signed-reverse-compatibility',
+      version: '1.0.0',
+      adcpVersion: '3.2.0-beta.6',
+      capabilities: { supported_versions: ['3.1.18', '3.2.0-beta.6'] },
+      validation: { requests: 'off', responses: 'off' },
+      legacyCreativeFormatConverter: ({ formatId }) =>
+        formatId.id === 'display-300x250'
+          ? {
+              format_option_id: 'display-300x250',
+              format_kind: 'image',
+              params: { width: 300, height: 250 },
+            }
+          : undefined,
+    });
+
+    const listed = await server.dispatchTestRequest({ method: 'tools/list' });
+    assert.ok(!listed.tools.some(tool => ['get_products', 'create_media_buy'].includes(tool.name)));
+    const discovered = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_products',
+        arguments: { ...vector.legacy_request, adcp_version: '3.1' },
+      },
+    });
+    assert.notStrictEqual(discovered.isError, true, JSON.stringify(discovered.structuredContent));
+    assert.strictEqual(discovered.structuredContent.products[0].product_id, retainedSelection.productId);
+    assert.strictEqual(discovered.structuredContent.proposals, undefined);
+    assert.strictEqual(discovered.structuredContent.outcome, undefined);
+    assert.strictEqual(discovered.structuredContent.purchase_continuation, undefined);
+
+    const created = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'create_media_buy',
+        arguments: { ...vector.continuation_input.legacy_create_request, adcp_version: '3.1' },
+      },
+    });
+    assert.notStrictEqual(created.isError, true, JSON.stringify(created.structuredContent));
+    assert.strictEqual(created.structuredContent.media_buy_id, 'reverse-vector-buy');
+    assert.deepStrictEqual(calls, ['get_products', 'create_media_buy']);
   });
 
   it('supports a compact-only sales platform and derives proposal capabilities', async () => {
@@ -181,7 +327,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'compact-only',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.3',
+      adcpVersion: '3.2.0-beta.6',
       validation: { requests: 'off', responses: 'off' },
     });
 
@@ -214,7 +360,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'scoped-compact',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.3',
+      adcpVersion: '3.2.0-beta.6',
       validation: { requests: 'off', responses: 'off' },
     });
     const response = await server.dispatchTestRequest(
@@ -251,7 +397,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'anonymous-session',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.3',
+      adcpVersion: '3.2.0-beta.6',
       resolveSessionKey: () => 'anonymous-session',
       validation: { requests: 'off', responses: 'off' },
     });
@@ -279,7 +425,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'compact-replay-auth',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.3',
+      adcpVersion: '3.2.0-beta.6',
       idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
       resolveIdempotencyPrincipal: () => 'deliberately-shared-principal',
       resolveSessionKey: () => 'deliberately-shared-session',
@@ -328,7 +474,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'refinement-scope',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.3',
+      adcpVersion: '3.2.0-beta.6',
       validation: { requests: 'off', responses: 'off' },
     });
     const response = await server.dispatchTestRequest(
@@ -1129,6 +1275,456 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     assert.deepStrictEqual(declaration.v1_format_ref, [
       { agent_url: 'https://seller.example/custom-formats', id: 'homepage_takeover' },
     ]);
+  });
+
+  it('resolves seller-owned legacy product formats asynchronously with exact owner routing', async () => {
+    const base = buildPlatform();
+    const calls = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const product = (product_id, agent_url, id) => ({
+      product_id,
+      name: product_id,
+      description: 'Legacy custom format',
+      format_ids: [{ agent_url, id }],
+      delivery_type: 'non_guaranteed',
+      publisher_properties: [{ publisher_domain: 'seller.example', selection_type: 'all' }],
+      reporting_capabilities: {
+        available_reporting_frequencies: ['daily'],
+        expected_delay_minutes: 60,
+        timezone: 'UTC',
+        supports_webhooks: false,
+        available_metrics: ['impressions'],
+        date_range_support: 'date_range',
+      },
+      pricing_options: [
+        { pricing_option_id: `${product_id}-cpm`, pricing_model: 'cpm', fixed_price: 5, currency: 'USD' },
+      ],
+    });
+    const ownerA = product('owner-a', 'https://formats-a.example/catalog', 'shared_takeover');
+    ownerA.placements = [
+      {
+        placement_id: 'companion',
+        name: 'Companion placement',
+        format_ids: [{ agent_url: 'https://formats-c.example/catalog', id: 'shared_takeover' }],
+      },
+    ];
+    const dualDeclared = product('dual-declared', 'https://formats-d.example/catalog', 'shared_takeover');
+    dualDeclared.format_options = [
+      {
+        format_option_id: 'takeover-d',
+        format_kind: 'custom',
+        format_shape: 'takeover_d',
+        format_schema: {
+          uri: 'https://schemas.example/takeover-d.json',
+          digest: `sha256:${'d'.repeat(64)}`,
+        },
+        params: {},
+        v1_format_ref: dualDeclared.format_ids,
+      },
+    ];
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async () => ({
+            cache_scope: 'account',
+            products: [
+              ownerA,
+              product('owner-b', 'https://formats-b.example/catalog', 'shared_takeover'),
+              product('known-aao', 'https://creative.adcontextprotocol.org/', 'display_300x250_image'),
+              dualDeclared,
+            ],
+          }),
+        },
+      }),
+      {
+        name: 'async-legacy-format-resolution',
+        version: '1.0.0',
+        adcpVersion: '3.1.18',
+        capabilities: { supported_versions: ['3.0.25', '3.1.18'] },
+        validation: { requests: 'off', responses: 'off' },
+        legacyCreativeFormatResolverConcurrency: 2,
+        legacyCreativeFormatResolver: async context => {
+          calls.push(context);
+          assert.strictEqual(Object.isFrozen(context.formatId), true);
+          assert.strictEqual(context.signal.aborted, false);
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise(resolve => setImmediate(resolve));
+          inFlight -= 1;
+          const owner = new URL(context.formatId.agent_url).hostname.split('-')[1].split('.')[0];
+          return {
+            format_option_id: `takeover-${owner}`,
+            format_kind: 'custom',
+            format_shape: `takeover_${owner}`,
+            format_schema: {
+              uri: `https://schemas.example/takeover-${owner}.json`,
+              digest: `sha256:${(owner === 'a' ? 'a' : 'b').repeat(64)}`,
+            },
+            params: {},
+          };
+        },
+      }
+    );
+
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_products',
+        arguments: {
+          adcp_version: '3.1.18',
+          account: { account_id: 'acc_async_formats' },
+          brief: 'custom takeovers',
+        },
+      },
+    });
+
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.strictEqual(calls.length, 3, 'known AAO and dual-declared formats must not invoke the adopter resolver');
+    assert.strictEqual(maxInFlight, 2, 'format resolution must honor the configured concurrency bound');
+    assert.deepStrictEqual(
+      calls.map(({ operation, servedAdcpVersion, accountId, formatId }) => ({
+        operation,
+        servedAdcpVersion,
+        accountId,
+        owner: formatId.agent_url,
+      })),
+      [
+        {
+          operation: 'get_products',
+          servedAdcpVersion: '3.1',
+          accountId: 'acc_async_formats',
+          owner: 'https://formats-a.example/catalog',
+        },
+        {
+          operation: 'get_products',
+          servedAdcpVersion: '3.1',
+          accountId: 'acc_async_formats',
+          owner: 'https://formats-c.example/catalog',
+        },
+        {
+          operation: 'get_products',
+          servedAdcpVersion: '3.1',
+          accountId: 'acc_async_formats',
+          owner: 'https://formats-b.example/catalog',
+        },
+      ]
+    );
+    const products = result.structuredContent.products;
+    assert.strictEqual(products[0].format_options[0].format_option_id, 'takeover-a');
+    assert.strictEqual(products[0].placements[0].format_options[0].format_option_id, 'takeover-c');
+    assert.deepStrictEqual(products[0].placements[0].format_options[0].v1_format_ref, [
+      { agent_url: 'https://formats-c.example/catalog', id: 'shared_takeover' },
+    ]);
+    assert.strictEqual(products[1].format_options[0].format_option_id, 'takeover-b');
+    assert.deepStrictEqual(products[0].format_options[0].v1_format_ref, [
+      { agent_url: 'https://formats-a.example/catalog', id: 'shared_takeover' },
+    ]);
+    assert.deepStrictEqual(products[1].format_options[0].v1_format_ref, [
+      { agent_url: 'https://formats-b.example/catalog', id: 'shared_takeover' },
+    ]);
+    assert.strictEqual(products[3].format_options[0].format_option_id, 'takeover-d');
+
+    calls.length = 0;
+    const v30Result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_products',
+        arguments: {
+          adcp_version: '3.0.25',
+          account: { account_id: 'acc_async_formats' },
+          brief: 'custom takeovers on 3.0',
+        },
+      },
+    });
+    assert.notStrictEqual(v30Result.isError, true, JSON.stringify(v30Result.structuredContent));
+    assert.strictEqual(calls.length, 3);
+    assert.ok(calls.every(call => call.servedAdcpVersion === '3.0'));
+    assert.deepStrictEqual(v30Result.structuredContent.products[0].format_ids[0], {
+      agent_url: 'https://formats-a.example/catalog',
+      id: 'shared_takeover',
+    });
+  });
+
+  it('consumes per-product catalog snapshots for top-level and placement formats without emitting metadata', async () => {
+    const base = buildPlatform();
+    const topRef = { agent_url: 'https://catalog-owner.example/formats', id: 'homepage' };
+    const placementRef = { agent_url: 'https://catalog-owner.example/formats', id: 'companion' };
+    const snapshot = {
+      source: 'publisher',
+      publisher_domain: 'catalog-owner.example',
+      formats: [
+        {
+          format_option_id: 'homepage-canonical',
+          format_kind: 'custom',
+          format_shape: 'homepage',
+          format_schema: {
+            uri: 'https://catalog-owner.example/schemas/homepage.json',
+            digest: `sha256:${'e'.repeat(64)}`,
+          },
+          params: {},
+          v1_format_ref: [topRef],
+        },
+        {
+          format_option_id: 'companion-canonical',
+          format_kind: 'custom',
+          format_shape: 'companion',
+          format_schema: {
+            uri: 'https://catalog-owner.example/schemas/companion.json',
+            digest: `sha256:${'f'.repeat(64)}`,
+          },
+          params: {},
+          v1_format_ref: [placementRef],
+        },
+      ],
+    };
+    let resolverCalls = 0;
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async () => ({
+            cache_scope: 'account',
+            products: [
+              {
+                product_id: 'snapshot-product',
+                name: 'Snapshot product',
+                format_ids: [topRef],
+                placements: [{ placement_id: 'companion', format_ids: [placementRef] }],
+                projectionCatalogs: [snapshot],
+              },
+            ],
+          }),
+        },
+      }),
+      {
+        name: 'per-product-projection-snapshot',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+        legacyCreativeFormatResolver: async () => {
+          resolverCalls += 1;
+          throw new Error('snapshot-backed formats must not invoke the resolver');
+        },
+      }
+    );
+
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_products',
+        arguments: { account: { account_id: 'acc_test' }, brief: 'snapshot formats' },
+      },
+    });
+
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.strictEqual(resolverCalls, 0);
+    const projected = result.structuredContent.products[0];
+    assert.strictEqual(projected.projectionCatalogs, undefined);
+    assert.strictEqual(projected.format_options[0].format_option_id, 'homepage-canonical');
+    assert.strictEqual(projected.placements[0].format_options[0].format_option_id, 'companion-canonical');
+  });
+
+  it('rejects duplicate product ids when only one row carries projection catalogs', async () => {
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async () => ({
+            cache_scope: 'account',
+            products: [
+              { product_id: 'duplicate', name: 'Catalog row', format_options: [], projectionCatalogs: [{}] },
+              { product_id: 'duplicate', name: 'Plain row', format_options: [] },
+            ],
+          }),
+        },
+      }),
+      { name: 'duplicate-projection-scope', version: '1.0.0', validation: { requests: 'off', responses: 'off' } }
+    );
+
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'get_products', arguments: { account: { account_id: 'acc_test' }, brief: 'duplicates' } },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+  });
+
+  it('fails closed when asynchronous legacy product format resolution is unavailable or invalid', async () => {
+    const base = buildPlatform();
+    for (const resolver of [
+      async () => null,
+      async () => ({ format_kind: 'custom', params: {} }),
+      () => {
+        throw new Error('catalog unavailable synchronously');
+      },
+      async () => {
+        throw new Error('catalog unavailable');
+      },
+    ]) {
+      const server = createAdcpServerFromPlatform(
+        buildPlatform({
+          sales: {
+            ...base.sales,
+            getProducts: async () => ({
+              cache_scope: 'account',
+              products: [
+                {
+                  product_id: 'unresolved-custom',
+                  name: 'Unresolved custom',
+                  description: 'Must not cross the canonical boundary',
+                  format_ids: [{ agent_url: 'https://formats.example/catalog', id: 'unknown_custom' }],
+                },
+              ],
+            }),
+          },
+        }),
+        {
+          name: 'failed-async-legacy-format-resolution',
+          version: '1.0.0',
+          validation: { requests: 'off', responses: 'off' },
+          legacyCreativeFormatResolver: resolver,
+        }
+      );
+      const result = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'get_products',
+          arguments: { account: { account_id: 'acc_test' }, brief: 'unresolved custom format' },
+        },
+      });
+      assert.strictEqual(result.isError, true);
+      assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+    }
+  });
+
+  it('bounds asynchronous legacy format resolution with a shared aborting deadline', async () => {
+    const base = buildPlatform();
+    assert.throws(
+      () =>
+        createAdcpServerFromPlatform(buildPlatform(), {
+          name: 'invalid-legacy-format-resolution-limit',
+          version: '1.0.0',
+          legacyCreativeFormatResolverConcurrency: 0,
+          legacyCreativeFormatResolver: async () => null,
+        }),
+      /legacyCreativeFormatResolverConcurrency must be an integer between 1 and 64/
+    );
+    assert.throws(
+      () =>
+        createAdcpServerFromPlatform(buildPlatform(), {
+          name: 'invalid-legacy-format-resolution-timeout',
+          version: '1.0.0',
+          legacyCreativeFormatResolverTimeoutMs: 2_147_483_648,
+          legacyCreativeFormatResolver: async () => null,
+        }),
+      /legacyCreativeFormatResolverTimeoutMs must be an integer between 1 and 2147483647/
+    );
+    let resolverSignal;
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async () => ({
+            cache_scope: 'account',
+            products: [
+              {
+                product_id: 'deadline-custom',
+                name: 'Deadline custom',
+                format_ids: [{ agent_url: 'https://formats.example/catalog', id: 'hung_custom' }],
+              },
+            ],
+          }),
+        },
+      }),
+      {
+        name: 'bounded-async-legacy-format-resolution',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+        legacyCreativeFormatResolverTimeoutMs: 20,
+        legacyCreativeFormatResolverConcurrency: 1,
+        legacyCreativeFormatResolver: ({ signal }) => {
+          resolverSignal = signal;
+          return new Promise(() => {});
+        },
+      }
+    );
+
+    const startedAt = Date.now();
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_products',
+        arguments: { account: { account_id: 'acc_test' }, brief: 'deadline custom format' },
+      },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+    assert.strictEqual(resolverSignal?.aborted, true);
+    assert.ok(Date.now() - startedAt < 1_000, 'hung resolver must not stall the get_products response');
+  });
+
+  it('cancels legacy format resolution with the request and does not start queued lookups', async () => {
+    const base = buildPlatform();
+    let resolverCalls = 0;
+    let resolverStartedResolve;
+    const resolverStarted = new Promise(resolve => {
+      resolverStartedResolve = resolve;
+    });
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async () => ({
+            cache_scope: 'account',
+            products: [
+              {
+                product_id: 'cancelled-custom',
+                name: 'Cancelled custom',
+                format_ids: [
+                  { agent_url: 'https://formats.example/catalog', id: 'first' },
+                  { agent_url: 'https://formats.example/catalog', id: 'second' },
+                  { agent_url: 'https://formats.example/catalog', id: 'third' },
+                ],
+              },
+            ],
+          }),
+        },
+      }),
+      {
+        name: 'request-cancelled-legacy-format-resolution',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+        legacyCreativeFormatResolverTimeoutMs: 10_000,
+        legacyCreativeFormatResolverConcurrency: 1,
+        legacyCreativeFormatResolver: () => {
+          resolverCalls += 1;
+          resolverStartedResolve();
+          return new Promise(() => {});
+        },
+      }
+    );
+    const controller = new AbortController();
+    const resultPromise = server.dispatchTestRequest(
+      {
+        method: 'tools/call',
+        params: {
+          name: 'get_products',
+          arguments: { account: { account_id: 'acc_test' }, brief: 'cancelled custom format' },
+        },
+      },
+      { signal: controller.signal }
+    );
+    await resolverStarted;
+    const startedAt = Date.now();
+    controller.abort(new Error('buyer cancelled'));
+    const result = await resultPromise;
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+    assert.strictEqual(resolverCalls, 1, 'queued lookups must not invoke the resolver after cancellation');
+    assert.ok(Date.now() - startedAt < 1_000, 'request cancellation must promptly settle the response');
   });
 
   it('rejects format-agnostic modern products while preserving nested 3.0 response projection', async () => {
@@ -2578,6 +3174,7 @@ describe('CreativeBuilderPlatform + AudiencePlatform wiring', () => {
       legacyHandlers: {
         creative: {
           buildCreative: async () => ({ creative_manifest: { manifest_id: 'mf_1', assets: [] } }),
+          listCreativeFormats: async () => ({ formats: [] }),
         },
       },
     });
@@ -2589,11 +3186,18 @@ describe('CreativeBuilderPlatform + AudiencePlatform wiring', () => {
     return result.structuredContent;
   }
 
-  it('omits media_buy capabilities for a creative-only platform (#2438)', async () => {
+  it('omits media_buy capabilities when creative-only handlers use overlapping tool names (#2438, #2680)', async () => {
     const caps = await getCapabilities(buildCreativeOnlyPlatform());
 
     assert.deepStrictEqual(caps.supported_protocols, ['creative']);
     assert.strictEqual(caps.media_buy, undefined);
+  });
+
+  it('accepts creative specialisms implemented through the merged legacy handler seam (#2680)', async () => {
+    const caps = await getCapabilities(buildCreativeOnlyPlatform({ specialisms: ['creative-generative'] }));
+
+    assert.deepStrictEqual(caps.supported_protocols, ['creative']);
+    assert.ok(caps.specialisms.includes('creative-generative'));
   });
 
   it('preserves a media_buy null override for a creative-only platform (#2438)', async () => {
@@ -2695,6 +3299,142 @@ describe('CreativeBuilderPlatform + AudiencePlatform wiring', () => {
     });
     assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
     assert.ok(sawReq, 'creative.buildCreative should be invoked');
+  });
+
+  it('preview_creative dispatches canonical capability and creative-library routes through previewCreative', async () => {
+    const seen = [];
+    const platform = {
+      ...buildCreativeOnlyPlatform({ specialisms: ['creative-template'] }),
+      creative: {
+        buildCreativeLegacy: async () => ({ manifest_id: 'mf_1', assets: [] }),
+        previewCreative: async req => {
+          seen.push(req);
+          return { response_type: 'single', previews: [] };
+        },
+      },
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'canonical-preview',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const requests = [
+      {
+        request_type: 'single',
+        target_capability_id: 'display.responsive',
+        creative_manifest: { manifest_id: 'mf_inline', assets: [] },
+      },
+      { request_type: 'single', creative_id: 'creative_library_1' },
+    ];
+    for (const args of requests) {
+      const result = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'preview_creative', arguments: args },
+      });
+      assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    }
+
+    assert.deepStrictEqual(seen, requests);
+  });
+
+  it('preview_creative keeps format_id requests on previewCreativeLegacy when both aliases exist', async () => {
+    const calls = [];
+    const platform = {
+      ...buildCreativeOnlyPlatform({ specialisms: ['creative-template'] }),
+      creative: {
+        buildCreativeLegacy: async () => ({ manifest_id: 'mf_1', assets: [] }),
+        previewCreative: async () => {
+          calls.push('canonical');
+          return { response_type: 'single', previews: [] };
+        },
+        previewCreativeLegacy: async () => {
+          calls.push('legacy');
+          return { response_type: 'single', previews: [] };
+        },
+      },
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'legacy-preview-alias',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'preview_creative',
+        arguments: {
+          request_type: 'single',
+          format_id: { id: 'legacy', agent_url: 'https://creative.example/mcp' },
+        },
+      },
+    });
+
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.deepStrictEqual(calls, ['legacy']);
+  });
+
+  it('preview_creative treats a batch item format_id as legacy identity', async () => {
+    const calls = [];
+    const legacyBatch = {
+      request_type: 'batch',
+      requests: [
+        {
+          creative_id: 'creative_legacy',
+          format_id: { id: 'legacy', agent_url: 'https://creative.example/mcp' },
+        },
+      ],
+    };
+    const platform = {
+      ...buildCreativeOnlyPlatform({ specialisms: ['creative-template'] }),
+      creative: {
+        buildCreativeLegacy: async () => ({ manifest_id: 'mf_1', assets: [] }),
+        previewCreative: async () => {
+          calls.push('canonical');
+          return { response_type: 'batch', previews: [] };
+        },
+        previewCreativeLegacy: async () => {
+          calls.push('legacy');
+          return { response_type: 'batch', previews: [] };
+        },
+      },
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'legacy-preview-batch-alias',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'preview_creative', arguments: legacyBatch },
+    });
+
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.deepStrictEqual(calls, ['legacy']);
+
+    const canonicalOnly = createAdcpServerFromPlatform(
+      {
+        ...platform,
+        creative: {
+          buildCreativeLegacy: platform.creative.buildCreativeLegacy,
+          previewCreative: platform.creative.previewCreative,
+        },
+      },
+      {
+        name: 'canonical-only-preview-batch',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+    const rejected = await canonicalOnly.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'preview_creative', arguments: legacyBatch },
+    });
+
+    assert.strictEqual(rejected.isError, true, JSON.stringify(rejected.structuredContent));
+    assert.match(JSON.stringify(rejected.structuredContent), /UNSUPPORTED_FEATURE/);
+    assert.deepStrictEqual(calls, ['legacy']);
   });
 
   it('F13: creative-generative specialism accepts the merged CreativeBuilderPlatform shape', async () => {
@@ -3148,7 +3888,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
       taskWebhookEmitter: {
         emit: async params => {
           emits.push(params);
-          return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+          return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
         },
       },
     });
@@ -3272,7 +4012,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
       taskWebhookEmitter: {
         emit: async params => {
           emits.push(params);
-          return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+          return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
         },
       },
     });
@@ -3421,7 +4161,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     const productsPush = await dispatchGetProducts(productsServer, {
       buying_mode: 'wholesale',
       brief: undefined,
-      push_notification_config: { url: 'https://buyer.example.com/webhook' },
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'op_products_wholesale' },
     });
     assert.strictEqual(productsPush.isError, true);
     assert.strictEqual(productsPush.structuredContent.adcp_error.code, 'INVALID_REQUEST');
@@ -3463,7 +4203,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     const signalsPush = await dispatchGetSignals(signalsServer, {
       discovery_mode: 'wholesale',
       brief: undefined,
-      push_notification_config: { url: 'https://buyer.example.com/webhook' },
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'op_signals_wholesale' },
     });
     assert.strictEqual(signalsPush.isError, true);
     assert.strictEqual(signalsPush.structuredContent.adcp_error.code, 'INVALID_REQUEST');
@@ -3793,6 +4533,13 @@ describe('HITL dual-method dispatch — *Task variants', () => {
 });
 
 describe('NODE_ENV gate on default in-memory task registry', () => {
+  function replayOptions(scope) {
+    return {
+      idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
+      resolveSessionKey: () => scope,
+    };
+  }
+
   function emptyPlatform() {
     return {
       capabilities: {
@@ -3841,6 +4588,7 @@ describe('NODE_ENV gate on default in-memory task registry', () => {
         createAdcpServerFromPlatform(emptyPlatform(), {
           name: 't',
           version: '0',
+          ...replayOptions('task-registry-test'),
           validation: { requests: 'off', responses: 'off' },
         })
       );
@@ -3853,6 +4601,7 @@ describe('NODE_ENV gate on default in-memory task registry', () => {
         createAdcpServerFromPlatform(emptyPlatform(), {
           name: 't',
           version: '0',
+          ...replayOptions('task-registry-development'),
           validation: { requests: 'off', responses: 'off' },
         })
       );
@@ -3866,6 +4615,7 @@ describe('NODE_ENV gate on default in-memory task registry', () => {
           createAdcpServerFromPlatform(emptyPlatform(), {
             name: 't',
             version: '0',
+            ...replayOptions('task-registry-production-refusal'),
             validation: { requests: 'off', responses: 'off' },
           }),
         /in-memory task registry refused/
@@ -3879,6 +4629,7 @@ describe('NODE_ENV gate on default in-memory task registry', () => {
         createAdcpServerFromPlatform(emptyPlatform(), {
           name: 't',
           version: '0',
+          ...replayOptions('task-registry-unset-refusal'),
           validation: { requests: 'off', responses: 'off' },
         })
       );
@@ -3902,6 +4653,7 @@ describe('NODE_ENV gate on default in-memory task registry', () => {
           createAdcpServerFromPlatform(emptyPlatform(), {
             name: 't',
             version: '0',
+            ...replayOptions('task-registry-production-ack'),
             validation: { requests: 'off', responses: 'off' },
           })
         );
@@ -3917,6 +4669,7 @@ describe('NODE_ENV gate on default in-memory task registry', () => {
         createAdcpServerFromPlatform(emptyPlatform(), {
           name: 't',
           version: '0',
+          ...replayOptions('task-registry-explicit'),
           taskRegistry: createInMemoryTaskRegistry(),
           // Explicit stateStore opt-in mirrors the explicit-taskRegistry
           // pattern this test exercises — both opt-outs have to be
@@ -5628,7 +6381,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
       taskWebhookEmitter: {
         emit: async params => {
           emits.push(params);
-          return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+          return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
         },
         unsigned: true,
       },
@@ -5646,7 +6399,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
           start_time: '2026-05-01T00:00:00Z',
           end_time: '2026-06-01T00:00:00Z',
           account: { account_id: 'acc_1' },
-          push_notification_config: { url: 'https://buyer.example.com/webhook' },
+          push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'op_registry_failure' },
         },
       },
     });
@@ -5702,7 +6455,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
       validation: { requests: 'off', responses: 'off' },
       taskWebhookEmitter: {
         emit: async params => ({
-          operation_id: params.operation_id,
+          delivery_id: params.delivery_id,
           idempotency_key: 'k',
           attempts: 1,
           delivered: true,
@@ -5722,7 +6475,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
           start_time: '2026-05-01T00:00:00Z',
           end_time: '2026-06-01T00:00:00Z',
           account: { account_id: 'acc_1' },
-          push_notification_config: { url: 'https://buyer.example.com/webhook' },
+          push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'op_observability' },
         },
       },
     });
@@ -5854,7 +6607,7 @@ describe('HITL push notification webhook on terminal state', () => {
     const fakeEmitter = {
       emit: async params => {
         emits.push(params);
-        return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+        return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
       },
     };
 
@@ -5905,56 +6658,55 @@ describe('HITL push notification webhook on terminal state', () => {
     assert.ok(typeof emit.payload.timestamp === 'string');
     assert.deepStrictEqual(emit.payload.result, { media_buy_id: 'mb_42', status: 'active' });
     assert.strictEqual(emit.payload.token, 'webhook-token-1234');
-    assert.match(emit.operation_id, new RegExp(`^task-webhook:acc_1:create_media_buy:${taskId}$`));
-    assert.notStrictEqual(emit.operation_id, 'op_webhook_test');
+    assert.match(emit.delivery_id, new RegExp(`^task-webhook:acc_1:create_media_buy:${taskId}$`));
+    assert.notStrictEqual(emit.delivery_id, 'op_webhook_test');
     assertMcpWebhookPayloadValid(emit.payload);
   });
 
-  it('treats webhook URL as opaque when push config omits operation_id', async () => {
+  it('rejects beta.6 webhook registration when operation_id is omitted', async () => {
     const emits = [];
     const fakeEmitter = {
       emit: async params => {
         emits.push(params);
-        return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+        return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
       },
     };
 
     const platform = buildHitlPlatform(async () => ({ media_buy_id: 'mb_42', status: 'active' }));
-    const server = createAdcpServerFromPlatform(platform, {
-      name: 'webhook',
-      version: '0.0.1',
-      validation: { requests: 'off', responses: 'off' },
-      taskWebhookEmitter: fakeEmitter,
-    });
-
-    const result = await server.dispatchTestRequest({
-      method: 'tools/call',
-      params: {
-        name: 'create_media_buy',
-        arguments: {
-          buyer_ref: 'b1',
-          idempotency_key: '11111111-1111-1111-1111-111111111111',
-          packages: [],
-          start_time: '2026-05-01T00:00:00Z',
-          end_time: '2026-06-01T00:00:00Z',
-          account: { account_id: 'acc_1' },
-          push_notification_config: {
-            url: 'https://buyer.example.com/step/create_media_buy/op_url_must_not_be_parsed',
-            token: 'webhook-token-1234',
+    for (const adcpVersion of ['3.2-beta.6']) {
+      const server = createAdcpServerFromPlatform(platform, {
+        name: 'webhook',
+        version: '0.0.1',
+        adcpVersion: '3.2.0-beta.6',
+        validation: { requests: 'off', responses: 'off' },
+        taskWebhookEmitter: fakeEmitter,
+      });
+      const result = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'create_media_buy',
+          arguments: {
+            buyer_ref: 'b1',
+            idempotency_key: '11111111-1111-1111-1111-111111111111',
+            packages: [],
+            start_time: '2026-05-01T00:00:00Z',
+            end_time: '2026-06-01T00:00:00Z',
+            account: { account_id: 'acc_1' },
+            adcp_major_version: 3,
+            adcp_version: adcpVersion,
+            push_notification_config: {
+              url: 'https://buyer.example.com/step/create_media_buy/op_url_must_not_be_parsed',
+              token: 'webhook-token-1234',
+            },
           },
         },
-      },
-    });
+      });
 
-    assert.strictEqual(result.structuredContent.status, 'submitted');
-    await server.awaitTask(result.structuredContent.task_id);
-
-    assert.strictEqual(emits.length, 1, 'one webhook emitted on terminal completion');
-    assert.ok(emits[0].payload.operation_id.startsWith('create_media_buy.'));
-    assert.match(emits[0].operation_id, /^task-webhook:acc_1:create_media_buy:task_/);
-    assert.notStrictEqual(emits[0].payload.operation_id, 'op_url_must_not_be_parsed');
-    assert.notStrictEqual(emits[0].operation_id, 'op_url_must_not_be_parsed');
-    assertMcpWebhookPayloadValid(emits[0].payload);
+      assert.strictEqual(result.isError, true);
+      assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+      assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config.operation_id');
+    }
+    assert.strictEqual(emits.length, 0);
   });
 
   it('emits webhook on failed task with structured error', async () => {
@@ -5963,7 +6715,7 @@ describe('HITL push notification webhook on terminal state', () => {
     const fakeEmitter = {
       emit: async params => {
         emits.push(params);
-        return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+        return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
       },
     };
 
@@ -5987,7 +6739,7 @@ describe('HITL push notification webhook on terminal state', () => {
           start_time: '2026-05-01T00:00:00Z',
           end_time: '2026-06-01T00:00:00Z',
           account: { account_id: 'acc_1' },
-          push_notification_config: { url: 'https://buyer.example.com/webhook' },
+          push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'op_failed_task' },
         },
       },
     });
@@ -6005,7 +6757,7 @@ describe('HITL push notification webhook on terminal state', () => {
     const fakeEmitter = {
       emit: async params => {
         emits.push(params);
-        return { operation_id: params.operation_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+        return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
       },
     };
     const platform = buildHitlPlatform(async () => ({ media_buy_id: 'mb_silent' }));
@@ -6086,7 +6838,11 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
   }
 
   async function dispatchWithUrl(server, url, token) {
-    return dispatchWithPushConfig(server, { url, ...(token != null && { token }) });
+    return dispatchWithPushConfig(server, {
+      url,
+      operation_id: 'op_url_validation',
+      ...(token != null && { token }),
+    });
   }
 
   function makeServer({ warns, emits } = {}) {
@@ -6102,7 +6858,7 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
               emit: async params => {
                 emits.push(params);
                 return {
-                  operation_id: params.operation_id,
+                  delivery_id: params.delivery_id,
                   idempotency_key: 'k',
                   attempts: 1,
                   delivered: true,
@@ -6209,7 +6965,7 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
   });
 
   for (const [label, operationId, reasonFragment] of [
-    ['non-string operation_id', 123, 'must be a string'],
+    ['non-string operation_id', 123, 'must match'],
     ['empty operation_id', '', 'must match'],
     ['operation_id over 255 chars', 'a'.repeat(256), 'must match'],
     ['operation_id with invalid character', 'op/bad', 'must match'],
@@ -6319,7 +7075,10 @@ describe('tasks_get wire tool (B9)', () => {
     const taskId = await createTask(server, 'acc_owner');
     const result = await server.dispatchTestRequest({
       method: 'tools/call',
-      params: { name: 'tasks_get', arguments: { task_id: taskId, account: { account_id: 'acc_owner' } } },
+      params: {
+        name: 'tasks_get',
+        arguments: { task_id: taskId, account: { account_id: 'acc_owner' }, include_result: true },
+      },
     });
     assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
     const payload = result.structuredContent;
@@ -6356,7 +7115,10 @@ describe('tasks_get wire tool (B9)', () => {
             start_time: '2026-05-01T00:00:00Z',
             end_time: '2026-06-01T00:00:00Z',
             account: { account_id: 'acc_owner' },
-            push_notification_config: { url: 'https://buyer.example/webhooks/tasks' },
+            push_notification_config: {
+              url: 'https://buyer.example/webhooks/tasks',
+              operation_id: 'op_submitted_task_tools',
+            },
           },
         },
       });
@@ -6377,7 +7139,7 @@ describe('tasks_get wire tool (B9)', () => {
       assert.strictEqual(status.structuredContent.status, 'submitted');
       assert.strictEqual(status.structuredContent.has_webhook, true);
       assert.strictEqual(status.structuredContent.result, undefined);
-      assert.strictEqual(status.structuredContent.adcp_version, '3.2-beta.3');
+      assert.strictEqual(status.structuredContent.adcp_version, '3.2-beta.6');
 
       const listed = await server.dispatchTestRequest({
         method: 'tools/call',
@@ -7134,7 +7896,7 @@ describe('createAdcpServerFromPlatform — default resolveIdempotencyPrincipal',
       {
         name: 'principal-compat',
         version: '0.0.1',
-        adcpVersion: '3.2.0-beta.3',
+        adcpVersion: '3.2.0-beta.6',
         idempotency,
         validation: { requests: 'off', responses: 'off' },
       }

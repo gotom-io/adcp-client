@@ -12,11 +12,21 @@
  *
  * @example
  * ```typescript
- * import { createAdcpServer, serve } from '@adcp/sdk/server/legacy/v5';
+ * import {
+ *   createAdcpServer,
+ *   createIdempotencyStore,
+ *   memoryBackend,
+ *   serve,
+ * } from '@adcp/sdk/server/legacy/v5';
+ *
+ * // Single-process example. Use pgBackend(pool) or redisBackend(client) for
+ * // durable, replica-safe production replay.
+ * const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });
  *
  * serve(() => createAdcpServer({
  *   name: 'My Publisher',
  *   version: '1.0.0',
+ *   idempotency,
  *
  *   // Second argument carries `toolName` and (when `authenticate` is wired
  *   // on `serve()`) the caller's `authInfo`. Adapters that front an
@@ -43,7 +53,11 @@ import {
   toReleasePrecisionVersion,
   type AdcpVersion,
 } from '../version';
-import { isMovingAdcpPrereleaseFamilyAlias, resolveAdcpVersion } from '../utils/adcp-version-config';
+import {
+  isAdcpVersionAtLeast,
+  isMovingAdcpPrereleaseFamilyAlias,
+  resolveAdcpVersion,
+} from '../utils/adcp-version-config';
 import { getValidator, hasSchemaBundle, resolveBundleKey, getMcpProfileInputSchema } from '../validation/schema-loader';
 import { TOOL_INPUT_SHAPES } from '../schemas';
 import { TaskTypeValues } from '../types/enums.generated';
@@ -114,6 +128,7 @@ import {
   syncGovernanceResponse,
   reportUsageResponse,
   toStructuredContent,
+  _getExplicitResponseSummary,
   type McpToolResponse,
 } from './responses';
 
@@ -150,11 +165,18 @@ function hasIdempotencyClearAll(store: IdempotencyStore): boolean {
   // configured backend opts in (memory backend does; pg backend does not).
   return typeof store.clearAll === 'function';
 }
+
+// Built-in request claims use the full replay window as their base fence.
+// Renew periodically while a handler is active so genuinely long-running
+// work retains that full window from its latest liveness point; the base
+// fence itself still prevents a transient renewal outage from reopening the
+// mutation.
+const IDEMPOTENCY_CLAIM_RENEW_INTERVAL_MS = 60_000;
 import { isMutatingTask, requestUsesIdempotency, IDEMPOTENCY_KEY_PATTERN, MUTATING_TASKS } from '../utils/idempotency';
 import { STATUS_FREE_SYNC_RESPONSE_TOOLS } from '../utils/envelope-status-compat';
 import { validateRequest, validateResponse, formatIssues, type ValidationIssue } from '../validation/schema-validator';
 import { buildAdcpValidationErrorPayload } from '../validation/schema-errors';
-import { hashPayload, type IdempotencyStore } from './idempotency';
+import { hashPayload, IdempotencyClaimOwnershipError, type IdempotencyStore } from './idempotency';
 import {
   createWebhookEmitter,
   type WebhookEmitParams,
@@ -375,15 +397,12 @@ import type { AdcpProtocol, MediaBuyFeatures, AccountCapabilities, CreativeCapab
 import type { MediaChannel } from '../types/tools.generated';
 import type { RequireCacheScopeWhenProducts, ServerPayload } from '../types/server-payload';
 import type { CreateMediaBuyPayload as CreateMediaBuyServerPayload } from '../types/server-payload-aliases';
-import { STANDARD_ERROR_CODES, isStandardErrorCode } from '../types/error-codes';
 import {
-  MEDIA_BUY_TOOLS,
-  SIGNALS_TOOLS,
-  GOVERNANCE_TOOLS,
-  CREATIVE_TOOLS,
-  SPONSORED_INTELLIGENCE_TOOLS,
-  BRAND_RIGHTS_TOOLS,
-} from '../utils/capabilities';
+  DEFAULT_UNKNOWN_ERROR_RECOVERY,
+  STANDARD_ERROR_CODES,
+  isStandardErrorCode,
+  type ErrorRecovery,
+} from '../types/error-codes';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -456,6 +475,8 @@ export interface CallerMutationScope {
  */
 export interface HandlerContext<TAccount = unknown> {
   account?: TAccount;
+  /** Transport cancellation signal for the current request. */
+  signal?: AbortSignal;
   /**
    * AdCP release selected for this request after applying the buyer pin to
    * `capabilities.adcp.supported_versions`. This may be older than the
@@ -506,8 +527,8 @@ export interface HandlerContext<TAccount = unknown> {
    *
    *     await ctx.emitWebhook({
    *       url: push_notification_config.url,
-   *       payload: { task: { task_id, status: 'completed', result } },
-   *       operation_id: `create_media_buy.${media_buy_id}`,
+   *       payload: { operation_id, task_id, task_type: 'create_media_buy', status: 'completed', timestamp, result },
+   *       delivery_id: `create_media_buy.${media_buy_id}.completed`,
    *     });
    */
   emitWebhook?: (params: WebhookEmitParams) => Promise<WebhookEmitResult>;
@@ -1131,7 +1152,13 @@ export interface AdcpCapabilitiesConfig {
   features?: Partial<MediaBuyFeatures>;
   account?: Partial<AccountCapabilities>;
   creative?: Partial<CreativeCapabilities>;
-  extensions_supported?: string[];
+  extensions_supported?: readonly string[];
+  /**
+   * Vendor-namespaced extension capability data emitted at the top-level
+   * `get_adcp_capabilities.ext` field. Each populated namespace should also
+   * be listed in {@link extensions_supported}.
+   */
+  ext?: NonNullable<GetAdCPCapabilitiesResponse['ext']>;
   /**
    * RFC 9421 request-signing verifier capability. See
    * docs/building/implementation/security.mdx#signed-requests-transport-layer.
@@ -1149,13 +1176,9 @@ export interface AdcpCapabilitiesConfig {
    */
   specialisms?: NonNullable<GetAdCPCapabilitiesResponse['specialisms']>;
   /**
-   * Seller-declared idempotency replay window, required on `get_adcp_capabilities`
-   * responses per AdCP spec. Defaults to 86400 (24h). Spec bounds are 3600
-   * (1h) to 604800 (7d); `clampReplayTtl` enforces the range on output.
-   *
-   * When using `createIdempotencyStore` from `@adcp/sdk/server`, omit
-   * this — the framework reads `idempotency.ttlSeconds` from the wired
-   * store so the declared capability always matches actual behavior.
+   * @deprecated Idempotency capability data is derived exclusively from
+   * the active `idempotency` store. This legacy override is ignored so an
+   * unwired or mismatched store can never be advertised to buyers.
    */
   idempotency?: {
     replay_ttl_seconds?: number;
@@ -1182,7 +1205,7 @@ export interface AdcpCapabilitiesConfig {
    * - primitive overrides replace the auto-derived value.
    *
    * Top-level fields the framework owns (`adcp`, `supported_protocols`,
-   * `specialisms`, `extensions_supported`) are not accepted here — configure
+   * `specialisms`, `extensions_supported`, `ext`) are not accepted here — configure
    * them via their dedicated fields on {@link AdcpCapabilitiesConfig}.
    */
   overrides?: AdcpCapabilitiesOverrides;
@@ -1555,7 +1578,7 @@ export interface AdcpCustomToolConfig<
  * (and without falling back to `as any` when they typed it loosely).
  *
  * Subset of {@link WebhookEmitterOptions} the framework lifts to the
- * server config: signing key/provider, retry policy, idempotency-key
+ * server config: signing key/provider, retry policy, immutable delivery
  * store, fetch override, user-agent + tag, and the per-emit observability
  * hooks. Other emitter-internal knobs (rate limits, transport pool
  * sizing) stay on `WebhookEmitterOptions` for direct emitter callers.
@@ -1567,12 +1590,19 @@ export type WebhooksConfig = Pick<
   | 'signerKey'
   | 'signerProvider'
   | 'retries'
+  | 'deliveryStore'
   | 'idempotencyKeyStore'
+  | 'deliveryRetryHorizonSeconds'
+  | 'deliveryRecovery'
   | 'generateIdempotencyKey'
   | 'fetch'
   | 'userAgent'
   | 'tag'
 > & {
+  /** Stable publisher namespace for shared delivery-store keys. Defaults to the trusted server name. */
+  publisherScope?: string;
+  /** Trusted fallback namespace for a genuinely single-tenant server. */
+  tenantScope?: string;
   /** Observability: emitter-wide onAttempt hook. */
   onAttempt?: WebhookEmitterOptions['onAttempt'];
   /** Observability: emitter-wide onAttemptResult hook. */
@@ -1876,9 +1906,9 @@ export interface AdcpServerConfig<TAccount = unknown> {
    * if your server never emits webhooks.
    *
    * Provide exactly one of `signerKey` (in-process JWK) or `signerProvider`
-   * (KMS-backed async signing). The signing key or provider key MUST have
-   * `adcp_use: "webhook-signing"` — a request-signing key is a conformance
-   * violation per adcp#2423 (key purpose discriminator). Publishers publishing
+   * (KMS-backed async signing). The signing key or provider key SHOULD have
+   * `adcp_use: "request-signing"`; the deprecated `"webhook-signing"` value is
+   * accepted for compatibility. Publishers publishing
    * their JWKS at the `jwks_uri` on brand.json's `agents[]` entry reuse the
    * same key across every buyer they deliver to.
    */
@@ -2149,24 +2179,34 @@ interface ToolMeta {
 }
 
 /**
- * Clamp idempotency replay TTL to spec bounds (1h–7d).
- */
-function clampReplayTtl(seconds: number): number {
-  const MIN = 3600;
-  const MAX = 604800;
-  if (!Number.isFinite(seconds) || seconds < MIN) return MIN;
-  if (seconds > MAX) return MAX;
-  return Math.floor(seconds);
-}
-
-/**
  * Deep-merge the per-domain blocks from `overrides` onto `target`. Nested
  * objects merge recursively; arrays and primitives replace. `null` at the
  * top-level field explicitly drops the block; `undefined` is a no-op.
  */
 function applyCapabilityOverrides(target: GetAdCPCapabilitiesResponse, overrides: AdcpCapabilitiesOverrides): void {
   const targetAny = target as unknown as Record<string, unknown>;
+  const allowedKeys = new Set([
+    'media_buy',
+    'creative',
+    'signals',
+    'governance',
+    'brand',
+    'sponsored_intelligence',
+    'measurement',
+    'experimental_features',
+    'account',
+    'compliance_testing',
+    'webhook_signing',
+    'identity',
+    'request_signing',
+  ]);
   for (const [key, value] of Object.entries(overrides)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error(
+        `createAdcpServer: capabilities.overrides.${key} is not allowed. ` +
+          'Framework-owned capability fields must be configured through their dedicated options.'
+      );
+    }
     if (value === undefined) continue;
     if (value === null) {
       delete targetAny[key];
@@ -2235,21 +2275,9 @@ function deepMergePlainObjects(target: unknown, source: unknown): unknown {
 function stampReplayed(response: McpToolResponse): void {
   if (!response.structuredContent || typeof response.structuredContent !== 'object') return;
   const sc = response.structuredContent as Record<string, unknown>;
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
   sc.replayed = true;
-  if (Array.isArray(response.content)) {
-    const first = response.content[0];
-    if (first && first.type === 'text' && typeof first.text === 'string') {
-      try {
-        const parsed = JSON.parse(first.text);
-        if (parsed && typeof parsed === 'object') {
-          parsed.replayed = true;
-          first.text = JSON.stringify(parsed);
-        }
-      } catch {
-        // Text isn't JSON — leave it alone (implausible for AdCP responses).
-      }
-    }
-  }
+  syncContentJsonText(response, sc, mirrorsStructuredContent);
 }
 
 /**
@@ -2314,21 +2342,9 @@ function stampBridge(response: McpToolResponse, callback: string, tool: string, 
   if (!response.structuredContent || typeof response.structuredContent !== 'object') return;
   const marker: BridgeMarker = { callback, tool, merged_count: mergedCount };
   const sc = response.structuredContent as Record<string, unknown>;
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
   sc._bridge = marker;
-  if (Array.isArray(response.content)) {
-    const first = response.content[0];
-    if (first && first.type === 'text' && typeof first.text === 'string') {
-      try {
-        const parsed = JSON.parse(first.text);
-        if (parsed && typeof parsed === 'object') {
-          parsed._bridge = marker;
-          first.text = JSON.stringify(parsed);
-        }
-      } catch {
-        // Text isn't JSON — leave it alone (implausible for AdCP responses).
-      }
-    }
-  }
+  syncContentJsonText(response, sc, mirrorsStructuredContent);
 }
 
 /**
@@ -2343,22 +2359,9 @@ function stripEnvelopeEcho(response: McpToolResponse): McpToolResponse {
   const cloned = cloneFormattedResponse(response);
   if (cloned.structuredContent && typeof cloned.structuredContent === 'object') {
     const sc = cloned.structuredContent as Record<string, unknown>;
+    const mirrorsStructuredContent = contentTextMirrorsStructuredContent(cloned, sc);
     delete sc.context;
-  }
-  if (Array.isArray(cloned.content)) {
-    for (const item of cloned.content) {
-      if (item && item.type === 'text' && typeof item.text === 'string') {
-        try {
-          const parsed = JSON.parse(item.text);
-          if (parsed && typeof parsed === 'object') {
-            delete parsed.context;
-            item.text = JSON.stringify(parsed);
-          }
-        } catch {
-          // Text isn't JSON — leave it alone
-        }
-      }
-    }
+    syncContentJsonText(cloned, sc, mirrorsStructuredContent);
   }
   return cloned;
 }
@@ -2466,6 +2469,17 @@ function isThrownAdcpError(value: unknown): value is McpToolResponse {
   if (typeof (env as { code?: unknown }).code !== 'string') return false;
   if (typeof (env as { message?: unknown }).message !== 'string') return false;
   return Array.isArray((value as { content?: unknown }).content) && (value as { isError?: unknown }).isError === true;
+}
+
+function thrownAdcpErrorRecovery(response: McpToolResponse): ErrorRecovery {
+  const error = (response.structuredContent as { adcp_error: { code: string; recovery?: unknown } }).adcp_error;
+  if (isStandardErrorCode(error.code)) {
+    return STANDARD_ERROR_CODES[error.code].recovery;
+  }
+  if (error.recovery === 'transient' || error.recovery === 'correctable' || error.recovery === 'terminal') {
+    return error.recovery;
+  }
+  return DEFAULT_UNKNOWN_ERROR_RECOVERY;
 }
 
 /**
@@ -2719,6 +2733,47 @@ function taskOwnerScopeForContext(
   if (credential?.kind === 'api_key') return `api_key:${credential.key_id}`;
   if (typeof authInfo?.clientId === 'string' && authInfo.clientId.length > 0) return `client:${authInfo.clientId}`;
   return `account:${accountId}`;
+}
+
+/**
+ * Build the webhook delivery-store tenant namespace exclusively from trusted,
+ * resolved server context. Webhook payload and request-body delivery fields
+ * never participate, so one tenant cannot preclaim another tenant's delivery
+ * binding in a shared durable store.
+ */
+function webhookTenantScopeForContext<TAccount>(ctx: HandlerContext<TAccount>): string | undefined {
+  if (ctx.callerMutationScope) {
+    return JSON.stringify([
+      'caller',
+      ctx.callerMutationScope.tenant_id,
+      ctx.callerMutationScope.principal_id,
+      ctx.callerMutationScope.account_id ?? null,
+    ]);
+  }
+  const accountLike = ctx.account as
+    | { id?: unknown; account_id?: unknown; tenant_id?: unknown; tenantId?: unknown }
+    | undefined;
+  const accountId =
+    typeof accountLike?.id === 'string'
+      ? accountLike.id
+      : typeof accountLike?.account_id === 'string'
+        ? accountLike.account_id
+        : undefined;
+  const tenantId =
+    typeof accountLike?.tenant_id === 'string'
+      ? accountLike.tenant_id
+      : typeof accountLike?.tenantId === 'string'
+        ? accountLike.tenantId
+        : undefined;
+  const principal = authenticatedPrincipalForContext(ctx.authInfo, ctx.agent);
+  if (ctx.sessionKey !== undefined) {
+    return JSON.stringify(['session', ctx.sessionKey, tenantId ?? null, accountId ?? null, principal ?? null]);
+  }
+  if (tenantId !== undefined || accountId !== undefined) {
+    return JSON.stringify(['account', tenantId ?? null, accountId ?? null, principal ?? null]);
+  }
+  if (principal !== undefined) return JSON.stringify(['principal', principal]);
+  return undefined;
 }
 
 function compareProtocolTaskItems(
@@ -3188,6 +3243,10 @@ const MEDIA_BUY_ENTRIES: HandlerEntry[] = [
   { handlerKey: 'listCreatives', toolName: 'list_creatives' },
 ];
 
+const MEDIA_BUY_PROTOCOL_ENTRIES = MEDIA_BUY_ENTRIES.filter(
+  ({ handlerKey }) => !['listCreativeFormats', 'syncCreatives', 'listCreatives'].includes(handlerKey)
+);
+
 const PROPOSAL_NEGOTIATION_ENTRIES: HandlerEntry[] = [{ handlerKey: 'refineProposals', toolName: 'refine_proposals' }];
 
 const EVENT_TRACKING_ENTRIES: HandlerEntry[] = [
@@ -3268,23 +3327,37 @@ const BRAND_RIGHTS_ENTRIES: HandlerEntry[] = [
 // Protocol detection
 // ---------------------------------------------------------------------------
 
-const TOOL_PROTOCOL_MAP: [readonly string[], AdcpProtocol][] = [
-  [MEDIA_BUY_TOOLS, 'media_buy'],
-  [SIGNALS_TOOLS, 'signals'],
-  [GOVERNANCE_TOOLS, 'governance'],
-  [CREATIVE_TOOLS, 'creative'],
-  [SPONSORED_INTELLIGENCE_TOOLS, 'sponsored_intelligence'],
-  [BRAND_RIGHTS_TOOLS, 'brand'],
-];
+function hasDomainHandler(entries: readonly HandlerEntry[], handlers: object | undefined): boolean {
+  if (handlers === undefined) return false;
+  const candidate = handlers as Record<string, unknown>;
+  return entries.some(({ handlerKey }) => typeof candidate[handlerKey] === 'function');
+}
 
-function detectProtocols(toolNames: string[]): AdcpProtocol[] {
-  const nameSet = new Set(toolNames);
+/**
+ * Derive buyer-visible protocol domains from the handler group that owns each
+ * operation, not from the flattened tools/list catalog. Several compatibility
+ * tools intentionally appear in more than one protocol's discovery list
+ * (`list_creative_formats`, `list_creatives`, and `sync_creatives`), so tool
+ * names alone cannot distinguish a creative agent from a media-buy seller.
+ * Utility groups (accounts, tasks, event tracking, protocol helpers, custom
+ * tools) do not independently activate a protocol domain.
+ */
+function detectProtocolsFromHandlers<TAccount>(config: AdcpServerConfig<TAccount>): AdcpProtocol[] {
   const protocols: AdcpProtocol[] = [];
-  for (const [tools, protocol] of TOOL_PROTOCOL_MAP) {
-    if (tools.some(t => nameSet.has(t))) {
-      protocols.push(protocol);
-    }
+  const declaresSalesSpecialism = config.capabilities?.specialisms?.some(specialism => specialism.startsWith('sales-'));
+  const hasAnyMediaBuyHandler = hasDomainHandler(MEDIA_BUY_ENTRIES, config.mediaBuy);
+  if (
+    hasDomainHandler(MEDIA_BUY_PROTOCOL_ENTRIES, config.mediaBuy) ||
+    hasDomainHandler(PROPOSAL_NEGOTIATION_ENTRIES, config.proposalNegotiation) ||
+    (declaresSalesSpecialism && hasAnyMediaBuyHandler)
+  ) {
+    protocols.push('media_buy');
   }
+  if (hasDomainHandler(SIGNALS_ENTRIES, config.signals)) protocols.push('signals');
+  if (hasDomainHandler(GOVERNANCE_ENTRIES, config.governance)) protocols.push('governance');
+  if (hasDomainHandler(CREATIVE_ENTRIES, config.creative)) protocols.push('creative');
+  if (hasDomainHandler(SI_ENTRIES, config.sponsoredIntelligence)) protocols.push('sponsored_intelligence');
+  if (hasDomainHandler(BRAND_RIGHTS_ENTRIES, config.brandRights)) protocols.push('brand');
   return protocols;
 }
 
@@ -3473,23 +3546,9 @@ function sanitizeAdcpErrorEnvelope(response: McpToolResponse): void {
   }
   if (!changed) return;
 
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
   sc.adcp_error = filtered;
-  if (Array.isArray(response.content)) {
-    const first = response.content[0];
-    if (first && first.type === 'text' && typeof first.text === 'string') {
-      try {
-        const parsed = JSON.parse(first.text);
-        if (parsed && typeof parsed === 'object') {
-          parsed.adcp_error = filtered;
-          first.text = JSON.stringify(parsed);
-        }
-      } catch {
-        // Text isn't JSON — leave it alone. adcpError()-emitted envelopes
-        // always serialize to JSON, so the only hit here would be a seller
-        // who hand-rolled a non-JSON content[0] (implausible for AdCP).
-      }
-    }
-  }
+  syncContentJsonText(response, sc, mirrorsStructuredContent);
 }
 
 /**
@@ -3573,15 +3632,19 @@ function enrichErrorTwoLayer(
   const envValid = env != null && typeof env === 'object' && typeof env.code === 'string';
   const payloadList = sc.errors;
   const payloadValid = Array.isArray(payloadList) && payloadList.length > 0;
-  if (payloadValid && sanitizePayloadErrors(sc)) syncContentJsonText(response, sc);
+  const mirrorsBeforePayloadSanitization = contentTextMirrorsStructuredContent(response, sc);
+  if (payloadValid && sanitizePayloadErrors(sc)) {
+    syncContentJsonText(response, sc, mirrorsBeforePayloadSanitization);
+  }
 
   // Path A: envelope present, payload missing → synthesise payload-layer
   // `errors[]` from the envelope. The `adcpError()` builder always lands
   // here; hand-rolled `{adcp_error: {...}}` envelopes too.
   if (envValid && !payloadValid) {
+    const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
     sc.errors = [projectEnvelopeToPayloadError(env)];
     applyArmDiscriminators(sc, descriptor);
-    syncContentJsonText(response, sc);
+    syncContentJsonText(response, sc, mirrorsStructuredContent);
     return;
   }
 
@@ -3597,9 +3660,10 @@ function enrichErrorTwoLayer(
       // (already warned about by the dispatcher's `isErrorArm` branch)
       // shouldn't synthesise a half-formed envelope.
       if (typeof projected.code === 'string' && typeof projected.message === 'string') {
+        const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
         sc.adcp_error = projected;
         applyArmDiscriminators(sc, descriptor);
-        syncContentJsonText(response, sc);
+        syncContentJsonText(response, sc, mirrorsStructuredContent);
       }
     }
     return;
@@ -3634,26 +3698,27 @@ function applyArmDiscriminators(sc: Record<string, unknown>, descriptor: ErrorAr
 }
 
 /**
- * Mirror a mutated `structuredContent` back into the L2 JSON text fallback
- * so MCP clients reading either transport layer see the same shape. Silent
- * no-op when the L2 text isn't a JSON envelope (legitimate for non-JSON
- * `content[0].text` summaries from `wrapErrorArm`).
+ * Detect the framework's JSON-bodied L2 fallback before mutating L3. Merely
+ * parsing as JSON is insufficient: an adopter-authored summary may itself be
+ * a JSON object and must remain exact text.
  */
-function syncContentJsonText(response: McpToolResponse, structuredContent: Record<string, unknown>): void {
-  if (!Array.isArray(response.content)) return;
+function contentTextMirrorsStructuredContent(
+  response: McpToolResponse,
+  structuredContent: Record<string, unknown>
+): boolean {
+  if (!Array.isArray(response.content)) return false;
   const first = response.content[0];
-  if (!first || first.type !== 'text' || typeof first.text !== 'string') return;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(first.text);
-  } catch {
-    // Not a JSON-bodied L2 fallback (e.g. wrapErrorArm's "CODE: message"
-    // summary). Leave it alone — the L3 structuredContent is the
-    // authoritative carrier; readers that fall back to L2 prose can
-    // still extract the code via pattern match.
-    return;
-  }
-  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+  return first?.type === 'text' && first.text === JSON.stringify(structuredContent);
+}
+
+function syncContentJsonText(
+  response: McpToolResponse,
+  structuredContent: Record<string, unknown>,
+  mirroredBeforeMutation: boolean
+): void {
+  if (!mirroredBeforeMutation || !Array.isArray(response.content)) return;
+  const first = response.content[0];
+  if (!first || first.type !== 'text') return;
   first.text = JSON.stringify(structuredContent);
 }
 
@@ -3694,8 +3759,9 @@ function normalizeGetProductsCacheScope(
   // auth context cannot contain an account-specific overlay, so it is cacheable
   // as the public layer. Any account or auth context makes omission ambiguous;
   // strict response validation should surface that.
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
   sc.cache_scope = 'public';
-  syncContentJsonText(response, sc);
+  syncContentJsonText(response, sc, mirrorsStructuredContent);
   return undefined;
 }
 
@@ -3709,22 +3775,9 @@ function injectContextIntoResponse(response: McpToolResponse, context: unknown):
   if (context === null || typeof context !== 'object' || Array.isArray(context)) return;
   const sc = response.structuredContent as Record<string, unknown> | undefined;
   if (sc && typeof sc === 'object' && !('context' in sc)) {
+    const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
     sc.context = context;
-    // Keep the L2 text fallback (JSON body) in sync with structuredContent
-    if (Array.isArray(response.content)) {
-      const first = response.content[0];
-      if (first && first.type === 'text' && typeof first.text === 'string') {
-        try {
-          const parsed = JSON.parse(first.text);
-          if (parsed && typeof parsed === 'object' && !('context' in parsed)) {
-            parsed.context = context;
-            first.text = JSON.stringify(parsed);
-          }
-        } catch {
-          // Text isn't JSON — leave it alone
-        }
-      }
-    }
+    syncContentJsonText(response, sc, mirrorsStructuredContent);
   }
 }
 
@@ -3774,21 +3827,9 @@ function injectEnvelopeStatusIntoResponse(response: McpToolResponse, toolName: s
   // should set `status` themselves; this injector only fills in the default
   // when the handler hasn't.
   const status = response.isError === true ? 'failed' : 'completed';
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
   sc.status = status;
-  if (Array.isArray(response.content)) {
-    const first = response.content[0];
-    if (first && first.type === 'text' && typeof first.text === 'string') {
-      try {
-        const parsed = JSON.parse(first.text);
-        if (parsed && typeof parsed === 'object' && !('status' in parsed)) {
-          parsed.status = status;
-          first.text = JSON.stringify(parsed);
-        }
-      } catch {
-        // Text isn't JSON — leave it alone
-      }
-    }
-  }
+  syncContentJsonText(response, sc, mirrorsStructuredContent);
 }
 
 const MEDIA_BUY_RESPONSE_TOOLS_REQUIRING_STATUS_SPLIT = new Set([
@@ -3816,9 +3857,10 @@ function normalizeMediaBuyStatusCollision(response: McpToolResponse, toolName: s
   const looksLikeMediaBuyPayload =
     typeof sc.media_buy_id === 'string' || 'media_buy_status' in sc || Array.isArray(sc.packages);
   if (!looksLikeMediaBuyPayload) return;
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
   if (sc.media_buy_status === undefined) sc.media_buy_status = status;
   delete sc.status;
-  syncContentJsonText(response, sc);
+  syncContentJsonText(response, sc, mirrorsStructuredContent);
 }
 
 function injectVersionIntoResponse(response: McpToolResponse, servedVersion: string | undefined): void {
@@ -3830,21 +3872,9 @@ function injectVersionIntoResponse(response: McpToolResponse, servedVersion: str
   const wireVersion = toReleasePrecisionVersion(servedVersion);
   const sc = response.structuredContent as Record<string, unknown> | undefined;
   if (sc && typeof sc === 'object' && !('adcp_version' in sc)) {
+    const mirrorsStructuredContent = contentTextMirrorsStructuredContent(response, sc);
     sc.adcp_version = wireVersion;
-    if (Array.isArray(response.content)) {
-      const first = response.content[0];
-      if (first && first.type === 'text' && typeof first.text === 'string') {
-        try {
-          const parsed = JSON.parse(first.text);
-          if (parsed && typeof parsed === 'object' && !('adcp_version' in parsed)) {
-            parsed.adcp_version = wireVersion;
-            first.text = JSON.stringify(parsed);
-          }
-        } catch {
-          // Text isn't JSON — leave it alone
-        }
-      }
-    }
+    syncContentJsonText(response, sc, mirrorsStructuredContent);
   }
 }
 
@@ -4201,6 +4231,32 @@ function compareAdcpRelease(left: ParsedAdcpRelease, right: ParsedAdcpRelease): 
   return 0;
 }
 
+const PUSH_OPERATION_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,255}$/;
+
+function releaseRequiresPushOperationId(release: string): boolean {
+  return isAdcpVersionAtLeast(resolveBundleKey(release), '3.2.0-beta.5');
+}
+
+function pushOperationIdError(
+  params: Record<string, unknown>,
+  release: ServedAdcpRelease
+): McpToolResponse | undefined {
+  if (!releaseRequiresPushOperationId(release.validationVersion)) return undefined;
+  const config = params.push_notification_config;
+  if (config === undefined) return undefined;
+  if (
+    !isPlainObject(config) ||
+    typeof config.operation_id !== 'string' ||
+    !PUSH_OPERATION_ID_PATTERN.test(config.operation_id)
+  ) {
+    return adcpError('INVALID_REQUEST', {
+      message: `push_notification_config.operation_id must match ${PUSH_OPERATION_ID_PATTERN.source}`,
+      field: 'push_notification_config.operation_id',
+    });
+  }
+  return undefined;
+}
+
 let bundledCompatibleReleases: ParsedAdcpRelease[] | undefined;
 
 function bundledReleasesForMajors(majors: readonly number[], configured: ParsedAdcpRelease): ParsedAdcpRelease[] {
@@ -4352,8 +4408,8 @@ function selectServedAdcpRelease(
  * default `resolveIdempotencyPrincipal` synthesis, capability projection,
  * async-task envelopes, status normalization via `StatusMappers`,
  * multi-tenant routing via `TenantRegistry`, and async task completion
- * webhook delivery. Synchronous terminal responses remain inline unless
- * an adopter explicitly enables the non-conformant compatibility option.
+ * webhook delivery. Under AdCP 3.2 synchronous terminal responses remain
+ * silent on the task-webhook channel.
  *
  * Reach for `createAdcpServer` directly only when you need fine control
  * over individual handlers, are mid-migration from a v5 codebase, or
@@ -4595,6 +4651,17 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // production check below.
   const idempotencyDisabled = idempotencyConfig === 'disabled';
   const idempotency: IdempotencyStore | undefined = idempotencyDisabled ? undefined : idempotencyConfig;
+  if (
+    idempotency &&
+    (!Number.isSafeInteger(idempotency.ttlSeconds) || idempotency.ttlSeconds < 3600 || idempotency.ttlSeconds > 604800)
+  ) {
+    throw new TypeError('createAdcpServer: idempotency.ttlSeconds must be a safe integer between 3600 and 604800.');
+  }
+  if (idempotency && typeof idempotency.renew !== 'function') {
+    throw new TypeError(
+      'createAdcpServer: idempotency.renew is required so long-running mutation handlers cannot outlive their owner claim.'
+    );
+  }
   if (idempotencyDisabled) {
     // Allowlist gate. The earlier draft refused the flag only when
     // NODE_ENV === 'production', which is a footgun: NODE_ENV defaults to
@@ -4810,7 +4877,45 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // Instantiate the emitter once — handler contexts expose its `emit`
   // bound method so per-request code calls `ctx.emitWebhook(...)` without
   // knowing about the emitter's construction or options.
-  const webhookEmitter = webhooks ? createWebhookEmitter(webhooks) : undefined;
+  const configuredWebhookStore = webhooks?.deliveryStore ?? webhooks?.idempotencyKeyStore;
+  if (
+    webhooks &&
+    process.env.NODE_ENV !== 'test' &&
+    process.env.NODE_ENV !== 'development' &&
+    configuredWebhookStore?.durability !== 'durable'
+  ) {
+    throw new Error(
+      'createAdcpServer: production webhook emission requires a durable WebhookDeliveryStore. ' +
+        'The store atomically retains each delivery key, canonical payload fingerprint, and first-attempt time ' +
+        'through the advertised retry horizon. Pass the shared store as webhooks.deliveryStore; ' +
+        'memoryWebhookDeliveryStore() is for development and tests only.'
+    );
+  }
+  if (
+    webhooks &&
+    process.env.NODE_ENV !== 'test' &&
+    process.env.NODE_ENV !== 'development' &&
+    webhooks.deliveryRecovery?.durability !== 'durable'
+  ) {
+    throw new Error(
+      'createAdcpServer: production webhook emission requires durable deliveryRecovery. ' +
+        'Checkpoint the exact destination, payload/timestamp, authentication reference, and retry policy before ' +
+        'the first attempt, then recover unsettled deliveries after restart.'
+    );
+  }
+  const webhookEmitter = webhooks
+    ? createWebhookEmitter({
+        ...webhooks,
+        publisherScope: webhooks.publisherScope ?? name,
+        // Intentionally unbound until handler dispatch derives trusted scope.
+        tenantScope: undefined,
+      })
+    : undefined;
+  const configuredWebhookTenantScope = webhooks?.tenantScope;
+  const configuredWebhookEmitter =
+    webhookEmitter && configuredWebhookTenantScope !== undefined
+      ? webhookEmitter.forTenantScope(configuredWebhookTenantScope)
+      : webhookEmitter;
 
   // Resolve `instructions` — sync function form is evaluated at construction.
   // Under `serve({ reuseAgent: false })` (the default) the factory runs
@@ -5373,6 +5478,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         const ctx: HandlerContext<TAccount> = {
           store: stateStore,
           servedAdcpVersion: requestRelease.validationVersion,
+          ...(extra?.signal !== undefined && { signal: extra.signal }),
         };
         if (extra?.authInfo) {
           ctx.authInfo = extra.authInfo;
@@ -5395,8 +5501,6 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             }
           }
         }
-        if (webhookEmitter) ctx.emitWebhook = webhookEmitter.emit.bind(webhookEmitter);
-
         // Echo params.context into any response (success or error) so buyers
         // can trace correlation_id end-to-end. Framework-generated errors
         // (ACCOUNT_NOT_FOUND, SERVICE_UNAVAILABLE) go through this too.
@@ -5409,7 +5513,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         // envelope outside `adcpError()` — `adcpError()` already filters its
         // own output, but a hand-rolled `{ isError, structuredContent:
         // { adcp_error: ... } }` would otherwise ship unfiltered.
-        const finalize = (response: McpToolResponse): McpToolResponse => {
+        const finalizeProtocolEnvelope = (response: McpToolResponse): McpToolResponse => {
           sanitizeAdcpErrorEnvelope(response);
           // Two-layer error emission: when the tool's response schema
           // declares an Error arm (`errors: [...]` required), mirror
@@ -5422,8 +5526,10 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           injectEnvelopeStatusIntoResponse(response, toolName);
           injectContextIntoResponse(response, params.context);
           injectVersionIntoResponse(response, requestRelease.wireVersion);
-          return applyResponseEnhancer(response);
+          return response;
         };
+        const finalize = (response: McpToolResponse): McpToolResponse =>
+          applyResponseEnhancer(finalizeProtocolEnvelope(response));
 
         if (releaseError) return finalize(releaseError);
         if (!releaseDefinesTool(toolName, requestRelease)) {
@@ -5434,6 +5540,8 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             })
           );
         }
+        const operationIdError = pushOperationIdError(params, requestRelease);
+        if (operationIdError) return finalize(operationIdError);
 
         // --- Buyer-agent registry resolution (#1269 / #1292) ---
         // Runs after `authInfo` is populated and before account resolution
@@ -5537,11 +5645,11 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         const requestIsStateChanging = requestUsesIdempotency(toolName, params);
         const hasIdempotencyKeyField = Object.prototype.hasOwnProperty.call(params, 'idempotency_key');
         const requestUsesOptionalIdempotency = toolName === 'get_products' && hasIdempotencyKeyField;
-        const suppliedIdempotencyKey = typeof params.idempotency_key === 'string' ? params.idempotency_key : undefined;
+        let suppliedIdempotencyKey = typeof params.idempotency_key === 'string' ? params.idempotency_key : undefined;
         // The 3.2 compatibility schema deliberately leaves the finalize key
         // optional. Replay a supplied key, but do not reject older callers
         // that omit it. SDK 14 buyers auto-inject one on this path.
-        const requestUsesReplay = toolIsMutating || requestUsesOptionalIdempotency;
+        const requestUsesReplay = toolIsMutating || requestIsStateChanging || requestUsesOptionalIdempotency;
         if (hasInvalidGetProductsFinalizeIntent(toolName, params)) {
           return finalize(
             adcpError('INVALID_REQUEST', {
@@ -5551,21 +5659,42 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             })
           );
         }
+        if (requestIsStateChanging && !toolIsMutating && !idempotency && !idempotencyDisabled) {
+          if (!warnedAboutOptionalReplayWithoutIdempotency) {
+            warnedAboutOptionalReplayWithoutIdempotency = true;
+            logger.error(
+              'createAdcpServer: get_products proposal finalization was refused because no idempotency store is configured.'
+            );
+          }
+          return finalize(
+            adcpError('SERVICE_UNAVAILABLE', {
+              message: 'Proposal finalization requires an idempotency store',
+            })
+          );
+        }
+        if (requestIsStateChanging && !toolIsMutating && idempotency && suppliedIdempotencyKey === undefined) {
+          // The 3.2 compatibility schema leaves this key optional for older
+          // callers. Derive a stable server-side key from the canonical
+          // finalize request so the compatibility path remains replay-safe
+          // instead of either double-executing or becoming a breaking
+          // missing-field rejection.
+          // Hash the request directly: hashPayload's exclusion rules are
+          // intentionally shallow and apply to these top-level retry-only
+          // fields. Wrapping `params` would accidentally make refreshed
+          // context/governance/webhook credentials mint a different key.
+          suppliedIdempotencyKey = `compat_finalize_${hashPayload(params)}`;
+        }
         if (
-          (requestIsStateChanging || requestUsesOptionalIdempotency) &&
+          requestUsesOptionalIdempotency &&
           !toolIsMutating &&
           !idempotency &&
           !idempotencyDisabled &&
-          !capConfig?.idempotency?.replay_ttl_seconds &&
           !warnedAboutOptionalReplayWithoutIdempotency
         ) {
           warnedAboutOptionalReplayWithoutIdempotency = true;
           logger.error(
-            requestIsStateChanging
-              ? 'createAdcpServer: get_products proposal finalization was called without an idempotency store. ' +
-                  'Exact retries can create duplicate holds; configure idempotency or explicitly disable it.'
-              : 'createAdcpServer: get_products was called with idempotency_key but no idempotency store is configured. ' +
-                  'Replay protection is unavailable; configure idempotency or explicitly disable it.'
+            'createAdcpServer: get_products was called with idempotency_key but no idempotency store is configured. ' +
+              'Replay protection is unavailable; configure idempotency or explicitly disable it.'
           );
         }
 
@@ -6091,7 +6220,9 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         }
 
         // --- Idempotency (mutating tools + get_products proposal finalize) ---
-        let idempotencyCheck: { key: string; principal: string; payloadHash: string; extraScope?: string } | undefined;
+        let idempotencyCheck:
+          | { key: string; principal: string; payloadHash: string; claimToken: string; extraScope?: string }
+          | undefined;
         if (idempotency && requestUsesReplay) {
           const key = suppliedIdempotencyKey;
           if (!key) {
@@ -6161,7 +6292,12 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               if (!isErrorResponse(cachedFormatted)) {
                 stampReplayed(cachedFormatted);
               }
-              return finalize(cachedFormatted);
+              // The cached envelope has already passed through the adopter's
+              // response enhancer. Reapply only protocol-owned per-request
+              // stamps here: enhancers may be non-idempotent (for example,
+              // appending audit metadata), so invoking one again would make
+              // a replay differ from the original response.
+              return finalizeProtocolEnvelope(cachedFormatted);
             }
             if (checkResult.kind === 'conflict') {
               return finalize(
@@ -6193,7 +6329,13 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                 })
               );
             }
-            idempotencyCheck = { key, principal, payloadHash: checkResult.payloadHash, extraScope };
+            idempotencyCheck = {
+              key,
+              principal,
+              payloadHash: checkResult.payloadHash,
+              claimToken: checkResult.claimToken,
+              extraScope,
+            };
           } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
             logger.error('Idempotency check failed', { tool: toolName, error: reason });
@@ -6206,9 +6348,50 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           }
         }
 
+        // Keep the request owner fence alive for the entire handler and
+        // response-publication path. Without renewal, a mutation running
+        // longer than the 120-second claim lease could be reclaimed and
+        // executed concurrently by a retry. Renewal is serialized so a
+        // slow backend cannot accumulate overlapping timer callbacks; the
+        // final save/release CAS remains the authoritative ownership check.
+        let claimRenewalTimer: ReturnType<typeof setInterval> | undefined;
+        let claimRenewalPending: Promise<void> | undefined;
+        if (idempotencyCheck && idempotency) {
+          const renewClaim = () => {
+            if (claimRenewalPending) return;
+            claimRenewalPending = idempotency
+              .renew({
+                principal: idempotencyCheck.principal,
+                key: idempotencyCheck.key,
+                claimToken: idempotencyCheck.claimToken,
+                extraScope: idempotencyCheck.extraScope,
+              })
+              .catch(err => {
+                const reason = err instanceof Error ? err.message : String(err);
+                logger.warn('Idempotency claim renewal failed; final publication will re-check ownership', {
+                  tool: toolName,
+                  error: reason,
+                });
+              })
+              .finally(() => {
+                claimRenewalPending = undefined;
+              });
+          };
+          claimRenewalTimer = setInterval(renewClaim, IDEMPOTENCY_CLAIM_RENEW_INTERVAL_MS);
+          if (typeof claimRenewalTimer === 'object' && 'unref' in claimRenewalTimer) claimRenewalTimer.unref();
+        }
+
         // --- Handler ---
+        let mutationHandlerCompleted = false;
         try {
+          if (webhookEmitter) {
+            const tenantScope = webhookTenantScopeForContext(ctx);
+            const scopedEmitter =
+              tenantScope === undefined ? configuredWebhookEmitter! : webhookEmitter.forTenantScope(tenantScope);
+            ctx.emitWebhook = scopedEmitter.emit.bind(scopedEmitter);
+          }
           const result = await handler(params, ctx);
+          mutationHandlerCompleted = true;
           // Narrow Error / Submitted arms of the *Response union before
           // reaching the success-arm builder: wrap() on an Error payload
           // would still serialize it but apply success-shaped defaults
@@ -6327,7 +6510,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                     | undefined;
                   if (sc && typeof sc === 'object') {
                     const merged = mergeSeededProductsIntoResponse(sc, seeded);
-                    formatted = wrap(merged);
+                    formatted = wrap(merged, _getExplicitResponseSummary(formatted));
                     stampBridge(formatted, 'getSeededProducts', toolName, seeded.length);
                   }
                 }
@@ -6860,23 +7043,31 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                   exposeSchemaPath: exposeErrorDetails,
                   rootSchemaId: outcome.schemaId,
                 });
-                const errEnvelope = adcpError('VALIDATION_ERROR', errPayload);
+                const errEnvelope = finalize(adcpError('VALIDATION_ERROR', errPayload));
                 if (idempotencyCheck && idempotency) {
-                  // Cache the VALIDATION_ERROR briefly so a buyer SDK
-                  // retrying on the same key doesn't trigger unbounded
-                  // re-execution — strict-mode drift is deterministic,
-                  // the next handler call would return the same error.
-                  // Short TTL (10s) absorbs a typical retry burst.
-                  //
-                  // Stores that pre-date #758 may not implement
-                  // `saveTransientError`; fall back to `release` so the
-                  // claim is at least freed for a fresh retry.
+                  // A mutating handler has already returned, so its side
+                  // effect may be committed even though strict response
+                  // validation rejected the representation. Fence that
+                  // ambiguity for the full replay window: a short-lived
+                  // retry-storm entry could disappear and permit the same
+                  // mutation to execute again. Read-only keyed operations
+                  // retain the short transient-error behavior.
                   try {
-                    if (idempotency.saveTransientError) {
+                    if (toolIsMutating || requestIsStateChanging) {
+                      await idempotency.save({
+                        principal: idempotencyCheck.principal,
+                        key: idempotencyCheck.key,
+                        payloadHash: idempotencyCheck.payloadHash,
+                        claimToken: idempotencyCheck.claimToken,
+                        response: stripEnvelopeEcho(errEnvelope),
+                        extraScope: idempotencyCheck.extraScope,
+                      });
+                    } else if (idempotency.saveTransientError) {
                       await idempotency.saveTransientError({
                         principal: idempotencyCheck.principal,
                         key: idempotencyCheck.key,
                         payloadHash: idempotencyCheck.payloadHash,
+                        claimToken: idempotencyCheck.claimToken,
                         response: errEnvelope,
                         extraScope: idempotencyCheck.extraScope,
                       });
@@ -6884,21 +7075,39 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                       await idempotency.release({
                         principal: idempotencyCheck.principal,
                         key: idempotencyCheck.key,
+                        claimToken: idempotencyCheck.claimToken,
                         extraScope: idempotencyCheck.extraScope,
                       });
                     }
                   } catch (err) {
                     const reason = err instanceof Error ? err.message : String(err);
-                    logger.warn('Idempotency transient-error cache failed — retry storm may re-execute handler', {
+                    logger.warn('Idempotency validation-error publication failed', {
                       tool: toolName,
                       error: reason,
                     });
+                    return finalize(
+                      adcpError('SERVICE_UNAVAILABLE', {
+                        message:
+                          err instanceof IdempotencyClaimOwnershipError
+                            ? 'The request lost its idempotency claim before its response could be published. Retry safely.'
+                            : 'The response could not be published to the idempotency store. Reconcile by natural key before retrying.',
+                      })
+                    );
                   }
                 }
-                return finalize(errEnvelope);
+                return errEnvelope;
               }
             }
           }
+          // Complete every potentially-throwing framework transformation
+          // before publishing the successful idempotency record. If an
+          // enhancer or envelope normalizer fails, the catch below still
+          // owns the request claim and can replace it with an ambiguity
+          // fence; publishing success first would make that replacement
+          // impossible and an exact retry would re-trigger the same broken
+          // post-processing path.
+          formatted = finalize(formatted);
+
           // Cache successful mutations for replay. Errors and commercial
           // rejection rows re-execute on retry, not replayed — capability /
           // status changes in the seller's ledger must take effect without
@@ -6926,6 +7135,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                   principal: idempotencyCheck.principal,
                   key: idempotencyCheck.key,
                   payloadHash: idempotencyCheck.payloadHash,
+                  claimToken: idempotencyCheck.claimToken,
                   response: cacheable,
                   extraScope: idempotencyCheck.extraScope,
                 });
@@ -6935,6 +7145,14 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                   tool: toolName,
                   error: reason,
                 });
+                return finalize(
+                  adcpError('SERVICE_UNAVAILABLE', {
+                    message:
+                      err instanceof IdempotencyClaimOwnershipError
+                        ? 'The request lost its idempotency claim before its response could be published. Retry safely.'
+                        : 'The response could not be published to the idempotency store. Reconcile by natural key before retrying.',
+                  })
+                );
               }
               // Fresh-path responses omit `replayed` — per envelope spec,
               // absence signals fresh execution. The replay path stamps
@@ -6944,6 +7162,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                 await idempotency.release({
                   principal: idempotencyCheck.principal,
                   key: idempotencyCheck.key,
+                  claimToken: idempotencyCheck.claimToken,
                   extraScope: idempotencyCheck.extraScope,
                 });
               } catch (err) {
@@ -6954,20 +7173,116 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                   tool: toolName,
                   error: reason,
                 });
+                return finalize(
+                  adcpError('SERVICE_UNAVAILABLE', {
+                    message:
+                      err instanceof IdempotencyClaimOwnershipError
+                        ? 'The request lost its idempotency claim before its response could be published. Retry safely.'
+                        : 'The response could not be released from the idempotency store. Reconcile by natural key before retrying.',
+                  })
+                );
               }
             }
           }
-          return finalize(formatted);
+          return formatted;
         } catch (err) {
-          // Release the idempotency claim on any thrown path — whether
-          // we unwrap a typed envelope or fall through to SERVICE_UNAVAILABLE,
-          // the handler did not produce a cached response and the next retry
-          // should proceed normally.
+          if (idempotencyCheck && idempotency && (toolIsMutating || requestIsStateChanging)) {
+            // Once a mutating application handler has been invoked, a thrown
+            // exception cannot prove that no side effect committed. Never
+            // release that claim for blind re-execution. Stable typed errors
+            // are cached as the handler outcome; unknown exceptions and
+            // post-handler framework failures become a full-window ambiguity
+            // fence that requires natural-key reconciliation.
+            let thrownTypedEnvelope: McpToolResponse | undefined;
+            if (isThrownAdcpError(err)) {
+              const env = (err.structuredContent as { adcp_error: { code: string; message: string } }).adcp_error;
+              logger.warn('Handler threw an adcpError envelope — prefer `return` over `throw` for typed errors', {
+                tool: toolName,
+                handler: handlerKey,
+                code: env.code,
+                message: env.message,
+                stack: err instanceof Error ? err.stack : undefined,
+              });
+              thrownTypedEnvelope = err;
+            } else if (err instanceof AdcpError) {
+              logger.warn('Handler threw an AdcpError', {
+                tool: toolName,
+                handler: handlerKey,
+                code: err.code,
+                message: err.message,
+                stack: err.stack,
+              });
+              thrownTypedEnvelope = projectThrownAdcpError(err);
+            }
+
+            const thrownRecovery = thrownTypedEnvelope ? thrownAdcpErrorRecovery(thrownTypedEnvelope) : undefined;
+            let replayEnvelope: McpToolResponse;
+            if (!mutationHandlerCompleted && thrownTypedEnvelope && thrownRecovery !== 'transient') {
+              // A terminal typed rejection thrown directly by the handler is
+              // a stable outcome. Cache it so exact retry cannot re-enter the
+              // mutation. Transient typed errors are intentionally not
+              // replayed as retryable for the full window: after handler
+              // admission they are indistinguishable from commit-then-throw.
+              replayEnvelope = thrownTypedEnvelope;
+            } else {
+              const reason = err instanceof Error ? err.message : String(err);
+              logger.error('Mutating handler outcome is uncertain and requires reconciliation', {
+                tool: toolName,
+                handler: handlerKey,
+                error: reason,
+                stack: err instanceof Error ? err.stack : undefined,
+              });
+              replayEnvelope = adcpError('SERVICE_UNAVAILABLE', {
+                message:
+                  'The mutating handler did not produce a safely publishable response. Reconcile the operation by natural key before retrying.',
+              });
+            }
+
+            try {
+              replayEnvelope = finalize(replayEnvelope);
+            } catch (finalizeErr) {
+              const finalizeReason = finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr);
+              logger.error('Response processing failed while formatting a fenced mutation outcome', {
+                tool: toolName,
+                error: finalizeReason,
+              });
+              replayEnvelope = adcpError('SERVICE_UNAVAILABLE', {
+                message:
+                  'The mutating handler did not produce a safely publishable response. Reconcile the operation by natural key before retrying.',
+              });
+            }
+
+            try {
+              await idempotency.save({
+                principal: idempotencyCheck.principal,
+                key: idempotencyCheck.key,
+                payloadHash: idempotencyCheck.payloadHash,
+                claimToken: idempotencyCheck.claimToken,
+                response: stripEnvelopeEcho(replayEnvelope),
+                extraScope: idempotencyCheck.extraScope,
+              });
+            } catch (saveErr) {
+              const saveReason = saveErr instanceof Error ? saveErr.message : String(saveErr);
+              logger.error('Idempotency mutation-outcome publication failed; retaining the live owner claim', {
+                tool: toolName,
+                error: saveReason,
+              });
+              return adcpError('SERVICE_UNAVAILABLE', {
+                message:
+                  'The mutating handler outcome could not be published to the idempotency store. Reconcile by natural key before retrying.',
+              });
+            }
+            return replayEnvelope;
+          }
+          // Non-mutating thrown paths may release their optional claim: no
+          // state-changing handler was invoked, so exact retry is safe.
+          let idempotencyReleaseError: unknown;
           if (idempotencyCheck && idempotency) {
             try {
               await idempotency.release({
                 principal: idempotencyCheck.principal,
                 key: idempotencyCheck.key,
+                claimToken: idempotencyCheck.claimToken,
                 extraScope: idempotencyCheck.extraScope,
               });
             } catch (releaseErr) {
@@ -6976,7 +7291,18 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                 tool: toolName,
                 error: releaseReason,
               });
+              idempotencyReleaseError = releaseErr;
             }
+          }
+          if (idempotencyReleaseError !== undefined) {
+            return finalize(
+              adcpError('SERVICE_UNAVAILABLE', {
+                message:
+                  idempotencyReleaseError instanceof IdempotencyClaimOwnershipError
+                    ? 'The failed request lost its idempotency claim before the claim could be released. Retry safely.'
+                    : 'The failed request could not be released from the idempotency store. Reconcile by natural key before retrying.',
+              })
+            );
           }
           // Auto-unwrap `throw adcpError(...)`. Handlers that throw an
           // envelope (instead of returning it) should behave identically —
@@ -7041,6 +7367,9 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               }),
             })
           );
+        } finally {
+          if (claimRenewalTimer !== undefined) clearInterval(claimRenewalTimer);
+          if (claimRenewalPending) await claimRenewalPending;
         }
       };
 
@@ -7167,7 +7496,11 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             })
           );
         }
-        if (params?.include_result === true && response.status === 'completed') {
+        if (
+          params?.include_result === true &&
+          (response.status === 'completed' || response.status === 'failed' || response.status === 'rejected') &&
+          task.result !== undefined
+        ) {
           response.result = task.result as GetTaskStatusResponse['result'];
         }
         if (isPlainObject(params?.context)) response.context = params.context;
@@ -7351,28 +7684,27 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // A seller that registers mutating handlers but doesn't supply an
   // `idempotency` store cannot honor the v3 retry contract: buyer
   // retries will double-book because there's no replay cache. The
-  // framework logs a loud error at server-creation time so operators
-  // notice before shipping to production, but doesn't throw — that
-  // would make the framework unusable in testing contexts where
-  // idempotency isn't the unit-under-test. Operators who've thought
-  // about it can suppress the error by setting
-  // `capabilities.idempotency.replay_ttl_seconds` directly.
+  // framework permits this implicit omission only in development/test,
+  // where idempotency may not be the unit under test. All other
+  // environments fail startup. Operators who deliberately cannot provide
+  // replay safety must use the explicit `idempotency: 'disabled'` mode and
+  // its acknowledgement gate. The advertised capability remains
+  // `supported: false`; only a wired store can declare replay safety.
   const registeredMutatingTools = [...registeredToolNames].filter(t => MUTATING_TASKS.has(t));
-  if (
-    registeredMutatingTools.length > 0 &&
-    !idempotency &&
-    !idempotencyDisabled &&
-    !capConfig?.idempotency?.replay_ttl_seconds
-  ) {
-    logger.error(
+  if (registeredMutatingTools.length > 0 && !idempotency && !idempotencyDisabled) {
+    const message =
       `createAdcpServer: ${registeredMutatingTools.length} mutating tools registered ` +
-        `(${registeredMutatingTools.slice(0, 3).join(', ')}${
-          registeredMutatingTools.length > 3 ? ', ...' : ''
-        }) without an idempotency store. AdCP v3 requires sellers to support idempotent replay ` +
-        `on mutating requests — buyer retries will double-book without it. ` +
-        `Pass \`idempotency: createIdempotencyStore({ backend, ttlSeconds })\`, ` +
-        `or set \`capabilities.idempotency.replay_ttl_seconds\` to acknowledge the non-compliance.`
-    );
+      `(${registeredMutatingTools.slice(0, 3).join(', ')}${
+        registeredMutatingTools.length > 3 ? ', ...' : ''
+      }) without an idempotency store. AdCP v3 requires sellers to support idempotent replay ` +
+      `on mutating requests — buyer retries will double-book without it. ` +
+      `Pass \`idempotency: createIdempotencyStore({ backend, ttlSeconds })\` or explicitly set ` +
+      `\`idempotency: 'disabled'\` when the seller intentionally cannot provide replay safety.`;
+    const env = process.env.NODE_ENV;
+    if (env !== 'test' && env !== 'development') {
+      throw new Error(message);
+    }
+    logger.error(message);
   }
 
   // MUTATING_TASKS is derived at module load by introspecting Zod
@@ -7390,7 +7722,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   }
 
   // --- Auto-register get_adcp_capabilities ---
-  const protocols = detectProtocols([...registeredToolNames]);
+  const protocols = detectProtocolsFromHandlers(config);
 
   // Idempotency capability declaration. Spec defines a discriminated
   // union (`get-adcp-capabilities-response.json` `adcp.idempotency.oneOf`):
@@ -7401,14 +7733,13 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // natural-key dedup before retrying spend-committing operations. Lying
   // here (declaring `supported: true` while skipping replay) is a
   // money-flow footgun: a 504-retry under the same key double-books.
-  const idempotencyCapability: GetAdCPCapabilitiesResponse['adcp']['idempotency'] = idempotencyDisabled
-    ? { supported: false }
-    : {
-        supported: true,
-        replay_ttl_seconds: clampReplayTtl(
-          capConfig?.idempotency?.replay_ttl_seconds ?? idempotency?.ttlSeconds ?? 86400
-        ),
-      };
+  const idempotencyCapability: GetAdCPCapabilitiesResponse['adcp']['idempotency'] =
+    idempotencyDisabled || !idempotency
+      ? { supported: false }
+      : {
+          supported: true,
+          replay_ttl_seconds: idempotency.ttlSeconds,
+        };
 
   const capabilitiesData: GetAdCPCapabilitiesResponse = {
     status: 'completed',
@@ -7460,8 +7791,12 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     };
   }
 
-  if (capConfig?.extensions_supported?.length) {
-    capabilitiesData.extensions_supported = capConfig.extensions_supported;
+  if (capConfig?.extensions_supported !== undefined) {
+    capabilitiesData.extensions_supported = [...capConfig.extensions_supported];
+  }
+
+  if (capConfig?.ext !== undefined) {
+    capabilitiesData.ext = structuredClone(capConfig.ext);
   }
 
   if (capConfig?.request_signing) {
@@ -7474,6 +7809,27 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
 
   if (capConfig?.overrides) {
     applyCapabilityOverrides(capabilitiesData, capConfig.overrides);
+  }
+
+  if (webhooks) {
+    const profile = webhooks.tag ?? 'adcp/webhook-signing/v1';
+    if (profile !== 'adcp/webhook-signing/v1') {
+      throw new Error(
+        `createAdcpServer: webhooks.tag must be "adcp/webhook-signing/v1" so the emitted tag matches the advertised AdCP profile; got ${JSON.stringify(profile)}`
+      );
+    }
+    const algorithm = webhooks.signerKey?.alg ?? webhooks.signerProvider?.algorithm;
+    if (algorithm === undefined) {
+      throw new Error('createAdcpServer: webhooks must provide a signing key or provider with an advertised algorithm');
+    }
+    capabilitiesData.webhook_signing = {
+      ...capabilitiesData.webhook_signing,
+      supported: true,
+      profile,
+      algorithms: [algorithm],
+      legacy_hmac_fallback: capabilitiesData.webhook_signing?.legacy_hmac_fallback ?? false,
+      delivery_retry_horizon_seconds: webhooks.deliveryRetryHorizonSeconds ?? 86_400,
+    };
   }
 
   // Resolve signing once, after capability overrides, then use this exact
@@ -7647,6 +8003,13 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         data = projectCapabilitiesToVersion(data, release.validationVersion);
       }
       if (selected !== undefined && (selected.major < 3 || (selected.major === 3 && selected.minor === 1))) {
+        if (data.webhook_signing) {
+          delete (
+            data.webhook_signing as NonNullable<GetAdCPCapabilitiesResponse['webhook_signing']> & {
+              delivery_retry_horizon_seconds?: number;
+            }
+          ).delivery_retry_horizon_seconds;
+        }
         delete (data.adcp as GetAdCPCapabilitiesResponse['adcp'] & { capability_changes?: unknown }).capability_changes;
         const forwardMediaBuy = data.media_buy as
           | (NonNullable<typeof data.media_buy> & {

@@ -30,6 +30,50 @@ function runGeneratorHarness(source) {
   }
 }
 
+test('issue #2674 array fields match their relaxed public Zod types', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { relaxZodCompatibilityArrayTypes } from __GENERATOR__;
+
+const input = \`export type Product = {
+} & (NamedFormatProduct | CanonicalFormatProduct) & {
+  publisher_properties: [
+    PublisherPropertySelector & {},
+    ...(PublisherPropertySelector & {})[]
+  ];
+  placements?: [Placement, ...Placement[]];
+};
+export interface NamedFormatProduct {}
+export interface CanonicalFormatProduct {}
+positions?: [DisclosurePosition, ...DisclosurePosition[]];\`;
+writeFileSync(__OUTPUT__, JSON.stringify({ output: relaxZodCompatibilityArrayTypes(input) }));
+`);
+
+  assert.match(result.output, /publisher_properties: \(PublisherPropertySelector & \{\}\)\[\];/);
+  assert.match(result.output, /positions\?: DisclosurePosition\[\];/);
+  assert.match(result.output, /placements\?: \[Placement, \.\.\.Placement\[\]\];/);
+  assert.doesNotMatch(result.output, /NamedFormatProduct \| CanonicalFormatProduct/);
+});
+
+test('issue #2674 preserves Product marker fields when either marker becomes non-empty', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { relaxZodCompatibilityArrayTypes } from __GENERATOR__;
+
+const input = \`export type Product = {} & (NamedFormatProduct | CanonicalFormatProduct) & {
+  product_id: string;
+};
+export interface NamedFormatProduct {
+  named_format_id: string;
+}
+export interface CanonicalFormatProduct {}\`;
+writeFileSync(__OUTPUT__, JSON.stringify({ output: relaxZodCompatibilityArrayTypes(input) }));
+`);
+
+  assert.match(result.output, /NamedFormatProduct \| CanonicalFormatProduct/);
+  assert.match(result.output, /named_format_id: string;/);
+});
+
 test('PostalCountrySystem propagates unconditional requirements into every anyOf branch', () => {
   const result = runGeneratorHarness(`
 import { writeFileSync } from 'node:fs';
@@ -57,6 +101,121 @@ writeFileSync(__OUTPUT__, JSON.stringify({
     ['country', 'system'],
   ]);
   assert.equal(result.originalBranchesRemainUntouched, true);
+});
+
+test('PostalArea preserves the native branch fields and non-empty values type', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds, enforceStrictSchema } from __GENERATOR__;
+
+const source = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/core/postal-area.json'), 'utf8')
+);
+const transformed = applyCodegenSchemaWorkarounds(source, 'PostalArea');
+const native = transformed.anyOf.find((branch: any) => branch.title === 'Postal Country Area');
+const nested = enforceStrictSchema({ type: 'object', properties: { postal: source } })
+  .properties.postal.anyOf.find((branch: any) => branch.title === 'Postal Country Area');
+writeFileSync(__OUTPUT__, JSON.stringify({
+  hasAllOf: Array.isArray(native.allOf),
+  required: native.required,
+  properties: Object.keys(native.properties),
+  valuesMinItems: native.properties.values.minItems,
+  valuesTsType: native.properties.values.tsType,
+  nestedHasAllOf: Array.isArray(nested.allOf),
+  nestedProperties: Object.keys(nested.properties),
+}));
+`);
+
+  assert.equal(result.hasAllOf, false);
+  assert.deepEqual(result.required, ['country', 'system', 'values']);
+  assert.deepEqual(result.properties, ['country', 'system', 'values']);
+  assert.equal(result.valuesMinItems, 1);
+  assert.equal(result.valuesTsType, '[string, ...string[]]');
+  assert.equal(result.nestedHasAllOf, false);
+  assert.deepEqual(result.nestedProperties, ['country', 'system', 'values']);
+});
+
+test('GetMediaBuysResponse folds creative approval refinements without dropping base fields', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds } from __GENERATOR__;
+
+const source = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/media-buy/get-media-buys-response.json'), 'utf8')
+);
+const transformed = applyCodegenSchemaWorkarounds(source, 'GetMediaBuysResponse');
+const approval = transformed.properties.media_buys.items.properties.packages.items
+  .properties.creative_approvals.items;
+const indicatorTypeOverlay = (approval.properties.indicators.items.allOf ?? [])
+  .find((member: any) => member.properties?.type);
+const evaluatedTypeOverlay = (approval.properties.indicator_types_evaluated.items.allOf ?? [])
+  .find((member: any) => member.enum);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  hasAllOf: Array.isArray(approval.allOf),
+  required: approval.required,
+  properties: Object.keys(approval.properties),
+  indicatorTypes: evaluatedTypeOverlay.enum,
+  indicatorKinds: indicatorTypeOverlay.properties.type.enum,
+}));
+`);
+
+  assert.equal(result.hasAllOf, false);
+  assert.ok(result.required.includes('creative_id'));
+  assert.ok(result.required.includes('approval_status'));
+  for (const field of [
+    'creative_id',
+    'approval_status',
+    'rejection_reason',
+    'approval_scopes',
+    'indicators',
+    'indicator_types_evaluated',
+    'indicators_as_of',
+    'indicators_evaluated_scope',
+  ]) {
+    assert.ok(result.properties.includes(field), `${field} should remain in the approval shape`);
+  }
+  assert.deepEqual(result.indicatorTypes, ['creative_fatigue', 'creative_quality_opportunity']);
+  assert.deepEqual(result.indicatorKinds, ['creative_fatigue', 'creative_quality_opportunity']);
+});
+
+test('ListCreativesResponse keeps assigned-package identity alongside indicator refinements', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds } from __GENERATOR__;
+
+const source = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/creative/list-creatives-response.json'), 'utf8')
+);
+const transformed = applyCodegenSchemaWorkarounds(source, 'ListCreativesResponse');
+const assignment = transformed.properties.creatives.items.properties.assignments
+  .properties.assigned_packages.items;
+writeFileSync(__OUTPUT__, JSON.stringify({
+  hasAllOf: Array.isArray(assignment.allOf),
+  required: assignment.required,
+  properties: Object.keys(assignment.properties),
+}));
+`);
+
+  assert.equal(result.hasAllOf, false);
+  assert.ok(result.required.includes('package_id'));
+  assert.ok(result.required.includes('assigned_date'));
+  for (const field of [
+    'package_id',
+    'media_buy_id',
+    'assigned_date',
+    'approval_status',
+    'rejection_reason',
+    'approval_scopes',
+    'indicators',
+    'indicator_types_evaluated',
+    'indicators_as_of',
+    'indicators_evaluated_scope',
+  ]) {
+    assert.ok(result.properties.includes(field), `${field} should remain in the assignment shape`);
+  }
 });
 
 test('refine_proposals result overlays preserve the canonical proposal base', () => {
@@ -125,6 +284,86 @@ writeFileSync(__OUTPUT__, JSON.stringify({
   assert.equal(result.finalized.status, 'committed');
   assert.ok(result.finalized.required.includes('expires_at'));
   assert.equal(result.finalized.hasExpiry, true);
+});
+
+test('CanonicalProposal exposes beta.5 budget guidance and forecast fields', () => {
+  const source = ts.createSourceFile(
+    CORE_TYPES_PATH,
+    fs.readFileSync(CORE_TYPES_PATH, 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const proposal = source.statements.find(
+    statement => ts.isInterfaceDeclaration(statement) && statement.name.text === 'CanonicalProposal'
+  );
+  assert.ok(proposal, 'CanonicalProposal should be emitted from its authoritative schema');
+
+  const property = name =>
+    proposal.members.find(
+      member =>
+        ts.isPropertySignature(member) &&
+        (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)) &&
+        member.name.text === name
+    );
+  const guidance = property('total_budget_guidance');
+  assert.ok(guidance?.questionToken, 'total_budget_guidance should be optional');
+  assert.ok(ts.isTypeLiteralNode(guidance.type), 'total_budget_guidance should retain its object shape');
+  assert.deepEqual(
+    guidance.type.members.map(member => member.name.text),
+    ['min', 'recommended', 'max', 'currency']
+  );
+  const currency = guidance.type.members.find(member => member.name.text === 'currency');
+  assert.equal(currency.questionToken, undefined, 'guidance currency should remain required');
+  assert.equal(currency.type.kind, ts.SyntaxKind.StringKeyword);
+
+  const forecast = property('forecast');
+  assert.ok(forecast?.questionToken, 'forecast should be optional');
+  assert.ok(ts.isTypeReferenceNode(forecast.type));
+  assert.equal(forecast.type.typeName.text, 'CanonicalDeliveryForecast');
+});
+
+test('request_proposals outcome branches retain products and legacy continuation fields', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds, enforceStrictSchema } from __GENERATOR__;
+
+const source = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/media-buy/request-proposals-response.json'), 'utf8')
+);
+const transformed = enforceStrictSchema(applyCodegenSchemaWorkarounds(source, 'RequestProposalsResponse'));
+const proposed = transformed.oneOf.find(
+  (branch: any) => branch.properties?.outcome?.const === 'proposed'
+);
+const productsAvailable = transformed.oneOf.find(
+  (branch: any) => branch.properties?.outcome?.const === 'products_available'
+);
+const legacyCreate = productsAvailable.properties.purchase_continuation.oneOf.find(
+  (branch: any) => branch.properties?.kind?.const === 'legacy_create'
+);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  branchCount: transformed.oneOf.length,
+  productsAvailableRequired: productsAvailable.required,
+  productsAvailableProperties: Object.keys(productsAvailable.properties),
+  productsMinItems: productsAvailable.properties.products.minItems,
+  proposedForbidsContinuation: proposed.properties.purchase_continuation === false,
+  productsAvailableForbidsProposals: productsAvailable.properties.proposals === false,
+  continuationRequired: legacyCreate.required,
+  continuationProperties: Object.keys(legacyCreate.properties),
+}));
+`);
+
+  assert.equal(result.branchCount, 4);
+  assert.ok(result.productsAvailableRequired.includes('products'));
+  assert.ok(result.productsAvailableRequired.includes('purchase_continuation'));
+  assert.ok(result.productsAvailableProperties.includes('purchase_continuation'));
+  assert.equal(result.productsMinItems, 1);
+  assert.equal(result.proposedForbidsContinuation, true);
+  assert.equal(result.productsAvailableForbidsProposals, true);
+  assert.ok(result.continuationRequired.includes('continuation_token'));
+  assert.ok(result.continuationRequired.includes('losses'));
+  assert.ok(result.continuationProperties.includes('product_ids'));
 });
 
 test('GetMediaBuyDeliveryResponse isolates optional breakdown identifiers under unique compat titles', () => {

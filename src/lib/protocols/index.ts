@@ -11,6 +11,7 @@ export {
 import { closeMCPConnections } from './mcp';
 import { closeCurrentMCPConnectionScope, withMCPConnectionScope } from './mcp-scope';
 import { closeA2AConnections } from './a2a';
+import { randomUUID } from 'node:crypto';
 
 /**
  * Close protocol connections for the given protocol.
@@ -70,6 +71,7 @@ import { resolveBundleKey, toReleasePrecisionWire, validateAdcpVersionWire } fro
 import { buildAgentSigningContext, CAPABILITY_OP, ensureCapabilityLoaded } from '../signing/client';
 import { withResponseSizeLimit } from './responseSizeLimit';
 import { preparedProtocolToolCallFor } from './prepared-call-context';
+import { isAdcpVersionAtLeast } from '../utils/adcp-version-config';
 import {
   withTransportDiagnostics,
   type TransportActivityHandler as TransportActivityHandlerFn,
@@ -278,10 +280,11 @@ export interface TransportOptions {
    * the SDK uses the global `fetch` implementation.
    *
    * Supplying this function makes it the trusted network boundary: the SDK
-   * still validates URL schemes, redirect behavior, timeouts, and body limits,
-   * but delegates DNS resolution and address policy to the implementation.
-   * It must prevent DNS rebinding and unsafe private-address access itself (for
-   * example with an egress proxy or its own DNS pinning).
+   * still validates URL schemes, redirect behavior, timeouts, body limits, and
+   * literal IP addresses, but delegates hostname DNS resolution and resolved
+   * address policy to the implementation. It must prevent DNS rebinding and
+   * unsafe private-address access itself (for example with an egress proxy or
+   * its own DNS pinning).
    */
   trustedFetchFn?: typeof fetch;
   /**
@@ -339,6 +342,12 @@ export interface CallToolOptions {
   webhookSecret?: string;
   /** Bearer token for push_notification_config validation. */
   webhookToken?: string;
+  /**
+   * Buyer operation identifier echoed by task-status webhooks. TaskExecutor
+   * supplies its stable task ID; direct protocol callers receive a generated
+   * identifier when they omit this value.
+   */
+  operationId?: string;
   /** Pinned protocol generation when the agent advertises both v2 and v3. */
   serverVersion?: 'v2' | 'v3';
   /** A2A session continuity (contextId carries conversation, taskId resumes a task). */
@@ -415,16 +424,18 @@ function applyPublishedSchemaCompatibility(
 export interface PreparedProtocolToolCall {
   /** Exact AdCP tool arguments that the target service will receive. */
   args: Record<string, unknown>;
-  /** A2A carries task-status webhook registration outside tool arguments. */
+  /** Native A2A TaskPushNotificationConfig retained independently of AdCP registration. */
   pushNotificationConfig?: PushNotificationConfig;
+  /** Stable operation ID generated for a beta.5 application webhook registration. */
+  operationId?: string;
 }
 
 /**
  * Materialize protocol-owned request fields before a tool call is authorized.
  *
  * Governance binds the complete downstream AdCP argument object, including
- * version fields and (for MCP) `push_notification_config`. Keeping this pure
- * preparation step shared with {@link ProtocolClient.callTool} prevents the
+ * version fields and `push_notification_config`. Keeping this preparation
+ * step shared with {@link ProtocolClient.callTool} prevents the
  * authorized payload from drifting from the payload that reaches the service.
  */
 export function prepareProtocolToolCall(
@@ -435,6 +446,7 @@ export function prepareProtocolToolCall(
     | 'webhookUrl'
     | 'webhookSecret'
     | 'webhookToken'
+    | 'operationId'
     | 'serverVersion'
     | 'adcpVersion'
     | 'wireAdcpVersion'
@@ -448,15 +460,14 @@ export function prepareProtocolToolCall(
   );
   const argsWithVersion = applyVersionEnvelope(args, envelope);
   applyPublishedSchemaCompatibility(options.toolName, argsWithVersion, args);
-
-  // The in-process MCP client has historically had no protocol webhook
-  // registration path. Preserve that behavior and, crucially, describe the
-  // exact arguments that path will receive.
-  if (agent.protocol === 'mcp' && agent._inProcessMcpClient) {
-    return { args: argsWithVersion };
-  }
+  const effectiveBundle =
+    typeof argsWithVersion.adcp_version === 'string' ? resolveBundleKey(argsWithVersion.adcp_version) : undefined;
+  const usesApplicationRegistration =
+    options.serverVersion !== 'v2' && isAdcpVersionAtLeast(effectiveBundle, '3.2.0-beta.5');
 
   let pushNotificationConfig: PushNotificationConfig | undefined;
+  let applicationPushNotificationConfig: PushNotificationConfig | undefined;
+  let operationId: string | undefined;
   if (options.webhookUrl) {
     if (options.webhookSecret) {
       pushNotificationConfig = {
@@ -475,14 +486,29 @@ export function prepareProtocolToolCall(
         ...(options.webhookToken && { token: options.webhookToken }),
       };
     }
+    if (usesApplicationRegistration && pushNotificationConfig) {
+      operationId = options.operationId ?? randomUUID();
+      applicationPushNotificationConfig = {
+        ...pushNotificationConfig,
+        url: options.webhookUrl,
+        operation_id: operationId,
+      };
+    } else if (agent.protocol === 'mcp' && !agent._inProcessMcpClient) {
+      // Preserve the pre-beta.5 MCP wire shape for explicitly negotiated
+      // older bundles. A2A used only its native configuration on those lines.
+      applicationPushNotificationConfig = pushNotificationConfig;
+    }
   }
 
   return {
-    args:
-      agent.protocol === 'mcp' && pushNotificationConfig
-        ? { ...argsWithVersion, push_notification_config: pushNotificationConfig }
-        : argsWithVersion,
-    ...(pushNotificationConfig ? { pushNotificationConfig } : {}),
+    // AdCP 3.2 task-webhook registration is application-layer data on every
+    // transport. A2A's native TaskPushNotificationConfig is a distinct
+    // transport feature and must not replace this argument.
+    args: applicationPushNotificationConfig
+      ? { ...argsWithVersion, push_notification_config: applicationPushNotificationConfig }
+      : argsWithVersion,
+    ...(agent.protocol === 'a2a' && pushNotificationConfig ? { pushNotificationConfig } : {}),
+    ...(operationId ? { operationId } : {}),
   };
 }
 
@@ -509,6 +535,7 @@ export class ProtocolClient {
       webhookUrl,
       webhookSecret,
       webhookToken,
+      operationId,
       serverVersion,
       session,
       adcpVersion,
@@ -527,6 +554,7 @@ export class ProtocolClient {
         webhookUrl,
         webhookSecret,
         webhookToken,
+        operationId,
         serverVersion,
         adcpVersion,
         wireAdcpVersion,
@@ -743,7 +771,6 @@ export class ProtocolClient {
                   throw err;
                 }
               } else if (agent.protocol === 'a2a') {
-                // For A2A, pass pushNotificationConfig separately (not in skill parameters)
                 try {
                   return await callA2ATool(
                     agent.agent_uri,

@@ -61,6 +61,7 @@ import type {
   GetMediaBuysPayload,
   GetAccountFinancialsHandlerResult,
   GetBrandIdentityPayload,
+  GetProductsHandlerResult,
   GetProductsPayload,
   LegacyGetRightsPayload,
   ListAccountsHandlerResult,
@@ -84,8 +85,13 @@ import type {
   LegacyUpdateRightsPayload,
   UpdateMediaBuyPayload,
 } from '@adcp/sdk/server';
-import { createAdcpServerFromPlatform, defineOperationalPlatform } from '@adcp/sdk/server';
+import {
+  createAdcpServerFromPlatform,
+  defineOperationalPlatform,
+  withResponseSummary,
+} from '@adcp/sdk/server';
 import { createAdcpServer as createLegacyAdcpServer } from '@adcp/sdk/server/legacy/v5';
+import { normalizeLegacyGetProductsResponse } from '@adcp/sdk/v2/projection';
 import { createSingleAgentClient, extractAdcpErrorFromMcp, extractAdcpErrorFromTransport } from '@adcp/sdk';
 import type {
   CreateMediaBuyPayload as TypesCreateMediaBuyPayload,
@@ -111,26 +117,33 @@ import type {
 import type {
   AccountReference,
   CreativeBrief,
+  DisclosurePosition,
   FormatSchemaReferenceResult,
   CreateMediaBuyPayload as RootCreateMediaBuyPayload,
   GetProductsPayload as RootGetProductsPayload,
   LegacyProduct,
   LegacyGetProductsResponse,
   MediaBuyAvailableAction,
+  Package,
   ProductCardFields,
   ProductCardDetailedFields,
+  GetProductsRequest,
   SLAWindow,
   SlaWindow,
   UpdateMediaBuyPayload as RootUpdateMediaBuyPayload,
+  LegacyGetProductsRequest,
 } from '@adcp/sdk';
+import { z } from 'zod';
 import type {
   AdCPVersionEnvelope,
   AudienceCharacteristic,
   CanonicalFormatBase as ToolCanonicalFormatBase,
   CommercialTerms,
   ExplicitPackagesWithFixedAllocation,
+  ListCreativesResponse,
   Placement,
   PostalCountrySystem,
+  PublisherPropertySelector,
   ProductFormatDeclaration,
   ProtocolEnvelope,
   SelectedPlacements,
@@ -155,12 +168,220 @@ import type {
   None1,
   None2,
   PlatformExtensionReference1,
+  PostalArea,
+  PostalArea1,
   Product1,
   Property1,
 } from '@adcp/sdk/types/core.generated';
 import { createCanonicalReferenceResolver as createSubpathCanonicalReferenceResolver } from '@adcp/sdk/canonical-references';
 import { customToolFor, customToolForSchema, TOOL_INPUT_SCHEMAS, TOOL_INPUT_SHAPES, TOOL_REQUEST_SCHEMAS } from '@adcp/sdk/schemas';
 import * as publicSchemas from '@adcp/sdk/schemas';
+
+// Public schema declarations must retain their object helpers and complete
+// parse outputs after packing, not just while compiling inside the repository.
+void publicSchemas.ProductSchema.shape.reporting_capabilities;
+void publicSchemas.ProductSchema.extend({});
+void publicSchemas.PackageSchema.pick({ package_id: true });
+void publicSchemas.PackageRequestSchema.extend({});
+void publicSchemas.PackageUpdateSchema.omit({ paused: true });
+void publicSchemas.GetProductsResponseSchema.pick({ status: true });
+void publicSchemas.PackageSchema.safeParse({});
+
+// Issue #2674: exercise the packed declarations through the same composition
+// patterns used by real adopters, not only through bare helper access.
+const _productOutputExtensionsSchema = z.object({
+  publisher_properties: z.array(publicSchemas.PublisherPropertySelectorSchema),
+});
+const _compatibleProductSchema = publicSchemas.ProductSchema.safeExtend(_productOutputExtensionsSchema.shape);
+const _stagedCompatibleProductSchema = _compatibleProductSchema.safeExtend({
+  placements: z.array(z.object({ placement_id: z.string(), name: z.string() })).optional(),
+});
+const _consumerProductSchema = publicSchemas.ProductSchema.safeExtend({
+  publisher_properties: z.array(z.object({ property_id: z.string() })).optional(),
+});
+const _stagedConsumerProductSchema = _consumerProductSchema.safeExtend({
+  placements: z.array(z.object({ placement_id: z.string(), name: z.string() })).optional(),
+});
+function _acceptZodObject<T extends z.ZodObject>(schema: T): T {
+  return schema;
+}
+_acceptZodObject(publicSchemas.ProductSchema);
+_acceptZodObject(_stagedConsumerProductSchema);
+_acceptZodObject(_stagedCompatibleProductSchema);
+declare const _stagedConsumerProduct: z.output<typeof _stagedConsumerProductSchema>;
+const _stagedPublisherProperties: Array<{ property_id: string }> | undefined =
+  _stagedConsumerProduct.publisher_properties;
+void _stagedPublisherProperties;
+publicSchemas.ProductSchema.safeExtend({
+  // @ts-expect-error Product compatibility bridges still require Zod schemas.
+  publisher_properties: 123,
+});
+publicSchemas.ProductSchema.safeExtend({
+  // @ts-expect-error Product compatibility bridges still require Zod schemas.
+  placements: 123,
+});
+publicSchemas.ProductSchema.safeExtend({
+  // @ts-expect-error Unbridged Product fields retain normal safeExtend compatibility checks.
+  name: z.number(),
+});
+const _composedProductsResponseSchema = publicSchemas.GetProductsResponseSchema.extend({
+  status: z.literal('completed'),
+  products: z.array(_compatibleProductSchema),
+})
+  .partial()
+  .extend({ products: z.array(_compatibleProductSchema.partial()).optional() });
+declare const _unknownPackedInput: unknown;
+const _composedProductsResponse = _composedProductsResponseSchema.safeParse(_unknownPackedInput);
+if (_composedProductsResponse.success) {
+  _composedProductsResponse.data.products?.map(product => product.product_id);
+}
+type _IsAny<T> = 0 extends 1 & T ? true : false;
+type _IsNever<T> = [T] extends [never] ? true : false;
+type _Assert<T extends true> = T;
+type _ComposedProduct = NonNullable<z.output<typeof _composedProductsResponseSchema>['products']>[number];
+type _ComposedProductIsTyped = _Assert<_IsAny<_ComposedProduct> extends false ? true : false>;
+type _ProductWithPlacementsPublisherProperties = z.output<
+  typeof _productWithPlacementsSchema
+>['publisher_properties'];
+type _ProductWithPlacementsPublisherPropertiesIsTyped = _Assert<
+  _IsAny<_ProductWithPlacementsPublisherProperties> extends false
+    ? _IsNever<_ProductWithPlacementsPublisherProperties> extends false
+      ? true
+      : false
+    : false
+>;
+const _pickedProductPublisherPropertiesSchema = publicSchemas.ProductSchema.pick({ publisher_properties: true });
+type _PickedPublisherProperties = z.output<
+  typeof _pickedProductPublisherPropertiesSchema
+>['publisher_properties'];
+type _PickedPublisherPropertiesIsTyped = _Assert<
+  _IsAny<_PickedPublisherProperties> extends false
+    ? _IsNever<_PickedPublisherProperties> extends false
+      ? true
+      : false
+    : false
+>;
+declare const _pickedPublisherProperties: _PickedPublisherProperties;
+const _pickedPublisherPropertiesAsPublic: PublisherPropertySelector[] = _pickedPublisherProperties;
+void (null as unknown as _ComposedProductIsTyped);
+void (null as unknown as _ProductWithPlacementsPublisherPropertiesIsTyped);
+void (null as unknown as _PickedPublisherPropertiesIsTyped);
+void _pickedPublisherPropertiesAsPublic;
+declare const _consumerProduct: z.output<typeof _consumerProductSchema>;
+const _consumerProductId: string = _consumerProduct.product_id;
+void _consumerProductId;
+const _productChannelsSchema = publicSchemas.ProductSchema.pick({ channels: true });
+const _productChannelsInput: z.input<typeof _productChannelsSchema> = {};
+void _productChannelsInput;
+const _productWithPlacementsSchema = publicSchemas.ProductSchema.safeExtend({
+  placements: z.array(z.object({
+    placement_id: z.string(),
+    name: z.string(),
+  })).optional(),
+});
+declare const _productWithPlacements: z.output<typeof _productWithPlacementsSchema>;
+const _productPublisherProperties: PublisherPropertySelector[] = _productWithPlacements.publisher_properties;
+void _productPublisherProperties;
+type _InferredPackage = z.infer<typeof publicSchemas.PackageSchema>;
+declare const _inferredPackage: _InferredPackage;
+const _inferredPackageAsPublic: Package = _inferredPackage;
+declare const _publicPackage: Package;
+const _publicPackageAsInferred: _InferredPackage = _publicPackage;
+void _inferredPackageAsPublic;
+void _publicPackageAsInferred;
+const _packedGetProductsRequest: GetProductsRequest =
+  publicSchemas.GetProductsRequestSchema.parse(_unknownPackedInput);
+void _packedGetProductsRequest;
+const _minimalPackedGetProductsRequestInput: z.input<typeof publicSchemas.GetProductsRequestSchema> = {
+  buying_mode: 'brief',
+};
+void _minimalPackedGetProductsRequestInput;
+const _extendedPackedGetProductsRequest = publicSchemas.GetProductsRequestSchema.extend({
+  local_extension: z.string().optional(),
+}).parse({ buying_mode: 'wholesale' }) satisfies GetProductsRequest & {
+  local_extension?: string;
+};
+void _extendedPackedGetProductsRequest;
+const _summarizedProducts: GetProductsHandlerResult = withResponseSummary(
+  { products: [], cache_scope: 'public' },
+  'Synthetic sample data for demonstration only.'
+);
+// @ts-expect-error — the published wrapper must retain its payload type.
+const _invalidSummarizedProducts: GetProductsHandlerResult = withResponseSummary(
+  { products: 'not-an-array', cache_scope: 'public' },
+  'Invalid fixture.'
+);
+const _normalizedRecoveredProducts = normalizeLegacyGetProductsResponse({ products: [] });
+const _invalidForecastNormalization = normalizeLegacyGetProductsResponse({
+  products: [{ forecast: [] }],
+});
+type _NormalizedRecoveredProductsIsTyped = _Assert<
+  _IsAny<typeof _normalizedRecoveredProducts> extends false ? true : false
+>;
+// @ts-expect-error — an array forecast selects the unknown safety overload.
+const _invalidForecastNormalizationAsTyped: { products: Array<{ forecast: Record<string, unknown> }> } =
+  _invalidForecastNormalization;
+void _summarizedProducts;
+void _invalidSummarizedProducts;
+void _normalizedRecoveredProducts;
+void _invalidForecastNormalizationAsTyped;
+void (null as unknown as _NormalizedRecoveredProductsIsTyped);
+
+const _wireFields = publicSchemas.LegacyGetProductsRequestSchema.parse({
+  buying_mode: 'wholesale',
+  fields: ['format_ids'],
+  brand: {
+    domain: 'buyer.example',
+    brand_kit_override: {
+      logo: {
+        asset_type: 'image',
+        url: 'https://buyer.example/logo.png',
+        width: 100,
+        height: 100,
+        provenance: {
+          disclosure: {
+            required: true,
+            jurisdictions: [
+              {
+                country: 'US',
+                regulation: 'example_rule',
+                render_guidance: { positions: ['overlay'] },
+              },
+            ],
+          },
+        },
+      },
+    },
+  },
+});
+type _WireFieldSupportsLegacy = _Assert<
+  'format_ids' extends NonNullable<LegacyGetProductsRequest['fields']>[number] ? true : false
+>;
+const _wireField: NonNullable<LegacyGetProductsRequest['fields']>[number] | undefined = _wireFields.fields?.[0];
+const _canonicalGetProductsFields: z.input<typeof publicSchemas.GetProductsRequestSchema> = {
+  buying_mode: 'wholesale',
+  fields: ['format_options'],
+};
+const _legacyGetProductsFields: z.input<typeof publicSchemas.LegacyGetProductsRequestSchema> = {
+  buying_mode: 'wholesale',
+  fields: ['format_ids'],
+};
+const _disclosurePosition: DisclosurePosition | undefined =
+  _wireFields.brand?.brand_kit_override?.logo?.provenance?.disclosure?.jurisdictions?.[0]?.render_guidance
+    ?.positions?.[0];
+void _wireField;
+void _canonicalGetProductsFields;
+void _legacyGetProductsFields;
+void _disclosurePosition;
+void (null as unknown as _WireFieldSupportsLegacy);
+
+type PackedAssignedPackage = NonNullable<
+  NonNullable<ListCreativesResponse['creatives'][number]['assignments']>['assigned_packages']
+>[number];
+declare const _packedAssignment: PackedAssignedPackage;
+const _packedAssignmentId: string = _packedAssignment.package_id;
+const _packedAssignedDate: string = _packedAssignment.assigned_date;
+void [_packedAssignmentId, _packedAssignedDate, _packedAssignment.approval_status, _packedAssignment.indicators];
 
 declare const _server: AdcpServer;
 void _server;
@@ -280,6 +501,28 @@ const _payloadResults: [
   ok([]),
 ];
 void _payloadResults;
+
+const _nativePostalArea: PostalArea = { country: 'US', system: 'zip', values: ['10001'] };
+const _legacyNamedNativePostalArea: PostalArea1 = _nativePostalArea;
+// @ts-expect-error Native postal targeting requires at least one value.
+const _emptyNativePostalArea: PostalArea = { country: 'US', system: 'zip', values: [] };
+void _legacyNamedNativePostalArea;
+void _emptyNativePostalArea;
+
+type PackedCreativeApproval = NonNullable<
+  GetMediaBuysPayload['media_buys'][number]['packages'][number]['creative_approvals']
+>[number];
+const _packedCreativeApproval: PackedCreativeApproval = {
+  creative_id: 'creative-1',
+  approval_status: 'approved',
+  rejection_reason: 'not used for approved creatives',
+  approval_scopes: [],
+  indicator_types_evaluated: ['creative_fatigue'],
+  indicators: [],
+  indicators_as_of: '2026-08-20T00:00:00Z',
+  indicators_evaluated_scope: [],
+};
+void _packedCreativeApproval;
 
 const _accountHandlerResults: [
   ListAccountsHandlerResult,

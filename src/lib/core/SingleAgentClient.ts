@@ -5,7 +5,14 @@ import * as schemas from '../types/schemas.generated';
 import type { AgentConfig } from '../types';
 import { ADCP_ENVELOPE_FIELDS } from '../types/adcp';
 import { parseAdcpMajorVersion, type AdcpVersion } from '../version';
-import { isAdcpVersionSupported, isPre31AdcpVersion, resolveAdcpVersion } from '../utils/adcp-version-config';
+import {
+  isAdcpVersionSupported,
+  isAdcpVersionAtLeast,
+  isPre31AdcpVersion,
+  isPre32AdcpVersion,
+  resolveAdcpVersion,
+} from '../utils/adcp-version-config';
+import { beta6ReportingRequestIssue, type Beta6DeliveryRequestIssue } from '../media-buy/reporting-version';
 import { getVersionAdapter, resolveAdapterKey } from '../adapters/version';
 import { isExternalSchemaRootActive, schemaAllowsTopLevelField } from '../validation/schema-loader';
 import type {
@@ -84,14 +91,30 @@ import type {
 import { type MutatingRequestInput, generateIdempotencyKey, requestUsesIdempotency } from '../utils/idempotency';
 
 import type { MCPWebhookPayload, AdCPAsyncResponseData, TaskStatus } from '../types/core.generated';
-import type { Task as A2ATask, TaskStatusUpdateEvent } from '@a2a-js/sdk';
-import { A2AClient as A2AClientImpl } from '@a2a-js/sdk/client';
-// A2A SDK client used untyped — wire shapes are validated at runtime, matching
-// the prior CommonJS `require('@a2a-js/sdk/client')` behaviour.
-const A2AClient: any = A2AClientImpl;
+import type { Client as A2AClient } from '@a2a-js/sdk/client';
+import { createA2AClientFromCardUrl } from '../protocols/a2a';
+type A2ATask = Record<string, any>;
+type TaskStatusUpdateEvent = Record<string, any>;
 
-import { TaskExecutor, DeferredTaskError } from './TaskExecutor';
+import {
+  TaskExecutor,
+  DEFERRED_SETTLEMENT_ACK,
+  acknowledgeDeferredSettlement,
+  rejectDeferredSettlement,
+  hasCompletionHandlerAlreadyPublished,
+  markCompletionHandlerAlreadyPublished,
+  AfterProtocolDispatchHookError,
+  BeforeProtocolDispatchHookError,
+  type BeforeProtocolDispatchHook,
+  type ExternalTaskSettlementObservation,
+  type ExternalTaskStatusResult,
+} from './TaskExecutor';
 import { attachMatch } from './match';
+import {
+  assertNativeRequestProposalsResult,
+  assertNativeRequestProposalsTask,
+  guardNativeRequestProposalsCompletion,
+} from './request-proposals-guard';
 import { withTaskDeadline } from './task-deadline';
 import { createMCPRequestHeaders } from '../auth';
 import { isAbortOrTimeoutError } from '../protocols/abort';
@@ -123,8 +146,14 @@ import type {
   WebhookUrlTemplate,
 } from './ConversationTypes';
 import type { AdcpTaskName, TaskRequestFor, TaskResponseTypeMap } from './AgentClient';
+import type { DeferredTaskStorage } from '../storage/interfaces';
 import type { Activity, AsyncHandlerConfig, WebhookMetadata } from './AsyncHandler';
-import { AsyncHandler } from './AsyncHandler';
+import {
+  AsyncHandler,
+  WebhookDedupClaimRetentionError,
+  WebhookDedupConflictError,
+  WebhookDedupInputError,
+} from './AsyncHandler';
 import { verifyWebhookRequest, type WebhookHeaderValue, type WebhookHeadersLike } from '../webhooks';
 import {
   InMemoryWebhookRegistrationStore,
@@ -145,6 +174,9 @@ import {
   canonicalTargetUri,
 } from '../signing/server';
 import { unwrapProtocolResponse } from '../utils/response-unwrapper';
+import { getLatestA2ADataPartFromTask } from '../utils/a2a-artifacts';
+import { extractAdcpTaskStatusFromPayload, isAdcpStatus } from './task-status';
+import { responseParser } from './ProtocolResponseParser';
 import {
   isWellKnownAgentCardUrl as isWellKnownCardUrl,
   buildCardUrls,
@@ -204,6 +236,8 @@ import {
   type CanonicalGetProductsResponse,
   type CanonicalListCreativesRequest,
   type CanonicalListCreativesResponse,
+  type CanonicalPreviewCreativeRequest,
+  type CanonicalPreviewCreativeResponse,
   type CanonicalSyncCreativesRequest,
   type CanonicalUpdateMediaBuyRequest,
   type CreativeFormatWireMode,
@@ -217,8 +251,11 @@ import {
 } from '../v2/projection/catalog-snapshot';
 import type { CanonicalFormatLegacyResolutionContext, CanonicalFormatLegacyResolver } from '../v2/projection/v2-to-v1';
 import { toCanonicalOnlyResponse } from '../v2/projection/augment-response';
-import { legacyFormatRefsForDeclaration } from '../v2/projection/legacy-metadata';
-import type { V1FormatId, V1Product } from '../v2/projection/types';
+import {
+  legacyFormatRefsForDeclaration,
+  structuredCloneWithLegacyCreativeMetadata,
+} from '../v2/projection/legacy-metadata';
+import { isProjectionProductInput, type V1FormatId, type V1Product } from '../v2/projection/types';
 import { canonicalize as canonicalizeJson } from '../utils/jcs';
 
 type ReadRequestOptions = Pick<TaskOptions, 'signal' | 'transport'>;
@@ -231,6 +268,68 @@ const CAPABILITY_DISCOVERY_CONTEXT = Symbol('capabilityDiscoveryContext');
 type InternalReadRequestOptions = ReadRequestOptions & {
   [CAPABILITY_DISCOVERY_CONTEXT]?: CapabilityDiscoveryContext;
 };
+type UnprojectedPreDispatchHook<T> = BeforeProtocolDispatchHook<T>;
+
+function a2aUrlString(input: string | URL | Request): string {
+  return typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+}
+
+function a2aScopedHeaders(
+  input: string | URL | Request,
+  requestHeaders: HeadersInit | undefined,
+  configuredAgentUrl: string,
+  agentHeaders: Record<string, string> | undefined,
+  authToken: string | undefined
+): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  new Headers(requestHeaders).forEach((value, key) => {
+    normalized[key] = value;
+  });
+  const sameOrigin = new URL(a2aUrlString(input)).origin === new URL(configuredAgentUrl).origin;
+  if (!sameOrigin) {
+    for (const key of Object.keys(normalized)) {
+      if (!['accept', 'content-type', 'a2a-version', 'a2a-extensions'].includes(key.toLowerCase())) {
+        delete normalized[key];
+      }
+    }
+    return normalized;
+  }
+  return {
+    ...normalized,
+    ...agentHeaders,
+    ...(authToken && {
+      Authorization: `Bearer ${authToken}`,
+      'x-adcp-auth': authToken,
+    }),
+  };
+}
+
+function sameA2AProtocolVersion(left: unknown, right: unknown): boolean {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  const normalize = (value: string) => value.split('.').slice(0, 2).join('.');
+  return normalize(left) === normalize(right);
+}
+
+function selectA2AJsonRpcUrl(agentCard: any, protocolVersion: string, configuredAgentUrl: string): string | undefined {
+  const interfaces = Array.isArray(agentCard?.supportedInterfaces)
+    ? agentCard.supportedInterfaces.filter(
+        (candidate: any) => candidate?.protocolBinding === 'JSONRPC' && typeof candidate?.url === 'string'
+      )
+    : [];
+  const selected =
+    interfaces.find((candidate: any) => sameA2AProtocolVersion(candidate.protocolVersion, protocolVersion)) ??
+    interfaces.find((candidate: any) => sameA2AProtocolVersion(candidate.protocolVersion, '1.0')) ??
+    interfaces[0];
+  if (!selected) return undefined;
+  const resolved = new URL(selected.url, configuredAgentUrl);
+  if (resolved.origin !== new URL(configuredAgentUrl).origin) {
+    throw new Error(
+      `A2A Agent Card selected a cross-origin JSON-RPC endpoint (${resolved.origin}); ` +
+        `configure that endpoint explicitly before sending credentials`
+    );
+  }
+  return resolved.toString();
+}
 
 function creativeSchemaSupport(value: unknown, depth = 0): CreativeFormatWireMode {
   if (depth > 24 || value === null || typeof value !== 'object') return 'unknown';
@@ -281,6 +380,27 @@ function hasMediaBuyCreativeFormatData(request: unknown): boolean {
   });
 }
 
+function legacyCreativeIdentityPath(value: unknown, path = '$', seen = new WeakSet<object>()): string | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  if (seen.has(value)) return `${path} (cycle)`;
+  seen.add(value);
+  try {
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string' || (Array.isArray(value) && key === 'length')) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable) continue;
+      const childPath = Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`;
+      if (/(^|_)(?:format_ids?|v1_format_ref)($|_)/.test(key)) return childPath;
+      if (!('value' in descriptor)) return `${childPath} (accessor)`;
+      const nested = legacyCreativeIdentityPath(descriptor.value, childPath, seen);
+      if (nested) return nested;
+    }
+    return undefined;
+  } finally {
+    seen.delete(value);
+  }
+}
+
 const CANONICAL_CREATIVE_ACTIVITY_TASKS = new Set([
   'get_products',
   'create_media_buy',
@@ -290,6 +410,30 @@ const CANONICAL_CREATIVE_ACTIVITY_TASKS = new Set([
   'get_media_buys',
   'get_media_buy_delivery',
   'get_creative_delivery',
+]);
+
+// Missing legacy-HMAC registrations are safe only for tools that cannot
+// mutate seller state. `get_products` is intentionally absent because its
+// legacy proposal-finalization variant is state-changing.
+const RECORDLESS_HMAC_READ_ONLY_TASKS = new Set([
+  'get_adcp_capabilities',
+  'list_products',
+  'list_creative_formats',
+  'preview_creative',
+  'list_transformers',
+  'list_creatives',
+  'get_media_buys',
+  'get_media_buy_delivery',
+  'media_buy_delivery',
+  'get_creative_delivery',
+  'get_signals',
+  'list_accounts',
+  'get_property_list',
+  'list_property_lists',
+  'list_content_standards',
+  'get_content_standards',
+  'si_get_offering',
+  'get_plan_audit_logs',
 ]);
 
 /**
@@ -343,6 +487,37 @@ interface CanonicalCreativeRoutingSnapshot {
   readonly account: Readonly<Record<string, unknown>>;
   readonly packages?: readonly CanonicalPackageRouteSelectorSnapshot[];
   readonly new_packages?: readonly CanonicalPackageRouteSelectorSnapshot[];
+}
+
+interface DeferredClientFinalizationContext {
+  readonly kind: 'single-agent';
+  readonly taskType: string;
+  readonly handlerName?: keyof AsyncHandlerConfig;
+  readonly canonical: boolean;
+  readonly serverVersion?: 'v2' | 'v3';
+  readonly serverVersionSynthetic?: boolean;
+  readonly productPolicyRequest: Readonly<Record<string, unknown>>;
+  readonly projectionCatalogs?: readonly ProjectionCatalogSnapshot[];
+  readonly routingSnapshot?: CanonicalCreativeRoutingSnapshot;
+  readonly optionTaskId?: string;
+  readonly optionContextId?: string;
+}
+
+function isDeferredClientFinalizationContext(value: unknown): value is DeferredClientFinalizationContext {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const context = value as Record<string, unknown>;
+  return (
+    context.kind === 'single-agent' &&
+    typeof context.taskType === 'string' &&
+    typeof context.canonical === 'boolean' &&
+    !!context.productPolicyRequest &&
+    typeof context.productPolicyRequest === 'object' &&
+    !Array.isArray(context.productPolicyRequest) &&
+    (context.serverVersion === undefined || context.serverVersion === 'v2' || context.serverVersion === 'v3') &&
+    (context.serverVersionSynthetic === undefined || typeof context.serverVersionSynthetic === 'boolean') &&
+    (context.projectionCatalogs === undefined || Array.isArray(context.projectionCatalogs)) &&
+    (context.handlerName === undefined || typeof context.handlerName === 'string')
+  );
 }
 
 const CANONICAL_PACKAGE_ROUTE_TASKS = new Set(['create_media_buy', 'update_media_buy', 'get_media_buys']);
@@ -441,9 +616,17 @@ function canonicalCreativeRoutingSnapshot(
 
 const canonicalCreativeExecutionStorage = globalAsyncLocalStorage<{
   taskType: string;
+  canonical: boolean;
   legacyFormatConverter?: LegacyFormatConverter;
   canonicalRequest?: unknown;
 }>('canonicalCreativeExecution');
+
+function isCanonicalCreativeExecution(taskType: string | undefined): boolean {
+  if (!taskType) return false;
+  if (CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType)) return true;
+  const active = canonicalCreativeExecutionStorage.getStore();
+  return active?.canonical === true && active.taskType === taskType;
+}
 
 /**
  * Snapshot semantic payloads without executing adopter-controlled behavior.
@@ -527,15 +710,8 @@ function projectPreparedCanonicalCreativeResponseValue(
   if (!value || typeof value !== 'object') return value;
 
   let projected = value as Record<string, unknown>;
-  const isProduct =
-    typeof projected.product_id === 'string' &&
-    ('name' in projected || 'description' in projected) &&
-    (Array.isArray(projected.format_ids) || Array.isArray(projected.format_options));
-  if (isProduct) {
-    const canonical = toCanonicalOnlyResponse(
-      { products: [projected as unknown as V1Product] },
-      { legacyFormatConverter }
-    );
+  if (isProjectionProductInput(projected)) {
+    const canonical = toCanonicalOnlyResponse({ products: [projected] }, { legacyFormatConverter });
     if (canonical.diagnostics.length > 0 || canonical.response.products.length !== 1) {
       throw new CreativeFormatProjectionError(
         taskType,
@@ -624,9 +800,8 @@ function projectCanonicalCreativeAncillaryValue(
 /** Keep legacy creative identity confined to the transport adapter. */
 function canonicalCreativeActivity(activity: Activity): Activity {
   const active = canonicalCreativeExecutionStorage.getStore();
-  const effectiveTaskType =
-    active?.taskType && CANONICAL_CREATIVE_ACTIVITY_TASKS.has(active.taskType) ? active.taskType : activity.task_type;
-  if (!CANONICAL_CREATIVE_ACTIVITY_TASKS.has(effectiveTaskType) || activity.payload === undefined) {
+  const effectiveTaskType = active?.taskType && active.canonical ? active.taskType : activity.task_type;
+  if (!isCanonicalCreativeExecution(effectiveTaskType) || activity.payload === undefined) {
     return activity;
   }
   const converter = active?.taskType === effectiveTaskType ? active.legacyFormatConverter : undefined;
@@ -667,11 +842,8 @@ function canonicalCreativeTransportActivity(
   event: import('../protocols').TransportActivity
 ): import('../protocols').TransportActivity {
   const active = canonicalCreativeExecutionStorage.getStore();
-  const taskType =
-    active?.taskType && CANONICAL_CREATIVE_ACTIVITY_TASKS.has(active.taskType)
-      ? active.taskType
-      : (event.taskType ?? event.tool);
-  if (!taskType || !CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType)) return event;
+  const taskType = active?.taskType && active.canonical ? active.taskType : (event.taskType ?? event.tool);
+  if (!taskType || !isCanonicalCreativeExecution(taskType)) return event;
   return {
     ...event,
     ...(event.requestBody !== undefined && {
@@ -734,6 +906,15 @@ export type CanonicalReadTaskOptions = TaskOptions & {
 export type SyncCreativesTaskOptions = CreativeDeliveryTaskOptions & {
   creativeFormatProjection?: SyncCreativeFormatProjection;
 };
+
+function snapshotTaskOptions<T extends TaskOptions | undefined>(options: T): T {
+  if (!options) return options;
+  return {
+    ...options,
+    ...(options.transport !== undefined && { transport: { ...options.transport } }),
+    ...(options.metadata !== undefined && { metadata: structuredClone(options.metadata) }),
+  } as T;
+}
 
 const PRIMARY_ADCP_TASK_NAMES = {
   get_products: true,
@@ -845,6 +1026,7 @@ type NormalizedWebhookPayload = {
   message?: string;
   timestamp?: string;
   idempotency_key?: string;
+  notification_id?: string;
   protocol?: 'mcp' | 'a2a';
 };
 
@@ -892,6 +1074,9 @@ export type WebhookParseErrorCode =
   | 'webhook_registration_mismatch'
   | 'webhook_verification_context_missing'
   | 'webhook_registration_store_unavailable'
+  | 'webhook_durable_settlement_unavailable'
+  | 'webhook_publication_in_progress'
+  | 'webhook_idempotency_conflict'
   | 'webhook_verification_unavailable';
 
 export interface WebhookVerificationConfig {
@@ -966,9 +1151,12 @@ export interface WebhookParseSuccess {
     operationId: string;
     contextId?: string;
     idempotencyKey?: string;
+    notificationId?: string;
     status: TaskStatus;
     timestamp?: string;
     message?: string;
+    previewHandler?: 'canonical' | 'legacy';
+    requiresDurableSettlement?: boolean;
   };
 }
 
@@ -1002,6 +1190,14 @@ const WEBHOOK_TASK_STATUSES = new Set<string>([
   'auth-required',
   'unknown',
 ]);
+const DURABLE_SETTLEMENT_TERMINAL_STATUSES = new Set<import('./ConversationTypes').TaskStatus>([
+  'completed',
+  'failed',
+  'rejected',
+  'canceled',
+  'governance-denied',
+  'aborted',
+]);
 
 // Top-level fields that every MCP webhook envelope must carry, regardless of
 // negotiated AdCP version. `operation_id` is intentionally NOT here: it became
@@ -1016,6 +1212,12 @@ const MCP_WEBHOOK_REQUIRED_FIELDS = ['idempotency_key', 'task_id', 'task_type', 
  * Configuration for SingleAgentClient (and multi-agent client)
  */
 export interface SingleAgentClientConfig extends ConversationConfig {
+  /** Durable storage for restart-safe A2A human continuations. */
+  deferredStorage?: DeferredTaskStorage;
+  /** Resolve current trusted agent configuration for a persisted continuation. */
+  resolveDeferredAgent?: (agentId: string) => AgentConfig | undefined | Promise<AgentConfig | undefined>;
+  /** Lifetime of a persisted continuation token in seconds. Defaults to seven days. */
+  deferredTaskTtlSeconds?: number;
   /** Converter for seller-specific legacy creative formats at canonical read, write, and webhook boundaries. */
   legacyFormatConverter?: LegacyFormatConverter;
   /** Pre-resolved exact-owner publisher/community catalogs used at every projection boundary. */
@@ -1413,18 +1615,46 @@ export class SingleAgentClient {
   private _syntheticV2WarningFired = false; // Gate: emit the synthetic-v2 warning once per client instance
   private readonly productPolicyRequestParamsByTask = new Map<string, ProductPolicyRequestState>();
   private readonly canonicalCreativeTaskAssociations = new Map<string, CanonicalCreativeTaskAssociation>();
+  private readonly previewCreativeHandlersByTask = new Map<string, 'canonical' | 'legacy'>();
   private readonly canonicalLegacyRoutes = new Map<string, CanonicalLegacyRoute>();
   private readonly resolvedAdcpVersion: string;
   private readonly webhookRegistrationStore: WebhookRegistrationStore;
   private readonly webhookReplayStore: ReplayStore;
   private readonly webhookRevocationStore: RevocationStore;
   private readonly webhookJwksResolvers = new Map<string, JwksResolver>();
+  private readonly durableSettlementRecoverers = new Set<
+    (
+      operationId: string,
+      observation: ExternalTaskSettlementObservation
+    ) => Promise<ExternalTaskStatusResult | undefined>
+  >();
+  private readonly durableDeferredResumeAuthorizers = new Set<
+    (operationId: string, token: string) => boolean | undefined | Promise<boolean | undefined>
+  >();
+  private readonly durableDeferredOperationRecoveryAuthorizers = new Set<
+    (
+      operationId: string,
+      recoveryKey: string,
+      purpose: 'pause-recovery' | 'callback-checkpoint'
+    ) => boolean | undefined | Promise<boolean | undefined>
+  >();
+  private readonly durableDeferredResumeTokenReplacers = new Set<
+    (
+      operationId: string,
+      currentToken: string,
+      replacementToken: string
+    ) => boolean | undefined | Promise<boolean | undefined>
+  >();
 
   constructor(
     private agent: AgentConfig,
     private config: SingleAgentClientConfig = {}
   ) {
-    this.config = { ...config, transport: normalizeTransportOptions(config.transport) };
+    // Own the nested trust-boundary object at construction. Normalization
+    // historically returns the input object unchanged for the preferred
+    // `trustedFetchFn` spelling, so clone first while retaining function identity.
+    const configuredTransport = config.transport === undefined ? undefined : { ...config.transport };
+    this.config = { ...config, transport: normalizeTransportOptions(configuredTransport) };
     config = this.config;
     // Validate the configured adcpVersion at construction time. Throws
     // ConfigurationError if the pin's major differs from ADCP_MAJOR_VERSION
@@ -1454,10 +1684,48 @@ export class SingleAgentClient {
       workingTimeout: config.workingTimeout || 120000, // Max 120s for working status
       defaultMaxClarifications: config.defaultMaxClarifications || 3,
       enableConversationStorage: config.persistConversations !== false,
+      deferredStorage: config.deferredStorage,
+      resolveDeferredAgent:
+        config.resolveDeferredAgent ??
+        (async agentId => {
+          if (agentId !== this.normalizedAgent.id) return undefined;
+          return this.normalizedAgent.protocol === 'a2a'
+            ? this.ensureCanonicalUrlResolved()
+            : this.ensureEndpointDiscovered();
+        }),
+      deferredTaskTtlSeconds: config.deferredTaskTtlSeconds,
+      canRecoverDeferredSettlement: () => this.durableSettlementRecoverers.size > 0,
+      authorizeDeferredSettlementResume: async (operationId, token) => {
+        for (const authorize of this.durableDeferredResumeAuthorizers) {
+          if ((await authorize(operationId, token)) === true) return true;
+        }
+        return false;
+      },
+      authorizeDeferredSettlementOperationRecovery: async (operationId, recoveryKey, purpose) => {
+        for (const authorize of this.durableDeferredOperationRecoveryAuthorizers) {
+          if ((await authorize(operationId, recoveryKey, purpose)) === true) return true;
+        }
+        return false;
+      },
+      replaceDeferredSettlementResumeToken: async (operationId, currentToken, replacementToken) => {
+        for (const replace of this.durableDeferredResumeTokenReplacers) {
+          if ((await replace(operationId, currentToken, replacementToken)) === true) return true;
+        }
+        return false;
+      },
+      recoverDeferredSettlement: async (result, operationId, serverTaskId) => {
+        const settlement = await this.wrapPersistedDeferredSettlement(result, operationId, serverTaskId);
+        return {
+          result: settlement.result,
+          ...(settlement.afterDispatch !== undefined && { afterFinalize: settlement.afterDispatch }),
+        };
+      },
       webhookUrlTemplate: config.webhookUrlTemplate,
       agentId: agent.id,
       webhookSecret: config.webhookSecret,
       onWebhookRegistration: registration => this.persistWebhookRegistration(registration),
+      onDurableSettlementRequired: operationId => this.markWebhookDurableSettlementRequired(operationId),
+      externalTaskSettlementRetentionMs: registrationTtl * 1000,
       strictSchemaValidation: config.validation?.strictSchemaValidation !== false, // Default: true
       logSchemaViolations: config.validation?.logSchemaViolations !== false, // Default: true
       filterInvalidProducts: config.validation?.filterInvalidProducts === true, // Default: false
@@ -1493,25 +1761,64 @@ export class SingleAgentClient {
       ? Math.floor(this.config.webhookVerification.now() * 1000)
       : Date.now();
     const ttlSeconds = this.config.webhookRegistrationTtlSeconds ?? 7 * 24 * 60 * 60;
+    const activeCreativeExecution = canonicalCreativeExecutionStorage.getStore();
+    const previewMode =
+      args.taskType === 'preview_creative' && activeCreativeExecution?.taskType === args.taskType
+        ? activeCreativeExecution.canonical
+          ? 'canonical'
+          : 'legacy'
+        : undefined;
+    // Keep an operation-scoped fallback before awaiting durable persistence.
+    // This preserves preview callback identity for immediate HMAC callbacks and
+    // for the legacy HMAC compatibility path when the registration store is
+    // temporarily unavailable.
+    if (previewMode) {
+      this.rememberPreviewCreativeHandlerKey(args.operationId, previewMode);
+      if (previewMode === 'canonical') {
+        this.rememberCanonicalCreativeTaskAssociation(args.operationId, args.taskType);
+      } else {
+        this.canonicalCreativeTaskAssociations.delete(args.operationId);
+      }
+    }
+    const persistedAgentUrl = new URL(args.agent.agent_uri);
+    persistedAgentUrl.username = '';
+    persistedAgentUrl.password = '';
+    persistedAgentUrl.hash = '';
     try {
       await this.webhookRegistrationStore.putIfAbsent({
         agentId: args.agent.id,
-        agentUrl: args.agent.agent_uri,
+        agentUrl: persistedAgentUrl.toString(),
         protocol: args.agent.protocol,
         operationId: args.operationId,
         taskType: args.taskType,
         callbackUrl: args.callbackUrl,
         method: 'POST',
         mode: args.mode,
+        ...(previewMode && { previewMode }),
         createdAt: nowMs,
         expiresAt: nowMs + ttlSeconds * 1000,
       });
     } catch (cause) {
       // RFC 9421 has no safe fallback without seller-pinned provenance. Legacy
-      // HMAC remains verifiable from the configured global secret, preserving
-      // pre-registration behavior across restarts and replicas.
-      if (args.mode === 'rfc9421') throw cause;
+      // HMAC remains verifiable from the configured global secret only for the
+      // explicit recordless read-only allowlist. Mutation and unknown-task
+      // receivers require registration provenance, so dispatch must fail too.
+      if (args.mode === 'rfc9421' || !RECORDLESS_HMAC_READ_ONLY_TASKS.has(args.taskType)) {
+        const error = new ConfigurationError('Could not persist trusted webhook registration for this operation.');
+        Object.defineProperty(error, 'cause', { value: cause, configurable: true });
+        throw error;
+      }
     }
+  }
+
+  private async markWebhookDurableSettlementRequired(operationId: string): Promise<void> {
+    const mark = this.webhookRegistrationStore.markRequiresDurableSettlement;
+    if (!mark) {
+      throw new ConfigurationError(
+        'A custom webhookRegistrationStore must implement markRequiresDurableSettlement for durable mutation callbacks.'
+      );
+    }
+    await mark.call(this.webhookRegistrationStore, this.agent.id, operationId);
   }
 
   private webhookJwksFor(registration: Readonly<WebhookRegistration>): JwksResolver {
@@ -1559,6 +1866,33 @@ export class SingleAgentClient {
     projectionCatalogs: readonly ProjectionCatalogSnapshot[] | undefined = this.config.projectionCatalogs
   ): LegacyFormatConverter | undefined {
     return legacyFormatConverterFromCatalogSnapshots(projectionCatalogs, override ?? this.config.legacyFormatConverter);
+  }
+
+  /** Use an already-composed per-call converter without reapplying configured catalog precedence. */
+  private finalLegacyFormatConverter(composed?: LegacyFormatConverter): LegacyFormatConverter | undefined {
+    return composed ?? this.resolveLegacyFormatConverter();
+  }
+
+  private assertDurableProjectionOverrideSupported(override: LegacyFormatConverter | undefined): void {
+    if (!override || !this.config.deferredStorage) return;
+    throw new TypeError(
+      'Per-call legacyFormatConverter functions cannot be used with durable deferredStorage because functions ' +
+        'cannot be persisted for restart recovery. Configure legacyFormatConverter on the client, or pass ' +
+        'serializable projectionCatalogs for this call.'
+    );
+  }
+
+  private assertDurablePropertyListCredentialSupported(taskType: string, requestParams: Record<string, unknown>): void {
+    if (!this.config.deferredStorage || taskType !== 'get_products') return;
+    const propertyList = propertyListReferenceFromRequest(requestParams);
+    if (!propertyList?.auth_token) return;
+    const policyConfig = this.config.validation?.productPropertyPolicy;
+    if (policyConfig === false || policyConfig?.enforceRequestPropertyList === false) return;
+    throw new ConfigurationError(
+      'Durable deferred recovery cannot persist property_list.auth_token for buyer-side property-list ' +
+        'verification. Configure validation.productPropertyPolicy.enforceRequestPropertyList as false, ' +
+        'or use a client without deferredStorage for this request.'
+    );
   }
 
   private canonicalAccountScope(account: unknown): string {
@@ -1666,6 +2000,26 @@ export class SingleAgentClient {
         });
       }
     }
+  }
+
+  private rememberCanonicalProductRoutesForCompletion(
+    taskType: string,
+    data: unknown,
+    legacyFormatConverter: LegacyFormatConverter | undefined,
+    account: unknown
+  ): void {
+    if (taskType !== 'get_products' || !data || typeof data !== 'object' || Array.isArray(data)) return;
+    const authoritativeProducts = Array.isArray((data as { products?: unknown[] }).products)
+      ? (data as { products: unknown[] }).products
+      : [];
+    const { response } = toCanonicalOnlyResponse(data as { products?: V1Product[] }, {
+      legacyFormatConverter,
+    });
+    this.rememberCanonicalProductRoutes(
+      response.products,
+      account,
+      authoritativeProducts.length > 0 ? authoritativeProducts : response.products
+    );
   }
 
   private routeForOption(
@@ -1884,6 +2238,279 @@ export class SingleAgentClient {
     return this.resolvedAdcpVersion;
   }
 
+  /** Poll through the same discovered/canonical protocol endpoint used for dispatch. @internal */
+  async getTaskStatus(
+    taskId: string,
+    transport?: import('../protocols').TransportOptions,
+    signal?: AbortSignal
+  ): Promise<TaskInfo> {
+    // Transport options define the outbound trust boundary. Own them before
+    // endpoint discovery yields so caller mutation cannot change the fetch or
+    // private-address policy between discovery and tasks/get.
+    const transportSnapshot = transport === undefined ? undefined : { ...transport };
+    const options = { transport: transportSnapshot, signal };
+    const agent =
+      this.normalizedAgent.protocol === 'a2a'
+        ? await this.ensureCanonicalUrlResolved(options)
+        : await this.ensureEndpointDiscovered(options);
+    return this.executor.getTaskStatus(agent, taskId, transportSnapshot, signal);
+  }
+
+  /** Register durable restart/replica settlement recovery for an SDK coordinator. @internal */
+  registerDurableSettlementRecovery(
+    recoverer: (
+      operationId: string,
+      observation: ExternalTaskSettlementObservation
+    ) => Promise<ExternalTaskStatusResult | undefined>
+  ): () => void {
+    this.durableSettlementRecoverers.add(recoverer);
+    return () => this.durableSettlementRecoverers.delete(recoverer);
+  }
+
+  /** Register exact-token authorization for committed deferred continuation recovery. @internal */
+  registerDurableDeferredResumeAuthorization(
+    authorizer: (operationId: string, token: string) => boolean | undefined | Promise<boolean | undefined>
+  ): () => void {
+    this.durableDeferredResumeAuthorizers.add(authorizer);
+    return () => this.durableDeferredResumeAuthorizers.delete(authorizer);
+  }
+
+  /** Register owner-capability authorization for committed operation route discovery. @internal */
+  registerDurableDeferredOperationRecoveryAuthorization(
+    authorizer: (
+      operationId: string,
+      recoveryKey: string,
+      purpose: 'pause-recovery' | 'callback-checkpoint'
+    ) => boolean | undefined | Promise<boolean | undefined>
+  ): () => void {
+    this.durableDeferredOperationRecoveryAuthorizers.add(authorizer);
+    return () => this.durableDeferredOperationRecoveryAuthorizers.delete(authorizer);
+  }
+
+  /** Register an atomic committed-route handoff for a nested durable pause. @internal */
+  registerDurableDeferredResumeTokenReplacement(
+    replacer: (
+      operationId: string,
+      currentToken: string,
+      replacementToken: string
+    ) => boolean | undefined | Promise<boolean | undefined>
+  ): () => void {
+    this.durableDeferredResumeTokenReplacers.add(replacer);
+    return () => this.durableDeferredResumeTokenReplacers.delete(replacer);
+  }
+
+  /** Whether this exact continuation currently has a durable SDK checkpoint. @internal */
+  hasDurablyStoredDeferredTask(token: string): Promise<boolean> {
+    return this.executor.hasDurablyStoredDeferredTask(token);
+  }
+
+  /** Recover the current committed pause when its opaque token handoff was interrupted. @internal */
+  recoverDeferredTaskForOperation<T>(
+    operationId: string,
+    recoveryKey: string,
+    publishTerminalTaskStatus = true
+  ): Promise<{ token: string; result: TaskResult<T> } | undefined> {
+    return this.executor.recoverDeferredTaskForOperation(operationId, recoveryKey, publishTerminalTaskStatus);
+  }
+
+  /** Bridge a store-recovered callback into the deferred terminal checkpoint. @internal */
+  checkpointExternalDeferredSettlement<T>(
+    token: string,
+    operationId: string,
+    terminalResult: TaskResult<T>
+  ): Promise<TaskResult<T> | undefined> {
+    return this.executor.checkpointExternalDeferredSettlement(token, operationId, terminalResult);
+  }
+
+  /** Resolve and checkpoint the current generation using a separate owner capability. @internal */
+  checkpointExternalDeferredSettlementForOperation<T>(
+    operationId: string,
+    recoveryKey: string,
+    terminalResult: TaskResult<T>
+  ): Promise<{ token: string; result?: TaskResult<T> } | undefined> {
+    return this.executor.checkpointExternalDeferredSettlementForOperation(operationId, recoveryKey, terminalResult);
+  }
+
+  /** Publish a callback only after an external durable inbox has bound and settled it. @internal */
+  async publishDurablySettledWebhook(args: {
+    operationId: string;
+    serverTaskId: string;
+    taskType: string;
+    status: import('./ConversationTypes').TaskStatus;
+    result?: unknown;
+    error?: string;
+    idempotencyKey?: string;
+  }): Promise<void> {
+    const metadata: WebhookMetadata = {
+      operation_id: args.operationId,
+      task_id: args.serverTaskId,
+      agent_id: this.agent.id,
+      task_type: args.taskType,
+      status: args.status,
+      ...(args.error !== undefined && { message: args.error }),
+      ...(args.idempotencyKey !== undefined && { idempotency_key: args.idempotencyKey }),
+      timestamp: new Date().toISOString(),
+      protocol: this.normalizedAgent.protocol,
+    };
+    await this.config.onActivity?.({
+      type: 'webhook_received',
+      operation_id: metadata.operation_id,
+      agent_id: metadata.agent_id,
+      task_id: metadata.task_id,
+      task_type: metadata.task_type,
+      status: metadata.status,
+      payload: args.result,
+      timestamp: metadata.timestamp,
+    });
+    await this.asyncHandler?.handleDurablySettledResult({
+      result: args.result as AdCPAsyncResponseData | undefined,
+      metadata,
+    });
+  }
+
+  private async recoverDurableSettlement(
+    operationId: string,
+    observation: ExternalTaskSettlementObservation
+  ): Promise<ExternalTaskStatusResult | undefined> {
+    for (const recoverer of this.durableSettlementRecoverers) {
+      const recovered = await recoverer(operationId, observation);
+      if (recovered) return recovered;
+    }
+    return undefined;
+  }
+
+  private async recoverPersistedDeferredTerminal(
+    operationId: string,
+    status: import('./ConversationTypes').TaskStatus,
+    result: unknown,
+    serverTaskId: string | undefined,
+    taskType: string,
+    idempotencyKey?: string
+  ): Promise<ExternalTaskStatusResult> {
+    if (!serverTaskId) {
+      throw new Error('A committed deferred continuation completed without its trusted seller task identity.');
+    }
+    const recovered = await this.recoverDurableSettlement(operationId, {
+      status,
+      result,
+      serverTaskId,
+      taskType,
+      ...(idempotencyKey !== undefined && { idempotencyKey }),
+      deferredCheckpointOwned: true,
+    });
+    if (
+      !recovered ||
+      recovered.queued === true ||
+      recovered.settled !== true ||
+      recovered.status === undefined ||
+      !DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(recovered.status)
+    ) {
+      throw new Error(
+        'The committed deferred continuation reached a terminal seller result, but durable settlement recovery was unavailable.'
+      );
+    }
+    return recovered;
+  }
+
+  private taskResultFromRecoveredSettlement<T>(
+    original: TaskResult<T>,
+    recovered: ExternalTaskStatusResult
+  ): TaskResult<T> {
+    const status = recovered.status!;
+    const settled = {
+      ...original,
+      success: status === 'completed',
+      status,
+      metadata: { ...original.metadata, status },
+    } as TaskResult<T> & { data?: T; error?: string };
+    if (recovered.result === undefined) delete settled.data;
+    else settled.data = recovered.result as T;
+    if (recovered.error === undefined) delete settled.error;
+    else settled.error = recovered.error;
+    const recoveredResult = attachMatch(settled as TaskResult<T>) as TaskResult<T>;
+    if (hasCompletionHandlerAlreadyPublished(recovered)) {
+      markCompletionHandlerAlreadyPublished(recoveredResult);
+    }
+    return recoveredResult;
+  }
+
+  private async wrapPersistedDeferredSettlement<T>(
+    result: TaskResult<T>,
+    operationId: string,
+    persistedServerTaskId?: string
+  ): Promise<{ result: TaskResult<T>; afterDispatch?: () => Promise<void> }> {
+    if (DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(result.status)) {
+      const recovered = await this.recoverPersistedDeferredTerminal(
+        operationId,
+        result.status,
+        result.data,
+        result.metadata.serverTaskId ?? persistedServerTaskId,
+        result.metadata.taskName,
+        result.metadata.idempotency_key
+      );
+      return {
+        result: this.taskResultFromRecoveredSettlement(result, recovered),
+        ...(recovered.afterDispatch !== undefined && { afterDispatch: recovered.afterDispatch }),
+      };
+    }
+    if (result.deferred) {
+      const deferred = result.deferred;
+      result = attachMatch({
+        ...result,
+        deferred: {
+          ...deferred,
+          resume: input => this.resumeDeferredTask<T>(deferred.token, input),
+        },
+      } as TaskResult<T>);
+    }
+    if (!result.submitted) return { result };
+
+    const submitted = result.submitted;
+    return {
+      result: attachMatch({
+        ...result,
+        submitted: {
+          ...submitted,
+          track: async transport => {
+            const task = await submitted.track(transport);
+            if (!DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(task.status as import('./ConversationTypes').TaskStatus)) {
+              return task;
+            }
+            const recovered = await this.recoverPersistedDeferredTerminal(
+              operationId,
+              task.status as import('./ConversationTypes').TaskStatus,
+              task.result,
+              task.taskId ?? persistedServerTaskId,
+              task.taskType
+            );
+            await recovered.afterDispatch?.();
+            return {
+              ...task,
+              status: recovered.status!,
+              ...(recovered.result === undefined ? { result: undefined } : { result: recovered.result }),
+              ...(recovered.error === undefined ? { error: undefined } : { error: recovered.error }),
+            };
+          },
+          waitForCompletion: async (pollInterval, signal) => {
+            const completion = await submitted.waitForCompletion(pollInterval, signal);
+            if (!DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(completion.status)) return completion;
+            const recovered = await this.recoverPersistedDeferredTerminal(
+              operationId,
+              completion.status,
+              completion.data,
+              completion.metadata.serverTaskId ?? submitted.taskId ?? persistedServerTaskId,
+              completion.metadata.taskName,
+              completion.metadata.idempotency_key
+            );
+            const settled = this.taskResultFromRecoveredSettlement(completion, recovered);
+            await recovered.afterDispatch?.();
+            return settled;
+          },
+        },
+      } as TaskResult<T>),
+    };
+  }
+
   /** Effective release pin emitted in protocol envelopes. @internal */
   getWireAdcpVersion(): string {
     return this.config.wireAdcpVersion ?? this.resolvedAdcpVersion;
@@ -2034,14 +2661,7 @@ export class SingleAgentClient {
     let got401 = false;
 
     const fetchImpl = async (url: string | URL | Request, requestInit?: RequestInit) => {
-      const headers: Record<string, string> = {
-        ...(requestInit?.headers as Record<string, string>),
-        ...this.normalizedAgent.headers,
-        ...(authToken && {
-          Authorization: `Bearer ${authToken}`,
-          'x-adcp-auth': authToken,
-        }),
-      };
+      const headers = a2aScopedHeaders(url, requestInit?.headers, agentUri, this.normalizedAgent.headers, authToken);
 
       const response = await withAbortSignal<Response>(
         [readOptions?.signal, requestInit?.signal],
@@ -2060,11 +2680,11 @@ export class SingleAgentClient {
     const cardUrls = buildCardUrls(agentUri);
 
     try {
-      let client: InstanceType<typeof A2AClient> | undefined;
+      let client: A2AClient | undefined;
       let lastError: Error = new Error(`A2A agent card not found at ${cardUrls.join(', ')}`);
       for (const cardUrl of cardUrls) {
         try {
-          client = await withResponseSizeLimit(maxResponseBytes, () => A2AClient.fromCardUrl(cardUrl, { fetchImpl }));
+          client = await withResponseSizeLimit(maxResponseBytes, () => createA2AClientFromCardUrl(cardUrl, fetchImpl));
           break;
         } catch (err: unknown) {
           lastError = err as Error;
@@ -2074,14 +2694,21 @@ export class SingleAgentClient {
       if (!client) {
         throw lastError;
       }
-      const agentCard = await withResponseSizeLimit(maxResponseBytes, async () =>
-        client.agentCardPromise ? client.agentCardPromise : client.agentCard
-      );
+      const agentCard = await withResponseSizeLimit(maxResponseBytes, async () => {
+        const compatibleClient = client as unknown as {
+          getAgentCard?: () => Promise<any>;
+          agentCardPromise?: Promise<any>;
+          agentCard?: any;
+        };
+        return typeof compatibleClient.getAgentCard === 'function'
+          ? compatibleClient.getAgentCard()
+          : (compatibleClient.agentCardPromise ?? compatibleClient.agentCard);
+      });
 
-      // Use the canonical URL from the agent card, falling back to computed base URL
-      if (agentCard?.url) {
-        return agentCard.url;
-      }
+      // Persist only the JSON-RPC interface negotiated by the official
+      // client, and never widen credential scope based on untrusted card data.
+      const canonicalUrl = selectA2AJsonRpcUrl(agentCard, client.protocolVersion, agentUri);
+      if (canonicalUrl) return canonicalUrl;
 
       return this.computeBaseUrl(agentUri);
     } catch (error: unknown) {
@@ -2393,31 +3020,19 @@ export class SingleAgentClient {
    *
    * @example
    * ```typescript
-   * import { verifyWebhookRequest } from '@adcp/sdk/webhooks';
-   *
-   * app.post('/webhook/:taskType', async (req, res) => {
-   *   try {
-   *     const check = verifyWebhookRequest({
-   *       rawBody: req.rawBody,
-   *       headers: req.headers,
-   *       globalSecret: process.env.WEBHOOK_SECRET,
-   *     });
-   *     if (!check.ok) return res.status(401).json({ error: check.reason });
-   *
-   *     const handled = await client.handleWebhook(
-   *       req.body,
-   *       req.params.taskType,
-   *       req.params.operationId,
-   *       check.signature,
-   *       check.timestamp,
-   *       req.rawBody
-   *     );
-   *     res.status(200).json({ received: handled });
-   *   } catch (error) {
-   *     res.status(401).json({ error: error.message });
-   *   }
-   * });
+   * app.post(
+   *   '/webhook/:task_type/:operation_id',
+   *   express.raw({ type: 'application/json' }),
+   *   client.createWebhookHandler({
+   *     getRequestUrl: req => `https://buyer.example${req.originalUrl}`,
+   *   }),
+   * );
    * ```
+   *
+   * `createWebhookHandler()` preserves the SDK's typed HTTP mapping: authentication
+   * failures return 401, invalid/conflicting deliveries return 400/409, rate abuse
+   * returns 429, and transient verification, storage, or publication failures return
+   * 503 for seller retry. Do not map every `handleWebhook()` exception to 401.
    */
   async handleWebhook(
     payload: MCPWebhookPayload | A2ATask | TaskStatusUpdateEvent,
@@ -2463,7 +3078,12 @@ export class SingleAgentClient {
       try {
         registration = await this.webhookRegistrationStore.get(this.agent.id, trustedOperationId);
       } catch (cause) {
-        if (!this.config.webhookSecret) {
+        const routedTaskType = options.taskType && options.taskType !== 'unknown' ? options.taskType : undefined;
+        if (
+          !this.config.webhookSecret ||
+          routedTaskType === undefined ||
+          !RECORDLESS_HMAC_READ_ONLY_TASKS.has(routedTaskType)
+        ) {
           return {
             ok: false,
             code: 'webhook_registration_store_unavailable',
@@ -2491,7 +3111,33 @@ export class SingleAgentClient {
           message: 'Webhook registration state contains invalid timestamps.',
         };
       }
+      try {
+        const registeredAgentUrl = new URL(registration.agentUrl);
+        if (registeredAgentUrl.username || registeredAgentUrl.password) {
+          throw new TypeError('Webhook registration seller URL contains userinfo.');
+        }
+      } catch (cause) {
+        return {
+          ok: false,
+          code: 'webhook_registration_store_unavailable',
+          message: 'Webhook registration state contains an invalid seller URL.',
+          cause,
+        };
+      }
       if (registration.expiresAt <= nowMs) registration = undefined;
+    }
+
+    const trustedRouteTaskType = options.taskType && options.taskType !== 'unknown' ? options.taskType : undefined;
+    if (
+      !registration &&
+      this.config.webhookSecret &&
+      (trustedRouteTaskType === undefined || !RECORDLESS_HMAC_READ_ONLY_TASKS.has(trustedRouteTaskType))
+    ) {
+      return {
+        ok: false,
+        code: 'webhook_registration_store_unavailable',
+        message: 'A trusted webhook registration is required for this task type.',
+      };
     }
 
     if (authHeaders.hasRfc9421 && !trustedOperationId) {
@@ -2665,16 +3311,46 @@ export class SingleAgentClient {
       return parsedPayload;
     }
 
-    const parsedTaskType =
+    const topLevelTaskType =
       isObjectRecord(parsedPayload.payload) && typeof parsedPayload.payload.task_type === 'string'
         ? parsedPayload.payload.task_type
         : undefined;
     const payloadRecord = isObjectRecord(parsedPayload.payload) ? parsedPayload.payload : undefined;
+    const signedRoute = extractSignedWebhookRoute(parsedPayload.payload);
+    if (!signedRoute.ok) {
+      return {
+        ok: false,
+        code: 'webhook_envelope_invalid',
+        message: signedRoute.message,
+      };
+    }
+    const parsedTaskType = signedRoute.taskType ?? topLevelTaskType;
+    if (!registration && this.config.webhookSecret && trustedOperationId === undefined) {
+      return {
+        ok: false,
+        code: 'webhook_verification_context_missing',
+        message: 'Legacy HMAC verification requires a trusted route operation id.',
+      };
+    }
+    const hmacAuthenticated = registration?.mode === 'hmac-sha256' || (!registration && this.config.webhookSecret);
+    if (
+      hmacAuthenticated &&
+      (signedRoute.operationId === undefined ||
+        signedRoute.operationId !== trustedOperationId ||
+        signedRoute.taskType === undefined ||
+        signedRoute.taskType !== trustedRouteTaskType)
+    ) {
+      return {
+        ok: false,
+        code: 'webhook_registration_mismatch',
+        message: 'Legacy HMAC webhook body is not bound to the trusted callback route.',
+      };
+    }
     if (
       registration &&
-      ((typeof payloadRecord?.operation_id === 'string' && payloadRecord.operation_id !== registration.operationId) ||
-        (parsedTaskType !== undefined && parsedTaskType !== registration.taskType) ||
-        (typeof payloadRecord?.agent_id === 'string' && payloadRecord.agent_id !== registration.agentId))
+      ((signedRoute.operationId !== undefined && signedRoute.operationId !== registration.operationId) ||
+        (signedRoute.taskType !== undefined && signedRoute.taskType !== registration.taskType) ||
+        (signedRoute.agentId !== undefined && signedRoute.agentId !== registration.agentId))
     ) {
       return {
         ok: false,
@@ -2696,9 +3372,26 @@ export class SingleAgentClient {
     const associatedTaskType = associatedTaskTypes.size === 1 ? [...associatedTaskTypes][0] : undefined;
     const routedTaskType = options.taskType === 'unknown' ? undefined : options.taskType;
     const declaredTaskType = routedTaskType ?? parsedTaskType;
+    const previewOperationId =
+      typeof payloadRecord?.operation_id === 'string' ? payloadRecord.operation_id : options.operationId;
+    const localPreviewHandler =
+      declaredTaskType === 'preview_creative' && previewOperationId
+        ? this.previewCreativeHandlerForWebhook({
+            operation_id: previewOperationId,
+            task_id: '',
+            context_id: '',
+            task_type: 'preview_creative',
+          })
+        : undefined;
+    // Durable registration provenance wins when available. During the legacy
+    // HMAC store-outage fallback, the operation-scoped local marker must win
+    // over a stale canonical association on a reused task or context id.
+    const previewHandler = registration?.previewMode ?? localPreviewHandler;
+    const authoritativePreviewTask = declaredTaskType === 'preview_creative' && previewHandler !== undefined;
     if (
-      associatedTaskTypes.size > 1 ||
-      (associatedTaskType !== undefined && declaredTaskType !== undefined && associatedTaskType !== declaredTaskType)
+      !authoritativePreviewTask &&
+      (associatedTaskTypes.size > 1 ||
+        (associatedTaskType !== undefined && declaredTaskType !== undefined && associatedTaskType !== declaredTaskType))
     ) {
       return {
         ok: false,
@@ -2706,12 +3399,13 @@ export class SingleAgentClient {
         message: 'Webhook task_type does not match the locally tracked task association.',
       };
     }
-    let normalizedTaskType = associatedTaskType ?? declaredTaskType;
+    let normalizedTaskType = authoritativePreviewTask ? declaredTaskType : (associatedTaskType ?? declaredTaskType);
     try {
       const normalizedPayload = this.normalizeWebhookPayload(
         parsedPayload.payload,
         normalizedTaskType ?? 'unknown',
-        options.operationId ?? 'unknown'
+        options.operationId ?? 'unknown',
+        registration?.mode === 'rfc9421'
       );
       normalizedTaskType = normalizedPayload.task_type;
       if (registration && (normalizedPayload.protocol ?? 'mcp') !== registration.protocol) {
@@ -2721,7 +3415,11 @@ export class SingleAgentClient {
           message: 'Authenticated webhook protocol does not match the trusted registration.',
         };
       }
-      if (associatedTaskType !== undefined && normalizedPayload.task_type !== associatedTaskType) {
+      if (
+        !authoritativePreviewTask &&
+        associatedTaskType !== undefined &&
+        normalizedPayload.task_type !== associatedTaskType
+      ) {
         return {
           ok: false,
           code: 'webhook_envelope_invalid',
@@ -2738,10 +3436,18 @@ export class SingleAgentClient {
         message: normalizedPayload.message,
         timestamp: normalizedPayload.timestamp || new Date().toISOString(),
         idempotency_key: normalizedPayload.idempotency_key,
+        notification_id: normalizedPayload.notification_id,
         protocol: normalizedPayload.protocol ?? 'mcp',
       };
-      const canonicalResult = this.canonicalizeWebhookCreativeResult(metadata, normalizedPayload.result);
-      const canonicalCreativeTask = CANONICAL_CREATIVE_ACTIVITY_TASKS.has(normalizedPayload.task_type);
+      const canonicalCreativeTask =
+        CANONICAL_CREATIVE_ACTIVITY_TASKS.has(normalizedPayload.task_type) ||
+        (normalizedPayload.task_type === 'preview_creative' &&
+          (previewHandler !== undefined ? previewHandler === 'canonical' : associatedTaskType === 'preview_creative'));
+      const canonicalResult = this.canonicalizeWebhookCreativeResult(
+        metadata,
+        normalizedPayload.result,
+        canonicalCreativeTask
+      );
       const legacyFormatConverter = this.legacyFormatConverterForWebhook(metadata);
       const canonicalEnvelope = canonicalCreativeTask
         ? stripLegacyCreativeIdentity(
@@ -2772,13 +3478,21 @@ export class SingleAgentClient {
           taskType: normalizedPayload.task_type,
           status: normalizedPayload.status,
           message: canonicalMessage,
+          previewHandler,
           timestamp: normalizedPayload.timestamp,
           idempotencyKey: normalizedPayload.idempotency_key,
+          notificationId: normalizedPayload.notification_id,
+          requiresDurableSettlement: registration?.requiresDurableSettlement,
         },
       };
     } catch (error) {
       const canonicalCreativeTask =
-        normalizedTaskType !== undefined && CANONICAL_CREATIVE_ACTIVITY_TASKS.has(normalizedTaskType);
+        normalizedTaskType !== undefined &&
+        (CANONICAL_CREATIVE_ACTIVITY_TASKS.has(normalizedTaskType) ||
+          (normalizedTaskType === 'preview_creative' &&
+            (previewHandler !== undefined
+              ? previewHandler === 'canonical'
+              : associatedTaskType === 'preview_creative')));
       if (error instanceof WebhookDispatchError) {
         if (!canonicalCreativeTask) {
           return { ok: false, code: error.code, message: error.message };
@@ -2805,6 +3519,26 @@ export class SingleAgentClient {
   }
 
   private async dispatchParsedWebhook(parsed: WebhookParseSuccess): Promise<boolean> {
+    if (parsed.metadata.taskType === 'preview_creative' && parsed.metadata.previewHandler) {
+      for (const key of [parsed.metadata.operationId, parsed.metadata.taskId, parsed.metadata.contextId]) {
+        if (!key) continue;
+        this.rememberPreviewCreativeHandlerKey(key, parsed.metadata.previewHandler);
+        if (parsed.metadata.previewHandler === 'canonical') {
+          this.rememberCanonicalCreativeTaskAssociation(key, 'preview_creative');
+        } else {
+          this.canonicalCreativeTaskAssociations.delete(key);
+        }
+      }
+    }
+    const canonicalCreativeTask =
+      parsed.metadata.taskType === 'preview_creative' && parsed.metadata.previewHandler !== undefined
+        ? parsed.metadata.previewHandler === 'canonical'
+        : this.isCanonicalCreativeWebhook({
+            operation_id: parsed.metadata.operationId,
+            context_id: parsed.metadata.contextId,
+            task_id: parsed.metadata.taskId,
+            task_type: parsed.metadata.taskType,
+          });
     let metadata: WebhookMetadata = {
       operation_id: parsed.metadata.operationId,
       context_id: parsed.metadata.contextId,
@@ -2815,57 +3549,250 @@ export class SingleAgentClient {
       message: parsed.metadata.message,
       timestamp: parsed.metadata.timestamp || new Date().toISOString(),
       idempotency_key: parsed.metadata.idempotencyKey,
+      notification_id: parsed.metadata.notificationId,
       protocol: parsed.protocol,
-      rawHTTPPayload: CANONICAL_CREATIVE_ACTIVITY_TASKS.has(parsed.metadata.taskType)
-        ? stripLegacyCreativeIdentity(parsed.envelope)
-        : parsed.envelope,
+      rawHTTPPayload: canonicalCreativeTask ? stripLegacyCreativeIdentity(parsed.envelope) : parsed.envelope,
     };
-    this.rememberCanonicalCreativeWebhookContext(metadata);
     try {
-      const canonicalResult = this.canonicalizeWebhookCreativeResult(metadata, parsed.result);
-      const policyDispatch = await this.applyProductPropertyPolicyToWebhookResult(
-        canonicalResult as AdCPAsyncResponseData | undefined,
-        metadata
-      );
-      const webhookResult = policyDispatch.result;
-      metadata = policyDispatch.metadata;
+      this.asyncHandler?.assertWebhookDedupInput(metadata);
+    } catch (error) {
+      if (error instanceof WebhookDedupInputError) {
+        throw new WebhookDispatchError('webhook_envelope_invalid', error.message, error);
+      }
+      throw error;
+    }
+    this.rememberCanonicalCreativeWebhookContext(metadata);
+    let externalStatus: ExternalTaskStatusResult | undefined;
+    let forgetPolicyState = false;
+    try {
+      const canonicalResult = this.canonicalizeWebhookCreativeResult(metadata, parsed.result, canonicalCreativeTask);
+      const dedupResult = canonicalResult as AdCPAsyncResponseData | undefined;
+      const dedupMetadata = { ...metadata };
+      let webhookResult = dedupResult;
+      let suppressHandler = false;
 
-      // Emit activity
-      await this.config.onActivity?.(
-        canonicalCreativeActivity({
-          type: 'webhook_received',
-          operation_id: metadata.operation_id,
-          agent_id: metadata.agent_id,
-          context_id: metadata.context_id,
-          task_id: metadata.task_id,
-          task_type: metadata.task_type,
-          status: metadata.status,
-          payload: canonicalResult,
-          timestamp: metadata.timestamp,
-        })
-      );
+      const dispatchClaimedWebhook = async (): Promise<boolean> => {
+        try {
+          const policyDispatch = await this.applyProductPropertyPolicyToWebhookResult(webhookResult, metadata);
+          webhookResult = policyDispatch.result;
+          metadata = policyDispatch.metadata;
+          suppressHandler = policyDispatch.suppressHandler;
 
-      if (policyDispatch.suppressHandler) return true;
+          if (metadata.task_type === 'request_proposals') {
+            assertNativeRequestProposalsResult(webhookResult);
+          }
 
-      // Handle through async handler if configured
-      if (this.asyncHandler) {
-        await this.asyncHandler.handleWebhook({ result: webhookResult, metadata });
-        return true;
+          const observation = {
+            status: metadata.status as import('./ConversationTypes').TaskStatus,
+            result: webhookResult,
+            serverTaskId: metadata.task_id,
+            taskType: metadata.task_type,
+            ...(metadata.idempotency_key !== undefined && { idempotencyKey: metadata.idempotency_key }),
+          };
+          if (parsed.metadata.requiresDurableSettlement === true) {
+            const recovered = await this.recoverDurableSettlement(metadata.operation_id, observation);
+            if (recovered) {
+              const hasTerminalStatus =
+                recovered.status !== undefined && DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(recovered.status);
+              const validQueued =
+                recovered.queued === true &&
+                recovered.settled === false &&
+                recovered.duplicate !== true &&
+                recovered.status === undefined &&
+                recovered.result === undefined &&
+                recovered.error === undefined;
+              const validDuplicate =
+                recovered.duplicate === true &&
+                recovered.settled === true &&
+                recovered.queued !== true &&
+                hasTerminalStatus;
+              const validSettled =
+                recovered.settled === true &&
+                recovered.duplicate !== true &&
+                recovered.queued !== true &&
+                hasTerminalStatus &&
+                (recovered.status !== 'completed' || recovered.result !== undefined);
+              if (!validQueued && !validDuplicate && !validSettled) {
+                throw new WebhookDispatchError(
+                  'webhook_durable_settlement_unavailable',
+                  'The durable settlement recoverer returned an invalid or contradictory callback outcome.'
+                );
+              }
+              externalStatus = recovered;
+            } else {
+              throw new WebhookDispatchError(
+                'webhook_durable_settlement_unavailable',
+                'The callback requires durable mutation settlement, but no recoverable settlement route is available.'
+              );
+            }
+          } else {
+            externalStatus = await this.executor.observeExternalTaskStatus(
+              metadata.operation_id,
+              observation.status,
+              observation.result,
+              { serverTaskId: observation.serverTaskId, taskType: observation.taskType }
+            );
+          }
+          if (!externalStatus) throw new Error('Webhook settlement did not produce an observable status.');
+          if (externalStatus.queued) {
+            externalStatus = undefined;
+            return true;
+          }
+          if (externalStatus.duplicate) {
+            metadata = {
+              ...metadata,
+              status: externalStatus.status ?? metadata.status,
+              ...(externalStatus.error !== undefined && { message: externalStatus.error }),
+            };
+            const duplicateActivity: Activity = {
+              type: 'webhook_duplicate',
+              operation_id: metadata.operation_id,
+              agent_id: metadata.agent_id,
+              context_id: metadata.context_id,
+              task_id: metadata.task_id,
+              task_type: metadata.task_type,
+              status: metadata.status,
+              idempotency_key: metadata.idempotency_key,
+              timestamp: metadata.timestamp,
+            };
+            await this.config.onActivity?.(canonicalCreativeActivity(duplicateActivity));
+            await this.asyncHandler?.handleDurableSettlementDuplicate(metadata);
+            await externalStatus.afterDispatch?.();
+            externalStatus = undefined;
+            return true;
+          }
+          if (externalStatus.settled) {
+            webhookResult = externalStatus.result as AdCPAsyncResponseData | undefined;
+            metadata = {
+              ...metadata,
+              status: externalStatus.status ?? metadata.status,
+              ...(externalStatus.error !== undefined && { message: externalStatus.error }),
+            };
+          }
+
+          await this.config.onActivity?.(
+            canonicalCreativeActivity({
+              type: 'webhook_received',
+              operation_id: metadata.operation_id,
+              agent_id: metadata.agent_id,
+              context_id: metadata.context_id,
+              task_id: metadata.task_id,
+              task_type: metadata.task_type,
+              status: metadata.status,
+              payload: webhookResult,
+              timestamp: metadata.timestamp,
+            })
+          );
+
+          if (!suppressHandler && this.asyncHandler) {
+            await this.asyncHandler.handleClaimedWebhook({
+              result: webhookResult,
+              metadata,
+              previewHandler: parsed.metadata.previewHandler ?? this.previewCreativeHandlerForWebhook(metadata),
+            });
+          }
+          await externalStatus.afterDispatch?.();
+          externalStatus = undefined;
+          return this.asyncHandler !== undefined || suppressHandler;
+        } catch (error) {
+          const rejectedStatus = externalStatus;
+          externalStatus = undefined;
+          if (rejectedStatus?.onDispatchError) {
+            try {
+              await rejectedStatus.onDispatchError();
+            } catch (rejectionError) {
+              throw new WebhookDedupClaimRetentionError(
+                [error, rejectionError],
+                'Webhook dispatch failed and its durable settlement ownership could not be released.'
+              );
+            }
+          }
+          throw error;
+        }
+      };
+
+      if (!this.asyncHandler) {
+        let handled: boolean;
+        try {
+          handled = await dispatchClaimedWebhook();
+        } catch (error) {
+          if (error instanceof WebhookDedupClaimRetentionError) {
+            throw new WebhookDispatchError(
+              'webhook_publication_in_progress',
+              'Webhook dispatch failed while durable publication ownership remained active.',
+              error
+            );
+          }
+          throw error;
+        }
+        forgetPolicyState = DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(
+          metadata.status as import('./ConversationTypes').TaskStatus
+        );
+        return handled;
       }
 
-      return false;
-    } finally {
-      this.executor.observeExternalTaskStatus(
-        metadata.operation_id,
-        metadata.status as import('./ConversationTypes').TaskStatus,
-        metadata.rawHTTPPayload
+      let deduped: {
+        outcome: 'handled' | 'already_handled' | 'in_progress';
+        value?: boolean;
+      };
+      try {
+        deduped = await this.asyncHandler.runWebhookDeduplicated({
+          result: dedupResult,
+          metadata: dedupMetadata,
+          dispatch: dispatchClaimedWebhook,
+        });
+      } catch (error) {
+        if (error instanceof WebhookDedupClaimRetentionError) {
+          throw new WebhookDispatchError(
+            'webhook_publication_in_progress',
+            'Webhook dispatch failed while durable publication ownership remained active.',
+            error
+          );
+        }
+        if (error instanceof WebhookDedupConflictError) {
+          throw new WebhookDispatchError('webhook_idempotency_conflict', error.message, error);
+        }
+        if (error instanceof WebhookDedupInputError) {
+          throw new WebhookDispatchError('webhook_envelope_invalid', error.message, error);
+        }
+        throw error;
+      }
+      if (deduped.outcome === 'in_progress') {
+        throw new WebhookDispatchError(
+          'webhook_publication_in_progress',
+          'A matching callback publication is still in progress.'
+        );
+      }
+      if (deduped.outcome === 'already_handled') {
+        await this.config.onActivity?.(
+          canonicalCreativeActivity({
+            type: 'webhook_duplicate',
+            operation_id: metadata.operation_id,
+            agent_id: metadata.agent_id,
+            context_id: metadata.context_id,
+            task_id: metadata.task_id,
+            task_type: metadata.task_type,
+            status: metadata.status,
+            idempotency_key: metadata.idempotency_key,
+            timestamp: metadata.timestamp,
+          })
+        );
+        forgetPolicyState = DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(
+          metadata.status as import('./ConversationTypes').TaskStatus
+        );
+        return true;
+      }
+      forgetPolicyState = DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(
+        metadata.status as import('./ConversationTypes').TaskStatus
       );
-      this.forgetProductPolicyRequestParams(metadata);
+      return deduped.value ?? true;
+    } finally {
+      if (forgetPolicyState) this.forgetProductPolicyRequestParams(metadata);
     }
   }
 
   private rememberCanonicalCreativeWebhookContext(metadata: WebhookMetadata): void {
-    if (!metadata.context_id || !CANONICAL_CREATIVE_ACTIVITY_TASKS.has(metadata.task_type)) return;
+    if (!metadata.context_id || !this.isCanonicalCreativeWebhook(metadata)) return;
     const association =
       this.canonicalCreativeTaskAssociation(metadata.operation_id) ??
       this.canonicalCreativeTaskAssociation(metadata.task_id) ??
@@ -2877,9 +3804,15 @@ export class SingleAgentClient {
       association.legacyFormatConverter,
       association.routingSnapshot
     );
+    const previewHandler = this.previewCreativeHandlerForWebhook(metadata);
+    if (previewHandler) this.rememberPreviewCreativeHandlerKey(metadata.context_id, previewHandler);
   }
 
-  private canonicalizeWebhookCreativeResult(metadata: WebhookMetadata, result: unknown): unknown {
+  private canonicalizeWebhookCreativeResult(
+    metadata: WebhookMetadata,
+    result: unknown,
+    canonicalCreativeTask = this.isCanonicalCreativeWebhook(metadata)
+  ): unknown {
     if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
     const taskType = metadata.task_type;
     const legacyFormatConverter = this.legacyFormatConverterForWebhook(metadata);
@@ -2905,7 +3838,7 @@ export class SingleAgentClient {
         ),
       });
     }
-    const canonical = CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType)
+    const canonical = canonicalCreativeTask
       ? stripLegacyCreativeIdentity(projectCanonicalCreativeResponseValue(result, taskType, legacyFormatConverter))
       : result;
     const association =
@@ -2931,7 +3864,12 @@ export class SingleAgentClient {
    * @param operationId - Operation id
    * @returns Normalized webhook payload with extracted AdCP response
    */
-  private normalizeWebhookPayload(payload: unknown, taskType: string, operationId: string): NormalizedWebhookPayload {
+  private normalizeWebhookPayload(
+    payload: unknown,
+    taskType: string,
+    operationId: string,
+    allowLegacyA2AArtifactFallback = false
+  ): NormalizedWebhookPayload {
     if (!isObjectRecord(payload)) {
       throw new WebhookDispatchError(
         'webhook_unsupported_payload',
@@ -2946,7 +3884,116 @@ export class SingleAgentClient {
       );
     }
 
-    // 1. Check for MCP Webhook Payload (has task_id, status, task_type fields)
+    // 1. Check for A2A Task or TaskStatusUpdateEvent before considering MCP.
+    // Native A2A events also carry a top-level `status`, so MCP's broad
+    // candidate detector must never get first refusal.
+    const normalizedA2APayload = normalizeA2AWebhookEnvelope(payload);
+    if (normalizedA2APayload) {
+      const a2aPayload = normalizedA2APayload as A2ATask | TaskStatusUpdateEvent;
+      const statusMessageData = latestA2AWebhookMessageData(a2aPayload.status?.message?.parts);
+      const artifactExtraction = a2aPayload.kind === 'task' ? getLatestA2ADataPartFromTask(a2aPayload) : undefined;
+      const artifactData = artifactExtraction?.data;
+      // A terminal Task's artifacts are canonical. Its status.message can be
+      // an earlier progress observation and must not shadow the final result.
+      const adcpData = a2aPayload.kind === 'task' ? (artifactData ?? statusMessageData) : statusMessageData;
+      const artifactMetadata = isObjectRecord(artifactExtraction?.artifact.metadata)
+        ? artifactExtraction.artifact.metadata
+        : undefined;
+      const hasExplicitTaskEnvelope =
+        adcpData !== undefined &&
+        (Object.hasOwn(adcpData, 'result') || Object.hasOwn(adcpData, 'error') || Object.hasOwn(adcpData, 'errors'));
+      const dataAdcpStatus =
+        adcpData && hasExplicitTaskEnvelope && isAdcpStatus(adcpData.status)
+          ? adcpData.status
+          : extractAdcpTaskStatusFromPayload(adcpData);
+      const metadataAdcpStatus = isAdcpStatus(artifactMetadata?.adcp_status) ? artifactMetadata.adcp_status : undefined;
+      if (metadataAdcpStatus !== undefined && dataAdcpStatus !== undefined && metadataAdcpStatus !== dataAdcpStatus) {
+        throw new WebhookDispatchError(
+          'webhook_envelope_invalid',
+          'Invalid A2A webhook envelope: artifact and structured AdCP work statuses do not match.'
+        );
+      }
+      // Native A2A artifact metadata is the transport-safe work observation.
+      // It must win over typed result payloads whose domain `status` can use
+      // the same literals (for example a completed cancellation result).
+      const legacyArtifactStatus = legacyA2AArtifactStatus(a2aPayload, artifactExtraction?.artifact);
+      const usesLegacyArtifactFallback =
+        allowLegacyA2AArtifactFallback &&
+        metadataAdcpStatus === undefined &&
+        dataAdcpStatus === undefined &&
+        legacyArtifactStatus !== undefined;
+      const adcpStatus =
+        metadataAdcpStatus ?? dataAdcpStatus ?? (usesLegacyArtifactFallback ? legacyArtifactStatus : undefined);
+      const isTerminalAdcpStatus =
+        adcpStatus !== undefined &&
+        DURABLE_SETTLEMENT_TERMINAL_STATUSES.has(adcpStatus as import('./ConversationTypes').TaskStatus);
+      const hasTerminalEnvelope =
+        adcpData !== undefined &&
+        (!isTerminalAdcpStatus ||
+          metadataAdcpStatus !== undefined ||
+          usesLegacyArtifactFallback ||
+          Object.hasOwn(adcpData, 'result') ||
+          Object.hasOwn(adcpData, 'error') ||
+          Object.hasOwn(adcpData, 'errors'));
+      if (!adcpData || !adcpStatus || !WEBHOOK_TASK_STATUSES.has(adcpStatus) || !hasTerminalEnvelope) {
+        throw new WebhookDispatchError(
+          'webhook_envelope_invalid',
+          'Invalid A2A webhook envelope: structured AdCP status data is required; transport Task state is not an AdCP work observation.'
+        );
+      }
+
+      const wrapped = { result: a2aPayload };
+      const artifactTaskId = responseParser.getTaskId({
+        task_id: artifactMetadata?.adcp_task_id ?? artifactMetadata?.serverTaskId,
+      });
+      const dataTaskId = responseParser.getTaskId({ task_id: adcpData.task_id });
+      if (artifactTaskId && dataTaskId && artifactTaskId !== dataTaskId) {
+        throw new WebhookDispatchError(
+          'webhook_envelope_invalid',
+          'Invalid A2A webhook envelope: artifact and structured AdCP work task IDs do not match.'
+        );
+      }
+      // Prefer seller-issued AdCP work identity. For synchronous native A2A
+      // callbacks there may be no separate work handle; the authenticated,
+      // buyer-issued callback route operation is then the trusted identity.
+      // A2A transport Task.id is deliberately never used.
+      const taskId = artifactTaskId ?? dataTaskId ?? (usesLegacyArtifactFallback ? operationId : undefined);
+      if (!taskId) {
+        throw new WebhookDispatchError(
+          'webhook_envelope_invalid',
+          'Invalid A2A webhook envelope: a structured AdCP work task_id is required; transport Task.id is not accepted.'
+        );
+      }
+
+      const declaredTaskType = typeof adcpData.task_type === 'string' ? adcpData.task_type : undefined;
+      if (declaredTaskType && taskType !== 'unknown' && declaredTaskType !== taskType) {
+        throw new WebhookDispatchError(
+          'webhook_envelope_invalid',
+          'Invalid A2A webhook envelope: structured task_type does not match the trusted route.'
+        );
+      }
+
+      const result = Object.hasOwn(adcpData, 'result')
+        ? (adcpData.result as AdCPAsyncResponseData | undefined)
+        : (adcpData as AdCPAsyncResponseData);
+      const textParts = latestA2AWebhookTextParts(a2aPayload.status?.message?.parts);
+
+      return {
+        operation_id: operationId,
+        context_id: responseParser.getContextId(wrapped),
+        task_id: taskId,
+        task_type: taskType !== 'unknown' ? taskType : (declaredTaskType ?? 'unknown'),
+        status: adcpStatus,
+        result,
+        message: textParts.length > 0 ? textParts.join(' ') : undefined,
+        timestamp: a2aPayload.status?.timestamp || new Date().toISOString(),
+        ...(typeof adcpData.idempotency_key === 'string' && { idempotency_key: adcpData.idempotency_key }),
+        ...(typeof adcpData.notification_id === 'string' && { notification_id: adcpData.notification_id }),
+        protocol: 'a2a',
+      };
+    }
+
+    // 2. Check for MCP Webhook Payload (has task_id, status, task_type fields)
     if (isMcpWebhookCandidate(payload)) {
       const missing = missingMcpWebhookFields(payload);
       if (missing.length > 0) {
@@ -2969,7 +4016,7 @@ export class SingleAgentClient {
       }
       const mcpPayload = payload as unknown as MCPWebhookPayload;
       return {
-        operation_id: mcpPayload.operation_id || operationId || 'unknown',
+        operation_id: operationId && operationId !== 'unknown' ? operationId : mcpPayload.operation_id || 'unknown',
         context_id: mcpPayload.context_id ?? undefined,
         task_id: mcpPayload.task_id,
         task_type: taskType && taskType !== 'unknown' ? taskType : mcpPayload.task_type,
@@ -2978,68 +4025,8 @@ export class SingleAgentClient {
         message: mcpPayload.message ?? undefined,
         timestamp: mcpPayload.timestamp,
         idempotency_key: mcpPayload.idempotency_key,
+        notification_id: mcpPayload.notification_id ?? undefined,
         protocol: 'mcp',
-      };
-    }
-
-    // 2. Check for A2A Task or TaskStatusUpdateEvent
-    if ('kind' in payload && (payload.kind === 'task' || payload.kind === 'status-update')) {
-      const a2aPayload = payload as unknown as A2ATask | TaskStatusUpdateEvent;
-      const a2aStatus = a2aPayload.status?.state || 'unknown';
-      let result: AdCPAsyncResponseData | undefined = undefined;
-
-      // Try to extract data from status.message.parts first (for status updates)
-      const parts = a2aPayload.status?.message?.parts;
-      if (parts && Array.isArray(parts)) {
-        const dataPart = parts.find(p => 'data' in p && p.kind === 'data');
-        if (dataPart && 'data' in dataPart) {
-          result = dataPart.data as AdCPAsyncResponseData;
-        }
-      }
-
-      // If not found in parts, check artifacts (standard A2A task output location)
-      if (!result && 'artifacts' in a2aPayload && a2aPayload.artifacts && a2aPayload.artifacts.length > 0) {
-        try {
-          // Try to unwrap artifacts for all statuses
-          result = unwrapProtocolResponse({ result: a2aPayload }, taskType, 'a2a') as AdCPAsyncResponseData;
-        } catch (error) {
-          throw new WebhookDispatchError(
-            'webhook_result_invalid',
-            'Failed to unwrap A2A webhook payload artifacts.',
-            error
-          );
-        }
-      }
-
-      // Extract message part from status.message.parts (A2A Message structure)
-      let message: string | undefined = undefined;
-      if (a2aPayload.status?.message?.parts) {
-        const textParts = a2aPayload.status.message.parts
-          .filter(p => p.kind === 'text' && 'text' in p)
-          .map(p => ('text' in p ? p.text : ''));
-        if (textParts.length > 0) {
-          message = textParts.join(' ');
-        }
-      }
-
-      // Get task_id ensuring it's a string
-      let taskId = 'unknown';
-      if ('id' in a2aPayload && a2aPayload.id) {
-        taskId = String(a2aPayload.id);
-      } else if ('taskId' in a2aPayload && a2aPayload.taskId) {
-        taskId = String(a2aPayload.taskId);
-      }
-
-      return {
-        operation_id: operationId,
-        context_id: 'contextId' in a2aPayload ? a2aPayload.contextId : undefined,
-        task_id: taskId,
-        task_type: taskType,
-        status: a2aStatus,
-        result,
-        message: message,
-        timestamp: a2aPayload.status?.timestamp || new Date().toISOString(),
-        protocol: 'a2a',
       };
     }
 
@@ -3171,8 +4158,9 @@ export class SingleAgentClient {
           res.end(JSON.stringify({ status: 'accepted', received: handled }));
         }
       } catch (error: unknown) {
-        // Return error
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        // Stable verification/dispatch errors are safe for callers. Never
+        // reflect arbitrary handler, storage, or infrastructure messages.
+        const errorMessage = error instanceof WebhookDispatchError ? error.message : 'Webhook could not be processed.';
         const statusCode = webhookErrorHttpStatus(error);
 
         if (res.json) {
@@ -3243,18 +4231,24 @@ export class SingleAgentClient {
     options?: TaskOptions,
     transformCompletedResponse?: (data: T) => T,
     legacyFormatConverter?: LegacyFormatConverter,
-    canonicalRequest?: unknown
+    canonicalRequest?: unknown,
+    projectionCatalogs?: readonly ProjectionCatalogSnapshot[]
   ): Promise<TaskResult<T>> {
-    return withTaskDeadline(options, effectiveOptions =>
+    const requestParamsSnapshot = structuredClone(params);
+    const canonicalRequestSnapshot = canonicalRequest === undefined ? undefined : structuredClone(canonicalRequest);
+    const deferredProjectionCatalogs = projectionCatalogs ? structuredClone(projectionCatalogs) : undefined;
+    const taskOptionsSnapshot = snapshotTaskOptions(options);
+    return withTaskDeadline(taskOptionsSnapshot, effectiveOptions =>
       this.executeAndHandleWithinDeadline(
         taskType,
         handlerName,
-        params,
+        requestParamsSnapshot,
         inputHandler,
         effectiveOptions,
         transformCompletedResponse,
         legacyFormatConverter,
-        canonicalRequest
+        canonicalRequestSnapshot,
+        deferredProjectionCatalogs
       )
     );
   }
@@ -3267,15 +4261,19 @@ export class SingleAgentClient {
     options?: TaskOptions,
     transformCompletedResponse?: (data: T) => T,
     legacyFormatConverter?: LegacyFormatConverter,
-    canonicalRequest?: unknown
+    canonicalRequest?: unknown,
+    projectionCatalogs?: readonly ProjectionCatalogSnapshot[]
   ): Promise<TaskResult<T>> {
     throwIfAborted(options?.signal);
+    const canonicalCreativeInvocation =
+      CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType) || canonicalRequest !== undefined;
     // Normalize params for backwards compatibility before validation
     let normalizedParams = normalizeRequestParams(taskType, params, {
       skipIdempotencyAutoInject: options?.skipIdempotencyAutoInject,
       skipAccountValidation: options?.skipAccountValidation,
     });
-    this.assertRequestSupportedByConfiguredVersion(taskType, normalizedParams, options);
+    this.assertRequestSupportedByConfiguredVersion(taskType, normalizedParams, options, canonicalCreativeInvocation);
+    this.assertDurablePropertyListCredentialSupported(taskType, normalizedParams);
 
     // Inject an idempotency_key for mutating tools before schema validation
     // so callers don't have to supply one. TaskExecutor also guards against
@@ -3347,7 +4345,13 @@ export class SingleAgentClient {
     };
     const serverVersion = await this.detectServerVersion(detectionOptions);
     throwIfAborted(options?.signal);
-    this.assertRequestSupportedByTargetVersion(taskType, normalizedParams, capabilityDiscoveryContext.capabilities);
+    this.assertRequestSupportedByTargetVersion(
+      taskType,
+      normalizedParams,
+      capabilityDiscoveryContext.capabilities,
+      canonicalCreativeInvocation,
+      serverVersion
+    );
     const { options: effectiveOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
       taskType,
       options,
@@ -3375,9 +4379,36 @@ export class SingleAgentClient {
       this.executor.validateAdaptedRequestAgainstV2(taskType, adaptedParams, v25DriftLogs);
     }
 
-    const canonicalInputHandler = this.canonicalCreativeInputHandler(taskType, inputHandler);
+    const canonicalInputHandler = this.canonicalCreativeInputHandler(
+      taskType,
+      inputHandler,
+      canonicalCreativeInvocation
+    );
+    const routingSnapshot = canonicalCreativeInvocation
+      ? canonicalCreativeRoutingSnapshot(taskType, canonicalRequest ?? normalizedParams)
+      : undefined;
+    const deferredClientContext: DeferredClientFinalizationContext = {
+      kind: 'single-agent',
+      taskType,
+      handlerName,
+      canonical: canonicalCreativeInvocation,
+      serverVersion,
+      ...(capabilityDiscoveryContext.capabilities?._synthetic !== undefined && {
+        serverVersionSynthetic: capabilityDiscoveryContext.capabilities._synthetic,
+      }),
+      productPolicyRequest: productPolicyRequestSnapshot(normalizedParams),
+      ...(projectionCatalogs !== undefined && { projectionCatalogs }),
+      ...(routingSnapshot !== undefined && { routingSnapshot }),
+      ...(effectiveOptions?.taskId !== undefined && { optionTaskId: effectiveOptions.taskId }),
+      ...(effectiveOptions?.contextId !== undefined && { optionContextId: effectiveOptions.contextId }),
+    };
     let result = await canonicalCreativeExecutionStorage.run(
-      { taskType, legacyFormatConverter, canonicalRequest: canonicalRequest ?? normalizedParams },
+      {
+        taskType,
+        canonical: canonicalCreativeInvocation,
+        legacyFormatConverter,
+        canonicalRequest: canonicalRequest ?? normalizedParams,
+      },
       () =>
         this.executor.executeTask<T>(
           agent,
@@ -3386,7 +4417,9 @@ export class SingleAgentClient {
           canonicalInputHandler,
           effectiveOptions,
           serverVersion,
-          capabilityDiscoveryContext.capabilities
+          capabilityDiscoveryContext.capabilities,
+          undefined,
+          deferredClientContext
         )
     );
     throwIfAborted(effectiveOptions?.signal);
@@ -3402,40 +4435,154 @@ export class SingleAgentClient {
       result.debug_logs = [...(result.debug_logs ?? []), ...postAdapterLogs];
     }
 
-    // Normalize response to v3 format
+    return this.finalizeTaskResult(
+      result,
+      deferredClientContext,
+      effectiveOptions,
+      transformCompletedResponse,
+      legacyFormatConverter
+    );
+  }
+
+  private async finalizeTaskResult<T>(
+    result: TaskResult<T>,
+    context: DeferredClientFinalizationContext,
+    options?: TaskOptions,
+    transformCompletedResponse?: (data: T) => T,
+    legacyFormatConverter?: LegacyFormatConverter
+  ): Promise<TaskResult<T>> {
+    try {
+      return await this.finalizeTaskResultInner(
+        result,
+        context,
+        options,
+        transformCompletedResponse,
+        legacyFormatConverter
+      );
+    } catch (error) {
+      await rejectDeferredSettlement(result);
+      throw error;
+    }
+  }
+
+  private async finalizeTaskResultInner<T>(
+    result: TaskResult<T>,
+    context: DeferredClientFinalizationContext,
+    options?: TaskOptions,
+    transformCompletedResponse?: (data: T) => T,
+    legacyFormatConverter?: LegacyFormatConverter
+  ): Promise<TaskResult<T>> {
+    if (context.serverVersion !== undefined) {
+      result.metadata = {
+        ...result.metadata,
+        serverVersion: context.serverVersion,
+        ...(context.serverVersionSynthetic !== undefined && {
+          serverVersionSynthetic: context.serverVersionSynthetic,
+        }),
+      };
+    }
+    const completionHandlerAlreadyPublished = hasCompletionHandlerAlreadyPublished(result);
+    const settlementAcknowledger = (
+      result as TaskResult<T> & {
+        [DEFERRED_SETTLEMENT_ACK]?: (finalizedResult?: TaskResult<T>) => Promise<void>;
+      }
+    )[DEFERRED_SETTLEMENT_ACK];
+    const taskType = context.taskType;
+    const resumedOptions: TaskOptions = {
+      ...(options ?? {}),
+      ...(context.optionTaskId !== undefined && { taskId: context.optionTaskId }),
+      ...(context.optionContextId !== undefined && { contextId: context.optionContextId }),
+    };
+    const rawDeferredResume = result.deferred?.resume;
+    const rawSubmittedWaitForCompletion = result.submitted?.waitForCompletion;
+    const finalizerLegacyFormatConverter =
+      legacyFormatConverter ?? this.resolveLegacyFormatConverter(undefined, context.projectionCatalogs);
+
     if (result.success && result.data) {
       result.data = this.normalizeResponseToV3(taskType, result.data) as T;
     }
 
-    result = this.wrapProductPolicySubmittedContinuation(result, taskType, normalizedParams, options);
+    result = this.wrapProductPolicySubmittedContinuation(
+      result,
+      taskType,
+      context.productPolicyRequest,
+      resumedOptions
+    );
     if (result.status === 'working') {
-      this.rememberProductPolicyRequestParams(taskType, normalizedParams, result, options);
+      this.rememberProductPolicyRequestParams(taskType, context.productPolicyRequest, result, resumedOptions);
     }
-    this.rememberLegacyFormatConverter(taskType, legacyFormatConverter, result, options);
-    result = await this.applyProductPropertyPolicy(result, taskType, normalizedParams);
-    throwIfAborted(effectiveOptions?.signal);
+    this.rememberLegacyFormatConverter(taskType, finalizerLegacyFormatConverter, result, resumedOptions);
+    result = await this.applyProductPropertyPolicy(result, taskType, context.productPolicyRequest);
+    throwIfAborted(options?.signal);
 
-    if (CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType)) {
-      // The full canonical request is needed only while the protocol activity
-      // callback runs above. Async/terminal state retains a frozen routing-only
-      // projection so creative assets and webhook credentials are not pinned.
-      const routingSnapshot = canonicalCreativeRoutingSnapshot(taskType, canonicalRequest ?? normalizedParams);
-      result = this.canonicalizeCreativeTaskResult(result, taskType, transformCompletedResponse, legacyFormatConverter);
+    if (context.canonical) {
+      if (result.status === 'completed' && result.success && result.data) {
+        this.rememberCanonicalProductRoutesForCompletion(
+          taskType,
+          result.data,
+          finalizerLegacyFormatConverter,
+          context.productPolicyRequest.account
+        );
+      }
+      result = this.canonicalizeCreativeTaskResult(
+        result,
+        taskType,
+        transformCompletedResponse,
+        finalizerLegacyFormatConverter
+      );
       result = this.wrapCanonicalCreativeContinuations(
         result,
         taskType,
         transformCompletedResponse,
-        legacyFormatConverter,
-        routingSnapshot
+        finalizerLegacyFormatConverter,
+        context.routingSnapshot,
+        context.productPolicyRequest.account
       );
-      this.rememberCanonicalCreativeTaskIds(result, taskType, legacyFormatConverter, routingSnapshot);
+      this.rememberCanonicalCreativeTaskIds(result, taskType, finalizerLegacyFormatConverter, context.routingSnapshot);
+      if (result.success && result.status === 'completed' && result.data !== undefined) {
+        this.rememberCanonicalPackageRoutesForTask(taskType, result.data, context.routingSnapshot);
+      }
     } else if (result.status === 'completed' && result.success && result.data && transformCompletedResponse) {
       result = { ...result, data: transformCompletedResponse(result.data) };
     }
 
-    await this.notifyCompletedStatusHandler(result, taskType, handlerName, effectiveOptions);
+    if (context.handlerName) {
+      this.rememberPreviewCreativeHandler(result, taskType, context.handlerName, resumedOptions);
+      if (!completionHandlerAlreadyPublished) {
+        await this.notifyCompletedStatusHandler(result, taskType, context.handlerName, resumedOptions);
+        markCompletionHandlerAlreadyPublished(result);
+      }
+    }
 
-    return result;
+    // Replace the canonical wrapper's recursive closure with the shared
+    // finalizer. Durable tokens re-enter the public client path after restart;
+    // in-process tokens keep their one-shot executor closure.
+    if (result.deferred && rawDeferredResume) {
+      result.deferred = {
+        ...result.deferred,
+        resume: input =>
+          rawDeferredResume(input).then(next =>
+            this.finalizeTaskResult(next, context, options, transformCompletedResponse, finalizerLegacyFormatConverter)
+          ),
+      };
+    }
+    if (result.submitted && rawSubmittedWaitForCompletion) {
+      result.submitted = {
+        ...result.submitted,
+        waitForCompletion: async (pollInterval, signal) =>
+          this.finalizeTaskResult(
+            await rawSubmittedWaitForCompletion(pollInterval, signal),
+            context,
+            options,
+            transformCompletedResponse,
+            finalizerLegacyFormatConverter
+          ),
+      };
+    }
+
+    const finalized = attachMatch(result);
+    await settlementAcknowledger?.(finalized);
+    return finalized;
   }
 
   private async notifyCompletedStatusHandler<T>(
@@ -3462,11 +4609,15 @@ export class SingleAgentClient {
     throwIfAborted(options?.signal);
   }
 
-  private canonicalCreativeInputHandler(taskType: string, inputHandler?: InputHandler): InputHandler | undefined {
-    if (!inputHandler || !CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType)) return inputHandler;
+  private canonicalCreativeInputHandler(
+    taskType: string,
+    inputHandler?: InputHandler,
+    canonical = CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType)
+  ): InputHandler | undefined {
+    if (!inputHandler || !canonical) return inputHandler;
     return async context => {
       const active = canonicalCreativeExecutionStorage.getStore();
-      const converter = this.resolveLegacyFormatConverter(
+      const converter = this.finalLegacyFormatConverter(
         active?.taskType === taskType ? active.legacyFormatConverter : undefined
       );
       const project = <T>(value: T): CanonicalCreativeResponse<T> =>
@@ -3504,18 +4655,18 @@ export class SingleAgentClient {
       projected = transform(projected);
     } else if (canProjectRead && taskType === 'get_products' && record) {
       const active = canonicalCreativeExecutionStorage.getStore();
+      const converter = this.finalLegacyFormatConverter(
+        legacyFormatConverter ?? (active?.taskType === taskType ? active.legacyFormatConverter : undefined)
+      );
       const { response, diagnostics } = toCanonicalOnlyResponse(record as { products?: V1Product[] }, {
-        legacyFormatConverter: this.resolveLegacyFormatConverter(
-          legacyFormatConverter ?? (active?.taskType === taskType ? active.legacyFormatConverter : undefined)
-        ),
-        projectionCatalogs: this.config.projectionCatalogs,
+        legacyFormatConverter: converter,
       });
       const { _message: _dropLegacyMessage, ...canonical } = response as typeof response & { _message?: unknown };
       void _dropLegacyMessage;
       projected = { ...canonical, projection: { diagnostics } } as T;
     } else if (canProjectRead && taskType === 'list_creatives' && record) {
       const active = canonicalCreativeExecutionStorage.getStore();
-      const activeLegacyFormatConverter = this.resolveLegacyFormatConverter(
+      const activeLegacyFormatConverter = this.finalLegacyFormatConverter(
         legacyFormatConverter ?? (active?.taskType === taskType ? active.legacyFormatConverter : undefined)
       );
       const { _message: _dropLegacyMessage, ...safe } = record;
@@ -3537,7 +4688,7 @@ export class SingleAgentClient {
       projected = projectCanonicalCreativeResponseValue(
         projected,
         taskType,
-        this.resolveLegacyFormatConverter(
+        this.finalLegacyFormatConverter(
           legacyFormatConverter ?? (active?.taskType === taskType ? active.legacyFormatConverter : undefined)
         )
       ) as T;
@@ -3556,7 +4707,7 @@ export class SingleAgentClient {
         ? this.projectCanonicalCreativeData(taskType, result.data, transform, legacyFormatConverter)
         : undefined;
     const errorInstance = result.errorInstance;
-    const converter = this.resolveLegacyFormatConverter(legacyFormatConverter);
+    const converter = this.finalLegacyFormatConverter(legacyFormatConverter);
     const metadataRecord = result.metadata as TaskResult<T>['metadata'] & { inputRequest?: unknown };
     const semanticMetadata = {
       ...metadataRecord,
@@ -3632,7 +4783,8 @@ export class SingleAgentClient {
     taskType: string,
     transform?: (data: T) => T,
     legacyFormatConverter?: LegacyFormatConverter,
-    routingRequest?: unknown
+    routingRequest?: unknown,
+    productAccount?: unknown
   ): TaskResult<T> {
     const routingSnapshot = canonicalCreativeRoutingSnapshot(taskType, routingRequest);
     if (result.submitted) {
@@ -3642,23 +4794,37 @@ export class SingleAgentClient {
         submitted: {
           ...submitted,
           track: async transport => {
-            const canonical = this.canonicalizeCreativeTaskInfo<T>(
-              await canonicalCreativeExecutionStorage.run({ taskType, legacyFormatConverter }, () =>
-                submitted.track(transport)
-              ),
-              taskType,
-              transform,
-              legacyFormatConverter
+            const tracked = await canonicalCreativeExecutionStorage.run(
+              { taskType, canonical: true, legacyFormatConverter },
+              () => submitted.track(transport)
             );
+            if (tracked.status === 'completed' && tracked.result !== undefined) {
+              this.rememberCanonicalProductRoutesForCompletion(
+                taskType,
+                tracked.result,
+                legacyFormatConverter,
+                productAccount
+              );
+            }
+            const canonical = this.canonicalizeCreativeTaskInfo<T>(tracked, taskType, transform, legacyFormatConverter);
             if (canonical.status === 'completed' && canonical.result !== undefined) {
               this.rememberCanonicalPackageRoutesForTask(taskType, canonical.result, routingSnapshot);
             }
             return canonical;
           },
           waitForCompletion: async (pollInterval, signal) => {
-            const completed = await canonicalCreativeExecutionStorage.run({ taskType, legacyFormatConverter }, () =>
-              submitted.waitForCompletion(pollInterval, signal)
+            const completed = await canonicalCreativeExecutionStorage.run(
+              { taskType, canonical: true, legacyFormatConverter },
+              () => submitted.waitForCompletion(pollInterval, signal)
             );
+            if (completed.success && completed.status === 'completed' && completed.data !== undefined) {
+              this.rememberCanonicalProductRoutesForCompletion(
+                taskType,
+                completed.data,
+                legacyFormatConverter,
+                productAccount
+              );
+            }
             const canonical = this.canonicalizeCreativeTaskResult(
               completed,
               taskType,
@@ -3674,7 +4840,8 @@ export class SingleAgentClient {
               taskType,
               transform,
               legacyFormatConverter,
-              routingSnapshot
+              routingSnapshot,
+              productAccount
             );
           },
         },
@@ -3687,8 +4854,9 @@ export class SingleAgentClient {
         deferred: {
           ...deferred,
           resume: async input => {
-            const resumed = await canonicalCreativeExecutionStorage.run({ taskType, legacyFormatConverter }, () =>
-              deferred.resume(input)
+            const resumed = await canonicalCreativeExecutionStorage.run(
+              { taskType, canonical: true, legacyFormatConverter },
+              () => deferred.resume(input)
             );
             const canonical = this.canonicalizeCreativeTaskResult(resumed, taskType, transform, legacyFormatConverter);
             if (canonical.success && canonical.status === 'completed' && canonical.data !== undefined) {
@@ -3700,7 +4868,8 @@ export class SingleAgentClient {
               taskType,
               transform,
               legacyFormatConverter,
-              routingSnapshot
+              routingSnapshot,
+              productAccount
             );
           },
         },
@@ -3726,6 +4895,66 @@ export class SingleAgentClient {
       if (!key) continue;
       this.rememberCanonicalCreativeTaskAssociation(key, taskType, legacyFormatConverter, routingSnapshot);
     }
+  }
+
+  private rememberPreviewCreativeHandler<T>(
+    result: TaskResult<T>,
+    taskType: string,
+    handlerName: keyof AsyncHandlerConfig,
+    options?: TaskOptions
+  ): void {
+    if (taskType !== 'preview_creative') return;
+    const handler = handlerName === 'onPreviewCreativeLegacyStatusChange' ? 'legacy' : 'canonical';
+    const metadata = result.metadata as typeof result.metadata & { operationId?: string };
+    const keys = [
+      metadata.operationId,
+      metadata.taskId,
+      metadata.contextId,
+      metadata.serverTaskId,
+      result.submitted?.taskId,
+      options?.taskId,
+      options?.contextId,
+    ];
+    for (const key of keys) {
+      if (!key) continue;
+      this.rememberPreviewCreativeHandlerKey(key, handler);
+      if (handler === 'legacy') this.canonicalCreativeTaskAssociations.delete(key);
+    }
+  }
+
+  private rememberPreviewCreativeHandlerKey(key: string, handler: 'canonical' | 'legacy'): void {
+    this.previewCreativeHandlersByTask.delete(key);
+    this.previewCreativeHandlersByTask.set(key, handler);
+    while (this.previewCreativeHandlersByTask.size > TASK_SCOPED_STATE_LIMIT) {
+      const oldest = this.previewCreativeHandlersByTask.keys().next().value;
+      if (oldest === undefined) break;
+      this.previewCreativeHandlersByTask.delete(oldest);
+    }
+  }
+
+  private previewCreativeHandlerForWebhook(
+    metadata: Pick<WebhookMetadata, 'operation_id' | 'task_id' | 'context_id' | 'task_type'>
+  ): 'canonical' | 'legacy' | undefined {
+    if (metadata.task_type !== 'preview_creative') return undefined;
+    for (const key of [metadata.operation_id, metadata.task_id, metadata.context_id]) {
+      if (!key) continue;
+      const handler = this.previewCreativeHandlersByTask.get(key);
+      if (!handler) continue;
+      this.previewCreativeHandlersByTask.delete(key);
+      this.previewCreativeHandlersByTask.set(key, handler);
+      return handler;
+    }
+    return undefined;
+  }
+
+  private isCanonicalCreativeWebhook(
+    metadata: Pick<WebhookMetadata, 'operation_id' | 'task_id' | 'context_id' | 'task_type'>
+  ): boolean {
+    if (CANONICAL_CREATIVE_ACTIVITY_TASKS.has(metadata.task_type)) return true;
+    if (metadata.task_type !== 'preview_creative') return false;
+    return [metadata.operation_id, metadata.task_id, metadata.context_id].some(
+      key => this.canonicalCreativeTaskAssociation(key) !== undefined
+    );
   }
 
   private rememberCanonicalCreativeTaskAssociation(
@@ -4550,6 +5779,8 @@ export class SingleAgentClient {
         timestamp: new Date().toISOString(),
         clarificationRounds: 0,
         status: 'completed',
+        serverVersion: capabilities.version,
+        serverVersionSynthetic: capabilities._synthetic,
       },
     };
   }
@@ -4587,6 +5818,7 @@ export class SingleAgentClient {
     options?: CanonicalReadTaskOptions
   ): Promise<TaskResult<CanonicalGetProductsResponse>> {
     const { legacyFormatConverter, projectionCatalogs, ...taskOptions } = options ?? {};
+    this.assertDurableProjectionOverrideSupported(legacyFormatConverter);
     const effectiveLegacyFormatConverter = this.resolveLegacyFormatConverter(
       legacyFormatConverter,
       projectionCatalogs ?? this.config.projectionCatalogs
@@ -4611,7 +5843,9 @@ export class SingleAgentClient {
         void _dropLegacyMessage;
         return { ...canonical, projection: { diagnostics } } as CanonicalGetProductsResponse;
       },
-      effectiveLegacyFormatConverter
+      effectiveLegacyFormatConverter,
+      undefined,
+      projectionCatalogs
     );
   }
 
@@ -4622,6 +5856,24 @@ export class SingleAgentClient {
     options?: TaskOptions
   ): Promise<TaskResult<GetProductsResponse>> {
     return this.executeTaskUnprojected<GetProductsResponse>('get_products', params, inputHandler, options);
+  }
+
+  /** @internal Run final legacy get_products adaptation before an application-owned atomic mutation claim. */
+  async getProductsLegacyWithPreDispatch(
+    params: GetProductsRequest,
+    beforeDispatch: UnprojectedPreDispatchHook<GetProductsResponse>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<GetProductsResponse>> {
+    const requestSnapshot = structuredClone(params);
+    return this.executeTaskUnprojected<GetProductsResponse>(
+      'get_products',
+      requestSnapshot,
+      inputHandler,
+      options,
+      undefined,
+      beforeDispatch
+    );
   }
 
   /**
@@ -4667,8 +5919,15 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: CreativeDeliveryTaskOptions
   ): Promise<TaskResult<CanonicalCreativeResponse<CreateMediaBuyResponse>>> {
-    return withTaskDeadline(options, effectiveOptions =>
-      this.createMediaBuyWithinDeadline(params, inputHandler, effectiveOptions)
+    this.assertDurableProjectionOverrideSupported(options?.legacyFormatConverter);
+    const requestSnapshot = structuredCloneWithLegacyCreativeMetadata(params);
+    const projectionCatalogs = options?.projectionCatalogs ? structuredClone(options.projectionCatalogs) : undefined;
+    const snapshottedOptions = {
+      ...snapshotTaskOptions(options),
+      ...(projectionCatalogs !== undefined && { projectionCatalogs }),
+    };
+    return withTaskDeadline(snapshottedOptions, effectiveOptions =>
+      this.createMediaBuyWithinDeadline(requestSnapshot, inputHandler, effectiveOptions)
     );
   }
 
@@ -4780,7 +6039,8 @@ export class SingleAgentClient {
       taskOptions,
       undefined,
       effectiveLegacyFormatConverter,
-      params
+      params,
+      projectionCatalogs
     );
     if (result.data !== undefined) this.rememberCanonicalPackageRoutes(result.data, params);
     return result;
@@ -4804,6 +6064,27 @@ export class SingleAgentClient {
     );
   }
 
+  /** @internal Run deterministic legacy-create preflight before the caller atomically claims its mutation. */
+  async createMediaBuyLegacyWithPreDispatch(
+    params: MutatingRequestInput<CreateMediaBuyRequest>,
+    beforeDispatch: UnprojectedPreDispatchHook<CreateMediaBuyResponse>,
+    inputHandler?: InputHandler,
+    options?: CreativeDeliveryTaskOptions
+  ): Promise<TaskResult<CreateMediaBuyResponse>> {
+    // Snapshot synchronously at the public boundary. Request validation and
+    // endpoint/capability discovery contain awaits; callers must not be able to
+    // mutate nested commercial terms between validation and durable dispatch.
+    const requestSnapshot = structuredClone(params);
+    return this.executeTaskUnprojected<CreateMediaBuyResponse>(
+      'create_media_buy',
+      requestSnapshot,
+      inputHandler,
+      options,
+      'onCreateMediaBuyStatusChange',
+      beforeDispatch
+    );
+  }
+
   /**
    * Update an existing media buy
    *
@@ -4816,8 +6097,15 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: CreativeDeliveryTaskOptions
   ): Promise<TaskResult<CanonicalCreativeResponse<UpdateMediaBuyResponse>>> {
-    return withTaskDeadline(options, effectiveOptions =>
-      this.updateMediaBuyWithinDeadline(params, inputHandler, effectiveOptions)
+    this.assertDurableProjectionOverrideSupported(options?.legacyFormatConverter);
+    const requestSnapshot = structuredCloneWithLegacyCreativeMetadata(params);
+    const projectionCatalogs = options?.projectionCatalogs ? structuredClone(options.projectionCatalogs) : undefined;
+    const snapshottedOptions = {
+      ...snapshotTaskOptions(options),
+      ...(projectionCatalogs !== undefined && { projectionCatalogs }),
+    };
+    return withTaskDeadline(snapshottedOptions, effectiveOptions =>
+      this.updateMediaBuyWithinDeadline(requestSnapshot, inputHandler, effectiveOptions)
     );
   }
 
@@ -4859,7 +6147,8 @@ export class SingleAgentClient {
       taskOptions,
       undefined,
       effectiveLegacyFormatConverter,
-      params
+      params,
+      projectionCatalogs
     );
     if (result.data !== undefined) this.rememberCanonicalPackageRoutes(result.data, params);
     return result;
@@ -4895,8 +6184,28 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: SyncCreativesTaskOptions
   ): Promise<TaskResult<CanonicalCreativeResponse<SyncCreativesResponse>>> {
-    return withTaskDeadline(options, effectiveOptions =>
-      this.syncCreativesWithinDeadline(params, inputHandler, effectiveOptions)
+    this.assertDurableProjectionOverrideSupported(
+      options?.creativeFormatProjection?.legacyFormatConverter ?? options?.legacyFormatConverter
+    );
+    const requestSnapshot = structuredCloneWithLegacyCreativeMetadata(params);
+    const projectionCatalogs = options?.projectionCatalogs ? structuredClone(options.projectionCatalogs) : undefined;
+    const creativeFormatProjection = options?.creativeFormatProjection
+      ? {
+          ...options.creativeFormatProjection,
+          ...(options.creativeFormatProjection.selectorContainers !== undefined && {
+            selectorContainers: structuredCloneWithLegacyCreativeMetadata(
+              options.creativeFormatProjection.selectorContainers
+            ),
+          }),
+        }
+      : undefined;
+    const snapshottedOptions = {
+      ...snapshotTaskOptions(options),
+      ...(projectionCatalogs !== undefined && { projectionCatalogs }),
+      ...(creativeFormatProjection !== undefined && { creativeFormatProjection }),
+    };
+    return withTaskDeadline(snapshottedOptions, effectiveOptions =>
+      this.syncCreativesWithinDeadline(requestSnapshot, inputHandler, effectiveOptions)
     );
   }
 
@@ -4955,7 +6264,8 @@ export class SingleAgentClient {
       taskOptions,
       undefined,
       effectiveLegacyFormatConverter,
-      params
+      params,
+      projectionCatalogs
     );
   }
 
@@ -5035,6 +6345,7 @@ export class SingleAgentClient {
     options?: CanonicalReadTaskOptions
   ): Promise<TaskResult<CanonicalListCreativesResponse>> {
     const { legacyFormatConverter, projectionCatalogs, ...taskOptions } = options ?? {};
+    this.assertDurableProjectionOverrideSupported(legacyFormatConverter);
     const effectiveLegacyFormatConverter = this.resolveLegacyFormatConverter(
       legacyFormatConverter,
       projectionCatalogs ?? this.config.projectionCatalogs
@@ -5061,7 +6372,9 @@ export class SingleAgentClient {
           ),
         } as CanonicalListCreativesResponse;
       },
-      effectiveLegacyFormatConverter
+      effectiveLegacyFormatConverter,
+      undefined,
+      projectionCatalogs
     );
   }
 
@@ -5074,14 +6387,39 @@ export class SingleAgentClient {
     return this.executeTaskUnprojected<ListCreativesResponse>('list_creatives', params, inputHandler, options);
   }
 
-  /**
-   * Preview a creative through the legacy named-format protocol.
-   *
-   * @param params - Preview creative parameters
-   * @param inputHandler - Handler for clarification requests
-   * @param options - Task execution options
-   * @deprecated Migration-only access to `format_id`-based creative preview.
-   */
+  /** Preview a creative using canonical capability or creative-library identity. */
+  async previewCreative(
+    params: CanonicalPreviewCreativeRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CanonicalPreviewCreativeResponse>> {
+    const legacyPath = legacyCreativeIdentityPath(params);
+    if (legacyPath) {
+      const suggestion = 'Move this request to previewCreativeLegacy(), or replace format_id with canonical identity.';
+      throw new ProtocolFeatureUnsupportedError(['preview_creative.canonical_identity'], [], this.agent.agent_uri, {
+        message: `previewCreative() does not accept legacy creative identity at ${legacyPath}. ${suggestion}`,
+        field: legacyPath,
+        suggestion,
+        details: {
+          feature: 'preview_creative.canonical_identity',
+          tool: 'preview_creative',
+          field: legacyPath,
+        },
+      });
+    }
+    return this.executeAndHandle<CanonicalPreviewCreativeResponse>(
+      'preview_creative',
+      'onPreviewCreativeStatusChange',
+      params,
+      inputHandler,
+      options,
+      undefined,
+      undefined,
+      params
+    );
+  }
+
+  /** @deprecated Migration-only access to `format_id`-based creative preview. */
   async previewCreativeLegacy(
     params: PreviewCreativeRequest,
     inputHandler?: InputHandler,
@@ -5109,6 +6447,7 @@ export class SingleAgentClient {
     options?: CanonicalReadTaskOptions
   ): Promise<TaskResult<CanonicalCreativeResponse<GetMediaBuysResponse>>> {
     const { legacyFormatConverter, projectionCatalogs, ...taskOptions } = options ?? {};
+    this.assertDurableProjectionOverrideSupported(legacyFormatConverter);
     const result = await this.executeAndHandle<GetMediaBuysResponse>(
       'get_media_buys',
       'onGetMediaBuysStatusChange',
@@ -5116,7 +6455,9 @@ export class SingleAgentClient {
       inputHandler,
       taskOptions,
       undefined,
-      this.resolveLegacyFormatConverter(legacyFormatConverter, projectionCatalogs ?? this.config.projectionCatalogs)
+      this.resolveLegacyFormatConverter(legacyFormatConverter, projectionCatalogs ?? this.config.projectionCatalogs),
+      undefined,
+      projectionCatalogs
     );
     if (result.data !== undefined) this.rememberCanonicalPackageRoutes(result.data, params);
     return result;
@@ -5135,6 +6476,7 @@ export class SingleAgentClient {
     options?: CanonicalReadTaskOptions
   ): Promise<TaskResult<CanonicalCreativeResponse<GetMediaBuyDeliveryResponse>>> {
     const { legacyFormatConverter, projectionCatalogs, ...taskOptions } = options ?? {};
+    this.assertDurableProjectionOverrideSupported(legacyFormatConverter);
     return this.executeAndHandle<GetMediaBuyDeliveryResponse>(
       'get_media_buy_delivery',
       'onGetMediaBuyDeliveryStatusChange',
@@ -5142,7 +6484,9 @@ export class SingleAgentClient {
       inputHandler,
       taskOptions,
       undefined,
-      this.resolveLegacyFormatConverter(legacyFormatConverter, projectionCatalogs ?? this.config.projectionCatalogs)
+      this.resolveLegacyFormatConverter(legacyFormatConverter, projectionCatalogs ?? this.config.projectionCatalogs),
+      undefined,
+      projectionCatalogs
     );
   }
 
@@ -5152,7 +6496,8 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: CanonicalReadTaskOptions
   ): Promise<TaskResult<CanonicalCreativeResponse<GetCreativeDeliveryResponse>>> {
-    const { legacyFormatConverter, ...taskOptions } = options ?? {};
+    const { legacyFormatConverter, projectionCatalogs, ...taskOptions } = options ?? {};
+    this.assertDurableProjectionOverrideSupported(legacyFormatConverter);
     return this.executeAndHandle<GetCreativeDeliveryResponse>(
       'get_creative_delivery',
       'onGetCreativeDeliveryStatusChange',
@@ -5160,7 +6505,9 @@ export class SingleAgentClient {
       inputHandler,
       taskOptions,
       undefined,
-      legacyFormatConverter
+      this.resolveLegacyFormatConverter(legacyFormatConverter, projectionCatalogs ?? this.config.projectionCatalogs),
+      undefined,
+      projectionCatalogs
     );
   }
 
@@ -5710,6 +7057,10 @@ export class SingleAgentClient {
         return this.getMediaBuyDelivery(params as GetMediaBuyDeliveryRequest, inputHandler, options);
       case 'get_creative_delivery':
         return this.getCreativeDelivery(params as GetCreativeDeliveryRequest, inputHandler, options);
+      case 'request_proposals':
+        return guardNativeRequestProposalsCompletion(
+          await this.executeTaskUnprojected(taskName, params, inputHandler, options)
+        );
     }
     return this.executeTaskUnprojected(taskName, params, inputHandler, options);
   }
@@ -5754,16 +7105,20 @@ export class SingleAgentClient {
     params: any,
     inputHandler?: InputHandler,
     options?: TaskOptions,
-    handlerName?: keyof AsyncHandlerConfig
+    handlerName?: keyof AsyncHandlerConfig,
+    beforeDispatch?: UnprojectedPreDispatchHook<T>
   ): Promise<TaskResult<T>> {
-    return withTaskDeadline(options, async effectiveOptions => {
+    const requestParamsSnapshot = structuredClone(params);
+    const taskOptionsSnapshot = snapshotTaskOptions(options);
+    return withTaskDeadline(taskOptionsSnapshot, async effectiveOptions => {
       const result = await this.executeTaskUnprojectedWithinDeadline<T>(
         taskName,
-        params,
+        requestParamsSnapshot,
         inputHandler,
-        effectiveOptions
+        effectiveOptions,
+        beforeDispatch,
+        handlerName
       );
-      if (handlerName) await this.notifyCompletedStatusHandler(result, taskName, handlerName, effectiveOptions);
       return result;
     });
   }
@@ -5772,16 +7127,21 @@ export class SingleAgentClient {
     taskName: string,
     params: any,
     inputHandler?: InputHandler,
-    options?: TaskOptions
+    options?: TaskOptions,
+    beforeDispatch?: UnprojectedPreDispatchHook<T>,
+    handlerName?: keyof AsyncHandlerConfig
   ): Promise<TaskResult<T>> {
     throwIfAborted(options?.signal);
     const startTime = Date.now();
+    let detectedServerVersion: 'v2' | 'v3' | undefined;
+    let detectedServerVersionSynthetic: boolean | undefined;
     try {
       const normalizedParams = normalizeRequestParams(taskName, params, {
         skipIdempotencyAutoInject: options?.skipIdempotencyAutoInject,
         skipAccountValidation: options?.skipAccountValidation,
       });
       this.assertRequestSupportedByConfiguredVersion(taskName, normalizedParams, options);
+      this.assertDurablePropertyListCredentialSupported(taskName, normalizedParams);
 
       await this.validateTaskFeatures(taskName, options);
       if (this.config.requireV3ForMutations && requestUsesIdempotency(taskName, normalizedParams)) {
@@ -5805,7 +7165,15 @@ export class SingleAgentClient {
         [CAPABILITY_DISCOVERY_CONTEXT]: capabilityDiscoveryContext,
       };
       const serverVersion = await this.detectServerVersion(detectionOptions);
-      this.assertRequestSupportedByTargetVersion(taskName, normalizedParams, capabilityDiscoveryContext.capabilities);
+      detectedServerVersion = serverVersion;
+      detectedServerVersionSynthetic = capabilityDiscoveryContext.capabilities?._synthetic;
+      this.assertRequestSupportedByTargetVersion(
+        taskName,
+        normalizedParams,
+        capabilityDiscoveryContext.capabilities,
+        false,
+        serverVersion
+      );
       const { options: effectiveOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
         taskName,
         options,
@@ -5830,6 +7198,19 @@ export class SingleAgentClient {
         this.executor.validateAdaptedRequestAgainstV2(taskName, adaptedParams, v25DriftLogs);
       }
 
+      const deferredClientContext: DeferredClientFinalizationContext = {
+        kind: 'single-agent',
+        taskType: taskName,
+        ...(handlerName !== undefined && { handlerName }),
+        canonical: false,
+        serverVersion,
+        ...(capabilityDiscoveryContext.capabilities?._synthetic !== undefined && {
+          serverVersionSynthetic: capabilityDiscoveryContext.capabilities._synthetic,
+        }),
+        productPolicyRequest: productPolicyRequestSnapshot(normalizedParams),
+        ...(effectiveOptions?.taskId !== undefined && { optionTaskId: effectiveOptions.taskId }),
+        ...(effectiveOptions?.contextId !== undefined && { optionContextId: effectiveOptions.contextId }),
+      };
       let result = await this.executor.executeTask<T>(
         agent,
         taskName,
@@ -5837,7 +7218,9 @@ export class SingleAgentClient {
         inputHandler,
         effectiveOptions,
         serverVersion,
-        capabilityDiscoveryContext.capabilities
+        capabilityDiscoveryContext.capabilities,
+        beforeDispatch,
+        deferredClientContext
       );
 
       const postAdapterLogs = [...inputSchemaStripLogs, ...v25DriftLogs];
@@ -5845,19 +7228,11 @@ export class SingleAgentClient {
         result.debug_logs = [...(result.debug_logs ?? []), ...postAdapterLogs];
       }
 
-      // Normalize response to v3 format for consistent API surface
-      if (result.success && result.data) {
-        result.data = this.normalizeResponseToV3(taskName, result.data) as T;
-      }
-
-      result = this.wrapProductPolicySubmittedContinuation(result, taskName, normalizedParams, options);
-      if (result.status === 'working') {
-        this.rememberProductPolicyRequestParams(taskName, normalizedParams, result, options);
-      }
-      result = await this.applyProductPropertyPolicy(result, taskName, normalizedParams);
-
-      return result;
+      return this.finalizeTaskResult(result, deferredClientContext, effectiveOptions);
     } catch (error) {
+      if (error instanceof BeforeProtocolDispatchHookError || error instanceof AfterProtocolDispatchHookError) {
+        throw error.original;
+      }
       // Structured protocol errors carry typed fields (reason, actualVersion,
       // unsupportedFeatures, …) that callers use for recovery decisions. Auth
       // and timeout errors trigger OAuth flows / cancellation. All four are
@@ -5893,6 +7268,10 @@ export class SingleAgentClient {
           timestamp: new Date().toISOString(),
           clarificationRounds: 0,
           status: 'failed',
+          ...(detectedServerVersion !== undefined && { serverVersion: detectedServerVersion }),
+          ...(detectedServerVersionSynthetic !== undefined && {
+            serverVersionSynthetic: detectedServerVersionSynthetic,
+          }),
         },
         conversation: [],
         debug_logs: [],
@@ -5906,28 +7285,25 @@ export class SingleAgentClient {
    * Resume a deferred task using its token
    *
    * @param token - Deferred task token
-   * @param inputHandler - Handler to provide the missing input
+   * @param input - Human- or application-provided answer for the paused task
    *
    * @example
    * ```typescript
-   * try {
-   *   await client.createMediaBuy(params, handler);
-   * } catch (error) {
-   *   if (error instanceof DeferredTaskError) {
-   *     // Get human input and resume
-   *     const result = await client.resumeDeferredTask(
-   *       error.token,
-   *       (context) => humanProvidedValue
-   *     );
-   *   }
+   * const paused = await client.createMediaBuy(params, handler);
+   * if (paused.status === 'deferred') {
+   *   const result = await client.resumeDeferredTask(paused.deferred.token, humanProvidedValue);
    * }
    * ```
    */
-  async resumeDeferredTask<T = any>(token: string, inputHandler: InputHandler): Promise<TaskResult<T>> {
-    // This is a simplified implementation
-    // In a full implementation, you'd need to store deferred task state
-    // and restore it here
-    throw new Error('Deferred task resumption requires storage configuration');
+  async resumeDeferredTask<T = any>(token: string, input: unknown): Promise<TaskResult<T>> {
+    const { result, clientContext } = await this.executor.resumeDeferredTaskWithContext<T>(token, input);
+    const finalized = isDeferredClientFinalizationContext(clientContext)
+      ? await this.finalizeTaskResult(result, clientContext)
+      : result;
+    if (!isDeferredClientFinalizationContext(clientContext)) {
+      await acknowledgeDeferredSettlement(finalized);
+    }
+    return finalized;
   }
 
   // ====== CONVERSATION MANAGEMENT ======
@@ -5964,9 +7340,9 @@ export class SingleAgentClient {
     }
 
     const { taskType: creativeTaskType } = creativeAssociation;
-    const legacyFormatConverter = this.resolveLegacyFormatConverter(creativeAssociation.legacyFormatConverter);
+    const legacyFormatConverter = this.finalLegacyFormatConverter(creativeAssociation.legacyFormatConverter);
     const result = await canonicalCreativeExecutionStorage.run(
-      { taskType: creativeTaskType, legacyFormatConverter },
+      { taskType: creativeTaskType, canonical: true, legacyFormatConverter },
       () =>
         this.executor.executeTask<T>(
           agent,
@@ -6182,6 +7558,7 @@ export class SingleAgentClient {
       .getActiveTasks()
       .filter(task => task.agent.id === this.agent.id)
       .map(task => {
+        assertNativeRequestProposalsTask(task);
         if (!CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskName)) return task;
         const converter = this.resolveLegacyFormatConverter(
           this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter
@@ -6218,14 +7595,18 @@ export class SingleAgentClient {
   async listTasks(): Promise<TaskInfo[]> {
     const tasks = await this.executor.getTaskList(this.agent.id);
     return tasks.map(task =>
-      CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
-        ? this.canonicalizeCreativeTaskInfo(
-            task,
-            task.taskType,
-            undefined,
-            this.resolveLegacyFormatConverter(this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter)
-          )
-        : task
+      assertNativeRequestProposalsTask(
+        CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
+          ? this.canonicalizeCreativeTaskInfo(
+              task,
+              task.taskType,
+              undefined,
+              this.resolveLegacyFormatConverter(
+                this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter
+              )
+            )
+          : task
+      )
     );
   }
 
@@ -6237,14 +7618,17 @@ export class SingleAgentClient {
    */
   async getTaskInfo(taskId: string): Promise<TaskInfo | null> {
     const task = await this.executor.getTaskInfo(taskId);
-    return task && CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
-      ? this.canonicalizeCreativeTaskInfo(
-          task,
-          task.taskType,
-          undefined,
-          this.resolveLegacyFormatConverter(this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter)
-        )
-      : task;
+    if (!task) return null;
+    return assertNativeRequestProposalsTask(
+      CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
+        ? this.canonicalizeCreativeTaskInfo(
+            task,
+            task.taskType,
+            undefined,
+            this.resolveLegacyFormatConverter(this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter)
+          )
+        : task
+    );
   }
 
   /**
@@ -6269,16 +7653,18 @@ export class SingleAgentClient {
   onTaskUpdate(callback: (task: TaskInfo) => void): () => void {
     return this.executor.onTaskUpdate(this.agent.id, task =>
       callback(
-        CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
-          ? this.canonicalizeCreativeTaskInfo(
-              task,
-              task.taskType,
-              undefined,
-              this.resolveLegacyFormatConverter(
-                this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter
+        assertNativeRequestProposalsTask(
+          CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
+            ? this.canonicalizeCreativeTaskInfo(
+                task,
+                task.taskType,
+                undefined,
+                this.resolveLegacyFormatConverter(
+                  this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter
+                )
               )
-            )
-          : task
+            : task
+        )
       )
     );
   }
@@ -6296,14 +7682,18 @@ export class SingleAgentClient {
     onTaskFailed?: (task: TaskInfo, error: string) => void;
   }): () => void {
     const safe = (task: TaskInfo): TaskInfo =>
-      CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
-        ? this.canonicalizeCreativeTaskInfo(
-            task,
-            task.taskType,
-            undefined,
-            this.resolveLegacyFormatConverter(this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter)
-          )
-        : task;
+      assertNativeRequestProposalsTask(
+        CANONICAL_CREATIVE_ACTIVITY_TASKS.has(task.taskType)
+          ? this.canonicalizeCreativeTaskInfo(
+              task,
+              task.taskType,
+              undefined,
+              this.resolveLegacyFormatConverter(
+                this.canonicalCreativeTaskAssociation(task.taskId)?.legacyFormatConverter
+              )
+            )
+          : task
+      );
     return this.executor.onTaskEvents(this.agent.id, {
       ...(callbacks.onTaskCreated && { onTaskCreated: task => callbacks.onTaskCreated!(safe(task)) }),
       ...(callbacks.onTaskUpdated && { onTaskUpdated: task => callbacks.onTaskUpdated!(safe(task)) }),
@@ -6538,35 +7928,15 @@ export class SingleAgentClient {
       const { wrapFetchWithSizeLimit } = await import('../protocols/responseSizeLimit');
       const authToken = await ensureReadAuthToken();
       const agentHeaders = this.normalizedAgent.headers ?? {};
-      const sizeLimitedFetch = wrapFetchWithSizeLimit((input, init) =>
-        transport?.trustedFetchFn ? transport.trustedFetchFn(input, init) : fetch(input as RequestInfo | URL, init)
+      const configuredAgentUrl = this.normalizedAgent.agent_uri;
+      const sizeLimitedFetch = wrapFetchWithSizeLimit(
+        createAgentTransportFetch(configuredAgentUrl, {
+          trustedFetchFn: transport?.trustedFetchFn,
+          allowPrivateIp: transport?.allowPrivateIp,
+        })
       );
-      const normalizeHeaders = (headers?: HeadersInit): Record<string, string> => {
-        const normalized: Record<string, string> = {};
-        if (!headers) return normalized;
-        if (headers instanceof Headers) {
-          headers.forEach((value, key) => {
-            normalized[key] = value;
-          });
-        } else if (Array.isArray(headers)) {
-          for (const [key, value] of headers) {
-            normalized[key] = value;
-          }
-        } else {
-          Object.assign(normalized, headers);
-        }
-        return normalized;
-      };
-      const buildHeaders = (requestInit?: RequestInit): Record<string, string> => ({
-        ...normalizeHeaders(requestInit?.headers),
-        ...agentHeaders,
-        ...(authToken && {
-          Authorization: `Bearer ${authToken}`,
-          'x-adcp-auth': authToken,
-        }),
-      });
       const fetchImpl = async (url: string | URL | Request, requestInit?: RequestInit) => {
-        const headers = buildHeaders(requestInit);
+        const headers = a2aScopedHeaders(url, requestInit?.headers, configuredAgentUrl, agentHeaders, authToken);
         return withAbortSignal<Response>([options?.signal, requestInit?.signal], requestTimeoutMs, signal =>
           sizeLimitedFetch(url as RequestInfo | URL, { ...requestInit, headers, signal })
         );
@@ -6574,14 +7944,14 @@ export class SingleAgentClient {
 
       const cardUrls = buildCardUrls(this.normalizedAgent.agent_uri);
 
-      let client: InstanceType<typeof A2AClient> | undefined;
+      let client: A2AClient | undefined;
       let lastCardError: Error = new Error(`A2A agent card not found at ${cardUrls.join(', ')}`);
       for (const cardUrl of cardUrls) {
         try {
           // Wrap A2A card discovery so `transport.maxResponseBytes` applies
           // to agent-card fetches and the deferred `agentCardPromise` read
           // below — both fire fetches that would otherwise bypass the cap.
-          client = await withResponseSizeLimit(maxResponseBytes, () => A2AClient.fromCardUrl(cardUrl, { fetchImpl }));
+          client = await withResponseSizeLimit(maxResponseBytes, () => createA2AClientFromCardUrl(cardUrl, fetchImpl));
           break;
         } catch (err: unknown) {
           lastCardError = err as Error;
@@ -6590,9 +7960,16 @@ export class SingleAgentClient {
       if (!client) {
         throw lastCardError;
       }
-      const agentCard = await withResponseSizeLimit(maxResponseBytes, async () =>
-        client.agentCardPromise ? client.agentCardPromise : client.agentCard
-      );
+      const agentCard = await withResponseSizeLimit(maxResponseBytes, async () => {
+        const compatibleClient = client as unknown as {
+          getAgentCard?: () => Promise<any>;
+          agentCardPromise?: Promise<any>;
+          agentCard?: any;
+        };
+        return typeof compatibleClient.getAgentCard === 'function'
+          ? compatibleClient.getAgentCard()
+          : (compatibleClient.agentCardPromise ?? compatibleClient.agentCard);
+      });
 
       const tools = agentCard?.skills
         ? agentCard.skills.map(
@@ -6612,7 +7989,7 @@ export class SingleAgentClient {
         : [];
 
       return {
-        name: agentCard?.displayName || agentCard?.name || this.normalizedAgent.name,
+        name: agentCard?.name || this.normalizedAgent.name,
         description: agentCard?.description,
         protocol: this.normalizedAgent.protocol,
         url: this.normalizedAgent.agent_uri,
@@ -6951,6 +8328,7 @@ export class SingleAgentClient {
    */
   async getIdempotencyReplayTtlSeconds(): Promise<number | undefined> {
     const capabilities = await this.getCapabilities();
+    if (capabilities.idempotency?.supported === false) return undefined;
     if (capabilities.idempotency) {
       assertValidIdempotencyReplayTtlSeconds(capabilities.idempotency.replayTtlSeconds);
       return capabilities.idempotency.replayTtlSeconds;
@@ -7030,7 +8408,24 @@ export class SingleAgentClient {
    * result set. A pre-3.1 client pin should not silently drop those controls
    * or let a generic schema error hide the recovery path.
    */
-  private assertRequestSupportedByConfiguredVersion(taskName: string, params: unknown, _options?: TaskOptions): void {
+  private assertRequestSupportedByConfiguredVersion(
+    taskName: string,
+    params: unknown,
+    _options?: TaskOptions,
+    canonicalCreativeInvocation = false
+  ): void {
+    const configuredVersion = this.config.wireAdcpVersion ?? this.resolvedAdcpVersion;
+    const beta6Issue = beta6ReportingRequestIssue(taskName, params);
+    if (beta6Issue && !isAdcpVersionAtLeast(configuredVersion, '3.2.0-beta.6')) {
+      this.throwBeta6ReportingUnsupported(taskName, beta6Issue, configuredVersion);
+    }
+    if (
+      taskName === 'preview_creative' &&
+      canonicalCreativeInvocation &&
+      isPre32AdcpVersion(this.config.wireAdcpVersion ?? this.resolvedAdcpVersion)
+    ) {
+      this.throwCanonicalPreviewUnsupported(this.config.wireAdcpVersion ?? this.resolvedAdcpVersion);
+    }
     if (!isPre31AdcpVersion(this.resolvedAdcpVersion)) return;
     const request =
       params && typeof params === 'object' && !Array.isArray(params) ? (params as Record<string, unknown>) : {};
@@ -7117,8 +8512,51 @@ export class SingleAgentClient {
   private assertRequestSupportedByTargetVersion(
     taskName: string,
     params: unknown,
-    capabilities: AdcpCapabilities | undefined
+    capabilities: AdcpCapabilities | undefined,
+    canonicalCreativeInvocation = false,
+    serverVersion?: 'v2' | 'v3'
   ): void {
+    const beta6Issue = beta6ReportingRequestIssue(taskName, params);
+    if (beta6Issue) {
+      const advertisedVersions = capabilities?.supportedVersions ?? [];
+      const responseVersion =
+        typeof capabilities?._raw?.adcp_version === 'string' ? capabilities._raw.adcp_version : undefined;
+      const supportsBeta6 =
+        advertisedVersions.some(version => isAdcpVersionAtLeast(version, '3.2.0-beta.6')) ||
+        (advertisedVersions.length === 0 && isAdcpVersionAtLeast(responseVersion, '3.2.0-beta.6'));
+      const hasAuthoritativeLegacyEvidence =
+        serverVersion === 'v2' ||
+        advertisedVersions.length > 0 ||
+        responseVersion !== undefined ||
+        (capabilities?._synthetic === false && capabilities?.version === 'v3');
+      if (!supportsBeta6 && hasAuthoritativeLegacyEvidence) {
+        this.throwBeta6ReportingUnsupported(
+          taskName,
+          beta6Issue,
+          advertisedVersions.join(', ') || responseVersion || serverVersion || capabilities?.version || 'unknown',
+          'the target seller does not advertise AdCP 3.2.0-beta.6 support'
+        );
+      }
+    }
+    if (taskName === 'preview_creative' && canonicalCreativeInvocation) {
+      const advertisedVersions = capabilities?.supportedVersions ?? [];
+      const responseVersion =
+        typeof capabilities?._raw?.adcp_version === 'string' ? capabilities._raw.adcp_version : undefined;
+      const supports32 =
+        advertisedVersions.some(version => !isPre32AdcpVersion(version)) ||
+        (advertisedVersions.length === 0 && responseVersion !== undefined && !isPre32AdcpVersion(responseVersion));
+      const hasAuthoritativeLegacyEvidence =
+        serverVersion === 'v2' ||
+        advertisedVersions.length > 0 ||
+        responseVersion !== undefined ||
+        (capabilities?._synthetic === false && capabilities?.version === 'v3');
+      if (!supports32 && hasAuthoritativeLegacyEvidence) {
+        this.throwCanonicalPreviewUnsupported(
+          advertisedVersions.join(', ') || responseVersion || serverVersion || capabilities?.version || 'unknown',
+          'the target seller does not advertise AdCP 3.2 support'
+        );
+      }
+    }
     if (isPre31AdcpVersion(this.resolvedAdcpVersion)) return;
     // supportedVersions is the authoritative negotiation field. Legacy 3.0
     // sellers omit it; buildVersion is advisory and must not select a newer
@@ -7167,6 +8605,48 @@ export class SingleAgentClient {
         current_version: currentVersion,
         tool: taskName,
         field,
+      },
+    });
+  }
+
+  private throwBeta6ReportingUnsupported(
+    taskName: string,
+    issue: Beta6DeliveryRequestIssue,
+    currentVersion: string,
+    incompatibility = `this client is pinned to ${currentVersion}`
+  ): never {
+    const suggestion = 'Negotiate AdCP 3.2.0-beta.6 or omit the beta.6 reporting field or metric.';
+    throw new ProtocolFeatureUnsupportedError([`${taskName}.${issue.field}`], [], this.agent.agent_uri, {
+      message: `${taskName} ${issue.field} requires AdCP 3.2.0-beta.6 or later; ${incompatibility}. ${suggestion}`,
+      field: issue.field,
+      suggestion,
+      details: {
+        feature: `${taskName}.${issue.field}`,
+        required_version: '3.2.0-beta.6',
+        capability_path: 'adcp.supported_versions',
+        current_version: currentVersion,
+        tool: taskName,
+        field: issue.field,
+      },
+    });
+  }
+
+  private throwCanonicalPreviewUnsupported(currentVersion: string, incompatibility?: string): never {
+    const suggestion =
+      'Use previewCreativeLegacy() for format_id-based sellers, or negotiate AdCP 3.2 before calling previewCreative().';
+    throw new ProtocolFeatureUnsupportedError(['preview_creative.canonical_identity'], [], this.agent.agent_uri, {
+      message:
+        `preview_creative canonical identity requires AdCP 3.2 or later; ` +
+        `${incompatibility ?? `this client is pinned to ${currentVersion}`}. ${suggestion}`,
+      field: 'target_capability_id',
+      suggestion,
+      details: {
+        feature: 'preview_creative.canonical_identity',
+        required_version: '3.2',
+        capability_path: 'adcp.supported_versions',
+        current_version: currentVersion,
+        tool: 'preview_creative',
+        field: 'target_capability_id',
       },
     });
   }
@@ -7498,6 +8978,126 @@ function isBareDeliveryReport(payload: Record<string, unknown>): boolean {
   );
 }
 
+/**
+ * Accept both A2A 1.0 JSON/protobuf envelopes and the SDK's 0.3 compatibility
+ * objects. A2A 1.0 removes the `kind` discriminator and wraps response/event
+ * variants in a oneof (`task`, `statusUpdate`, or an in-memory `payload`).
+ */
+function normalizeA2AWebhookEnvelope(payload: Record<string, unknown>): Record<string, any> | undefined {
+  if (payload.kind === 'task' || payload.kind === 'status-update') return payload;
+
+  const oneof = isObjectRecord(payload.payload) ? payload.payload : undefined;
+  const oneofCase = oneof?.$case;
+  const oneofValue = isObjectRecord(oneof?.value) ? oneof.value : undefined;
+  if (oneofValue && oneofCase === 'task') return { ...oneofValue, kind: 'task' };
+  if (oneofValue && oneofCase === 'statusUpdate') return { ...oneofValue, kind: 'status-update' };
+
+  if (isObjectRecord(payload.task)) return { ...payload.task, kind: 'task' };
+  if (isObjectRecord(payload.statusUpdate)) return { ...payload.statusUpdate, kind: 'status-update' };
+
+  if (typeof payload.id === 'string' && isObjectRecord(payload.status) && Array.isArray(payload.artifacts)) {
+    return { ...payload, kind: 'task' };
+  }
+  if (typeof payload.taskId === 'string' && isObjectRecord(payload.status) && !('artifact' in payload)) {
+    return { ...payload, kind: 'status-update' };
+  }
+  return undefined;
+}
+
+function a2aWebhookPartValue(part: unknown, expectedCase: 'data' | 'text'): unknown {
+  if (!isObjectRecord(part)) return undefined;
+  if (part.kind === expectedCase) return part[expectedCase];
+  if (part.kind === undefined && Object.hasOwn(part, expectedCase)) return part[expectedCase];
+  const content = isObjectRecord(part.content) ? part.content : undefined;
+  return content?.$case === expectedCase ? content.value : undefined;
+}
+
+function latestA2AWebhookMessageData(parts: unknown): Record<string, unknown> | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const data = a2aWebhookPartValue(parts[index], 'data');
+    if (!isObjectRecord(data)) continue;
+    return data;
+  }
+  return undefined;
+}
+
+function latestA2AWebhookTextParts(parts: unknown): string[] {
+  if (!Array.isArray(parts)) return [];
+  return parts
+    .map(part => a2aWebhookPartValue(part, 'text'))
+    .filter((value): value is string => typeof value === 'string');
+}
+
+type SignedWebhookRoute = {
+  operationId?: string;
+  taskType?: string;
+  agentId?: string;
+};
+
+function extractSignedWebhookRoute(
+  payload: unknown
+): ({ ok: true } & SignedWebhookRoute) | { ok: false; message: string } {
+  if (!isObjectRecord(payload)) return { ok: true };
+  const normalizedA2A = normalizeA2AWebhookEnvelope(payload);
+  const records: Record<string, unknown>[] = [payload];
+  if (normalizedA2A) {
+    records.length = 0;
+    const status = isObjectRecord(normalizedA2A.status) ? normalizedA2A.status : undefined;
+    const message = isObjectRecord(status?.message) ? status.message : undefined;
+    const messageData = latestA2AWebhookMessageData(message?.parts);
+    if (messageData) records.push(messageData);
+    if (normalizedA2A.kind === 'task') {
+      const artifactData = getLatestA2ADataPartFromTask(normalizedA2A as unknown as A2ATask)?.data;
+      if (artifactData) records.push(artifactData);
+    }
+  }
+
+  const oneValue = (field: 'operation_id' | 'task_type' | 'agent_id'): string | undefined | null => {
+    const values = new Set(
+      records
+        .map(record => record[field])
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    );
+    return values.size > 1 ? null : values.values().next().value;
+  };
+  const operationId = oneValue('operation_id');
+  const taskType = oneValue('task_type');
+  const agentId = oneValue('agent_id');
+  if (operationId === null || taskType === null || agentId === null) {
+    return {
+      ok: false,
+      message: 'Authenticated webhook contains contradictory signed routing fields.',
+    };
+  }
+  return {
+    ok: true,
+    ...(operationId !== undefined && { operationId }),
+    ...(taskType !== undefined && { taskType }),
+    ...(agentId !== undefined && { agentId }),
+  };
+}
+
+function legacyA2AArtifactStatus(
+  payload: A2ATask | TaskStatusUpdateEvent,
+  artifact: unknown
+): NormalizedWebhookPayload['status'] | undefined {
+  if (payload.kind !== 'task' || !isObjectRecord(artifact) || typeof artifact.name !== 'string') return undefined;
+  const transportState = payload.status?.state;
+  if (
+    artifact.name === 'result' &&
+    (transportState === 'completed' || transportState === 'TASK_STATE_COMPLETED' || transportState === 3)
+  )
+    return 'completed';
+  if (artifact.name !== 'error') return undefined;
+  if (transportState === 'failed' || transportState === 'TASK_STATE_FAILED' || transportState === 4) return 'failed';
+  if (transportState === 'rejected' || transportState === 'TASK_STATE_REJECTED' || transportState === 7)
+    return 'rejected';
+  if (transportState === 'canceled' || transportState === 'TASK_STATE_CANCELED' || transportState === 5)
+    return 'canceled';
+  return undefined;
+}
+
 function isMcpWebhookCandidate(payload: Record<string, unknown>): boolean {
   return (
     MCP_WEBHOOK_REQUIRED_FIELDS.some(field => field in payload) ||
@@ -7517,10 +9117,13 @@ function missingMcpWebhookFields(payload: Record<string, unknown>): string[] {
 function webhookErrorHttpStatus(error: unknown): number {
   if (error instanceof WebhookDispatchError) {
     if (error.code === 'webhook_signature_replayed') return 409;
+    if (error.code === 'webhook_idempotency_conflict') return 409;
     if (error.code === 'webhook_signature_rate_abuse') return 429;
     if (
       error.code === 'webhook_registration_store_unavailable' ||
       error.code === 'webhook_verification_unavailable' ||
+      error.code === 'webhook_durable_settlement_unavailable' ||
+      error.code === 'webhook_publication_in_progress' ||
       error.code === 'webhook_signature_revocation_stale'
     ) {
       return 503;

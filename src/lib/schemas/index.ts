@@ -40,12 +40,44 @@
  * ```
  */
 
-import type { z } from 'zod';
+import { z } from 'zod';
 import * as schemas from '../types/schemas.generated';
+import { GetProductsRequest_FieldsValues } from '../types/inline-enums.generated';
+import type { CanonicalGetProductsRequest } from '../v2/projection/creative-delivery';
 import { TOOL_REQUEST_SCHEMAS } from '../utils/tool-request-schemas';
 import type { KnownToolRequestSchemas } from '../utils/tool-request-schemas';
+import {
+  getToolSchemaDocument,
+  type ResolvedToolSchemaDocument,
+  type ResponseVariant,
+} from '../validation/schema-loader';
+import { resolveAdcpVersion } from '../utils/adcp-version-config';
 
 export * from '../types/schemas.generated';
+
+type LooseObjectSchemaFor<T extends object> = z.ZodObject<
+  {
+    [K in keyof T]-?: undefined extends T[K]
+      ? z.ZodOptional<z.ZodType<Exclude<T[K], undefined>, Exclude<T[K], undefined>>>
+      : z.ZodType<T[K], T[K]>;
+  },
+  z.core.$loose
+> &
+  z.ZodType<T & Record<string, unknown>, T & Record<string, unknown>>;
+
+/** Wire-compatible request schema, including the legacy `format_ids` selector. */
+export const LegacyGetProductsRequestSchema = schemas.GetProductsRequestSchema;
+
+type CanonicalGetProductsField = NonNullable<CanonicalGetProductsRequest['fields']>[number];
+const canonicalGetProductsFields = GetProductsRequest_FieldsValues.filter(
+  (field): field is CanonicalGetProductsField => field !== 'format_ids'
+) as [CanonicalGetProductsField, ...CanonicalGetProductsField[]];
+
+/** Primary request schema; legacy `format_ids` selection is rejected. */
+export const GetProductsRequestSchema = schemas.GetProductsRequestSchema.safeExtend({
+  fields: z.array(z.enum(canonicalGetProductsFields)).optional(),
+}) as unknown as LooseObjectSchemaFor<CanonicalGetProductsRequest>;
+
 export { BiddingPolicySchema } from '../validation/bidding-policy';
 export { CanonicalBudgetAllocationSchema } from '../validation/budget-allocation';
 export { TOOL_REQUEST_SCHEMAS } from '../utils/tool-request-schemas';
@@ -57,6 +89,34 @@ export {
   SyncCreativesActionSchema,
 } from '../validation/sync-creatives';
 export type { SyncCreativesItem, SyncCreativesSuccessStrict } from '../validation/sync-creatives';
+
+export interface ToolSchemaLookupOptions {
+  /** AdCP release/minor/legacy alias resolved through the bundled schema loader. */
+  adcpVersion?: string;
+}
+
+export interface ToolResponseSchemaLookupOptions extends ToolSchemaLookupOptions {
+  /** Response arm to retrieve. Defaults to the synchronous response schema. */
+  variant?: ResponseVariant;
+}
+
+export type VersionedToolSchema = ResolvedToolSchemaDocument;
+
+/** Retrieve the protocol-authored request JSON Schema for a specific AdCP release. */
+export function getToolInputSchema(
+  toolName: string,
+  options: ToolSchemaLookupOptions = {}
+): VersionedToolSchema | undefined {
+  return getToolSchemaDocument(toolName, 'request', resolveAdcpVersion(options.adcpVersion));
+}
+
+/** Retrieve a protocol-authored response JSON Schema for a specific AdCP release. */
+export function getToolResponseSchema(
+  toolName: string,
+  options: ToolResponseSchemaLookupOptions = {}
+): VersionedToolSchema | undefined {
+  return getToolSchemaDocument(toolName, options.variant ?? 'sync', resolveAdcpVersion(options.adcpVersion));
+}
 
 type InputShape = Record<string, z.ZodType>;
 type InputSchema = z.ZodType;

@@ -311,7 +311,18 @@ Building a server that receives AdCP tool calls? **v6 (recommended for new agent
 
 ```typescript
 import { serve } from '@adcp/sdk';
-import { createAdcpServerFromPlatform, definePlatform, defineSalesCorePlatform, refAccountId } from '@adcp/sdk/server';
+import {
+  createAdcpServerFromPlatform,
+  createIdempotencyStore,
+  definePlatform,
+  defineSalesCorePlatform,
+  memoryBackend,
+  refAccountId,
+} from '@adcp/sdk/server';
+
+// Single-process example. Use pgBackend(pool) or redisBackend(client) for
+// durable, replica-safe production replay.
+const idempotency = createIdempotencyStore({ backend: memoryBackend(), ttlSeconds: 86400 });
 
 const platform = definePlatform({
   capabilities: {
@@ -344,7 +355,7 @@ const platform = definePlatform({
   }),
 });
 
-serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', version: '1.0.0' }));
+serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', version: '1.0.0', idempotency }));
 ```
 
 `RequiredPlatformsFor<S>` enforces specialism claims at compile time — claim `'sales-non-guaranteed'` and the typechecker requires `SalesCorePlatform & SalesIngestionPlatform` on `sales`. `creative-template` and `creative-generative` claims both map to `CreativeBuilderPlatform`; `creative-ad-server` is its own archetype with `listCreatives` + `getCreativeDelivery`.
@@ -584,6 +595,7 @@ extension tools intentionally use that explicit raw-task route.
 - `syncCreatives()` - Upload/sync creative assets
 - `listCreatives()` - List creative assets
 - `buildCreativeLegacy()` - Build through the legacy named-format protocol (migration tooling only)
+- `previewCreative()` - Preview by advertised capability, inline manifest, or creative-library ID
 - `previewCreativeLegacy()` - Preview through the legacy named-format protocol (migration tooling only)
 - `getMediaBuyDelivery()` - Get delivery performance
 

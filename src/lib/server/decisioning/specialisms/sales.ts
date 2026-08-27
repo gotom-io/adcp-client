@@ -63,6 +63,7 @@
 import type { Account, NoAccountCtx } from '../account';
 import type { RequestContext } from '../context';
 import type { TaskHandoff } from '../async-outcome';
+import type { ResponseWithSummary } from '../response-summary';
 import type { RequireCacheScopeWhenProducts, ServerPayload } from '../../../types/server-payload';
 import type {
   GetProductsRequest,
@@ -102,6 +103,8 @@ import type {
   CanonicalProduct,
   CanonicalUpdateMediaBuyRequest,
 } from '../../../v2/projection/creative-delivery';
+import type { ProjectionCatalogSnapshot } from '../../../v2/projection/catalog-snapshot';
+import type { V1ProductInput } from '../../../v2/projection/types';
 
 type SyncCreative = CanonicalSyncCreativeAsset;
 type Ctx<TCtxMeta> = RequestContext<Account<TCtxMeta>>;
@@ -110,8 +113,12 @@ type ExclusivePayload<TLeft, TRight> =
   | (TRight & { [K in Exclude<keyof TLeft, keyof TRight>]?: never });
 type LegacyMediaBuyStatusInput<T> = T & { status?: MediaBuyStatus };
 
+export type GetProductsProjectionInput = (CanonicalProduct | V1ProductInput) & {
+  /** Exact owner-scoped aliases used only while projecting this product; never emitted on the wire. */
+  projectionCatalogs?: readonly ProjectionCatalogSnapshot[];
+};
 type CanonicalGetProductsPayload = Omit<ServerPayload<CanonicalCreativeResponse<GetProductsResponse>>, 'products'> & {
-  products?: CanonicalProduct[];
+  products?: GetProductsProjectionInput[];
 };
 export type GetProductsPayload = RequireCacheScopeWhenProducts<CanonicalGetProductsPayload>;
 type CreateMediaBuySuccessPayload = LegacyMediaBuyStatusInput<
@@ -156,7 +163,15 @@ export type RefineProposalsPayload = AdcpToolMap['refine_proposals']['result'];
  * with `{ creatives: [...] }` to form `SyncCreativesSuccess`.
  */
 export type SyncCreativesRow = SyncCreativesSuccess['creatives'][number];
-export type GetProductsHandlerResult = GetProductsPayload | TaskHandoff<GetProductsPayload>;
+/**
+ * Native product discovery result. Use `withResponseSummary(payload, text)`
+ * for a synchronous MCP text override while the SDK retains payload projection
+ * and validation; task handoffs continue to resolve to structured payloads.
+ */
+export type GetProductsHandlerResult =
+  | GetProductsPayload
+  | ResponseWithSummary<GetProductsPayload>
+  | TaskHandoff<GetProductsPayload>;
 export type CreateMediaBuyHandlerResult = CreateMediaBuyPayload | TaskHandoff<CreateMediaBuySuccessPayload>;
 export type UpdateMediaBuyHandlerResult = UpdateMediaBuyPayload | TaskHandoff<UpdateMediaBuyPayload>;
 export type SyncCreativesHandlerResult = SyncCreativesRow[] | TaskHandoff<SyncCreativesRow[]>;

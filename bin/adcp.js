@@ -52,6 +52,8 @@ const {
 const { scheduleVersionCheck } = require('./adcp-version-check.js');
 const { formatStoryboardResultsAsJUnit } = require('../dist/lib/testing/storyboard/junit.js');
 const { LIBRARY_VERSION } = require('../dist/lib/version.js');
+const { appendBuiltInVersionUnsupportedHint } = require('./adcp-version-unsupported-hint.js');
+const { sandboxRunOptions } = require('./adcp-storyboard-sandbox.js');
 const {
   createCLIOAuthProvider,
   hasValidOAuthTokens,
@@ -1048,12 +1050,18 @@ function parseAgentOptions(args) {
   const debug = args.includes('--debug') || process.env.ADCP_DEBUG === 'true';
   const dryRun = args.includes('--dry-run');
   const allowHttp = args.includes('--allow-http');
-  // `--no-sandbox` forces `account.sandbox: false` (production) on every
-  // request the runner builds. The default behavior leaves the field unset
-  // (spec-equivalent to false), but agents that key sandbox routing on
-  // field PRESENCE rather than VALUE behave differently. Setting the flag
-  // makes the production intent explicit on the wire.
+  // Migration escape hatch for compatibility harnesses that are testing
+  // transport/version behavior against a known schema-invalid legacy seller.
+  // Normal local compliance runs remain strict by default.
+  const strictResponseSchemaValidation = !args.includes('--no-strict-response-schema-validation');
+  // Direct storyboard runs can explicitly choose sandbox or production
+  // routing. Leaving both flags absent preserves the historical wire shape.
+  const sandbox = args.includes('--sandbox');
   const noSandbox = args.includes('--no-sandbox');
+  if (sandbox && noSandbox) {
+    console.error('Error: --sandbox and --no-sandbox are mutually exclusive.');
+    process.exit(2);
+  }
 
   // `--asserts-seeded-state` declares that the operator has provisioned
   // initial test state out-of-band (HTTP admin endpoint, pre-test script,
@@ -1232,6 +1240,8 @@ function parseAgentOptions(args) {
     debug,
     dryRun,
     allowHttp,
+    strictResponseSchemaValidation,
+    sandbox,
     noSandbox,
     assertsSeededState,
     mediaBuyLifecycleCompatibility,
@@ -1488,13 +1498,13 @@ function loadTestKitFile(testKitPath) {
   try {
     raw = fs.readFileSync(resolved, 'utf8');
   } catch (err) {
-    throw new Error(`failed to read test-kit at ${resolved}: ${err.message}`);
+    throw new Error(`failed to read test-kit at ${resolved} (${err?.code || 'filesystem error'}).`);
   }
   try {
     const { parse } = require('yaml');
     return parse(raw);
-  } catch (err) {
-    throw new Error(`failed to parse ${resolved} as YAML: ${err.message}`);
+  } catch {
+    throw new Error(`failed to parse test-kit at ${resolved} as YAML.`);
   }
 }
 
@@ -2011,6 +2021,11 @@ SUBCOMMANDS:
   step <agent> <id> <step_id>  Run a single step (stateless, LLM-friendly)
 
 RUN OPTIONS (full assessment):
+  Response-schema checks are strict and grading by default, matching the
+  hosted compliance grader. JSON output includes strict_validation_summary.
+  --no-strict-response-schema-validation
+                      Keep packaged-schema strict failures diagnostic-only.
+                      Intended only for temporary legacy migration harnesses.
   --tracks TRACKS     Comma-separated tracks to include in the report
   --storyboards IDS   Comma-separated storyboard/bundle IDs to run
   --compliance-version VERSION
@@ -2020,20 +2035,27 @@ RUN OPTIONS (full assessment):
                       --test-kit points into a compliance cache, its version is
                       selected automatically; an explicit mismatch is rejected.
   --compliance-dir PATH
-                      Use a specific compliance cache directory
+                      Use a specific compliance cache directory. For --file
+                      storyboards, this explicitly authorizes a cache-relative
+                      prerequisites.test_kit. --compliance-version alone does
+                      not authorize credential loading; pass --test-kit instead.
   --schema-root PATH  Use a specific schema bundle/root for validation.
                       --validator-source is accepted as an alias.
   --hosted-stable-line-alias VERSION
                       Hosted badge mode: allow a stable line (e.g. 3.1)
                       to resolve against a prerelease compliance cache.
   --file PATH         Run an ad-hoc storyboard YAML (spec evolution)
-  --test-kit PATH     Load test-kit YAML. If an ancestor index.json declares
+  --test-kit PATH     Load test-kit YAML for either run or step, overriding any
+                      cache-declared kit. If an ancestor index.json declares
                       adcp_version or published_version, the same compliance
                       line is required for storyboard resolution.
   --timeout SECONDS   Soft budget in seconds: stop starting new storyboards
                       after this budget, without aborting an active storyboard
                       (default: max(120, 10 × selected storyboard count))
   --brief TEXT        Custom brief for product discovery
+  --sandbox           Explicitly run against sandbox accounts. Sets
+                      account.sandbox=true and enables sandbox-only runner
+                      facilities such as functional request signing.
   --no-sandbox        Force production-path responses (#841). Sets
                       account.sandbox=false on every request AND stamps
                       ext.adcp.disable_sandbox=true to signal adopters
@@ -2675,6 +2697,27 @@ function enforceStrictFlags(args, removedFound) {
   }
 }
 
+async function resolveFileComplianceRunOptions(args, opts) {
+  let adcpVersion = opts.complianceVersion;
+  let complianceDir = opts.complianceDir;
+  let schemaRoot = opts.schemaRoot;
+  if (opts.complianceDir || opts.complianceVersion || opts.schemaRoot) {
+    const { loadComplianceIndex, getExternalSchemaRootForCompliance } =
+      await import('../dist/lib/testing/storyboard/index.js');
+    const resolveOptions = parseComplianceSelection(args).resolveOptions;
+    const index = loadComplianceIndex(resolveOptions);
+    if (opts.complianceVersion && index.adcp_version !== opts.complianceVersion) {
+      throw new Error(
+        `--compliance-version ${opts.complianceVersion} selected a compliance cache that declares ` +
+          `AdCP ${index.adcp_version}. Check --compliance-dir or ADCP_COMPLIANCE_DIR and select a matching cache.`
+      );
+    }
+    adcpVersion = adcpVersion || index.adcp_version;
+    schemaRoot = schemaRoot || getExternalSchemaRootForCompliance(resolveOptions, index.adcp_version);
+  }
+  return { adcpVersion, complianceDir, schemaRoot };
+}
+
 async function handleStoryboardRun(args) {
   let opts = parseAgentOptions(args);
   let {
@@ -2779,8 +2822,7 @@ async function handleStoryboardRun(args) {
     return;
   }
 
-  const { loadStoryboardFile, runStoryboard, loadComplianceIndex, getExternalSchemaRootForCompliance } =
-    await import('../dist/lib/testing/storyboard/index.js');
+  const { loadStoryboardFile, runStoryboard } = await import('../dist/lib/testing/storyboard/index.js');
   let storyboard;
   try {
     storyboard = loadStoryboardFile(filePath);
@@ -2788,18 +2830,12 @@ async function handleStoryboardRun(args) {
     console.error(`Failed to load storyboard from ${filePath}: ${err.message}`);
     process.exit(2);
   }
-  let fileComplianceVersion = opts.complianceVersion;
-  let fileSchemaRoot = opts.schemaRoot;
-  if (opts.complianceDir || opts.complianceVersion || opts.schemaRoot) {
-    try {
-      const resolveOptions = parseComplianceSelection(args).resolveOptions;
-      const index = loadComplianceIndex(resolveOptions);
-      fileComplianceVersion = fileComplianceVersion || index.adcp_version;
-      fileSchemaRoot = fileSchemaRoot || getExternalSchemaRootForCompliance(resolveOptions, index.adcp_version);
-    } catch (err) {
-      console.error(`ERROR: ${err.message}`);
-      process.exit(2);
-    }
+  let fileComplianceOptions;
+  try {
+    fileComplianceOptions = await resolveFileComplianceRunOptions(args, opts);
+  } catch (err) {
+    console.error(`ERROR: ${err.message}`);
+    process.exit(2);
   }
 
   const {
@@ -2873,8 +2909,6 @@ async function handleStoryboardRun(args) {
     ? await resolveWebhookReceiverOptions(args, { jsonOutput })
     : webhookReceiverBase;
 
-  const loadedTestKit = opts.loadedTestKit ?? null;
-
   const options = {
     protocol,
     ...buildResolvedAuthOption({
@@ -2885,15 +2919,17 @@ async function handleStoryboardRun(args) {
       resolvedOauthClientCredentials,
     }),
     ...(webhookReceiverOpts ?? {}),
-    ...(fileComplianceVersion && { adcpVersion: fileComplianceVersion }),
-    ...(fileSchemaRoot && { schemaRoot: fileSchemaRoot }),
-    ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
+    ...(fileComplianceOptions.complianceDir && { complianceDir: fileComplianceOptions.complianceDir }),
+    ...(fileComplianceOptions.adcpVersion && { adcpVersion: fileComplianceOptions.adcpVersion }),
+    ...(fileComplianceOptions.schemaRoot && { schemaRoot: fileComplianceOptions.schemaRoot }),
+    ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
+    ...sandboxRunOptions(opts),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
     ...(opts.mediaBuyLifecycleCompatibility && {
       mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
     }),
     ...(mergedRunHeaders && { headers: mergedRunHeaders }),
-    ...(loadedTestKit && { test_kit: loadedTestKit }),
+    ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -3726,25 +3762,17 @@ async function handleLocalAgentStoryboardRun(modulePath, args, opts) {
       createAgent,
       storyboards: storyboardsSpec,
       compliance: resolveOptions,
-      ...(opts.complianceVersion ||
-      opts.schemaRoot ||
-      opts.noSandbox ||
-      opts.assertsSeededState ||
-      opts.mediaBuyLifecycleCompatibility ||
-      opts.loadedTestKit
-        ? {
-            runStoryboardOptions: {
-              ...(opts.complianceVersion && !opts.complianceDir && { adcpVersion: opts.complianceVersion }),
-              ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
-              ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
-              ...(opts.assertsSeededState && { assertsSeededState: true }),
-              ...(opts.mediaBuyLifecycleCompatibility && {
-                mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
-              }),
-              ...(opts.loadedTestKit && { test_kit: opts.loadedTestKit }),
-            },
-          }
-        : {}),
+      runStoryboardOptions: {
+        ...sandboxRunOptions(opts),
+        ...(opts.complianceVersion && !opts.complianceDir && { adcpVersion: opts.complianceVersion }),
+        ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
+        ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
+        ...(opts.assertsSeededState && { assertsSeededState: true }),
+        ...(opts.mediaBuyLifecycleCompatibility && {
+          mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
+        }),
+        ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+      },
       onStoryboardComplete:
         jsonOutput || format === 'junit'
           ? undefined
@@ -4026,6 +4054,21 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
     }
   }
 
+  let runAdcpVersion = opts.complianceVersion && !opts.complianceDir ? opts.complianceVersion : undefined;
+  let runComplianceDir = opts.complianceDir;
+  let runSchemaRoot = opts.schemaRoot;
+  if (filePath) {
+    try {
+      const selected = await resolveFileComplianceRunOptions(args, opts);
+      runAdcpVersion = selected.adcpVersion;
+      runComplianceDir = selected.complianceDir;
+      runSchemaRoot = selected.schemaRoot;
+    } catch (err) {
+      console.error(`ERROR: ${err.message}`);
+      process.exit(2);
+    }
+  }
+
   // Auto-detect protocol from the first URL. Multi-instance deployments
   // share a codebase across replicas, so one probe is representative.
   let protocol = protocolFlag;
@@ -4154,14 +4197,16 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
     ...(opts.allowHttp && { allow_http: true }),
     multi_instance_strategy: strategy,
     ...(webhookReceiverOpts ?? {}),
-    ...(opts.complianceVersion && !opts.complianceDir && { adcpVersion: opts.complianceVersion }),
-    ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
-    ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
+    ...(runComplianceDir && { complianceDir: runComplianceDir }),
+    ...(runAdcpVersion && { adcpVersion: runAdcpVersion }),
+    ...(runSchemaRoot && { schemaRoot: runSchemaRoot }),
+    ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
+    ...sandboxRunOptions(opts),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
     ...(opts.mediaBuyLifecycleCompatibility && {
       mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
     }),
-    ...(opts.loadedTestKit && { test_kit: opts.loadedTestKit }),
+    ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -4336,6 +4381,21 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
     }
   }
 
+  let runAdcpVersion = opts.complianceVersion && !opts.complianceDir ? opts.complianceVersion : undefined;
+  let runComplianceDir = opts.complianceDir;
+  let runSchemaRoot = opts.schemaRoot;
+  if (filePath) {
+    try {
+      const selected = await resolveFileComplianceRunOptions(args, opts);
+      runAdcpVersion = selected.adcpVersion;
+      runComplianceDir = selected.complianceDir;
+      runSchemaRoot = selected.schemaRoot;
+    } catch (err) {
+      console.error(`ERROR: ${err.message}`);
+      process.exit(2);
+    }
+  }
+
   // Detect protocol from the first agent. Multi-agent topologies typically
   // share the same transport (the prod test-agent uses MCP across all 6
   // tenants), so one probe is representative. Per-agent transport overrides
@@ -4421,14 +4481,16 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
     agents: routing.agents,
     ...(routing.default_agent ? { default_agent: routing.default_agent } : {}),
     ...(webhookReceiverOpts ?? {}),
-    ...(opts.complianceVersion && !opts.complianceDir && { adcpVersion: opts.complianceVersion }),
-    ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
-    ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
+    ...(runComplianceDir && { complianceDir: runComplianceDir }),
+    ...(runAdcpVersion && { adcpVersion: runAdcpVersion }),
+    ...(runSchemaRoot && { schemaRoot: runSchemaRoot }),
+    ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
+    ...sandboxRunOptions(opts),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
     ...(opts.mediaBuyLifecycleCompatibility && {
       mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
     }),
-    ...(opts.loadedTestKit && { test_kit: opts.loadedTestKit }),
+    ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -4628,8 +4690,6 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
 
   await loadInvariantModules(rawArgs);
 
-  const loadedTestKit = opts.loadedTestKit ?? null;
-
   const testOptions = {
     protocol,
     brief: opts.brief,
@@ -4640,16 +4700,18 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     ...(authOption && { auth: authOption }),
     ...(opts.allowHttp && { allow_http: true }),
     ...(webhookReceiverOpts ?? {}),
-    ...(opts.noSandbox && { sandbox: false, disable_sandbox: true }),
+    ...sandboxRunOptions(opts),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
     ...(opts.mediaBuyLifecycleCompatibility && {
       mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
     }),
     ...(mergedAssessmentHeaders && { headers: mergedAssessmentHeaders }),
-    ...(loadedTestKit && { test_kit: loadedTestKit }),
+    ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+    ...(opts.testKitPath && { testKitPath: path.resolve(opts.testKitPath) }),
     ...(opts.complianceVersion && { version: opts.complianceVersion }),
     ...(opts.complianceDir && { complianceDir: opts.complianceDir }),
     ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
+    ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
     ...(opts.hostedStableLineAlias && { hostedStableLineAlias: opts.hostedStableLineAlias }),
   };
 
@@ -4727,7 +4789,8 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
       setAgentTesterLogger({ info: () => {}, error: () => {}, warn: () => {}, debug: () => {} });
     }
 
-    const result = await comply(agentUrl, testOptions);
+    let result = await comply(agentUrl, testOptions);
+    result = appendBuiltInVersionUnsupportedHint(result, agentArg, BUILT_IN_AGENTS);
 
     if (opts.summaryFile) {
       writeSummaryFile(opts.summaryFile, buildComplianceSummaryMarkdown(result, agentUrl));
@@ -4790,7 +4853,8 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
 
 async function handleStoryboardStepCmd(args) {
   const { getComplianceStoryboardById, runStoryboardStep } = await import('../dist/lib/testing/storyboard/index.js');
-  const {
+  let opts = parseAgentOptions(args);
+  let {
     authToken,
     authScheme,
     protocolFlag,
@@ -4798,11 +4862,32 @@ async function handleStoryboardStepCmd(args) {
     positionalArgs,
     complianceVersion,
     schemaRoot,
+    strictResponseSchemaValidation,
     mediaBuyLifecycleCompatibility,
-  } = parseAgentOptions(args);
-  const { resolveOptions } = parseComplianceSelection(args);
+  } = opts;
 
   enforceStrictFlags(args, warnRemovedFlags(args));
+
+  try {
+    const prepared = prepareTestKitComplianceSelection(args, opts);
+    args = prepared.args;
+    opts = prepared.opts;
+  } catch (err) {
+    await exitTestKitSelectionError(err, jsonOutput);
+  }
+
+  ({
+    authToken,
+    authScheme,
+    protocolFlag,
+    jsonOutput,
+    positionalArgs,
+    complianceVersion,
+    schemaRoot,
+    strictResponseSchemaValidation,
+    mediaBuyLifecycleCompatibility,
+  } = opts);
+  const { resolveOptions } = parseComplianceSelection(args);
 
   const agentArg = positionalArgs[0];
   const storyboardId = positionalArgs[1];
@@ -4853,8 +4938,12 @@ async function handleStoryboardStepCmd(args) {
     context,
     ...(contributions && { contributions }),
     request,
+    ...sandboxRunOptions(opts),
     ...(complianceVersion && { adcpVersion: complianceVersion }),
+    ...(opts.complianceDir && { complianceDir: opts.complianceDir }),
     ...(schemaRoot && { schemaRoot }),
+    ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+    ...(!strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
     ...(mediaBuyLifecycleCompatibility && {
       mediaBuyLifecycleCompatibility,
     }),

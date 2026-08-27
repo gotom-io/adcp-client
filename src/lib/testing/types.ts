@@ -7,6 +7,7 @@ import type { ControllerDetection } from './test-controller';
 import type { WebhookReceiver } from './storyboard/webhook-receiver';
 import type { AdcpVersion } from '../version';
 import type { TransportOptions, VersionEnvelopeMode } from '../protocols';
+import type { AgentRequestSigningConfig } from '../types/adcp';
 
 // Test scenarios that can be run
 export type TestScenario =
@@ -84,6 +85,15 @@ export interface TestOptions {
    */
   transport?: TransportOptions;
   /**
+   * RFC 9421 identity used for ordinary functional test/storyboard calls.
+   * Distinct from `StoryboardRunOptions.request_signing`, which configures
+   * the dedicated verifier-vector grader. Compliance runners populate this
+   * automatically from `signed-requests-runner.yaml > functional_dispatch`
+   * only for sandbox runs; callers may provide their own key/provider for a
+   * different trusted environment.
+   */
+  functional_request_signing?: AgentRequestSigningConfig;
+  /**
    * AdCP protocol version the test client should speak. Storyboard runners
    * set this from the compliance cache version instead of relying on the
    * installed package default.
@@ -116,6 +126,17 @@ export interface TestOptions {
    * authoritative over the SDK's generated Zod snapshot for the run.
    */
   schemaRoot?: string;
+  /**
+   * Whether strict AJV response-schema failures contribute to storyboard
+   * grading. Defaults to `true`, matching the hosted compliance grader.
+   *
+   * Set to `false` only for packaged-schema diagnostic migrations that need
+   * the historical lenient-Zod grade while inspecting
+   * `strict_validation_summary` and the per-validation `strict` verdicts.
+   * Strict validation still runs in that mode; it is informational rather
+   * than grading. An explicit external `schemaRoot` remains authoritative.
+   */
+  strictResponseSchemaValidation?: boolean;
   /** Custom User-Agent string sent with all outbound requests */
   userAgent?: string;
   // Brand reference for product discovery (preferred over brand_manifest)

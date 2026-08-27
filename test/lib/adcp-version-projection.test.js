@@ -4,7 +4,16 @@ const {
   sellerAdvertises31,
   shouldOmit31Fields,
   omit31BrandFields,
+  isAdcpVersionAtLeast,
 } = require('../../dist/lib/utils/adcp-version-config.js');
+
+test('isAdcpVersionAtLeast compares release-precision prerelease pins', () => {
+  assert.equal(isAdcpVersionAtLeast('3.2-beta.4', '3.2.0-beta.5'), false);
+  assert.equal(isAdcpVersionAtLeast('3.2-beta.5', '3.2.0-beta.5'), true);
+  assert.equal(isAdcpVersionAtLeast('3.2-beta.6', '3.2.0-beta.5'), true);
+  assert.equal(isAdcpVersionAtLeast('3.2.0', '3.2.0-beta.5'), true);
+  assert.equal(isAdcpVersionAtLeast('3.3.0', '3.2.0-beta.5'), true);
+});
 
 test('sellerAdvertises31: buildVersion is advisory and never used for negotiation', () => {
   assert.equal(sellerAdvertises31({ buildVersion: '3.1.0' }), false);
@@ -12,8 +21,8 @@ test('sellerAdvertises31: buildVersion is advisory and never used for negotiatio
 });
 test('sellerAdvertises31: true when supportedVersions contains a >=3.1 release', () => {
   assert.equal(sellerAdvertises31({ supportedVersions: ['3.0', '3.1'] }), true);
-  assert.equal(sellerAdvertises31({ _raw: { adcp_version: '3.2-beta.3' } }), true);
-  assert.equal(sellerAdvertises31({ supportedVersions: ['3.0'], _raw: { adcp_version: '3.2-beta.3' } }), false);
+  assert.equal(sellerAdvertises31({ _raw: { adcp_version: '3.2-beta.5' } }), true);
+  assert.equal(sellerAdvertises31({ supportedVersions: ['3.0'], _raw: { adcp_version: '3.2-beta.5' } }), false);
 });
 test('sellerAdvertises31: false for legacy 3.0-only sellers / missing fields', () => {
   assert.equal(sellerAdvertises31(undefined), false);

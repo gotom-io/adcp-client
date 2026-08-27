@@ -144,10 +144,10 @@ describe('storyboard runner AdCP version negotiation', () => {
 
     const options = applyStoryboardVersionOptions(
       { adcp_version: CURRENT_PRERELEASE_VERSION, compliance_dir: '/cache/3.2' },
-      { adcpVersion: '3.1.15' }
+      { adcpVersion: '3.1.18' }
     );
 
-    assert.strictEqual(options.adcpVersion, '3.1.15');
+    assert.strictEqual(options.adcpVersion, '3.1.18');
     assert.strictEqual(options.complianceDir, undefined);
   });
 
@@ -265,6 +265,15 @@ describe('storyboard runner AdCP version negotiation', () => {
         _client: shared,
         adcpVersion: CURRENT_PRERELEASE_VERSION,
         versionEnvelope: 'none',
+      }),
+      shared
+    );
+    assert.notStrictEqual(
+      getOrCreateClient('https://example.com/mcp', {
+        _client: shared,
+        adcpVersion: CURRENT_PRERELEASE_VERSION,
+        versionEnvelope: 'auto',
+        strictResponseSchemaValidation: false,
       }),
       shared
     );
@@ -1110,10 +1119,12 @@ describe('storyboard runner AdCP version negotiation', () => {
         complianceDir: '/tmp/compliance cache',
         schemaRoot: '/tmp/schema root',
         hostedStableLineAlias: '3.1',
+        testKitPath: '/tmp/test kit.yaml',
       }
     );
 
     assert.match(failures[0].fix_command, /--schema-root '\/tmp\/schema root'/);
     assert.match(failures[0].fix_command, /--hosted-stable-line-alias 3\.1/);
+    assert.match(failures[0].fix_command, /--test-kit '\/tmp\/test kit\.yaml'/);
   });
 });

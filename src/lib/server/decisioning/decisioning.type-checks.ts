@@ -67,6 +67,7 @@ import {
   AccountNotFoundError,
   defineSalesPlatform,
   defineSalesCorePlatform,
+  withResponseSummary,
   defineSalesIngestionPlatform,
   defineAudiencePlatform,
   defineSignalsPlatform,
@@ -74,6 +75,7 @@ import {
 } from './index';
 import type { ComplyControllerConfig } from '../../testing/comply-controller';
 import type { CanonicalListCreativesResponse } from '../../v2/projection/creative-delivery';
+import type { PostalArea } from '../../types/core.generated';
 import { getAccountMode } from '../account-mode';
 
 // ── AdcpError construction ────────────────────────────────────────────
@@ -266,6 +268,13 @@ function _signals_only_capabilities_compiles(): DecisioningCapabilities {
   };
 }
 
+function _standard_extension_capabilities_compile(): Pick<DecisioningCapabilities, 'extensions_supported' | 'ext'> {
+  return {
+    extensions_supported: ['example'] as const,
+    ext: { example: { feature: true } },
+  };
+}
+
 // Negative: channels rejects values outside the MediaChannel union.
 function _channels_rejects_unknown_channel(): Pick<DecisioningCapabilities, 'channels'> {
   // @ts-expect-error — 'billboard' is not a known MediaChannel value.
@@ -314,6 +323,32 @@ function _postal_area_support_accepts_native_and_deprecated_forms(): TargetingPo
     GB: ['outward'] as const,
     NL: ['postal_code'] as const,
     us_zip: true,
+  };
+}
+
+const _native_postal_area_with_values: PostalArea = {
+  country: 'US',
+  system: 'zip',
+  values: ['10001'],
+};
+
+// @ts-expect-error — native postal values are minItems: 1 on the wire.
+const _native_postal_area_rejects_empty_values: PostalArea = { country: 'US', system: 'zip', values: [] };
+
+type CreativeApprovalReadback = NonNullable<
+  GetMediaBuysPayload['media_buys'][number]['packages'][number]['creative_approvals']
+>[number];
+type CreativeApprovalRequiresCreativeId = {} extends Pick<CreativeApprovalReadback, 'creative_id'> ? false : true;
+const _creative_approval_requires_creative_id: CreativeApprovalRequiresCreativeId = true;
+
+function _creative_approval_readback_exposes_base_and_indicator_fields(): CreativeApprovalReadback {
+  return {
+    creative_id: 'creative-1',
+    approval_status: 'approved',
+    rejection_reason: 'not used for approved creatives',
+    indicator_types_evaluated: ['creative_fatigue'],
+    indicators: [],
+    indicators_as_of: '2026-08-20T00:00:00Z',
   };
 }
 
@@ -472,6 +507,14 @@ function _sales_platform_handler_results_accept_task_handoff() {
   void updateResult;
   void syncResult;
   return sales;
+}
+
+function _get_products_handler_accepts_sdk_owned_response_summary() {
+  const result: GetProductsHandlerResult = withResponseSummary(
+    { products: [], cache_scope: 'public' },
+    'Synthetic sample data for demonstration only.'
+  );
+  return result;
 }
 
 function _get_products_canonical_payload_preserves_cache_scope_invariant() {
@@ -777,6 +820,13 @@ function _define_platform_with_compliance_accepts_ct(p: _PlatformWithCT): _Platf
   return definePlatformWithCompliance(p);
 }
 
+// Positive: the capability schema is deliberately open to seller-specific
+// scenario names; canonical controller constants are recommendations only.
+const _custom_compliance_scenario: ComplianceTestingCapabilities = {
+  scenarios: ['seller_custom_fixture_reset'],
+};
+void _custom_compliance_scenario;
+
 // Negative: definePlatformWithCompliance rejects a platform missing compliance_testing
 // (compliance_testing is optional on DecisioningPlatformCapabilities, required by the helper).
 function _define_platform_with_compliance_rejects_missing_ct() {
@@ -879,6 +929,36 @@ function _preview_creative_requires_account_narrow(): void {
       void _ws;
       return {} as PreviewCreativeResponse;
     },
+  });
+}
+
+// Canonical preview is the primary platform hook and excludes legacy
+// named-format identity while retaining both protocol 3.2 lookup modes.
+function _preview_creative_accepts_canonical_routes(): void {
+  defineCreativeBuilderPlatform({
+    buildCreativeLegacy: async () => ({}) as never,
+    previewCreative: async req => {
+      const _capability: string | undefined = req.target_capability_id;
+      const _creative: string | undefined = req.creative_id;
+      void _capability;
+      void _creative;
+      return {} as PreviewCreativeResponse;
+    },
+  });
+}
+
+function _ad_server_accepts_canonical_preview(): void {
+  defineCreativeAdServerPlatform<{ workspace_id: string }>({
+    buildCreativeLegacy: async () => ({}) as never,
+    previewCreative: async (_req, ctx) => {
+      if (ctx.account != null) {
+        const _workspace: string = ctx.account.ctx_metadata.workspace_id;
+        void _workspace;
+      }
+      return {} as PreviewCreativeResponse;
+    },
+    listCreatives: async () => ({}) as CanonicalListCreativesResponse,
+    getCreativeDelivery: async () => ({}) as GetCreativeDeliveryResponse,
   });
 }
 
