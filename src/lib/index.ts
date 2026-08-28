@@ -2024,6 +2024,7 @@ export {
   isCompatibleWith,
   getCompatibleVersions,
   parseAdcpMajorVersion,
+  toReleasePrecisionVersion,
   ADCP_VERSION,
   ADCP_MAJOR_VERSION,
   LIBRARY_VERSION,
