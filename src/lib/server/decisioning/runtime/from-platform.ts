@@ -3930,6 +3930,7 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
         payload.completed_at = record.updatedAt;
       }
       if (record.statusMessage) payload.message = record.statusMessage;
+      if (record.ext !== undefined) payload.ext = record.ext;
       if (
         args.include_result === true &&
         (record.status === 'completed' || record.status === 'failed' || record.status === 'rejected') &&
@@ -4263,6 +4264,8 @@ function buildDefaultTaskRegistry(): TaskRegistry {
 type SubmittedEnvelope = {
   status: 'submitted';
   task_id: string;
+  /** Adopter-supplied, vendor-namespaced extension (`TaskHandoffOptions.ext`). */
+  ext?: Record<string, unknown>;
 };
 
 /**
@@ -4573,7 +4576,8 @@ async function routeIfHandoff<TInner, TWire>(
         rejectResponseSummary(inner);
         return await project(inner);
       },
-      options?.task_id
+      options?.task_id,
+      options?.ext
     );
   }
   rejectHandRolledSubmitted(result);
@@ -4585,7 +4589,8 @@ async function dispatchHitl<TResult>(
   taskRegistry: TaskRegistry,
   opts: DispatchHitlOpts,
   taskFn: (taskId: string) => Promise<TResult>,
-  overrideTaskId?: string
+  overrideTaskId?: string,
+  ext?: Record<string, unknown>
 ): Promise<SubmittedEnvelope> {
   const createStart = Date.now();
   const { taskId } = await taskRegistry.create({
@@ -4705,7 +4710,7 @@ async function dispatchHitl<TResult>(
   })();
   taskRegistry._registerBackground(taskId, completion);
 
-  return { status: 'submitted', task_id: taskId };
+  return { status: 'submitted', task_id: taskId, ...(ext !== undefined && { ext }) };
 }
 
 /**
