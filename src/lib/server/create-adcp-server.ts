@@ -7438,7 +7438,10 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     server.registerTool(
       'get_task_status',
       {
-        inputSchema: frameworkInputSchemaFor('get_task_status'),
+        // Adopter `toolSchemas` win here as for every dispatched tool above:
+        // the passthrough fallback advertises no fields, and LLM clients then
+        // send `account` as a string and `include_result` as "true".
+        inputSchema: toolSchemas?.['get_task_status'] ?? frameworkInputSchemaFor('get_task_status'),
         annotations: RO,
         _meta: frameworkToolMeta,
       },
@@ -7521,7 +7524,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     server.registerTool(
       'list_tasks',
       {
-        inputSchema: frameworkInputSchemaFor('list_tasks'),
+        inputSchema: toolSchemas?.['list_tasks'] ?? frameworkInputSchemaFor('list_tasks'),
         annotations: RO,
         _meta: frameworkToolMeta,
       },
