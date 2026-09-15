@@ -1540,7 +1540,13 @@ export {
   sanitizeTransportHeaders,
   sanitizeTransportUrl,
 } from './protocols';
-export { toReleasePrecisionWire, validateAdcpVersionWire } from './validation/schema-loader';
+export {
+  toReleasePrecisionWire,
+  validateAdcpVersionWire,
+  registerSchemaOverlay,
+  clearSchemaOverlays,
+} from './validation/schema-loader';
+export { validateRequest } from './validation/schema-validator';
 export type {
   CallToolOptions,
   TransportActivity,

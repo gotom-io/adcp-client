@@ -354,9 +354,77 @@ interface LoaderState {
 const states: Map<string, LoaderState> = new Map();
 const externalSchemaRoots: Map<string, string> = new Map();
 const scopedExternalSchemaRoots = new AsyncLocalStorage<Map<string, string>>();
+/**
+ * Adopter-registered JSON fragments deep-merged into one tool schema before it
+ * is compiled or published — the way to carry a spec change that is merged
+ * upstream but not yet in the pinned bundle. Keyed by the resolved schema
+ * directory, tool and direction: the exact pin (`3.2.0-beta.6`) and the wire
+ * form a request carries (`3.2-beta.6`) resolve to the same directory, so one
+ * registration covers both, while another release never sees it.
+ */
+const schemaOverlays: Map<string, Array<Record<string, unknown>>> = new Map();
 
 function stateCacheKey(bundleKey: string, root: string): string {
   return `${bundleKey}\0${root}`;
+}
+
+function overlayKey(root: string, toolName: string, direction: Direction): string {
+  return `${root}\0${toolName}::${direction}`;
+}
+
+/**
+ * Register a JSON-schema fragment to be deep-merged into `toolName`'s
+ * `direction` schema of the bundle `version` resolves to. Objects merge
+ * recursively, arrays merge element-wise (an overlay index beyond the base
+ * array is appended), scalars from the overlay win. Registering drops the
+ * bundle's compiled validators so the next lookup sees the overlay.
+ *
+ * Intended for fields the spec has already accepted but the pinned bundle
+ * does not carry yet; remove the overlay when the bundle catches up.
+ */
+export function registerSchemaOverlay(
+  version: string,
+  toolName: string,
+  direction: Direction,
+  overlay: Record<string, unknown>
+): void {
+  const root = resolveSchemaRoot(version);
+  const key = overlayKey(root, toolName, direction);
+  const overlays = schemaOverlays.get(key) ?? [];
+  overlays.push(overlay);
+  schemaOverlays.set(key, overlays);
+  for (const [stateKey, state] of states) {
+    if (state.root === root) states.delete(stateKey);
+  }
+}
+
+/** Drop every registered overlay and the validators compiled with them (test isolation). */
+export function clearSchemaOverlays(): void {
+  schemaOverlays.clear();
+  states.clear();
+}
+
+function applySchemaOverlays(root: string, toolName: string, direction: Direction, schema: LoadedSchema): LoadedSchema {
+  const overlays = schemaOverlays.get(overlayKey(root, toolName, direction));
+  if (!overlays || overlays.length === 0) return schema;
+  return overlays.reduce<unknown>((merged, overlay) => deepMergeSchema(merged, overlay), schema) as LoadedSchema;
+}
+
+function deepMergeSchema(base: unknown, overlay: unknown): unknown {
+  if (Array.isArray(base) && Array.isArray(overlay)) {
+    const merged = base.map((item, index) => (index < overlay.length ? deepMergeSchema(item, overlay[index]) : item));
+    return merged.concat(overlay.slice(base.length));
+  }
+  if (isPlainObject(base) && isPlainObject(overlay)) {
+    const merged: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(overlay)) merged[key] = deepMergeSchema(base[key], value);
+    return merged;
+  }
+  return overlay === undefined ? base : overlay;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function clearStatesForBundle(bundleKey: string): void {
@@ -820,7 +888,7 @@ export function getValidator(
   const fromBundled = file.includes(`${path.sep}bundled${path.sep}`);
   if (direction === 'request' || !fromBundled) ensureCoreLoaded(s);
 
-  const rawSchema = loadJson(file);
+  const rawSchema = applySchemaOverlays(s.root, toolName, direction, loadJson(file));
   // Bundled files inline every referenced subschema with the original
   // canonical `$id` (e.g. `core/version-envelope.json` appears nested
   // inside every bundled tool response). Bundled files carry NO
@@ -867,7 +935,7 @@ export function getToolSchemaDocument(
   const state = ensureInit(version);
   const file = state.fileIndex.get(`${toolName}::${direction}`);
   if (!file) return undefined;
-  const schema = loadJson(file) as Record<string, unknown>;
+  const schema = applySchemaOverlays(state.root, toolName, direction, loadJson(file)) as Record<string, unknown>;
   let resolvedVersion = state.version;
   try {
     const index = loadJson(path.join(state.root, 'index.json')) as Record<string, unknown>;
