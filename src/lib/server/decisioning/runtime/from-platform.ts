@@ -858,6 +858,10 @@ function asCanonicalProductResponse<T extends { products?: unknown[] }>(
   legacyFormatConverter: LegacyFormatConverter | undefined
 ): T {
   assertSafeGetProductsResponse(response);
+  // An answer without products[] — the wholesale `unchanged: true` probe — must
+  // stay without them: get-products-response forbids products on that shape,
+  // and the projection helpers below default a missing array to [].
+  if (!Array.isArray(response.products)) return asCanonicalServerResponse(response);
   validateDualProductFormatDeclarations(response, legacyFormatConverter);
   const projected = toCanonicalOnlyResponse(response as T & { products?: V1Product[] }, {
     legacyFormatConverter,
