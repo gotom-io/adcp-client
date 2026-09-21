@@ -108,6 +108,15 @@ export interface ProposalCapabilities {
   finalize?: boolean;
 
   /**
+   * When true, the manager serves `get_products` requests with
+   * `buying_mode: 'wholesale'` — the raw priced product feed, no brief and
+   * no proposals — and the framework advertises `wholesale` in
+   * `media_buy.buying_modes`. When false or absent, the manager is expected
+   * to refuse wholesale reads and the mode stays undeclared.
+   */
+  wholesale?: boolean;
+
+  /**
    * Grace window (in seconds) added to a committed proposal's `expires_at`
    * before the framework rejects `create_media_buy` calls referencing the
    * proposal with `PROPOSAL_EXPIRED`. Default 0 (strict).

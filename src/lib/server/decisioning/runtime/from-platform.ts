@@ -387,6 +387,20 @@ function deepMergePlainObjects(target: unknown, source: unknown): unknown {
   return out;
 }
 
+type BuyingMode = NonNullable<NonNullable<GetAdCPCapabilitiesResponse['media_buy']>['buying_modes']>[number];
+
+/**
+ * The `media_buy.buying_modes` a platform advertises. `brief` is universal;
+ * `wholesale` follows the ProposalManager's `capabilities.wholesale`; `refine`
+ * follows proposal support, since refine iterates on proposals.
+ */
+function projectedBuyingModes(supportsProposals: boolean | undefined, supportsWholesale: boolean): BuyingMode[] {
+  const modes: BuyingMode[] = ['brief'];
+  if (supportsWholesale) modes.push('wholesale');
+  if (supportsProposals) modes.push('refine');
+  return modes;
+}
+
 function mergeCapabilityOverride<T extends object>(adopter: T | null | undefined, framework: Partial<T>): T {
   return deepMergePlainObjects(adopter ?? {}, framework) as T;
 }
@@ -2581,6 +2595,9 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       : hasSalesPlatform
         ? false
         : undefined);
+  // Wholesale is a per-manager declaration: only a ProposalManager that opts
+  // in serves the raw product feed, so only then is the mode advertised.
+  const supportsWholesale = platform.proposalManager?.capabilities.wholesale === true;
   const hasMediaBuyProjection =
     hasSalesPlatform ||
     at != null ||
@@ -2622,7 +2639,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   const defaultCreativeWireMode = canonicalCreativeCapability ? 'canonical' : 'legacy';
   const mediaBuyOverrides: Partial<NonNullable<GetAdCPCapabilitiesResponse['media_buy']>> = {
     ...(hasSalesPlatform && {
-      buying_modes: supportsProposals ? (['brief', 'refine'] as const) : (['brief'] as const),
+      buying_modes: projectedBuyingModes(supportsProposals, supportsWholesale),
     }),
     ...(at != null && { audience_targeting: at }),
     ...(ct != null && { conversion_tracking: ct }),

@@ -69,6 +69,27 @@ describe('capabilities.overrides — per-domain merge (#654)', () => {
     }
   });
 
+  it('passes the wholesale feed blocks through — the framework derives neither', async () => {
+    const server = createAdcpServer({
+      name: 'Test',
+      version: '1.0.0',
+      mediaBuy: { getProducts: async () => ({ products: [] }) },
+      capabilities: {
+        overrides: {
+          wholesale_feed_versioning: { supported: true, pricing_version_separate: true, cache_scope_account: true },
+          wholesale_feed_webhooks: { supported: false },
+        },
+      },
+    });
+    const caps = await callCapabilities(server);
+    assert.deepStrictEqual(caps.wholesale_feed_versioning, {
+      supported: true,
+      pricing_version_separate: true,
+      cache_scope_account: true,
+    });
+    assert.deepStrictEqual(caps.wholesale_feed_webhooks, { supported: false });
+  });
+
   it('adds fields that the framework does not auto-derive', async () => {
     const server = createAdcpServer({
       name: 'Test',

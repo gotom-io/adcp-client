@@ -56,6 +56,24 @@ async function dispatchCapabilities(server, args = {}) {
 }
 
 describe('Capability projections — declarative capability blocks on DecisioningCapabilities', () => {
+  it('advertises wholesale in buying_modes only when the ProposalManager declares it', async () => {
+    const proposalManager = wholesale => ({
+      capabilities: { salesSpecialism: 'sales-non-guaranteed', wholesale },
+      getProducts: async () => ({ products: [], cache_scope: 'public' }),
+    });
+    const modesFor = async wholesale => {
+      const server = createAdcpServerFromPlatform(
+        { ...basePlatform(), proposalManager: proposalManager(wholesale) },
+        { name: 'wholesale-modes', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+      );
+      return (await dispatchCapabilities(server)).structuredContent?.media_buy?.buying_modes;
+    };
+
+    assert.deepStrictEqual(await modesFor(true), ['brief', 'wholesale', 'refine']);
+    assert.deepStrictEqual(await modesFor(false), ['brief', 'refine']);
+    assert.deepStrictEqual(await modesFor(undefined), ['brief', 'refine']);
+  });
+
   it('modern platform servers advertise canonical creatives by default', async () => {
     const server = createAdcpServerFromPlatform(basePlatform(), {
       name: 'canonical-default',

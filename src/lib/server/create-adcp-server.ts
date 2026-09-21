@@ -1236,6 +1236,8 @@ export interface AdcpCapabilitiesOverrides {
   webhook_signing?: GetAdCPCapabilitiesResponse['webhook_signing'] | null;
   identity?: GetAdCPCapabilitiesResponse['identity'] | null;
   request_signing?: GetAdCPCapabilitiesResponse['request_signing'] | null;
+  wholesale_feed_versioning?: GetAdCPCapabilitiesResponse['wholesale_feed_versioning'] | null;
+  wholesale_feed_webhooks?: GetAdCPCapabilitiesResponse['wholesale_feed_webhooks'] | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2199,6 +2201,8 @@ function applyCapabilityOverrides(target: GetAdCPCapabilitiesResponse, overrides
     'webhook_signing',
     'identity',
     'request_signing',
+    'wholesale_feed_versioning',
+    'wholesale_feed_webhooks',
   ]);
   for (const [key, value] of Object.entries(overrides)) {
     if (!allowedKeys.has(key)) {
