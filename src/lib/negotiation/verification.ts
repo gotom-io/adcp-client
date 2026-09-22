@@ -806,6 +806,8 @@ const PROPOSAL_KEYS = new Set([
   'commercial_terms',
   'terms_digest',
   'insertion_order',
+  'forecast',
+  'total_budget_guidance',
 ]);
 const COMMERCIAL_KEYS = new Set([
   'source_feed_version',
