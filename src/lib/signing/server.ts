@@ -8,6 +8,7 @@
  * capability cache). The aggregate `@adcp/sdk/signing` barrel re-exports
  * both for back-compat.
  */
+export type { SsrfDnsLookup } from '../net';
 export {
   buildResponseSignatureBase,
   buildSignatureBase,
@@ -41,16 +42,17 @@ export {
   WebhookSignatureError,
   type WebhookSignatureErrorCode,
 } from './errors';
-export { StaticJwksResolver, type JwksResolver } from './jwks';
+export { StaticJwksResolver, type JwksResolution, type JwksResolver } from './jwks';
 export { HttpsJwksResolver, type HttpsJwksResolverOptions } from './jwks-https';
 export {
   BrandJsonJwksResolver,
   BrandJsonResolverError,
   fetchBrandJson,
   type BrandAgentType,
+  type FetchedBrandJson,
+  type FetchBrandJsonOptions,
   type BrandJsonJwksResolverOptions,
   type BrandJsonResolverErrorCode,
-  type FetchedBrandJson,
 } from './brand-jwks';
 export { parseSignature, parseSignatureInput, type ParsedSignature, type ParsedSignatureInput } from './parser';
 export {
@@ -124,6 +126,8 @@ export {
   readIdentityPosture,
   type AgentResolution,
   type AgentProtocol,
+  type AuthorizedOperatorScope,
+  type DelegatedOperatorAuthorizationContext,
   type AgentResolverErrorCode,
   type AgentResolverErrorDetail,
   type AgentEntry,

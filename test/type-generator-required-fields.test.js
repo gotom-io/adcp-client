@@ -18,6 +18,7 @@ function runGeneratorHarness(source) {
     script,
     source
       .replaceAll('__GENERATOR__', JSON.stringify(path.join(REPO_ROOT, 'scripts/generate-types.ts')))
+      .replaceAll('__ZOD_GENERATOR__', JSON.stringify(path.join(REPO_ROOT, 'scripts/generate-zod-from-ts.ts')))
       .replaceAll('__REPO_ROOT__', JSON.stringify(REPO_ROOT))
       .replaceAll('__OUTPUT__', JSON.stringify(output))
   );
@@ -74,6 +75,74 @@ writeFileSync(__OUTPUT__, JSON.stringify({ output: relaxZodCompatibilityArrayTyp
   assert.match(result.output, /named_format_id: string;/);
 });
 
+test('TransformerParam defaults and enumerable option values retain arbitrary JSON types (#2704)', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { postProcessTransformerParamJsonValues } from __ZOD_GENERATOR__;
+
+const input = \`export const TransformerParamSchema = z.object({
+    options: z.array(z.object({ value: JsonValueSchema })).optional(),
+    default: JsonValueSchema.optional(),
+});
+export const NextSchema = z.object({ value: z.object({}).passthrough() });\`;
+writeFileSync(__OUTPUT__, JSON.stringify({ output: postProcessTransformerParamJsonValues(input) }));
+`);
+
+  assert.match(result.output, /value: z\.json\(\)/);
+  assert.match(result.output, /default: z\.json\(\)\.optional\(\)/);
+  assert.match(result.output, /NextSchema = z\.object\(\{ value: z\.object/);
+});
+
+test('TransformerParam public types use recursive JSON values in aggregate tool output (#2704)', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { normalizeTransformerParamJsonValueTypes } from __GENERATOR__;
+
+const input = \`export type TransformerParam = {} & {
+  options?: { value: {}; label?: string }[];
+  default?: {};
+}
+export interface NextType { value: {}; }\`;
+writeFileSync(__OUTPUT__, JSON.stringify({ output: normalizeTransformerParamJsonValueTypes(input) }));
+`);
+
+  assert.match(result.output, /export type JsonValue = string \| number \| boolean \| null/);
+  assert.match(result.output, /value: JsonValue/);
+  assert.match(result.output, /default\?: JsonValue/);
+  assert.match(result.output, /NextType \{ value: \{\}/);
+});
+
+test('generated TransformerParamSchema accepts scalar, array, object, and null JSON values (#2704)', () => {
+  const { TransformerParamSchema } = require('../dist/lib/types/schemas.generated.js');
+  const values = ['voice-1', 1.25, true, null, ['a', 2], { provider: 'example' }];
+
+  for (const value of values) {
+    assert.strictEqual(
+      TransformerParamSchema.safeParse({
+        field: 'voice',
+        type: 'string',
+        value_source: 'enumerable',
+        default: value,
+        options: [{ value }],
+      }).success,
+      true,
+      `expected ${JSON.stringify(value)} to remain valid JSON`
+    );
+  }
+
+  for (const value of [undefined, () => true, 1n, Symbol('not-json'), Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.strictEqual(
+      TransformerParamSchema.safeParse({
+        field: 'voice',
+        type: 'string',
+        value_source: 'enumerable',
+        options: [{ value }],
+      }).success,
+      false
+    );
+  }
+});
+
 test('PostalCountrySystem propagates unconditional requirements into every anyOf branch', () => {
   const result = runGeneratorHarness(`
 import { writeFileSync } from 'node:fs';
@@ -101,6 +170,52 @@ writeFileSync(__OUTPUT__, JSON.stringify({
     ['country', 'system'],
   ]);
   assert.equal(result.originalBranchesRemainUntouched, true);
+});
+
+test('codegen ignores annotation-only x-* allOf members without collapsing the structural type', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { enforceStrictSchema } from __GENERATOR__;
+
+const transformed = enforceStrictSchema({
+  type: 'object',
+  properties: {
+    creative_id: { type: 'string' },
+    action: { type: 'string' },
+  },
+  required: ['creative_id', 'action'],
+  allOf: [{
+    'x-adcp-validation': {
+      verifier_constraints: { revision_echo: { must_equal_request: true } },
+    },
+  }],
+});
+writeFileSync(__OUTPUT__, JSON.stringify(transformed));
+`);
+
+  assert.deepEqual(Object.keys(result.properties), ['creative_id', 'action']);
+  assert.deepEqual(result.required, ['creative_id', 'action']);
+  assert.equal(result.allOf, undefined);
+});
+
+test('codegen keeps lexical anyOf constraints from creating impossible string intersections', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { enforceStrictSchema } from __GENERATOR__;
+
+const transformed = enforceStrictSchema({
+  type: 'string',
+  anyOf: [
+    { format: 'uri-template' },
+    { format: 'uri', pattern: '^https?://' },
+    { pattern: '^https?://[^\\\\s]+$' },
+  ],
+});
+writeFileSync(__OUTPUT__, JSON.stringify(transformed));
+`);
+
+  assert.equal(result.type, 'string');
+  assert.equal(result.anyOf, undefined);
 });
 
 test('PostalArea preserves the native branch fields and non-empty values type', () => {
@@ -366,6 +481,79 @@ writeFileSync(__OUTPUT__, JSON.stringify({
   assert.ok(result.continuationProperties.includes('product_ids'));
 });
 
+test('decline_proposals result branches retain shared fields beside an open unable arm', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds, enforceStrictSchema } from __GENERATOR__;
+
+const source = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/media-buy/decline-proposals-response.json'), 'utf8')
+);
+const transformed = enforceStrictSchema(applyCodegenSchemaWorkarounds(source, 'DeclineProposalsResponse'));
+const branches = transformed.oneOf.map((response: any) => response.properties.results.items.oneOf);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  branches: branches.map((arms: any[]) => arms.map((arm: any) => ({
+    outcome: arm.properties.outcome.const,
+    required: arm.required,
+    properties: Object.keys(arm.properties),
+  }))),
+}));
+`);
+
+  assert.equal(result.branches.length, 2, 'completed and submitted envelopes should both retain result arms');
+  for (const arms of result.branches) {
+    const declined = arms.find(arm => arm.outcome === 'declined');
+    const unable = arms.find(arm => arm.outcome === 'unable');
+    assert.ok(declined.required.includes('proposal_id'));
+    assert.ok(declined.required.includes('outcome'));
+    assert.ok(declined.properties.includes('proposal_id'));
+    assert.ok(!declined.properties.includes('reason'));
+    assert.ok(unable.required.includes('proposal_id'));
+    assert.ok(unable.required.includes('outcome'));
+    assert.ok(unable.required.includes('reason'));
+    assert.ok(unable.properties.includes('proposal_id'));
+    assert.ok(unable.properties.includes('reason'));
+  }
+});
+
+test('mutual-exclusion rewrite leaves branches with unsupported validators intact', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { enforceStrictSchema } from __GENERATOR__;
+
+const source = {
+  type: 'object',
+  properties: {
+    outcome: { type: 'string' },
+    proposal_id: { type: 'string' },
+    reason: { type: 'string' },
+  },
+  required: ['proposal_id', 'outcome'],
+  oneOf: [
+    {
+      properties: { outcome: { const: 'declined' } },
+      required: ['outcome'],
+      not: { required: ['reason'] },
+    },
+    {
+      properties: { outcome: { const: 'unable' } },
+      required: ['outcome', 'reason'],
+      dependentRequired: { reason: ['proposal_id'] },
+    },
+  ],
+};
+const transformed = enforceStrictSchema(source);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  retainsDependentRequired: transformed.oneOf[1].dependentRequired,
+  openArmHasOwnType: Object.hasOwn(transformed.oneOf[1], 'type'),
+}));
+`);
+
+  assert.deepEqual(result.retainsDependentRequired, { reason: ['proposal_id'] });
+  assert.equal(result.openArmHasOwnType, false, 'unsupported branch validators must prevent the rewrite');
+});
+
 test('GetMediaBuyDeliveryResponse isolates optional breakdown identifiers under unique compat titles', () => {
   const result = runGeneratorHarness(`
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -478,6 +666,32 @@ writeFileSync(__OUTPUT__, JSON.stringify({
   assert.ok(result.canonicalRequired.keyword.includes('match_type'));
   assert.ok(result.canonicalRequired.geo.includes('geo_level'));
   assert.ok(result.canonicalRequired.geo.includes('geo_code'));
+});
+
+test('reporting file transfer keeps the established audience activation type name distinct', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds } from __GENERATOR__;
+
+const schema = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/core/reporting-delivery-method.json'), 'utf8')
+);
+const transformed = applyCodegenSchemaWorkarounds(schema, 'ReportingDeliveryMethod');
+const nested = applyCodegenSchemaWorkarounds(
+  { properties: { reporting_delivery: schema } },
+  'MediaBuy'
+);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  originalTitle: schema.oneOf[0].title,
+  transformedTitle: transformed.oneOf[0].title,
+  nestedTransformedTitle: nested.properties.reporting_delivery.oneOf[0].title,
+}));
+`);
+
+  assert.equal(result.originalTitle, 'File transfer');
+  assert.equal(result.transformedTitle, 'Reporting file transfer');
+  assert.equal(result.nestedTransformedTitle, 'Reporting file transfer');
 });
 
 test('every unconditional canonical core required property is required in generated TypeScript', () => {

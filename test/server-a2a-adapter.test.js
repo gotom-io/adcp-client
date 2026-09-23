@@ -303,6 +303,30 @@ describe('createA2AAdapter', () => {
       assert.strictEqual(res.body.result.task.status.state, 'TASK_STATE_FAILED');
       assert.strictEqual(res.body.result.task.artifacts[0].parts[0].data.reason, 'REQUIRED_EXTENSION_MISSING');
     });
+
+    it('can disable the legacy handler and advertise only the native 1.0 interface', async () => {
+      const adcp = createAdcpServer({ mediaBuy: { getProducts: async () => ({ products: [] }) } });
+      const a2a = createA2AAdapter({
+        server: adcp,
+        agentCard: baseCard(),
+        legacyCompat: { enabled: false },
+      });
+      const card = await a2a.getAgentCard();
+      assert.deepStrictEqual(
+        card.supportedInterfaces.map(candidate => candidate.protocolVersion),
+        ['1.0']
+      );
+
+      const app = mountAdapter(a2a);
+      const cardResponse = await getAgentCard(app, { 'A2A-Version': '0.3' });
+      assert.ok(Array.isArray(cardResponse.body.supportedInterfaces));
+      assert.strictEqual(cardResponse.body.url, undefined);
+
+      const legacyResponse = await postJsonRpc(app, messageSend(dataPartMessage('get_products', {})), {
+        'A2A-Version': '1.0',
+      });
+      assert.strictEqual(legacyResponse.body.error.code, -32601);
+    });
   });
 
   describe('agent card', () => {
@@ -363,6 +387,63 @@ describe('createA2AAdapter', () => {
       assert.ok(!skillIds.includes('tasks_get'), 'MCP-safe task polling alias is not advertised as an A2A skill');
       assert.ok(!skillIds.includes('comply_test_controller'), 'compliance controller is not public-card discoverable');
       assert.ok(skillIds.includes('get_adcp_capabilities'), 'capabilities tool remains discoverable');
+    });
+
+    it('uses per-tool version availability when deriving A2A skills', async () => {
+      const adcp = createAdcpServer({
+        name: '3.0 A2A seller',
+        version: '1.0.0',
+        adcpVersion: '3.0.25',
+        capabilities: { supported_versions: ['3.0.25', '3.1.18'] },
+        toolVersions: { get_signals: { min: '3.1' } },
+        mediaBuy: { getProducts: async () => ({ products: [] }) },
+        signals: { getSignals: async () => ({ signals: [] }) },
+      });
+      const card = await createA2AAdapter({ server: adcp, agentCard: baseCard() }).getAgentCard();
+      const skillIds = card.skills.map(skill => skill.id);
+      assert.ok(skillIds.includes('get_products'));
+      assert.ok(!skillIds.includes('get_signals'));
+    });
+
+    it('derives unversioned A2A discovery from the default rather than the supported ceiling', async () => {
+      const adcp = createAdcpServer({
+        name: 'dual-version A2A seller',
+        version: '1.0.0',
+        adcpVersion: '3.2.0-rc.4',
+        defaultAdcpVersion: '3.1.18',
+        capabilities: { supported_versions: ['3.1.18', '3.2.0-rc.4'] },
+        mediaBuy: {
+          getProducts: async () => ({ products: [] }),
+          listProducts: async () => ({ outcome: 'listed', products: [], feed_version: 'feed-1' }),
+        },
+      });
+
+      const card = await createA2AAdapter({ server: adcp, agentCard: baseCard() }).getAgentCard();
+      const skillIds = card.skills.map(skill => skill.id);
+      assert.ok(skillIds.includes('get_products'));
+      assert.ok(!skillIds.includes('list_products'));
+    });
+
+    it('cannot reintroduce an unavailable tasks/get through A2A skill overrides', async () => {
+      const adcp = createAdcpServer({
+        name: '3.2 A2A task seller',
+        version: '1.0.0',
+        adcpVersion: '3.2.0-rc.4',
+        capabilities: { supported_versions: ['3.1.18', '3.2.0-rc.4'] },
+        toolVersions: { tasks_get: { max: '3.1' } },
+        customTools: {
+          tasks_get: {
+            handler: async () => ({ content: [{ type: 'text', text: '{}' }], structuredContent: {} }),
+          },
+        },
+      });
+      const card = await createA2AAdapter({
+        server: adcp,
+        agentCard: baseCard({
+          skills: [{ id: 'tasks/get', name: 'tasks/get', description: 'poll tasks', tags: ['adcp'] }],
+        }),
+      }).getAgentCard();
+      assert.ok(!card.skills.some(skill => skill.id === 'tasks/get'));
     });
 
     it('filters comply_test_controller from seller-supplied A2A skill overrides', async () => {
@@ -883,6 +964,53 @@ describe('createA2AAdapter', () => {
       assert.ok(sawAuth, 'authInfo threaded into handler');
       assert.strictEqual(sawAuth.clientId, 'buyer_1');
       assert.deepStrictEqual(sawAuth.scopes, ['read']);
+    });
+
+    it('propagates the same A2A principal through account resolution and native platform context (#2765)', async () => {
+      let resolverAuth;
+      let nativeAuth;
+      const platform = {
+        capabilities: { specialisms: [], config: {} },
+        accounts: {
+          resolve: async (_ref, ctx) => {
+            resolverAuth = ctx.authInfo;
+            return { id: 'acct-a2a', name: 'A2A account', status: 'active', ctx_metadata: {} };
+          },
+        },
+        statusMappers: {},
+        sales: {
+          getProducts: async (_req, ctx) => {
+            nativeAuth = ctx.authInfo;
+            return { products: [], cache_scope: 'account' };
+          },
+        },
+      };
+      const adcp = createAdcpServerFromPlatform(platform, {
+        name: 'a2a-native-auth',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+        stateStore: new InMemoryStateStore(),
+      });
+      const principal = {
+        token: 'a2a-secret',
+        clientId: 'buyer-a2a',
+        scopes: ['read'],
+        credential: { kind: 'api_key', key_id: 'buyer-a2a-key' },
+      };
+      const app = mountAdapter(
+        createA2AAdapter({ server: adcp, agentCard: baseCard(), authenticate: async () => principal })
+      );
+      const response = await postJsonRpc(
+        app,
+        messageSend(dataPartMessage('get_products', { account: { account_id: 'acct-a2a' } }))
+      );
+
+      assert.strictEqual(resolverAuth, principal);
+      assert.notStrictEqual(nativeAuth, principal);
+      assert.deepStrictEqual(nativeAuth, principal);
+      assert.ok(Object.isFrozen(nativeAuth));
+      assert.ok(Object.isFrozen(nativeAuth.credential));
+      assert.ok(!JSON.stringify(response.body).includes(principal.token));
     });
   });
 

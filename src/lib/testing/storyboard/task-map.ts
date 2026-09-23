@@ -194,6 +194,7 @@ async function compatibilityCoordinator(
 export interface StoryboardTaskExecutionOptions {
   skipIdempotencyAutoInject?: boolean;
   skipAccountValidation?: boolean;
+  skipRequestValidation?: boolean;
   responseProjection?: 'raw';
   mediaBuyLifecycleCompatibility?: MediaBuyLifecycleCoordinatorOptions;
   signal?: AbortSignal;
@@ -332,8 +333,16 @@ export async function executeStoryboardTask(
   // preserves the seller response; wire selection and response projection are
   // independent concerns.
   const forceRawProjection = opts.responseProjection === 'raw';
+  const mediaBuyPackages = [params.packages, params.new_packages].flatMap(value => (Array.isArray(value) ? value : []));
+  const preserveExplicitLegacySelectorRoutes =
+    (taskName === 'create_media_buy' || taskName === 'update_media_buy') &&
+    mediaBuyPackages.some(
+      pkg => pkg != null && typeof pkg === 'object' && Object.hasOwn(pkg as Record<string, unknown>, 'format_ids')
+    );
   const useLegacyCreativeMethod =
-    forceRawProjection || (gradesLegacyCreativeWire(client) && readCreativeWireHint(params) !== 'canonical');
+    forceRawProjection ||
+    preserveExplicitLegacySelectorRoutes ||
+    (gradesLegacyCreativeWire(client) && readCreativeWireHint(params) !== 'canonical');
   const legacyMethodName = useLegacyCreativeMethod ? LEGACY_CREATIVE_TASK_TO_METHOD[taskName] : undefined;
   const methodName =
     legacyMethodName ?? (Object.hasOwn(TASK_TO_METHOD, taskName) ? TASK_TO_METHOD[taskName] : undefined);
@@ -342,7 +351,7 @@ export async function executeStoryboardTask(
   // the raw response shape; it must not force the seller onto a legacy-only
   // response. Other creative lifecycle methods retain explicit legacy routing.
   const callParams =
-    legacyMethodName && taskName !== 'get_products' && !forceRawProjection
+    legacyMethodName && taskName !== 'get_products' && !forceRawProjection && !preserveExplicitLegacySelectorRoutes
       ? withLegacyCreativeWireHint(params)
       : params;
   const compatibilityMethod = opts.mediaBuyLifecycleCompatibility
@@ -367,10 +376,11 @@ export async function executeStoryboardTask(
   // Only pass TaskOptions when a flag is actually set — avoids changing
   // behavior for the common path that relies on method defaults.
   const taskOptions =
-    opts.skipIdempotencyAutoInject || opts.skipAccountValidation || opts.signal
+    opts.skipIdempotencyAutoInject || opts.skipAccountValidation || opts.skipRequestValidation || opts.signal
       ? {
           ...(opts.skipIdempotencyAutoInject && { skipIdempotencyAutoInject: true }),
           ...(opts.skipAccountValidation && { skipAccountValidation: true }),
+          ...(opts.skipRequestValidation && { skipRequestValidation: true }),
           ...(opts.signal && { signal: opts.signal }),
         }
       : undefined;

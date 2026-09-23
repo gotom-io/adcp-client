@@ -1,5 +1,6 @@
 import type { SingleAgentClient } from '../core/SingleAgentClient';
-import type * as V31Beta from '../types/v3-1-beta';
+import type { AccountReference } from '../types';
+import type { LegacyWholesaleFeedEvent, LegacyWholesaleProduct, LegacyWholesaleSignal } from './protocol-types';
 
 /**
  * Operating mode for a {@link WholesaleFeedSync} instance, resolved from the
@@ -35,10 +36,45 @@ export interface WholesaleFeedSyncClient {
   getSignals: SingleAgentClient['getSignals'];
 }
 
+/** JSON-safe snapshot format used by {@link WholesaleFeedSyncPersistenceHooks}. */
+export interface WholesaleFeedSyncPersistedState {
+  /** Snapshot schema version. Future incompatible shapes use a new value. */
+  version: 1;
+  products: {
+    items: LegacyWholesaleProduct[];
+    wholesaleFeedVersion?: string;
+    pricingVersion?: string;
+    cacheScope: 'public' | 'account';
+  };
+  signals: {
+    items: LegacyWholesaleSignal[];
+    wholesaleFeedVersion?: string;
+    pricingVersion?: string;
+    cacheScope: 'public' | 'account';
+  };
+  /** ISO-8601 timestamps from the last committed sync and webhook mutation. */
+  lastSyncedAt?: string;
+  lastEventAt?: string;
+  /** Highest seller-authored UUIDv7 observed by this mirror, when available. */
+  lastWebhookEventId?: string;
+}
+
+/**
+ * Adopter-owned persistence boundary for a wholesale-feed mirror.
+ *
+ * Each hook instance MUST be scoped to one seller agent and account overlay;
+ * sharing a snapshot across those boundaries can expose the wrong catalog.
+ * `saveState` calls are serialized and receive detached snapshots.
+ */
+export interface WholesaleFeedSyncPersistenceHooks {
+  loadState(): Promise<WholesaleFeedSyncPersistedState | null>;
+  saveState(state: WholesaleFeedSyncPersistedState): Promise<void>;
+}
+
 /**
  * Configuration for a {@link WholesaleFeedSync} instance.
  *
- * The SDK's primary version pin (`ADCP_VERSION`) stays at GA; the wholesale
+ * The SDK's primary version pin (`ADCP_VERSION`) provides the wholesale
  * feed surfaces activate when the agent declares `wholesale_feed_versioning`
  * and/or `wholesale_feed_webhooks` in its `get_adcp_capabilities` response.
  * Against pre-3.1 agents the sync still works in `'manual'` mode — bootstrap
@@ -49,12 +85,12 @@ export interface WholesaleFeedSyncConfig {
   client: WholesaleFeedSyncClient;
 
   /**
-   * Account scope for wholesale product/signal reads. Beta 3 wholesale-feed
+   * Account scope for wholesale product/signal reads. Wholesale-feed
    * webhooks are account-anchored; pass the same account used when registering
    * `notification_configs[]` so repair reads reconcile the correct public or
    * account overlay.
    */
-  account?: V31Beta.AccountReference;
+  account?: AccountReference;
 
   /**
    * Expected inbound webhook subscription scope. Set this when routing a
@@ -79,6 +115,25 @@ export interface WholesaleFeedSyncConfig {
     has(key: string): boolean | Promise<boolean>;
     add(key: string): void | Promise<void>;
   };
+
+  /**
+   * Optional durable mirror snapshot hooks. Restored versions are used for
+   * the first conditional product/signal reads, avoiding a cold bootstrap
+   * after process restart. Scope the backing record to the seller and the
+   * same account overlay supplied above.
+   *
+   * Webhook delivery dedupe remains the responsibility of
+   * `webhookDedupStore`; these hooks persist mirror contents and cursors.
+   */
+  persistenceHooks?: WholesaleFeedSyncPersistenceHooks;
+
+  /**
+   * Maximum time to await each persistence hook. Default: 30000 (30 seconds).
+   * A timeout rejects the current sync operation. Timed-out saves remain in
+   * the serialized write queue so a late older write cannot overwrite newer
+   * state; storage adapters should also enforce their own cancellation.
+   */
+  persistenceTimeoutMs?: number;
 
   /**
    * Version-probe interval in `'auto-poll'` mode. Default: 600000 (10
@@ -154,16 +209,16 @@ export interface WholesaleFeedSyncEvents {
   // can read `event_id`, `created_at`, and the discriminated `payload`.
   // `synthetic: true` flags events emitted from refresh() or auto-poll
   // diff computation (not from the agent's feed).
-  event: [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'product.created': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'product.updated': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'product.priced': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'product.removed': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'signal.created': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'signal.updated': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'signal.priced': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'signal.removed': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
-  'wholesale_feed.bulk_change': [{ event: V31Beta.WholesaleFeedEvent; synthetic?: boolean }];
+  event: [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'product.created': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'product.updated': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'product.priced': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'product.removed': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'signal.created': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'signal.updated': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'signal.priced': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'signal.removed': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
+  'wholesale_feed.bulk_change': [{ event: LegacyWholesaleFeedEvent; synthetic?: boolean }];
 }
 
 /**

@@ -12,6 +12,7 @@ import type { Storyboard } from './types';
 import { MUTATING_TASKS } from '../../utils/idempotency';
 import { validateFixtureResolutionDeclarations } from './fixture-resolution';
 import { valid as validSemver } from 'semver';
+import { parsePhaseCondition } from './phase-condition';
 
 /**
  * Supported `branch_set.semantics` values. Extend when AdCP adds `all_of`,
@@ -19,6 +20,9 @@ import { valid as validSemver } from 'semver';
  * on programmatically-constructed storyboards that bypass the YAML parser.
  */
 export const BRANCH_SET_SEMANTICS = ['any_of'] as const;
+
+/** Internal runner task used for protocol-authored steps that grade an agent's own synthesized output. */
+export const VALIDATION_ONLY_TASK = '__validation_only__';
 
 const IDENTIFIER_PATH_SEGMENT = String.raw`[A-Za-z_][A-Za-z0-9_-]*(?:\[\*\])*`;
 const IDENTIFIER_PATH_PATTERN = new RegExp(`^${IDENTIFIER_PATH_SEGMENT}(?:\\.${IDENTIFIER_PATH_SEGMENT})*$`);
@@ -51,13 +55,37 @@ export function parseStoryboard(yamlContent: string): Storyboard {
       }
     }
   }
-  validateStoryboardShape(parsed);
-  return parsed;
+  const normalized = normalizeValidationOnlyTasks(parsed);
+  validateStoryboardShape(normalized);
+  return normalized;
 }
 
 /** Load and parse a single storyboard file. Useful for ad-hoc testing of in-development YAMLs. */
 export function loadStoryboardFile(filePath: string): Storyboard {
   return parseStoryboard(readFileSync(filePath, 'utf-8'));
+}
+
+/**
+ * Return a runner-ready storyboard without mutating validation-only source
+ * steps. This keeps programmatic and frozen inputs safe while retaining the
+ * internal pseudo-task expected by execution and result projection.
+ */
+export function normalizeValidationOnlyTasks(storyboard: Storyboard): Storyboard {
+  let changed = false;
+  const phases = storyboard.phases.map(phase => {
+    if (!phase.steps) return phase;
+    let stepsChanged = false;
+    const steps = phase.steps.map(step => {
+      const rawStep = step as unknown as { task?: unknown; validations?: unknown };
+      if (rawStep.task !== undefined) return step;
+      if (!Array.isArray(rawStep.validations) || rawStep.validations.length === 0) return step;
+      changed = true;
+      stepsChanged = true;
+      return { ...step, task: VALIDATION_ONLY_TASK };
+    });
+    return stepsChanged ? { ...phase, steps } : phase;
+  });
+  return changed ? { ...storyboard, phases } : storyboard;
 }
 
 /**
@@ -76,9 +104,16 @@ export function validateStoryboardShape(storyboard: Storyboard): void {
   validateRequiredAnyOfTools(storyboard);
   validatePhaseDependsOn(storyboard);
   for (const phase of storyboard.phases) {
+    validatePhaseSkipIf(storyboard.id, phase);
     validateBranchSet(storyboard.id, phase);
     if (!phase.steps) continue;
     for (const step of phase.steps) {
+      const rawStep = step as unknown as { task?: unknown; validations?: unknown };
+      if (rawStep.task === undefined) {
+        if (!Array.isArray(rawStep.validations) || rawStep.validations.length === 0) {
+          throw new Error(`[${storyboard.id}] phase '${phase.id}' step '${step.id}': missing task and validations`);
+        }
+      }
       resolveContributesShorthand(storyboard.id, phase, step);
       validateFixtureForMutatingStep(storyboard.id, phase, step);
       validateOmitFlagCoherence(storyboard.id, phase, step);
@@ -88,6 +123,19 @@ export function validateStoryboardShape(storyboard: Storyboard): void {
       validateAdvisoryDeclarations(storyboard.id, phase, step);
       validatePeerSubstitutesFor(storyboard.id, phase, step);
     }
+  }
+}
+
+function validatePhaseSkipIf(storyboardId: string, phase: Storyboard['phases'][number]): void {
+  if (phase.skip_if === undefined) return;
+  if (typeof phase.skip_if !== 'string') {
+    throw new Error(`[${storyboardId}] phase '${phase.id}': skip_if must be a string`);
+  }
+  try {
+    parsePhaseCondition(phase.skip_if);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`[${storyboardId}] phase '${phase.id}': ${detail}`);
   }
 }
 

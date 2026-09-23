@@ -1,9 +1,23 @@
 # AdCP Type Summary
 
-> Generated at: 2026-08-26
-> @adcp/sdk v14.0.0-beta.12
+> Generated at: 2026-09-22
+> @adcp/sdk v14.0.0-rc.46
 
 Curated reference of the types that matter for using the AdCP client. For full generated types see `src/lib/types/tools.generated.ts` and `src/lib/types/core.generated.ts`.
+
+## MediaBuy Action Assessment Types
+
+Use `@adcp/sdk/media-buy/actions` for pure buyer assessment and `@adcp/sdk/server` for `mediaBuyActionResolver`. See [action assessment guide](guides/MEDIA-BUY-ACTION-ASSESSMENT.md).
+
+| Type | Use |
+| --- | --- |
+| `MediaBuyTask` | Narrow routing union: `update_media_buy`, `control_media_buy`, `refine_proposals`, `sync_creatives`. |
+| `ActionAvailability` | `available_now` with optional `nonDefaultRoute`, mode and authority; or `currently_unavailable` with reason, certainty and optional compatibility/constraint detail. |
+| `ActionBuy`, `ActionProduct`, `ActionProposal` | Structural inputs for joining current accepted terms with live actions and advisory products. |
+| `LiveMediaBuyAction` | Readable canonical or legacy entry for assessment, projection and existing preflight helpers, including rc.3 package scope. |
+| `MediaBuyAvailableAction`, `MediaBuyValidAction` | Generated legacy wire entry / deprecated flat vocabulary; distinct from canonical helper entries. |
+| `MediaBuyAction`, `MediaBuyActionId` | Action identifiers accepted by assessment / mutation helpers; runtime validation preserves unknown future data. |
+| `ProposalChangeTerm`, `ChangeTermConstraints` | Negotiated term view and portable discriminated budget / flight / package-count / effective-timing constraints. |
 
 ## Client Types
 
@@ -18,6 +32,77 @@ interface AgentConfig {
   oauth_resource?: string;       // Explicit RFC 8707 override retained for refresh
   headers?: Record<string, string>;
 }
+
+interface DelegatedOperatorAuthorizationContext {
+  brand?: string;
+  scope?: 'media_buying' | 'creative_generation' | 'rights_clearance'
+        | 'governance' | 'measurement' | 'agent_operations';
+  country?: string;
+}
+
+interface A2ALegacyCompatOptions {
+  enabled: boolean; // false requires native A2A 1.0; defaults to true
+}
+
+interface TransportOptions {
+  maxResponseBytes?: number;
+  trustedFetchFn?: typeof fetch;
+  allowPrivateIp?: boolean;
+  requestTimeoutMs?: number;
+  legacyCompat?: A2ALegacyCompatOptions; // A2A only
+}
+
+interface TaskOptions {
+  timeout?: number;             // Absolute whole-task deadline
+  signal?: AbortSignal;         // Caller cancellation
+  // Direct A2A mutation route, bound to authenticated principal + account scope.
+  durableContinuationRecovery?: { ownerScope: string };
+  // Trusted local receiver policy; snapshotted and persisted with generated
+  // webhook registrations, never inferred from or sent in task arguments.
+  delegatedOperatorAuthorization?: DelegatedOperatorAuthorizationContext;
+  // ...deadline, cancellation, transport, and conversation options...
+}
+
+interface DeferredContinuation<T> {
+  token: string;
+  question?: string;
+  resume(input: unknown): Promise<TaskResult<T>>;
+  recovery?: { operationId: string; recoveryKey: string }; // Host-only, persist once
+}
+
+// AgentClient public direct-mutation route recovery
+agent.recoverDirectPauseContinuation<T>({ operationId, recoveryKey, ownerScope });
+
+interface ValidateAdAgentsOptions {
+  timeoutMs?: number;           // Per-request ceiling
+  signal?: AbortSignal;         // One signal/deadline across the complete discovery flow
+  maxBodyBytes?: number;
+  userAgent?: string;
+  logLevel?: LogLevel;
+  urlForDomain?: (domain: string, path: string) => string;
+}
+
+interface CapabilityEvidenceScope {
+  agentUri: string;
+  adcpVersion: string;
+  scopeKey: string;             // Opaque, client-bound authorization/transport scope
+}
+
+interface CapabilityEvidenceSnapshot {
+  scope: CapabilityEvidenceScope;
+  capabilities: AdcpCapabilities;
+  observedAt: string;
+  expiresAt: string;
+  toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+}
+
+type CreateTargetingInput = TargetingOverlayInput | undefined; // whole field omitted / dimension null / value
+type UpdateTargetingInput = TargetingOverlayInput | undefined; // overlay field only; keyword deltas are siblings
+
+// Constructs, scopes, and primes one exact instance before first dispatch.
+AgentClient.createWithCapabilityPreflight(agent, async ({ client, scope }) => ({
+  ...(await loadCapabilityEvidence(client, scope)), scope,
+}));
 
 interface TaskResult<T = any> {
   success: boolean;
@@ -124,6 +209,184 @@ interface EstablishedProposalStore {
 // After restart: lifecycle.reconcileEstablishedProposalTask({ account, sellerTaskId })
 ```
 
+## Durable Task Settlement Intent Queue
+
+```typescript
+interface PgQueryable {
+  query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+}
+
+interface AdcpStructuredError {
+  code: string;
+  recovery: 'transient' | 'correctable' | 'terminal';
+  message: string;
+  field?: string;
+  suggestion?: string;
+  retry_after?: number;
+  details?: Record<string, unknown>;
+}
+
+interface DurableTaskSettlementRef {
+  taskId: string;
+  accountId: string;
+  registryId: string;
+  ownerScope: string;
+}
+
+type TaskSettlementIntent =
+  | { taskRef: DurableTaskSettlementRef; action: 'complete'; result: unknown }
+  | { taskRef: DurableTaskSettlementRef; action: 'fail'; error: AdcpStructuredError; result?: unknown };
+
+interface TaskSettlementIntentCheckpoint extends DurableTaskSettlementRef {
+  queueNamespace: string;
+  intentFingerprint: string;
+}
+
+function canonicalizeTaskSettlementIntent(intent: TaskSettlementIntent): TaskSettlementIntent;
+function applyTaskSettlementIntent(
+  intent: TaskSettlementIntent,
+  options: { registry: TaskRegistry } | { coordinator: PostgresTaskSettlementCoordinator; push: TaskPushSettlementConfig }
+): Promise<'settled'>;
+
+interface TaskSettlementIntentRecoveryContext {
+  attemptCount: number;
+  extendLease(): Promise<boolean>;
+}
+
+interface TaskSettlementIntentRecoveryMetrics {
+  claimed: number;
+  settled: number;
+  retried: number;
+  deadLettered: number;
+  leaseLost: number;
+}
+
+interface TaskSettlementIntentRecoveryErrorContext {
+  attemptCount: number;
+  taskRef: DurableTaskSettlementRef;
+  action: 'complete' | 'fail';
+  disposition: 'retry' | 'dead_letter' | 'lease_lost';
+}
+
+interface RecoverTaskSettlementIntentsOptions {
+  settle(intent: TaskSettlementIntent, context: TaskSettlementIntentRecoveryContext): Promise<'settled'>;
+  batchSize?: number;
+  leaseMs?: number;
+  retryAfterMs?: number;
+  maxRetryAfterMs?: number;
+  maxAttempts?: number;
+  workerId?: string;
+  onError?(error: unknown, context: TaskSettlementIntentRecoveryErrorContext): void | Promise<void>;
+}
+
+interface CreatePostgresTaskSettlementIntentQueueOptions {
+  db: PgQueryable;
+  namespace: string;
+  tableName?: string;
+  idempotencyHorizonMs?: number; // defaults to seven days
+}
+
+interface PostgresTaskSettlementIntentQueue {
+  readonly durability: 'durable';
+  enqueue(intent: TaskSettlementIntent, options?: { db?: PgQueryable }): Promise<TaskSettlementIntentCheckpoint>;
+  acknowledge(checkpoint: TaskSettlementIntentCheckpoint, options?: { db?: PgQueryable }): Promise<boolean>;
+  pruneAcknowledged(options?: { db?: PgQueryable; limit?: number }): Promise<number>;
+  recover(options: RecoverTaskSettlementIntentsOptions): Promise<TaskSettlementIntentRecoveryMetrics>;
+  probe(): Promise<void>;
+}
+
+const TASK_SETTLEMENT_INTENT_IDEMPOTENCY_HORIZON_MS: number; // seven days
+
+const settlementIntents = createPostgresTaskSettlementIntentQueue({
+  db: pool,
+  namespace: 'seller-prod',
+  tableName: 'seller_task_settlement_intents',
+  idempotencyHorizonMs: TASK_SETTLEMENT_INTENT_IDEMPOTENCY_HORIZON_MS,
+});
+```
+
+The queue requires a complete `DurableTaskSettlementRef`, including non-empty `registryId`. Use `canonicalizeTaskSettlementIntent()` for the immediate path so it compares the same cloned, validated, wire-safe artifact that `enqueue` persists. Pass the active transaction client to `enqueue(..., { db: tx })` so the domain outcome and immutable intent commit together. Acknowledgement compacts the payload and retains the exact fingerprint for `idempotencyHorizonMs` (seven days by default), preventing a conflicting artifact from rebinding the scoped task during the replay window. Schedule bounded `pruneAcknowledged()` calls when recovery traffic can be idle. Recovery is at least once: call `applyTaskSettlementIntent()` and acknowledge only after it returns `settled`. See `docs/guides/DURABLE-TASK-SETTLEMENT.md` for the complete workflow plus scoped dead-letter SQL.
+
+## Crash-Safe Push Task Settlement
+
+```typescript
+interface TaskPushSettlementConfig {
+  url: string;
+  operationId?: string; // required for AdCP 3.2.0-beta.5+
+  servedAdcpVersion?: string; // required when operationId is absent; must prove a pre-3.2 route
+  token?: string; // protected at rest by WebhookAuthenticationAdapter
+  authentication?: WebhookAuthentication;
+}
+interface ExternalTaskHandoffOptions { settlement: 'external'; task_id?: string; } // polling-only; omit push_notification_config
+interface ExternalTaskHandoffContext { id: string; taskRef: ScopedTaskRef; update(progress: TaskHandoffProgress): Promise<void>; heartbeat(): Promise<void>; /* no reject() */ }
+type TaskPushSettlementOutcome =
+  | { outcome: 'applied'; delivery: 'durably_bound' }
+  | { outcome: 'already_terminal'; status: TaskStatus; compatibility: 'compatible'; delivery: 'durably_bound' | 'recoverable' | 'delivered' | 'terminal' }
+  | { outcome: 'already_terminal'; status: TaskStatus; compatibility: 'conflicting'; delivery: 'not_applicable' }
+  | { outcome: 'not_found_in_scope'; delivery: 'not_applicable' };
+class TaskPushSettlementConfigurationError extends Error {}
+
+const settlements = createPostgresTaskSettlementCoordinator({
+  registry, publisherScope, outbox: { tableName }, authenticationAdapter,
+});
+await completeScopedPushTask(settlements, scopedTaskRef, push, result);
+await failScopedPushTask(settlements, scopedTaskRef, push, structuredError);
+await rejectScopedPushTask(settlements, scopedTaskRef, push, result, 'Business policy declined the request');
+// Recovery after task + outbox commit and intentional push-config deletion:
+// First compare the stored terminal result/error with the intended artifact.
+if (await settlements.hasTerminalCheckpoint(scopedTaskRef)) {
+  // The scoped terminal task still has its durable checkpoint.
+}
+```
+
+The registry and outbox must share one PostgreSQL pool. Run the task-registry status-widen migration and webhook-recovery migrations before settling legacy tables. These push helpers are for an application-managed integration that independently created the task and durably registered the protected push route; they do not make `ctx.handoffToTask(producer, { settlement: 'external' })` push-capable. That framework handoff remains polling-only and its producer receives `ExternalTaskHandoffContext`, which deliberately has no `reject()`. Poll `settlements.recovery` from a worker. After intentionally deleting an application-managed settled task's push config, first compare the stored terminal result/error and rejected message with the intended artifact; then `hasTerminalCheckpoint()` proves that the scoped task still has its deterministic durable webhook checkpoint without reconstructing the secret route. It does not prove artifact compatibility or delivery. Reconstructed coordinators must retain the same publisher scope, registry storage ID/namespace, and outbox table, and checkpoint tombstones must remain through the intent replay horizon. See `docs/migration-task-registry-scoping.md`.
+
+## PostgreSQL Webhook Runtime
+
+```typescript
+const webhooks = createPostgresWebhookRuntime({
+  db: pool,
+  publisherScope: 'seller-production',
+  deliveries: { tableName: 'seller_webhook_deliveries' },
+  outbox: { tableName: 'seller_webhook_outbox' },
+  signerProvider,
+  authenticationAdapter,
+});
+for (const sql of webhooks.migrations.all) await pool.query(sql);
+await webhooks.probe();
+const server = createAdcpServerFromPlatform(platform, {
+  name: 'seller-production', version: '1.0.0', webhooks: webhooks.serverConfig,
+});
+const instanceId = process.env.INSTANCE_ID;
+if (!instanceId) throw new Error('Set INSTANCE_ID to a stable worker identity');
+await webhooks.recoverOnce({ ownerToken: instanceId });
+```
+
+`createPostgresWebhookRuntime()` assembles the durable delivery store, encrypted recovery outbox, emitter, ready-to-pass server configuration, probes, migrations, fenced poller, and `WebhookEmitResult`-to-disposition mapping. Pass `webhooks.serverConfig` as the framework's `webhooks` option and schedule bounded `recoverOnce()` calls. Direct multi-tenant sends bind with `webhooks.emitter.forTenantScope(trustedTenant)`.
+
+## Persistent Notification Subscription Runtime
+
+```typescript
+const notifications = createPostgresPersistentNotificationRuntime({
+  db: pool, publisherScope: 'seller-production',
+  subscriptions: { tableName: 'seller_notification_subscriptions' },
+  webhooks: {
+    deliveries: { tableName: 'seller_webhook_deliveries' },
+    outbox: { tableName: 'seller_webhook_outbox' },
+    signerProvider,
+  },
+  proofAdapter, credentialAdapter,
+  authorizeDelivery: liveApplicationAuthorization,
+  // Optional allowlist for invalidation-only later-version caller events:
+  futureCallerInvalidationEventTypes: ['catalog.invalidated'],
+});
+for (const sql of notifications.migrations.all) await pool.query(sql);
+await notifications.probe();
+await notifications.recoverOnce({ ownerToken: stableWorkerId });
+```
+
+The runtime keeps caller and caller+account anchors separate, applies full-set replacement with generation CAS, proves the exact normalized destination tuple before activation, and keeps legacy credentials behind an opaque application binding. Its non-secret subscription generation is stored in the webhook outbox; every live and recovered attempt re-reads subscription state and calls the required application authorization callback before network access. Pause, removal, authorization loss, or destination replacement terminally suppresses unclaimed old-generation work. `include_future_event_types` remains fail closed unless the server explicitly classifies invalidation-only later-version caller events with `futureCallerInvalidationEventTypes`. See `docs/guides/PERSISTENT-NOTIFICATION-RUNTIME.md`.
+
 ## Production Webhook Tenant Binding
 
 An unbound production `WebhookEmitter` is safe to construct with a stable `publisherScope`, durable delivery store, and durable recovery outbox. It refuses direct emission until trusted tenant scope is bound:
@@ -199,7 +462,9 @@ Each tool is called as `agent.<methodName>(params)` and returns `TaskResult<Resp
 
 ### Protocol
 
-**`get_adcp_capabilities`** — Request parameters for cross-protocol capability discovery.
+#### `get_adcp_capabilities`
+
+Request parameters for cross-protocol capability discovery.
 
 _Request:_
 ```
@@ -230,7 +495,7 @@ _Response (success branch):_
   compliance_testing: object
   specialisms: Specialism[]
   extensions_supported: string[]
-  experimental_features: string[]
+  experimental_features: Experimental Feature Id[]
   wholesale_feed_versioning: object
   last_updated: string
   errors: Error[]
@@ -239,7 +504,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_task_status`** — Request parameters for get_task_status, the 3.
+#### `get_task_status`
+
+Request parameters for get_task_status, the 3.
 
 _Request:_
 ```
@@ -271,7 +538,9 @@ _Response (success branch):_
 }
 ```
 
-**`list_tasks`** — Request parameters for list_tasks, the 3.
+#### `list_tasks`
+
+Request parameters for list_tasks, the 3.
 
 _Request:_
 ```
@@ -295,13 +564,15 @@ _Response (success branch):_
 }
 ```
 
-**`sync_agent_notification_configs`** — Register, replace, pause, or clear agent-level webhook subscribers such as capabilities.
+#### `sync_agent_notification_configs`
+
+Register, replace, pause, or clear agent-level webhook subscribers such as capabilities.
 
 _Request:_
 ```
 {
   idempotency_key: string  // required
-  notification_configs: object[]  // required
+  notification_configs: Agent Notification Config[]  // required
   dry_run: boolean
   context: Context
 }
@@ -318,9 +589,86 @@ _Response (success branch):_
 }
 ```
 
+#### `sync_principal`
+
+Declaratively synchronize caller-scoped webhooks and reusable reporting destinations.
+
+_Request:_
+```
+{
+  idempotency_key: string  // required
+  configuration: object  // required
+  expected_configuration_version: string
+  expected_principal_kind: Principal Kind
+  dry_run: boolean
+  context: Context
+}
+```
+
+_Response (success branch):_
+```
+{
+  result: Applied principal configuration | Validated principal dry run | Failed principal sync  // required
+  context: Context
+}
+```
+
+#### `get_principal`
+
+Read caller-scoped connection configuration, version, and destination setup states without mutation.
+
+_Request:_
+```
+{
+  context: Context
+}
+```
+
+_Response (success branch):_
+```
+{
+  result: union  // required
+  context: Context
+}
+```
+
 ### Account Management
 
-**`list_accounts`** — Request parameters for listing accounts accessible to the authenticated agent.
+#### `list_account_changes`
+
+Request parameters for reading the durable account change feed.
+
+_Request:_
+```
+{
+  account: Account Ref  // required
+  adcp_version: string
+  cursor: string
+  starting_position: 'earliest' | 'latest'
+  resource_types: string[]
+  max_results: integer
+  context: Context
+}
+```
+
+_Response (success branch):_
+```
+{
+  changes: Account Change[]  // required
+  cursor: string  // required
+  has_more: boolean  // required
+  available_since: string  // required
+  generated_at: string  // required
+  status: 'completed'  // required
+  source_coverage: object[]
+  errors: Error[]
+  context: Context
+}
+```
+
+#### `list_accounts`
+
+Request parameters for listing accounts accessible to the authenticated agent.
 
 _Request:_
 ```
@@ -345,7 +693,9 @@ _Response (success branch):_
 }
 ```
 
-**`sync_accounts`** — Request parameters for syncing advertiser accounts with a seller.
+#### `sync_accounts`
+
+Request parameters for syncing advertiser accounts with a seller.
 
 _Request:_
 ```
@@ -368,7 +718,9 @@ _Response (success branch):_
 }
 ```
 
-**`sync_governance`** — Request parameters for registering governance agent endpoints on accounts.
+#### `sync_governance`
+
+Request parameters for registering governance agent endpoints on accounts.
 
 _Request:_
 ```
@@ -387,7 +739,9 @@ _Response (success branch):_
 }
 ```
 
-**`report_usage`** — Request parameters for reporting vendor service consumption after delivery.
+#### `report_usage`
+
+Request parameters for reporting vendor service consumption after delivery.
 
 _Request:_
 ```
@@ -409,7 +763,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_account_financials`** — Request parameters for querying financial status of an operator-billed account.
+#### `get_account_financials`
+
+Request parameters for querying financial status of an operator-billed account.
 
 _Request:_
 ```
@@ -439,7 +795,9 @@ _Response (success branch):_
 
 ### Media Buying
 
-**`get_products`** — AdCP 3.
+#### `get_products`
+
+AdCP 3.
 
 _Request:_
 ```
@@ -449,15 +807,18 @@ _Request:_
   brief: string
   refine: object[]
   brand: Brand Ref
+  acceptance_context: Acceptance Context
   catalog: Catalog
   account: Account Ref
   preferred_delivery_types: Delivery Type[]
   filters: Product Filters
   targeting_overlay: Targeting
+  media_buy_frequency_cap: Media Buy Frequency Cap
   required_overlay_support: Targeting Overlay Requirements
+  required_media_buy_support: Media Buy Support Requirements
   property_list: Property List Ref
-  fields: ('product_id' | 'name' | 'description' | 'publisher_properties' | 'channels' | 'video_placement_types' | 'audio_distribution_types' | 'sponsored_placement_types' | 'social_placement_surfaces' | 'format_ids' | 'format_options' | 'placements' | 'delivery_type' | 'exclusivity' | 'pricing_options' | 'forecast' | 'outcome_measurement' | 'delivery_measurement' | 'reporting_capabilities' | 'creative_policy' | 'catalog_types' | 'metric_optimization' | 'conversion_tracking' | 'data_provider_signals' | 'included_signals' | 'signal_targeting_allowed' | 'signal_targeting_options' | 'signal_targeting_rules' | 'demographic_targeting' | 'overlay_support' | 'targeting_resolution' | 'audience_evidence' | 'audience_evidence_selections' | 'max_optimization_goals' | 'catalog_match' | 'collections' | 'collection_targeting_allowed' | 'installments' | 'brief_relevance' | 'is_custom' | 'expires_at' | 'product_card' | 'product_card_detailed' | 'enforced_policies' | 'trusted_match')[]
-  time_budget
+  fields: ('product_id' | 'name' | 'description' | 'publisher_properties' | 'channels' | 'video_placement_types' | 'audio_distribution_types' | 'sponsored_placement_types' | 'social_placement_surfaces' | 'format_options' | 'placements' | 'delivery_type' | 'exclusivity' | 'pricing_options' | 'forecast' | 'reporting_capabilities' | 'measurement_terms' | 'performance_standards' | 'catalog_types' | 'signal_targeting_allowed' | 'signal_targeting_rules' | 'demographic_targeting' | 'overlay_support' | 'media_buy_support' | 'audience_evidence' | 'audience_evidence_selections' | 'max_optimization_goals' | 'catalog_match' | 'list_applications' | 'brief_relevance' | 'acceptance_policy_profile_ids' | 'identity' | 'expires_at' | 'allowed_actions' | 'format_ids' | 'outcome_measurement' | 'delivery_measurement' | 'creative_policy' | 'metric_optimization' | 'conversion_tracking' | 'data_provider_signals' | 'included_signals' | 'signal_targeting_options' | 'overlay_support' | 'media_buy_support' | 'targeting_resolution' | 'collections' | 'collection_targeting_allowed' | 'installments' | 'is_custom' | 'product_card' | 'product_card_detailed' | 'enforced_policies' | 'trusted_match')[]
+  time_budget: Duration
   push_notification_config: Push Notification Config
   pagination: Pagination Request
   if_wholesale_feed_version: string
@@ -496,18 +857,20 @@ _Watch out:_
 - `cache_scope` is required whenever the response includes `products` or `unchanged: true`. Use `public` for the universal rate card and `account` for account-specific rate cards or pricing overlays.
 - SDK server handlers may omit `cache_scope` only for no-account product feeds; the framework can safely infer `public` only when there is no inline account and no auth-derived/resolved account.
 
-**`list_products`** — Request parameters for synchronous product-offer reads.
+#### `list_products`
+
+Request parameters for synchronous product-offer reads.
 
 _Request:_
 ```
 {
-  adcp_version: Adcp_version
+  adcp_version: string
   idempotency_key: string
   context_id: string
-  context
+  context: Context
   governance_context: string
-  push_notification_config
-  account
+  push_notification_config: Push Notification Config
+  account: Canonical Account Ref
   brand: Brand Key
   criteria: Product Discovery Criteria
   fields: Product Fields
@@ -522,25 +885,35 @@ _Response (success branch):_
 ```
 {
   outcome: 'listed'  // required
+  products: Canonical Product[]  // required
+  feed_version: string  // required
+  cache_scope: 'public' | 'account'  // required
+  next_cursor: string
+  pricing_version: string
+  incomplete: object[]
+  replayed: 'true'
+  context: Context
 }
 ```
 
-**`request_proposals`** — Request parameters for creating actionable seller proposals.
+#### `request_proposals`
+
+Request parameters for creating actionable seller proposals.
 
 _Request:_
 ```
 {
   idempotency_key: string  // required
   brief: string  // required
-  adcp_version: Adcp_version
+  adcp_version: string
   context_id: string
-  context
+  context: Context
   governance_context: string
-  push_notification_config
-  account
+  push_notification_config: Push Notification Config
+  account: Canonical Account Ref
   brand: Brand Key
   criteria: Product Discovery Criteria
-  opportunity
+  opportunity: Opportunity Context
 }
 ```
 
@@ -548,66 +921,99 @@ _Response (success branch):_
 ```
 {
   outcome: 'proposed'  // required
+  proposals: Canonical Proposal[]  // required
+  products: Canonical Product[]  // required
+  adcp_version: string
+  incomplete: object[]
+  targeting_resolution: Get Products Targeting Resolution
   status: 'completed'
+  message: string
+  errors: Error[]
+  context: Context
+  replayed: 'true'
 }
 ```
 
-**`refine_proposals`** — Request parameters for creating one or more proposal revisions.
+#### `refine_proposals`
+
+Request parameters for creating one or more proposal revisions.
 
 _Request:_
 ```
 {
   idempotency_key: string  // required
   refinements: Proposal Refinement[]  // required
-  adcp_version: Adcp_version
+  adcp_version: string
   context_id: string
-  context
+  context: Context
   governance_context: string
-  push_notification_config
+  push_notification_config: Push Notification Config
 }
 ```
 
 _Response (success branch):_
 ```
 {
+  results: union[]  // required
+  products: Canonical Product[]  // required
+  adcp_version: string
   status: 'completed'
+  message: string
+  errors: Error[]
+  context: Context
+  replayed: 'true'
 }
 ```
 
-**`decline_proposals`** — Request parameters for terminally declining one or more proposals.
+#### `decline_proposals`
+
+Request parameters for terminally declining one or more proposals.
 
 _Request:_
 ```
 {
   idempotency_key: string  // required
   declines: Proposal Decline[]  // required
-  adcp_version: Adcp_version
+  adcp_version: string
   context_id: string
-  context
+  context: Context
   governance_context: string
-  push_notification_config
+  push_notification_config: Push Notification Config
   opportunity: Opportunity Context
 }
 ```
 
+_Response (success branch):_
+```
+{
+  results: object[]  // required
+  message: string
+  errors: Error[]
+  context: Context
+  replayed: 'true'
+}
+```
 
-**`buy_products`** — Create a MediaBuy directly from canonical published product offers.
+#### `buy_products`
+
+Create a MediaBuy directly from canonical published product offers.
 
 _Request:_
 ```
 {
   idempotency_key: string  // required
-  account  // required
+  account: Canonical Account Ref  // required
   feed_version: string  // required
-  purchases: Product Purchase[]  // required
+  purchases: Product Purchase Input[]  // required
   start_time: Start Timing  // required
   end_time: string  // required
-  adcp_version: Adcp_version
+  adcp_version: string
   brand: Brand Key
   advertiser_industry: Advertiser Industry
   pricing_version: string
   total_budget: object
   daily_budget_cap: number
+  frequency_cap: Media Buy Frequency Cap
   budget_cap_timezone: string
   budget_allocation: Canonical Budget Allocation
   pacing: Pacing
@@ -619,13 +1025,15 @@ _Request:_
   governance_context: string
   push_notification_config: Push Notification Config
   reporting_webhook: Reporting Webhook
-  opportunity
+  opportunity: Opportunity Context
   context: Context
 }
 ```
 
 
-**`accept_proposal`** — Accept a committed new-buy, amendment, or cancellation proposal.
+#### `accept_proposal`
+
+Accept a committed new-buy, amendment, or cancellation proposal.
 
 _Request:_
 ```
@@ -634,7 +1042,7 @@ _Request:_
   account: Canonical Account Ref  // required
   proposal_id: string  // required
   proposal_terms_digest: string  // required
-  adcp_version: Adcp_version
+  adcp_version: string
   total_budget: object
   daily_budget_cap: number
   budget_cap_timezone: string
@@ -643,13 +1051,15 @@ _Request:_
   governance_context: string
   push_notification_config: Push Notification Config
   reporting_webhook: Reporting Webhook
-  opportunity
+  opportunity: Opportunity Context
   context: Context
 }
 ```
 
 
-**`control_media_buy`** — Apply operational controls inside accepted commercial terms.
+#### `control_media_buy`
+
+Apply operational controls inside accepted commercial terms.
 
 _Request:_
 ```
@@ -658,13 +1068,14 @@ _Request:_
   account: Canonical Account Ref  // required
   media_buy_id: string  // required
   revision: integer  // required
-  adcp_version: Adcp_version
+  adcp_version: string
   name: string
   paused: boolean
   canceled: 'true'
   cancellation_reason: string
   total_budget: object
   daily_budget_cap: number,null
+  frequency_cap: Media Buy Frequency Cap | null
   budget_cap_timezone: string,null
   budget_allocation: Canonical Budget Allocation
   pacing: Pacing
@@ -687,13 +1098,15 @@ _Response (success branch):_
   implementation_date: string,null
   affected_package_ids: string[]
   available_actions: Canonical Media Buy Action[]
-  warnings: object[]
+  warnings: Warning[]
   context: Context
   replayed: 'true'
 }
 ```
 
-**`list_creative_formats`** — Deprecated 3.
+#### `list_creative_formats`
+
+Deprecated 3.
 
 _Request:_
 ```
@@ -736,7 +1149,9 @@ _Watch out:_
 - Use the typed factories from `@adcp/sdk`: `displayRender({ role, dimensions })` for display/video; `parameterizedRender({ role })` for audio and template formats (auto-injects `parameters_from_format_id: true`).
 - Audio formats (`type: "audio"`) have no width/height — declare `renders: [parameterizedRender({ role: "primary" })]` and encode duration/codec in `format_id.parameters` (declared via `accepts_parameters`).
 
-**`create_media_buy`** — AdCP 3.
+#### `create_media_buy`
+
+AdCP 3.
 
 _Request:_
 ```
@@ -749,11 +1164,12 @@ _Request:_
   governance_context: string
   plan_id: string
   proposal_id: string
-  opportunity
+  opportunity: Opportunity Context
   total_budget: object
   daily_budget_cap: number
+  frequency_cap: Media Buy Frequency Cap
   budget_cap_timezone: string
-  budget_allocation
+  budget_allocation: Budget Allocation
   packages: Package Request[]
   advertiser_industry: Advertiser Industry
   invoice_recipient: Business Entity
@@ -762,7 +1178,7 @@ _Request:_
   name: string
   agency_estimate_number: string
   pacing: Pacing
-  bidding
+  bidding: Bidding Policy
   paused: boolean
   push_notification_config: Push Notification Config
   reporting_webhook: Reporting Webhook
@@ -787,10 +1203,11 @@ _Response (success branch):_
   currency: string
   total_budget: number
   daily_budget_cap: number
+  frequency_cap: Media Buy Frequency Cap
   budget_cap_timezone: string
-  budget_allocation
+  budget_allocation: Budget Allocation
   pacing: Pacing
-  bidding
+  bidding: Bidding Policy
   valid_actions: Media Buy Valid Action[]
   available_actions: Media Buy Available Action[]
   planned_delivery: Planned Delivery
@@ -803,7 +1220,9 @@ _Response (success branch):_
 _Watch out:_
 - Server handlers should return business lifecycle state as `media_buy_status`. The framework owns the task envelope `status`; do not return top-level `status` as the media-buy state.
 
-**`update_media_buy`** — AdCP 3.
+#### `update_media_buy`
+
+AdCP 3.
 
 _Request:_
 ```
@@ -821,8 +1240,9 @@ _Request:_
   end_time: string
   total_budget: object
   daily_budget_cap: number,null
+  frequency_cap: Media Buy Frequency Cap | null
   budget_cap_timezone: string,null
-  budget_allocation
+  budget_allocation: Budget Allocation
   pacing: Pacing
   bidding: Bidding Policy | null
   packages: Package Update[]
@@ -844,10 +1264,11 @@ _Response (success branch):_
   currency: string
   total_budget: number
   daily_budget_cap: number
+  frequency_cap: Media Buy Frequency Cap
   budget_cap_timezone: string
-  budget_allocation
+  budget_allocation: Budget Allocation
   pacing: Pacing
-  bidding
+  bidding: Bidding Policy
   implementation_date: string,null
   invoice_recipient: Business Entity
   affected_packages: Package[]
@@ -862,7 +1283,9 @@ _Response (success branch):_
 _Watch out:_
 - Server handlers should return business lifecycle state as `media_buy_status`. The framework owns the task envelope `status`; do not return top-level `status` as the media-buy state.
 
-**`get_media_buys`** — Request parameters for retrieving media buy status, creative approvals, and delivery snapshots.
+#### `get_media_buys`
+
+Request parameters for retrieving media buy status, creative approvals, and delivery snapshots.
 
 _Request:_
 ```
@@ -883,7 +1306,7 @@ _Request:_
 _Response (success branch):_
 ```
 {
-  media_buys: object[]  // required
+  media_buys: Indicator Bearing[]  // required
   errors: Error[]
   pagination: Pagination Response
   sandbox: boolean
@@ -891,13 +1314,17 @@ _Response (success branch):_
 }
 ```
 
-**`get_media_buy_delivery`** — Request parameters for retrieving comprehensive delivery metrics.
+#### `get_media_buy_delivery`
+
+Request parameters for retrieving comprehensive delivery metrics.
 
 _Request:_
 ```
 {
   account: Account Ref
   media_buy_ids: string[]
+  reporting_revision_id: string
+  pagination: Pagination Request
   status_filter: Media Buy Status | Media Buy Status[]
   start_date: string
   end_date: string
@@ -915,13 +1342,17 @@ _Response (success branch):_
 ```
 {
   reporting_period: object  // required
-  currency: string  // required
   media_buy_deliveries: object[]  // required
   notification_type: 'scheduled' | 'final' | 'delayed' | 'adjusted' | 'window_update'
   partial_data: boolean
   unavailable_count: integer
   sequence_number: integer
   next_expected_at: string
+  reporting_revision_binding: object
+  reporting_revision: Reporting Revision
+  reporting_rows: object[]
+  pagination: Pagination Response
+  currency: string
   attribution_window: Attribution Window
   aggregated_totals: object
   errors: Error[]
@@ -930,7 +1361,114 @@ _Response (success branch):_
 }
 ```
 
-**`provide_performance_feedback`** — Request parameters for sharing performance outcomes with publishers.
+#### `get_reporting_status`
+
+Request parameters for reconciling managed reporting obligations, revisions, and materializations.
+
+_Request:_
+```
+{
+  account: Canonical Account Ref  // required
+  view: 'summary' | 'periods' | 'revision'  // required
+  media_buy_ids: string[]
+  delivery_config_ids: string[]
+  feed_purposes: ('pacing' | 'analytics' | 'billing')[]
+  period: object
+  health: Reporting Health[]
+  finality: Reporting Finality[]
+  reporting_revision_id: string
+  changes_after: string
+  pagination: Pagination Request
+  context: Context
+}
+```
+
+_Response (success branch):_
+```
+{
+  status: 'completed'  // required
+  view: 'summary' | 'periods' | 'revision'
+  ledger_snapshot_id: string
+  ledger_as_of: string
+  changes_checkpoint: string
+  account_id: string
+  scope: object
+  health: Reporting Health
+  coverage: Reporting Coverage
+  data_through: string,null
+  next_expected_at: string
+  obligation_counts: object
+  issues: Reporting Status Issue[]
+  periods: Reporting Obligation[]
+  revisions: Reporting Revision[]
+  adjustments: Reporting Adjustment[]
+  consumer_statuses: Reporting Consumer Status[]
+  adjustment_receipts: Reporting Adjustment Receipt[]
+  pagination: Pagination Response
+  revision: Reporting Revision
+  materializations: Reporting Materialization[]
+  receipts: Reporting Receipt[]
+  errors: Error[]
+  context: Context
+}
+```
+
+#### `sync_reporting_status`
+
+Submit authenticated consumer status for expected reporting periods.
+
+_Request:_
+```
+{
+  account: Canonical Account Ref  // required
+  idempotency_key: string  // required
+  statuses: Reporting Consumer Status[]  // required
+  adcp_version: string
+  context: Context
+}
+```
+
+_Response (success branch):_
+```
+{
+  status: 'completed'  // required
+  results: (Recorded reporting consumer status | Unchanged reporting consumer status | Failed reporting consumer status)[]  // required
+  context: Context
+}
+```
+
+_Watch out:_
+- A `completed` envelope does not mean every item succeeded: inspect each per-item `result`. For a schema-valid envelope, results map one-for-one to submitted statuses in request order.
+- `recorded_at` is seller-authored and response-only. Never send it in `statuses[]`.
+
+#### `sync_reporting_receipts`
+
+Submit authenticated consumer reconciliation receipts for durable reporting materializations.
+
+_Request:_
+```
+{
+  account: Canonical Account Ref  // required
+  idempotency_key: string  // required
+  adcp_version: string
+  receipts: Reporting Receipt[]
+  adjustment_receipts: Reporting Adjustment Receipt[]
+  context: Context
+}
+```
+
+_Response (success branch):_
+```
+{
+  status: 'completed'  // required
+  results: union[]  // required
+  context: Context
+}
+```
+
+#### `provide_performance_feedback`
+
+Request parameters for sharing performance outcomes with publishers.
 
 _Request:_
 ```
@@ -954,7 +1492,9 @@ _Response (success branch):_
 }
 ```
 
-**`sync_event_sources`** — Request parameters for configuring event sources on an account.
+#### `sync_event_sources`
+
+Request parameters for configuring event sources on an account.
 
 _Request:_
 ```
@@ -976,7 +1516,9 @@ _Response (success branch):_
 }
 ```
 
-**`log_event`** — Request parameters for logging conversion or marketing events.
+#### `log_event`
+
+Request parameters for logging conversion or marketing events.
 
 _Request:_
 ```
@@ -1002,7 +1544,9 @@ _Response (success branch):_
 }
 ```
 
-**`sync_audiences`** — Request parameters for managing CRM-based audiences on an account.
+#### `sync_audiences`
+
+Request parameters for managing CRM-based audiences on an account.
 
 _Request:_
 ```
@@ -1024,7 +1568,9 @@ _Response (success branch):_
 }
 ```
 
-**`sync_catalogs`** — Request parameters for syncing catalog feeds (products, inventory, stores, promotions, offerings) with approval workflow.
+#### `sync_catalogs`
+
+Request parameters for syncing catalog feeds (products, inventory, stores, promotions, offerings) with approval workflow.
 
 _Request:_
 ```
@@ -1058,7 +1604,9 @@ _Response (success branch):_
 
 ### Creative
 
-**`build_creative`** — Request parameters for AI-powered creative generation.
+#### `build_creative`
+
+Request parameters for AI-powered creative generation.
 
 _Request:_
 ```
@@ -1067,6 +1615,9 @@ _Request:_
   governance_context: string
   message: string
   creative_manifest: Creative Manifest
+  creative_representation_set: Creative Representation Set
+  representation_destination: Representation Destination
+  representation_selection_strategy: Representation Selection Strategy
   creative_id: string
   concept_id: string
   media_buy_id: string
@@ -1081,7 +1632,7 @@ _Request:_
   mode: 'execute' | 'estimate'
   max_spend: object
   max_creatives: integer
-  signal_conditions: object[]
+  signal_conditions: Signal Targeting[]
   max_variants: integer
   variant_axis: object
   keep_mode: 'keep_all' | 'keep_one' | 'keep_some'
@@ -1124,7 +1675,9 @@ _Watch out:_
 - Use `buildCreativeResponse({ creative_manifest })` / `buildCreativeMultiResponse({ creative_manifests })` from `@adcp/sdk/server` to enforce the shape at compile time.
 - Each asset under `creative_manifest.assets` needs an `asset_type` discriminator — use the factories: `imageAsset`, `videoAsset`, `audioAsset`, `htmlAsset`, `urlAsset`, `textAsset` (or `Asset.image(...)`).
 
-**`preview_creative`** — Request parameters for generating creative previews.
+#### `preview_creative`
+
+Request parameters for generating creative previews.
 
 _Request:_
 ```
@@ -1162,7 +1715,9 @@ _Response (success branch):_
 _Watch out:_
 - Each `renders[]` entry is a oneOf on `output_format` — use `urlRender({...})`, `htmlRender({...})`, or `bothRender({...})` to inject the discriminator and require the matching `preview_url`/`preview_html` field.
 
-**`list_creative_formats`** — Deprecated 3.
+#### `list_creative_formats`
+
+Deprecated 3.
 
 _Request:_
 ```
@@ -1204,7 +1759,9 @@ _Watch out:_
 - Use the typed factories from `@adcp/sdk`: `displayRender({ role, dimensions })` for display/video; `parameterizedRender({ role })` for audio and template formats (auto-injects `parameters_from_format_id: true`).
 - Audio formats (`type: "audio"`) have no width/height — declare `renders: [parameterizedRender({ role: "primary" })]` and encode duration/codec in `format_id.parameters` (declared via `accepts_parameters`).
 
-**`list_transformers`** — Request parameters for discovering account-scoped creative transformers (the creative analog of products), with optional brief filtering, per-param option expansion, and pricing.
+#### `list_transformers`
+
+Request parameters for discovering account-scoped creative transformers (the creative analog of products), with optional brief filtering, per-param option expansion, and pricing.
 
 _Request:_
 ```
@@ -1235,7 +1792,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_creative_delivery`** — Request parameters for retrieving creative delivery data with variant-level breakdowns.
+#### `get_creative_delivery`
+
+Request parameters for retrieving creative delivery data with variant-level breakdowns.
 
 _Request:_
 ```
@@ -1265,7 +1824,9 @@ _Response (success branch):_
 }
 ```
 
-**`list_creatives`** — Request parameters for querying creative library with filtering and pagination.
+#### `list_creatives`
+
+Request parameters for querying creative library with filtering and pagination.
 
 _Request:_
 ```
@@ -1303,14 +1864,16 @@ _Response (success branch):_
 }
 ```
 
-**`sync_creatives`** — Request parameters for syncing creative assets with upsert semantics.
+#### `sync_creatives`
+
+Request parameters for syncing creative assets with upsert semantics.
 
 _Request:_
 ```
 {
   account: Account Ref  // required
   idempotency_key: string  // required
-  creatives: object[]
+  creatives: Creative Asset[]
   creative_ids: string[]
   assignments: object[]
   assignment_operations: (Assign or update | Unassign | Replace assignment)[]
@@ -1332,7 +1895,9 @@ _Response (success branch):_
 }
 ```
 
-**`validate_input`** — Request parameters for validating a creative manifest against canonical formats and/or specific products without committing to a render.
+#### `validate_input`
+
+Request parameters for validating a creative manifest against canonical formats and/or specific products without committing to a render.
 
 _Request:_
 ```
@@ -1353,7 +1918,9 @@ _Response (success branch):_
 
 ### Signals
 
-**`get_signals`** — Request parameters for discovering signals based on description.
+#### `get_signals`
+
+Request parameters for discovering signals based on description.
 
 _Request:_
 ```
@@ -1379,7 +1946,7 @@ _Request:_
 _Response (success branch):_
 ```
 {
-  signals: object[]
+  signals: Signal Listing[]
   errors: Error[]
   incomplete: object[]
   wholesale_feed_version: string
@@ -1392,7 +1959,9 @@ _Response (success branch):_
 }
 ```
 
-**`activate_signal`** — Request parameters for activating a signal on a specific platform/account.
+#### `activate_signal`
+
+Request parameters for activating a signal on a specific platform/account.
 
 _Request:_
 ```
@@ -1419,7 +1988,9 @@ _Response (success branch):_
 
 ### Governance
 
-**`create_property_list`** — Request parameters for creating a new property list.
+#### `create_property_list`
+
+Request parameters for creating a new property list.
 
 _Request:_
 ```
@@ -1445,7 +2016,9 @@ _Response (success branch):_
 }
 ```
 
-**`update_property_list`** — Request parameters for updating an existing property list.
+#### `update_property_list`
+
+Request parameters for updating an existing property list.
 
 _Request:_
 ```
@@ -1472,7 +2045,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_property_list`** — Request parameters for retrieving a property list with resolved properties.
+#### `get_property_list`
+
+Request parameters for retrieving a property list with resolved properties.
 
 _Request:_
 ```
@@ -1498,7 +2073,9 @@ _Response (success branch):_
 }
 ```
 
-**`list_property_lists`** — Request parameters for listing property lists.
+#### `list_property_lists`
+
+Request parameters for listing property lists.
 
 _Request:_
 ```
@@ -1519,7 +2096,9 @@ _Response (success branch):_
 }
 ```
 
-**`delete_property_list`** — Request parameters for deleting a property list.
+#### `delete_property_list`
+
+Request parameters for deleting a property list.
 
 _Request:_
 ```
@@ -1541,7 +2120,9 @@ _Response (success branch):_
 }
 ```
 
-**`create_collection_list`** — Request parameters for creating a new collection list.
+#### `create_collection_list`
+
+Request parameters for creating a new collection list.
 
 _Request:_
 ```
@@ -1567,7 +2148,9 @@ _Response (success branch):_
 }
 ```
 
-**`update_collection_list`** — Request parameters for updating an existing collection list.
+#### `update_collection_list`
+
+Request parameters for updating an existing collection list.
 
 _Request:_
 ```
@@ -1594,7 +2177,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_collection_list`** — Request parameters for retrieving a collection list with resolved collections.
+#### `get_collection_list`
+
+Request parameters for retrieving a collection list with resolved collections.
 
 _Request:_
 ```
@@ -1620,7 +2205,9 @@ _Response (success branch):_
 }
 ```
 
-**`list_collection_lists`** — Request parameters for listing collection lists.
+#### `list_collection_lists`
+
+Request parameters for listing collection lists.
 
 _Request:_
 ```
@@ -1641,7 +2228,9 @@ _Response (success branch):_
 }
 ```
 
-**`delete_collection_list`** — Request parameters for deleting a collection list.
+#### `delete_collection_list`
+
+Request parameters for deleting a collection list.
 
 _Request:_
 ```
@@ -1663,7 +2252,9 @@ _Response (success branch):_
 }
 ```
 
-**`list_content_standards`** — Request parameters for listing content standards configurations.
+#### `list_content_standards`
+
+Request parameters for listing content standards configurations.
 
 _Request:_
 ```
@@ -1685,7 +2276,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_content_standards`** — Request parameters for retrieving a specific standards configuration.
+#### `get_content_standards`
+
+Request parameters for retrieving a specific standards configuration.
 
 _Request:_
 ```
@@ -1702,7 +2295,9 @@ _Response (success branch):_
 }
 ```
 
-**`create_content_standards`** — Request parameters for creating a new content standards configuration.
+#### `create_content_standards`
+
+Request parameters for creating a new content standards configuration.
 
 _Request:_
 ```
@@ -1724,7 +2319,9 @@ _Response (success branch):_
 }
 ```
 
-**`update_content_standards`** — Request parameters for updating an existing content standards configuration.
+#### `update_content_standards`
+
+Request parameters for updating an existing content standards configuration.
 
 _Request:_
 ```
@@ -1748,7 +2345,9 @@ _Response (success branch):_
 }
 ```
 
-**`calibrate_content`** — Request parameters for collaborative calibration dialogue.
+#### `calibrate_content`
+
+Request parameters for collaborative calibration dialogue.
 
 _Request:_
 ```
@@ -1771,7 +2370,9 @@ _Response (success branch):_
 }
 ```
 
-**`validate_content_delivery`** — Request parameters for batch validating delivery records.
+#### `validate_content_delivery`
+
+Request parameters for batch validating delivery records.
 
 _Request:_
 ```
@@ -1793,7 +2394,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_media_buy_artifacts`** — Request parameters for retrieving content artifacts from a media buy.
+#### `get_media_buy_artifacts`
+
+Request parameters for retrieving content artifacts from a media buy.
 
 _Request:_
 ```
@@ -1819,7 +2422,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_creative_features`** — Request parameters for evaluating creative features from a governance agent.
+#### `get_creative_features`
+
+Request parameters for evaluating creative features from a governance agent.
 
 _Request:_
 ```
@@ -1845,7 +2450,9 @@ _Response (success branch):_
 }
 ```
 
-**`sync_plans`** — Push campaign plans to the governance agent.
+#### `sync_plans`
+
+Push campaign plans to the governance agent.
 
 _Request:_
 ```
@@ -1865,7 +2472,9 @@ _Response (success branch):_
 }
 ```
 
-**`report_plan_outcome`** — Report the outcome of an action to the governance agent.
+#### `report_plan_outcome`
+
+Report the outcome of an action to the governance agent.
 
 _Request:_
 ```
@@ -1877,7 +2486,7 @@ _Request:_
   purchase_type: Purchase Type
   seller_response: object
   delivery: object
-  error: object
+  error: Reported Outcome Error
   governance_context: string
   context: Context
 }
@@ -1898,7 +2507,9 @@ _Response (success branch):_
 }
 ```
 
-**`report_plan_adjustment`** — Seller-authenticated append-only commitment adjustment report.
+#### `report_plan_adjustment`
+
+Seller-authenticated append-only commitment adjustment report.
 
 _Request:_
 ```
@@ -1934,7 +2545,9 @@ _Response (success branch):_
 }
 ```
 
-**`get_plan_audit_logs`** — Retrieve governance state and audit trail for a plan.
+#### `get_plan_audit_logs`
+
+Retrieve governance state and audit trail for a plan.
 
 _Request:_
 ```
@@ -1956,7 +2569,9 @@ _Response (success branch):_
 }
 ```
 
-**`check_governance`** — Orchestrator or seller calls the governance agent to validate an action against the campaign plan.
+#### `check_governance`
+
+Orchestrator or seller calls the governance agent to validate an action against the campaign plan.
 
 _Request:_
 ```
@@ -1976,7 +2591,7 @@ _Request:_
   planned_delivery: Planned Delivery
   delivery_metrics: object
   modification_summary: string
-  runtime_attestations: object[]
+  runtime_attestations: Attestation Reference[]
   invoice_recipient: Business Entity
   context: Context
 }
@@ -1999,7 +2614,7 @@ _Response (success branch):_
   categories_evaluated: string[]
   policies_evaluated: string[]
   mode: Governance Mode
-  runtime_attestation_evaluations: object[]
+  runtime_attestation_evaluations: Attestation Evaluation[]
   runtime_attestation_binding_digest: string
   governance_context: string
   context: Context
@@ -2008,7 +2623,9 @@ _Response (success branch):_
 
 ### Sponsored Intelligence
 
-**`si_get_offering`** — Get offering details, availability, and optionally matching products before session handoff.
+#### `si_get_offering`
+
+Get offering details, availability, and optionally matching products before session handoff.
 
 _Request:_
 ```
@@ -2039,7 +2656,9 @@ _Response (success branch):_
 }
 ```
 
-**`si_initiate_session`** — Host initiates SI session with brand agent - includes context, identity, and capability negotiation.
+#### `si_initiate_session`
+
+Host initiates SI session with brand agent - includes context, identity, and capability negotiation.
 
 _Request:_
 ```
@@ -2071,7 +2690,9 @@ _Response (success branch):_
 }
 ```
 
-**`si_send_message`** — Send a message within an active SI session.
+#### `si_send_message`
+
+Send a message within an active SI session.
 
 _Request:_
 ```
@@ -2099,7 +2720,9 @@ _Response (success branch):_
 }
 ```
 
-**`si_terminate_session`** — Terminate an SI session with reason (handoff_transaction, handoff_complete, user_exit, session_timeout, host_terminated).
+#### `si_terminate_session`
+
+Terminate an SI session with reason (handoff_transaction, handoff_complete, user_exit, session_timeout, host_terminated).
 
 _Request:_
 ```
@@ -2143,6 +2766,7 @@ These are the main domain objects returned in tool responses. Defined in `src/li
 | `ContentStandards` | Brand safety config — has standards_id, name, scope, policy entries, calibration exemplars |
 | `Catalog` | Data feed — typed (offering, product, store, etc.) with items, URL, or inline data |
 | `Offering` | Promotable item with asset groups — used in sponsored intelligence and catalog creatives |
+| `Reporting Consumer Status` | Consumer acknowledgement for one config/report/half-open period — received requires obligation, revision, and observed SHA-256; obligation_missing forbids them; revision_missing requires obligation only; unreadable requires obligation, revision, and failure_code; snapshot ID/time are paired; recorded_at is response-only |
 
 ## PricingOption Variants
 
@@ -2192,6 +2816,139 @@ const brand = BrandJsonSchema.parse(await res.json());
 ```
 
 Source of truth: `schemas/cache/{version}/brand.json` and `adagents.json` — regenerate with `npm run generate-wellknown-schemas` when the spec bumps.
+
+## Seller Reporting Source Contract
+
+Import from `@adcp/sdk/reporting/source`. This is a provider-neutral adapter boundary; the existing buyer-side `reconcileReporting` API is separate.
+
+```typescript
+type ReportingSourceManifestLevelV1 = 'basic' | 'evidenced';
+interface ReportingSourceExecutorV1 {
+  readonly capabilities: ReportingSourceCapabilitiesV1;
+  execute(request: ReportingSourceSliceRequestV1, context: { signal: AbortSignal; heartbeat?: () => void }): Promise<ReportingSourceExecutorResultV1>;
+}
+interface ReportingSourceStagedObjectReaderV1 {
+  read(input: { objectRef: string; objectGeneration: string; sourceScope: Record<string, unknown>; account: { account_id: string }; delivery_config_id: string; delivery_config_version: number; report_definition_id: string; reporting_obligation_id: string; maxBytes: number; signal: AbortSignal }): Promise<Uint8Array>;
+}
+type ReportingSourceExecutorResultV1 =
+  | { ok: true; response: ReportingSourceExecutionResponseV1; manifestBytes: Uint8Array }
+  | { ok: false; error: ReportingSourceErrorV1 };
+type InlineReportingMetricEvidenceV1 =
+  | { constituent_id: string; metric: string; status: 'present' | 'explicit_zero'; data_through: string }
+  | { constituent_id: string; metric: string; status: 'unsupported' | 'delayed' | 'partial' | 'stale' | 'missing'; reason: string; data_through?: string };
+interface InlineReportingAvailabilityEvidenceV1 {
+  version: '1.0';
+  cells: readonly InlineReportingMetricEvidenceV1[];
+}
+// Inline callback requests include constituents: { constituent_id, media_buy_id }[]; evidence-bearing responses add availability_evidence.
+// validateReportingSourceExecutionV1({ level, capabilities, request, result, objectReader })
+// runReportingSourceReplayConformanceV1({ level, executor, request, objectReader })
+// validateReportingRevisionSequenceV1(manifests, { crossFinalityBridge })
+// createInlineReportingSourceExecutor(deliveryFetch, offering) // basic compatibility adapter
+```
+
+`basic` is the Reliable Reporting Core floor: immutable objects, hashes, coverage, finality, and completeness. `evidenced` additionally proves every page, async-job poll, retry, and usage count within the 1 MiB manifest bound. Identity is the caller-owned opaque `sourceScope` plus AdCP account/config/report/period/obligation identities.
+
+## Seller Reporting Ledger
+
+Ledger symbols import from `@adcp/sdk/reporting/ledger`; `createPostgresPersistentNotificationRuntime` is a server symbol and imports from `@adcp/sdk/server`.
+
+```typescript
+// Build the notification path first: the store must be constructed with the
+// activity port, or lifecycle transitions record no activity and notify nobody.
+const attemptCheckpoint = createPostgresReportingNotificationAttemptCheckpoint({
+  db: pool,
+  namespace: 'seller-production',
+});
+const notifications = createPostgresPersistentNotificationRuntime({
+  db: pool,
+  publisherScope: 'seller-production',
+  checkpointDeliveryAttempt: attemptCheckpoint,
+  subscriptions: { acknowledgeIsolatedDatabase: true },
+  ...notificationOptions,
+});
+const reportingActivity = createPostgresReportingNotificationActivityRuntime({
+  db: pool,
+  notifications,
+  namespace: 'seller-production',
+  attemptCheckpoint,
+  tenantScopeForAccount: accountId => trustedTenantDirectory.tenantFor(accountId),
+});
+
+// One store, wired to the activity port, used by every participant below.
+const store = new PostgresReportingLedgerStore(pool, {
+  acknowledgeIsolatedDatabase: true,
+  notificationActivityPort: reportingActivity.port,
+});
+
+// Every migration this wiring needs, before probing.
+await pool.query(REPORTING_LEDGER_MIGRATION);
+for (const sql of notifications.migrations.all) await pool.query(sql);
+for (const sql of reportingActivity.migrations.all) await pool.query(sql);
+
+const producer = createReportingProducer({ store, source, offerings, contact });
+await producer.planObligations();
+await producer.runWorker();
+const getReportingStatus = createReportingStatusHandler(store);
+const getMediaBuyDelivery = createReportingDeliveryHandler(store); // exact reporting_revision_id reads
+
+// AdCP 3.2.0-rc.4: identity comes from authenticated transport.
+const syncReportingStatus = createSyncReportingStatusHandler(store, {
+  resolveConsumerId: context => context.agent.agent_url,
+});
+
+await reportingActivity.probe();
+// Run repeatedly from a durable scheduler; this call is bounded.
+await reportingActivity.recoverOnce({ ownerToken: stableWorkerId });
+const activityPage = await reportingActivity.listActivity({
+  tenantId: trustedTenant,
+  accountId: resolvedAccountId,
+  limit: 100,
+});
+```
+
+The store freezes configuration lineage and period-end denominators, retains immutable RFC 8785 JCS/SHA-256-bound revisions, atomically fences lifecycle projections against their revision evidence, and provides leased production plus snapshot-stable status pagination. `projectReportingObligationHealthV1` implements waiting, healthy, delayed, action_required, and complete without I/O.
+
+`ReportingLedgerNotificationActivityPortV1<TTransaction>` is the custom-store seam. Invoke it inside the authoritative transition transaction and fence both predecessor health and finality. The bundled PostgreSQL runtime persists exactly-once intent plus paginatable account activity, then projects health changes through `PersistentNotificationRuntime`; finality-only changes remain internal activity. It never owns subscriber credentials or sends webhooks itself. `listActivity()` is adopter-facing only because no public AdCP account-activity read task exists.
+
+## Reliable Reporting Service
+
+Import from `@adcp/sdk/reporting/service`. This is the adapter-first lifecycle owner over the source and ledger primitives; it does not introduce another store or transport.
+
+```typescript
+interface ReliableReportingAdapterV1 {
+  readonly sourceOffering: ReportingSourceOfferingV1;
+  readonly deliveryOffering: ReportingDeliveryOffering;
+  // Exactly one of fetchSlice or executor.
+  readonly fetchSlice?: InlineReportingDeliveryFetchV1;
+  readonly executor?: ReportingSourceWithReaderV1;
+  // Opt-in bounded replay window for the inline executor; never applied
+  // silently. A feed that outlives its replay ceiling needs this or a
+  // durable executor.
+  readonly inlineReplayRetention?: InlineReportingReplayRetentionV1;
+}
+
+const reporting = createReliableReportingService({
+  store,
+  adapters,
+  contact,
+  automatedRecoveryWindowSeconds,
+  statusRetentionDays, // enforce this commitment in the ledger database
+  resolveSource: account => ({ adapterId, sourceScope, sourceTimezone }),
+  resolveCurrency: account => currency,
+  resolveCoverage: account => ({ constituents }), // authorized media-buy/package denominator
+  resolveConsumerId, // optional; controls consumer-status handler/capability
+});
+
+await pool.query(reporting.setup.migrations[0]);
+const installedPlatform = reporting.install(platform);
+await reporting.installConfiguration(configuration, { account: ctx.account });
+await reporting.runCycle({ accountId }); // tenant-partitioned
+reporting.start({ intervalMilliseconds, deploymentWide: true }); // explicit full-ledger scan
+await reporting.stop();
+```
+
+Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free `sourceScope`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply `account`, `sourceScope`, `sourceTimezone`, `contract`, `currency`, `constituents`, or `mediaBuyIds`; `mediaBuyIds` is derived from `resolveCoverage`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires `platform.accounts.upsert`, which owns the advertised `sync_accounts` configuration path.
 
 ## Key Enums
 

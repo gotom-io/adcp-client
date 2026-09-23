@@ -1,9 +1,22 @@
-# Migrating from 13.x to 14 beta
+# Migrating from 13.x to the 14 prerelease
 
-SDK 14 adopts AdCP `3.2.0-beta.6` while preserving the canonical creative boundary introduced in SDK 13. Most SDK 13 applications can install the beta and continue using the established 3.x tools unchanged; adopt the compact 3.2 lifecycle only after the remote agent advertises it.
+SDK 14 adopts AdCP `3.2.0-rc.4` while preserving the canonical creative boundary introduced in SDK 13. Most SDK 13 applications can install the prerelease and continue using the established 3.x tools unchanged; adopt the compact 3.2 lifecycle only after the remote agent advertises it.
+
+Legacy signal-discovery adapters may keep supplying `opts.signals.getSignals`
+(or `legacyHandlers.signals.getSignals`) while declaring the truthful
+`signal-marketplace` or `signal-owned` specialism. That compatibility handler
+now satisfies platform validation without requiring adopters to invent an
+`activate_signal` implementation during an incremental migration.
 
 AdCP 3.2 prereleases are exact protocol pins: beta.6 replaces beta.5 in the
 SDK's compatible-version list rather than extending a rolling 3.2-beta range.
+Likewise, `3.2.0-rc.4` replaces `3.2.0-rc.3`; callers pinned to rc.3 must
+upgrade both peers together because the SDK does not advertise superseded 3.2
+prereleases as compatible wire releases and ships only the current
+prerelease's schema bundle. Pinning `adcpVersion: '3.2-rc'` follows whichever
+3.2 release candidate this SDK build carries; pinning a superseded exact
+prerelease such as `'3.2.0-rc.2'` raises a configuration error at schema load
+rather than silently validating against a different contract.
 Beta.1 restored `adcp_major_version` on `buy_products`,
 `accept_proposal`, and `control_media_buy`; the SDK now sends that field again
 for beta.1 and later while retaining its omission only for an explicitly
@@ -15,13 +28,35 @@ convergence, webhook retry horizons, and crash-safe continuation generation
 replacement. Beta.6 adds coordinated placements, seller-rendered stateful
 display, creative component assets, and A2A 1.0 request-signing method names.
 
+### Separate the server default from its supported ceiling
+
+An SDK 14 server can advertise and serve 3.2 without silently moving
+unversioned callers off 3.1:
+
+```ts
+const server = createAdcpServer({
+  adcpVersion: '3.2.0-rc.4',
+  defaultAdcpVersion: '3.1.18',
+  capabilities: { supported_versions: ['3.1.18', '3.2.0-rc.4'] },
+  // handlers...
+});
+```
+
+`adcpVersion` is the maximum supported release; `defaultAdcpVersion` is used
+only when the caller supplies no version claim. Explicit 3.2 callers select
+3.2. Standard and custom handlers can read the immutable
+`servedAdcpVersion`, as can DecisioningPlatform request and task-handoff
+contexts. `responseEnhancer` receives the same value in its new optional
+second argument. Discovery without a version claim uses the default release,
+including MCP `tools/list`, generated capabilities, and A2A agent cards.
+
 ### A2A 1.0 peer upgrade
 
 SDK 14's AdCP 3.2 transport requires `@a2a-js/sdk` 1.x. Upgrade the peer
 alongside the AdCP SDK:
 
 ```bash
-npm install @adcp/sdk@beta @a2a-js/sdk@^1.0.1
+npm install '@adcp/sdk@^14.0.0-0' @a2a-js/sdk@^1.0.1
 ```
 
 The client and server use the official 1.0 Agent Card and JSON-RPC APIs and
@@ -31,6 +66,166 @@ profile. Wire interoperability with 0.3 agents remains available through the
 installed. Existing `createA2AAdapter()` card options remain accepted, but
 `preferredTransport` and `protocolVersion` are deprecated because the adapter
 now advertises JSON-RPC 1.0 plus its 0.3 compatibility interface.
+
+Compatibility remains enabled by default. Native-only conformance and
+deployments can opt out without patching the package:
+
+```ts
+const client = await createA2AClientFromCardUrl(cardUrl, fetch, { enabled: false });
+const adapter = createA2AAdapter({
+  server,
+  agentCard,
+  legacyCompat: { enabled: false },
+});
+```
+
+For regular `AdCPClient` calls, set
+`transport: { legacyCompat: { enabled: false } }` on the client or task. The
+setting is forwarded to both the official card resolver and JSON-RPC
+transport. It is also part of the A2A client-cache identity, so native-only
+and compatibility-enabled calls never reuse each other's discovered client.
+
+The compliance runner does not inherit that adopter default. `comply()`,
+`runStoryboard()`, and `runStoryboardStep()` grade every A2A route with
+`legacyCompat: { enabled: false }`, including A2A entries in a routed
+multi-agent run. A seller that exposes only the v0.3 compatibility interface
+may still work for ordinary SDK calls, but it is not A2A 1.0 conformant and its
+compliance run now fails instead of being projected through the legacy layer.
+
+### Cross-origin signing-key delegation
+
+Signing-key discovery now evaluates the complete matching
+`authorized_operators[]` entry. Bare strings, missing/empty `brands`, malformed
+validity timestamps, future grants, and grants at or after `valid_until` no
+longer authorize an operator. Domain comparison remains eTLD+1-based (including
+private suffixes), while brand, activity scope, country, and time must all match
+the same entry.
+
+Broad grants remain configuration-free: use `brands: ['*']`, omit `scopes` for
+all activities (or use `['all']`), and omit `countries` for global scope. If a
+house publishes a constrained grant, bind the trusted verification context:
+
+```ts
+const client = new SingleAgentClient(agent, {
+  webhookVerification: {
+    resolverOptions: {
+      requiredOperatorBrand: 'brand_a',
+      requiredOperatorScope: 'media_buying',
+      requiredOperatorCountry: 'GB',
+    },
+  },
+});
+```
+
+These resolver options remain a trusted client-wide fallback for a client that
+uses one tuple. Shared clients can now select and durably persist the trusted
+tuple per dispatch:
+
+```ts
+await client.createMediaBuy(request, undefined, {
+  delegatedOperatorAuthorization: {
+    brand: 'brand_b',
+    scope: 'media_buying',
+    country: 'US',
+  },
+});
+```
+
+The per-call object takes whole-object precedence and is local receiver policy;
+the SDK neither infers it from request fields nor sends it on the wire. Custom
+`WebhookRegistrationStore` implementations must round-trip the versioned
+authorization fields so restart-time verification can revalidate the tuple
+against live `brand.json`, with immediate read-your-writes consistency after
+`putIfAbsent()`. The SDK reads the row back before seller dispatch and fails
+closed if a legacy projection drops either field. Do not persist a prior allow
+decision as authority.
+
+Pre-upgrade RFC 9421 rows without `authorizationContextVersion` cannot be
+safely backfilled from the receiver's current configuration. Automatic key
+discovery rejects them after upgrade; drain them first or re-dispatch the
+operation to create a versioned registration. A caller-supplied
+`webhookVerification.jwks` may support legacy rows only when it independently
+preserves their original trust boundary.
+
+### Durable webhook registration across replicas
+
+The process-local registration store cannot survive a restart or route a
+callback to another replica. SDK 14 includes first-party PostgreSQL and Redis
+stores with the same atomic create-or-identical contract:
+
+```ts
+import {
+  SingleAgentClient,
+  cleanupExpiredWebhookRegistrations,
+  getWebhookRegistrationMigration,
+  pgWebhookRegistrationStore,
+  redisWebhookRegistrationStore,
+} from '@adcp/sdk';
+import { PostgresReplayStore, getReplayStoreMigration } from '@adcp/sdk/signing/server';
+
+// PostgreSQL deployment bootstrap:
+await pool.query(getWebhookRegistrationMigration({
+  tableName: 'buyer_eu_webhook_registrations',
+}));
+const registrations = pgWebhookRegistrationStore(pool, {
+  tableName: 'buyer_eu_webhook_registrations',
+});
+await registrations.probe();
+await pool.query(getReplayStoreMigration('buyer_eu_webhook_replays'));
+const sharedReplayStore = new PostgresReplayStore(pool, {
+  tableName: 'buyer_eu_webhook_replays',
+});
+
+// Or Redis, using the same deployment-unique prefix on every replica:
+const redisRegistrations = redisWebhookRegistrationStore(redis, {
+  keyPrefix: 'buyer-eu:webhook-registration:v1:',
+});
+await redisRegistrations.probe();
+
+// Construct this identically in outbound workers and inbound HTTP replicas.
+const client = new SingleAgentClient(agentWithStableId, {
+  webhookRegistrationStore: registrations, // or redisRegistrations
+  webhookVerification: { replayStore: sharedReplayStore },
+});
+
+// Schedule for PostgreSQL; expiry checks do not depend on this cleanup.
+await cleanupExpiredWebhookRegistrations(pool, {
+  tableName: 'buyer_eu_webhook_registrations',
+  batchSize: 1_000,
+});
+```
+
+Run migrations and `probe()` before serving traffic. All replicas must use the
+same stable agent id and the same isolated table or key prefix. Redis reads
+must be primary-consistent and the deployment must support Lua. Retain records
+for at least the seller retry horizon; monitor Redis capacity because eviction
+causes fail-closed callback unavailability. RFC 9421 additionally requires a
+shared durable replay store so two replicas cannot accept the same signature.
+
+Existing custom-store rows are not imported automatically. They must preserve
+the complete `authorizationContextVersion` and
+`delegatedOperatorAuthorization` tuple. Drain or re-dispatch legacy/lossy rows
+rather than deriving their original authority from current configuration.
+
+The same options are accepted by `resolveAgent()`, `getAgentJwks()`,
+`createAgentJwksSet()`, and `ResolvedAgentJwksResolver`. A constrained list with
+no corresponding trusted option fails closed. Built-in JWKS caches now expire
+at the earlier of their configured TTL and the accepted delegation's
+`valid_until` boundary. Low-level `getAgentJwks()` callers receive that boundary
+as `operatorAuthorizationValidUntil` and must apply it to any custom cache.
+Webhook verification also rechecks that boundary immediately before accepting a
+delivery and committing its replay nonce.
+
+### Modern MCP validation errors
+
+Modern MCP `tools/list` continues to advertise the exact official AdCP input
+schema. Call-time domain validation now remains in the AdCP framework pipeline,
+so schema-invalid AdCP objects return the framework's structured `adcp_error`
+and `context` echo instead of a generic MCP input-validation string. Because
+the modern transport advertises that strict schema, it requests strict
+framework request validation even when the server-wide validation mode is
+`warn` or `off`; explicit custom tool schemas remain enforced by the MCP server
+layer.
 
 ### Beta.5 task webhook registration and polling
 
@@ -42,6 +237,13 @@ authorized request, registration provenance, route, and webhook envelope.
 Beta.5-or-later sellers return `INVALID_REQUEST` before handler dispatch when the field
 is missing or malformed. Explicitly negotiated older bundles keep their prior
 wire behavior.
+
+Regardless of negotiated version, a supplied malformed
+`push_notification_config` now returns a precise `INVALID_REQUEST` at
+`push_notification_config`, `.url`, or `.token` even when server request
+validation is `off`. Omit the field, or set it explicitly to `undefined`, to
+keep the polling-only behavior; a supplied object must include a string URL,
+and an own `token` property must be a string.
 
 Receivers continue to fence exact delivery retries by seller plus
 `idempotency_key`, and additionally fence terminal publication by authenticated
@@ -56,10 +258,29 @@ tasks. A failed response may carry both the top-level summary `error` and a
 canonical `result.errors[]`; they describe the same failure.
 
 ```bash
-npm install @adcp/sdk@beta
+npm install '@adcp/sdk@^14.0.0-0'
 ```
 
 The untagged npm install remains SDK 13. Keep that line for production AdCP 3.1 deployments until the 3.2 application and its counterparties have completed beta validation.
+
+### Breaking: push-enabled task handoffs require a terminal delivery owner
+
+SDK 14 now fails closed when a handler returns `ctx.handoffToTask(...)` for a
+request whose `push_notification_config.url` was validated but the server has
+no configured task-webhook delivery path. The initial response is a structured
+`UNSUPPORTED_FEATURE` error at `push_notification_config`; no task is created
+and the handoff callback does not run. The platform handler has already run to
+produce its handoff marker, so it must not make irreversible effects before
+returning it; framework-managed proposal reservations are unwound. Remove the
+push configuration and retry with a **new** `idempotency_key` to retain the
+polling-only path, or configure the framework `webhooks` emitter.
+
+This framework delivery path applies only to framework-settled handoffs.
+External settlement has no SDK terminal webhook delivery path, even when an
+emitter is configured; omit `push_notification_config` and use polling.
+
+Synchronous responses remain successful and silent on the task webhook channel
+even when a request includes `push_notification_config`.
 
 ## Compound compliance capability gates
 
@@ -87,6 +308,166 @@ An unmet predicate produces one whole-storyboard `not_applicable` result and no
 steps are dispatched. Empty and single-entry lists fail during storyboard
 loading; keep using `requires_capability` for a singular predicate.
 
+## `derived` account resolution is now an upstream-managed account-id namespace
+
+**Breaking, and the fix is mechanical.** SDK 13 documented
+`AccountStore.resolution: 'derived'` as "single-tenant; there is no
+`account_id` on the wire", and the framework refused inline `account_id`
+references for it (`INVALID_REQUEST`, `field: 'account.account_id'`). Those
+wire semantics were inverted relative to the adopters the mode exists for.
+Upstream [adcp#5062](https://github.com/adcontextprotocol/adcp/pull/5062)
+settled the account-reference model, and SDK 14 corrects the SDK to match
+(adcp-client#1647, which also resolves adcp-client#1628):
+
+| | SDK 13 (`'derived'`) | SDK 14 (`'derived'`) |
+|---|---|---|
+| Durable wire reference | none — account came from the credential | `{ account_id }` |
+| Inline `account_id` | refused with `INVALID_REQUEST` | **accepted**, and verified against the caller's reachable set |
+| `{ brand, operator }` arm | accepted, passed to your resolver | **refused** with `INVALID_REQUEST` (`field: 'account.brand'`) + a `list_accounts` suggestion |
+| `accounts.list` | optional | **required** — `createAdcpServerFromPlatform` throws `PlatformConfigError` without it |
+| `sync_accounts` | whatever your `upsert` did | natural-key provisioning entries fail per-row with `UNSUPPORTED_PROVISIONING`; `account: { account_id }` settings-update entries pass through |
+| `get_adcp_capabilities` | `require_operator_auth` unset | projects `account.require_operator_auth: true`, like a declared `'explicit'` (which also emits `supported_billing`, defaulting to `['agent']` — declare `capabilities.supportedBillings`) |
+| `accounts.resolve` returning a different id than the buyer named | served | refused with `ACCOUNT_NOT_FOUND` (framework-side backstop) |
+
+Why it had to change: an upstream-managed adapter (Meta / Snap ad accounts,
+AudioStack workspaces, a retail-media proxy) has no way to accept the id its
+own upstream assigned — buyers who called `list_accounts` got ids that every
+subsequent call rejected. The old contract was only usable by ignoring `ref`
+entirely, which is a tenant-isolation bug the moment a deployment serves more
+than one account.
+
+No alias spelling is introduced: `'derived'` stays the single name for the
+mode. A second spelling would silently defeat adopter code written as
+`resolution === 'derived'` without buying anything on the wire (`resolution`
+is SDK-local config), and `'account-id-namespace'` wouldn't discriminate
+anyway — under adcp#5062 both `'explicit'` and `'derived'` are account-id
+namespaces. An unrecognized `resolution` value is now a
+`PlatformConfigError` at construction rather than silently inheriting
+another mode's enforcement.
+
+### Recipe 1 — one account per credential (audiostack / flashtalking shape)
+
+Before:
+
+```ts
+const accounts = createDerivedAccountStore<MyMeta>({
+  toAccount: ctx => ({ id: 'audiostack', name: 'AudioStack', status: 'active', ctx_metadata: {} }),
+});
+```
+
+After — unchanged call shape. The factory now also publishes the one-row
+`list_accounts` the mode requires, verifies any buyer-supplied `account_id`
+against `toAccount(ctx).id` (mismatch → `ACCOUNT_NOT_FOUND`), and auto-selects
+the account on ref-less tools. Make sure `id` is the id you want buyers to
+read from `list_accounts` and send back — it is now on the wire in both
+directions.
+
+### Recipe 2 — many accounts per credential (Meta / Snap shape)
+
+This shape had no working Shape D before. Supply `listAccounts` instead of
+`toAccount`:
+
+```ts
+const accounts = createDerivedAccountStore<{ upstreamId: string }>({
+  // Scope by the caller's credential — this is the tenant-isolation boundary.
+  listAccounts: async ctx => {
+    const rows = await meta.adAccountsFor(ctx?.authInfo);
+    return rows.map(r => ({ id: r.account_id, name: r.name, status: 'active', ctx_metadata: { upstreamId: r.id } }));
+  },
+  // Optional, for rosters too large to enumerate per request. MUST filter by caller.
+  lookupAccount: (id, ctx) => meta.adAccountForCaller(id, ctx?.authInfo),
+});
+```
+
+`toAccount` and `listAccounts` are mutually exclusive; supplying both (or
+neither) throws `TypeError` at construction.
+
+### Recipe 3 — hand-rolled `'derived'` stores
+
+Two things to add:
+
+```ts
+import { refAccountId } from '@adcp/sdk/server';
+
+accounts: {
+  resolution: 'derived',
+  resolve: async (ref, ctx) => {
+    const reachable = await upstream.accountsFor(ctx?.authInfo); // credential-scoped
+    const id = refAccountId(ref);
+    if (id !== undefined) return reachable.find(a => a.id === id) ?? null; // verify, fail closed
+    return reachable.length === 1 ? reachable[0] : null;                   // no arbitrary default
+  },
+  // Required — construction throws without it. `opts.accounts.listAccounts`
+  // at the merge seam satisfies it too. The framework does not filter or
+  // page for you: honor req.account / req.status / req.sandbox and
+  // req.pagination in your own query.
+  list: async (req, ctx) => ({ items: await upstream.accountsFor(ctx?.authInfo) }),
+}
+```
+
+Belt and braces: if a `'derived'` resolver returns an account whose `id`
+isn't the one the buyer named, the framework refuses it with
+`ACCOUNT_NOT_FOUND` (and warns outside production) rather than serving the
+request against the wrong account. Don't rely on that instead of verifying —
+it can't tell whether *your* lookup was credential-scoped.
+
+If your ids are only ever issued out-of-band and there is nothing to
+enumerate, you are a seller-defined account-id namespace: declare
+`'explicit'`. Note two consequences: `'explicit'` applies **no** framework
+reference-shape enforcement, so a resolver that ignores `ref` will happily
+serve any `account_id` a buyer sends — keep the verification from the snippet
+above — and a *declared* `'explicit'` also projects
+`account.require_operator_auth: true`, like `'derived'`.
+
+### Recipe 3b — `sync_accounts` / `sync_governance` entries are verified
+
+Both tools carry their account reference inside the batch, so they never went
+through `accounts.resolve`. On a `'derived'` platform the framework now
+resolves each entry's `account_id` against the caller's reachable set before
+any write runs:
+
+- `sync_accounts` — an unreachable id fails the whole operation with
+  `ACCOUNT_NOT_FOUND` before `accounts.upsert` is called (the response row
+  schema requires `brand` + `operator`, which we don't have for an account we
+  refused to resolve, and failing the batch means no partial writes).
+- `sync_governance` — the individual row fails with `ACCOUNT_NOT_FOUND`;
+  reachable entries in the same batch still persist.
+
+Entries are also normalized to exactly one account reference first: an entry
+carrying two (a root `account_id` plus a nested `account`, or an `account`
+mixing `account_id` with `brand`/`operator`) is refused with
+`INVALID_REQUEST` rather than disambiguated by precedence. The schema's
+per-entry `oneOf` already forbids those shapes, but request validation is
+relaxable and a gate that reads one reference while the write uses another
+is a bypass.
+
+This applies to the merge-seam wiring (`opts.accounts.syncAccounts` /
+`syncGovernance`) as well as the platform interface. If you were relying on
+your own per-entry tenant gate, keep it — this is a framework floor, not a
+replacement.
+
+Settings-update rows you return must carry `brand` + `operator` (required by
+`sync-accounts-response.json`); echo them from your own account record. If
+your upstream accounts have no brand/operator you can express, don't wire
+`upsert` — tracked upstream at
+[adcontextprotocol/adcp#7517](https://github.com/adcontextprotocol/adcp/issues/7517).
+
+### Recipe 4 — buyers
+
+Buyers that special-cased "derived agents reject `account_id`" can drop the
+branch: against an SDK 14 derived agent, call `list_accounts`, then send
+`account: { account_id }` like any other account-id-namespace seller. Buyers
+that sent `{ brand, operator }` to a derived agent now get `INVALID_REQUEST`
+with a `list_accounts` suggestion in `error.suggestion`.
+
+### Conformance
+
+The cross-storyboard account-discovery gate no longer accepts `sync_accounts`
+as discovery for an agent declaring `account.require_operator_auth: true` —
+those agents must advertise `list_accounts`. Agents whose capabilities can't
+be read are classified as before (no new failures from an unparseable
+`get_adcp_capabilities`).
+
 ## Upgrade checklist
 
 1. Pin SDK 14 with the `beta` tag or an exact `14.0.0-beta.*` version. Do not rely on npm `latest` for beta rollout.
@@ -97,12 +478,16 @@ loading; keep using `requires_capability` for a singular predicate.
 6. Re-run TypeScript against generated schema imports. Prefer per-tool type slices if the complete schema barrel exhausts the default Node heap.
 7. Exercise mixed-version tests before rollout: 14→3.0, 14→3.1, 14→3.2 beta, and older buyer→14 server where applicable.
 8. If a legacy brief may return products without a proposal, configure a durable `LegacyPurchaseContinuationStore`, stable `principalScope`, and application-owned `reconcileLegacyPurchase(record, exactInput)` callback before offering `continueLegacyPurchase()`. Keep reverse compact-seller → older-buyer handlers application-owned.
-9. If established 3.0/3.1 proposal discovery and mutation can land on different processes, configure the same durable `EstablishedProposalStore`, stable `principalScope`, and stable non-secret `legacyPurchaseSellerSessionScope` on every coordinator. Add store-clock `completedAt` and `retainUntil` fields to refinement/decline completion tombstones, index `retainUntil`, and retain each proof for at least `ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS`. Conservatively backfill pre-upgrade tombstones to a future seven-day horizon, then run a database-clock sweeper that atomically prunes only expired rows. Recover submitted work with `reconcileEstablishedProposalTask({ account, sellerTaskId })`; see [Media-buy compatibility: durable established proposal state](./guides/MEDIA-BUY-3.2-COMPATIBILITY.md#durable-established-proposal-state). The bundled in-memory store is a non-durable reference implementation.
-10. Upgrade durable idempotency storage before application traffic: add the nullable PostgreSQL `retain_until` column/index, preserve `IdempotencyCacheEntry.retainUntil`, and add atomic `putIfAbsent()`, `replaceIfPayloadHash()`, `replaceIfPayloadHashAndExpired()`, and `deleteIfPayloadHash()` to every custom backend.
-11. Upgrade custom deferred-task storage with `putForSettlementOperationIfAbsent()`, `getBySettlementOperationId()`, and `replaceForSettlementOperationIfVersion()`. The initial token/index write and nested A→B index move must each be atomic.
-12. Replace webhook emitter `operation_id` arguments with SDK-local `delivery_id` values and upgrade custom stores to `WebhookDeliveryStore`. One delivery ID binds one canonical payload and key; use a fresh delivery ID for each changed status observation while retaining the AdCP `operation_id` inside the payload.
-13. Ensure custom 3.2 buyers include `push_notification_config.operation_id`, and update A2A integrations to keep the AdCP registration in skill parameters even when native A2A push configuration is also present.
-14. Treat failed/rejected task results as canonical terminal artifacts when `include_result` is requested; do not discard them while preserving only the summary error.
+9. If you declare `accounts.resolution: 'derived'`, wire `accounts.list` (or move to `createDerivedAccountStore`), make `accounts.resolve` verify buyer-supplied `account_id` values, and expect `account.require_operator_auth: true` in your capability payload. See [`derived` account resolution is now an upstream-managed account-id namespace](#derived-account-resolution-is-now-an-upstream-managed-account-id-namespace).
+10. If established 3.0/3.1 proposal discovery and mutation can land on different processes, configure the same durable `EstablishedProposalStore`, stable `principalScope`, and stable non-secret `legacyPurchaseSellerSessionScope` on every coordinator. Add store-clock `completedAt` and `retainUntil` fields to refinement/decline completion tombstones, index `retainUntil`, and retain each proof for at least `ESTABLISHED_PROPOSAL_COMPLETION_TOMBSTONE_RETENTION_MS`. Conservatively backfill pre-upgrade tombstones to a future seven-day horizon, then run a database-clock sweeper that atomically prunes only expired rows. Recover submitted work with `reconcileEstablishedProposalTask({ account, sellerTaskId })`; see [Media-buy compatibility: durable established proposal state](./guides/MEDIA-BUY-3.2-COMPATIBILITY.md#durable-established-proposal-state). The bundled in-memory store is a non-durable reference implementation.
+11. Upgrade durable idempotency storage before application traffic: add the nullable PostgreSQL `retain_until` column/index, preserve `IdempotencyCacheEntry.retainUntil`, and add atomic `putIfAbsent()`, `replaceIfPayloadHash()`, `replaceIfPayloadHashAndExpired()`, and `deleteIfPayloadHash()` to every custom backend.
+12. Upgrade custom deferred-task storage with `putForSettlementOperationIfAbsent()`, `getBySettlementOperationId()`, and `replaceForSettlementOperationIfVersion()`. The initial token/index write and nested A→B index move must each be atomic.
+13. Replace webhook emitter `operation_id` arguments with SDK-local `delivery_id` values and upgrade custom stores to `WebhookDeliveryStore`. One delivery ID binds one canonical payload and key; use a fresh delivery ID for each changed status observation while retaining the AdCP `operation_id` inside the payload.
+14. Ensure custom 3.2 buyers include `push_notification_config.operation_id`, and update A2A integrations to keep the AdCP registration in skill parameters even when native A2A push configuration is also present.
+15. Treat failed/rejected task results as canonical terminal artifacts when `include_result` is requested; do not discard them while preserving only the summary error.
+16. Persist the complete `ScopedTaskRef` for out-of-process task settlement and acknowledge durable queue items only after `applied` or after reading back an `already_terminal` task and proving its exact result/error artifact. Matching terminal status alone is insufficient. Retry or dead-letter scoped misses and conflicting terminal outcomes. Upgrade populated PostgreSQL task registries with the phased [`getDecisioningTaskRegistryScopeV1Upgrade()` runbook](./migration-task-registry-scoping.md#populated-postgresql-upgrade), not application-boot bootstrap DDL.
+17. For out-of-process settlement, return `ctx.handoffToTask(producer, { settlement: 'external' })`; the producer must durably queue the complete handle before returning, and the framework withholds `submitted` until that commit succeeds. External settlement is polling-only: omit `push_notification_config`. Its custom durable registry must expose a stable non-empty `registryId` and return that exact ID in every `create()` reference; a mismatch is a custom create-contract violation, rejected before the producer runs or `submitted` is acknowledged. Framework-settled push handoffs configure production `webhooks`; `taskWebhookEmitter` is test/development-only. `dispatchHitl` owns their terminal task mutation and delivery. `createPostgresTaskSettlementCoordinator()` with `completeScopedPushTask()`, `failScopedPushTask()`, or `rejectScopedPushTask()` is a lower-level application-managed push-settlement path, not a requirement for framework-settled handoffs and not a way to make external settlement push-capable. Before first use of rejection, run `getDecisioningTaskRegistryStatusWidenV61Migration()` against legacy task tables; its bounded `ACCESS EXCLUSIVE` lock can briefly block task reads and writes. See [task registry scope migration](./migration-task-registry-scoping.md#out-of-process-settlement).
+18. Upgrade to Node `^20.19.0 || >=22.12.0`, whose two boundaries enable the `require(esm)` support needed by the SDK's CommonJS dependency graph. Node 21 and Node 22.0–22.11 are not supported. Keep Undici 6 for the fully supported configuration, or use the tested best-effort Undici 7 override on Node 20.19+. See the [Node/Undici compatibility policy](./guides/NODE-UNDICI-COMPATIBILITY.md).
 
 ### Webhook delivery identity and retry horizons
 
@@ -176,6 +561,14 @@ plus a stable non-secret equality fingerprint. The adapter must authenticate
 the supplied tenant/destination/snapshot context. Settled records redact payload
 and protected secret references. The application still owns KMS
 keys, secret management, tenant authorization/RBAC, and management APIs or UI.
+For crash-safe task settlement, `createPostgresTaskSettlementCoordinator()`
+explicitly removes the top-level validation `token` from the persisted payload
+and protects it with the same adapter under the distinct `payload_token`
+purpose before writing the outbox. Generic recovery checkpoints preserve
+payload fields named `token`; use `recovery.prepare(...,
+{ protectPayloadToken: true })` only for a protocol field known to be secret.
+The legacy transport-authentication adapter context keeps `purpose` undefined
+for upgrade-compatible KMS AAD.
 
 `deliveryRetryHorizonSeconds` defaults to 86,400 seconds and accepts 86,400
 through 604,800. `createAdcpServer()` advertises the configured value under
@@ -715,7 +1108,7 @@ import { getToolInputSchema, getToolResponseSchema } from '@adcp/sdk/schemas';
 
 const request = getToolInputSchema('create_media_buy', { adcpVersion: '3.0' });
 const response = getToolResponseSchema('create_media_buy', {
-  adcpVersion: '3.2.0-beta.6',
+  adcpVersion: '3.2.0-rc.4',
   variant: 'sync',
 });
 

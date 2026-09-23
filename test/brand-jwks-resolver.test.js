@@ -23,6 +23,7 @@ const path = require('node:path');
 const {
   BrandJsonJwksResolver,
   BrandJsonResolverError,
+  fetchBrandJson,
   verifyWebhookSignature,
   InMemoryReplayStore,
   InMemoryRevocationStore,
@@ -95,6 +96,70 @@ async function startServer(routes) {
 }
 
 describe('BrandJsonJwksResolver', () => {
+  it('rejects a public-looking brand host when injected DNS resolves it to loopback', async () => {
+    let lookupCalls = 0;
+    const resolver = new BrandJsonJwksResolver('https://brand.public.example/.well-known/brand.json', {
+      agentType: 'sales',
+      lookup: async () => {
+        lookupCalls += 1;
+        return [{ address: '127.0.0.1', family: 4 }];
+      },
+    });
+
+    await assert.rejects(
+      () => resolver.resolve('any'),
+      err => {
+        assert.ok(err instanceof BrandJsonResolverError);
+        assert.strictEqual(err.code, 'fetch_failed');
+        assert.ok(err.cause instanceof SsrfRefusedError);
+        assert.strictEqual(err.cause.code, 'private_address');
+        return true;
+      }
+    );
+    assert.strictEqual(lookupCalls, 1);
+  });
+
+  it('uses the same injected DNS lookup for brand.json and the selected JWKS URL', async () => {
+    const server = await startServer({
+      '/.well-known/brand.json': {
+        body: {
+          agents: [
+            {
+              type: 'sales',
+              url: 'PLACEHOLDER',
+              id: 'sales_1',
+              jwks_uri: 'PLACEHOLDER',
+            },
+          ],
+        },
+      },
+      '/jwks.json': { body: { keys: [primaryPublic] } },
+    });
+    try {
+      const port = server.origin.split(':').pop();
+      const brandOrigin = `http://brand.public.example:${port}`;
+      const jwksOrigin = `http://keys.public.example:${port}`;
+      const agent = server.state.routes['/.well-known/brand.json'].body.agents[0];
+      agent.url = `${brandOrigin}/`;
+      agent.jwks_uri = `${jwksOrigin}/jwks.json`;
+      const lookedUp = [];
+      const resolver = new BrandJsonJwksResolver(`${brandOrigin}/.well-known/brand.json`, {
+        agentType: 'sales',
+        allowPrivateIp: true,
+        lookup: async hostname => {
+          lookedUp.push(hostname);
+          return [{ address: '127.0.0.1', family: 4 }];
+        },
+      });
+
+      const jwk = await resolver.resolve('test-ed25519-2026');
+      assert.ok(jwk);
+      assert.deepStrictEqual(lookedUp, ['brand.public.example', 'keys.public.example']);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it('resolves a JWK by following agents[].jwks_uri on a flat brand.json', async () => {
     const server = await startServer({
       '/.well-known/brand.json': {
@@ -647,5 +712,93 @@ describe('BrandJsonJwksResolver', () => {
     } finally {
       await server.stop();
     }
+  });
+
+  it('exports the bounded brand.json fetcher with the protocol body allowance', async () => {
+    const payload = JSON.stringify({ agents: [], padding: 'x'.repeat(70 * 1024) });
+    const server = await startServer({
+      '/.well-known/brand.json': { body: payload },
+    });
+    try {
+      const fetched = await fetchBrandJson({
+        startUrl: `${server.origin}/.well-known/brand.json`,
+        allowPrivateIp: true,
+      });
+      assert.strictEqual(fetched.status, 'ok');
+      assert.strictEqual(fetched.finalUrl, `${server.origin}/.well-known/brand.json`);
+      assert.strictEqual(fetched.data.padding.length, 70 * 1024);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('surfaces HTTP status without message parsing', async () => {
+    const server = await startServer({
+      '/.well-known/brand.json': { status: 404, body: { error: 'missing' } },
+    });
+    try {
+      await assert.rejects(
+        () =>
+          fetchBrandJson({
+            startUrl: `${server.origin}/.well-known/brand.json`,
+            allowPrivateIp: true,
+          }),
+        err => {
+          assert.ok(err instanceof BrandJsonResolverError);
+          assert.strictEqual(err.code, 'fetch_failed');
+          assert.strictEqual(err.httpStatus, 404);
+          return true;
+        }
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('refuses transport redirects instead of following them', async () => {
+    const server = await startServer({
+      '/.well-known/brand.json': { status: 302, headers: { location: '/redirected.json' }, body: '' },
+      '/redirected.json': { body: { agents: [] } },
+    });
+    try {
+      await assert.rejects(
+        () =>
+          fetchBrandJson({
+            startUrl: `${server.origin}/.well-known/brand.json`,
+            allowPrivateIp: true,
+          }),
+        err => err instanceof BrandJsonResolverError && err.httpStatus === 302
+      );
+      assert.strictEqual(server.state.hits['/redirected.json'], 0);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('normalizes transport failures to the typed public error', async () => {
+    const server = await startServer({ '/.well-known/brand.json': { body: { agents: [] } } });
+    const url = `${server.origin}/.well-known/brand.json`;
+    await server.stop();
+    await assert.rejects(
+      () => fetchBrandJson({ startUrl: url, allowPrivateIp: true }),
+      err => {
+        assert.ok(err instanceof BrandJsonResolverError);
+        assert.strictEqual(err.code, 'fetch_failed');
+        assert.strictEqual(err.message, 'Unable to fetch brand.json');
+        assert.ok(err.cause instanceof Error);
+        return true;
+      }
+    );
+  });
+
+  it('enforces hard ceilings on public fetch overrides', async () => {
+    await assert.rejects(
+      () => fetchBrandJson({ startUrl: 'https://example.com/brand.json', timeoutMs: 10_001 }),
+      /timeoutMs must be an integer between 1 and 10000/
+    );
+    await assert.rejects(
+      () => fetchBrandJson({ startUrl: 'https://example.com/brand.json', maxBodyBytes: 262_145 }),
+      /maxBodyBytes must be an integer between 1 and 262144/
+    );
   });
 });

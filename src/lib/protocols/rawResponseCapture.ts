@@ -14,6 +14,10 @@ import { globalAsyncLocalStorage } from '../utils/global-async-local-storage';
 export interface RawHttpCapture {
   url: string;
   method: string;
+  /** JSON-RPC method parsed from a JSON request body, when available. */
+  requestJsonRpcMethod?: string;
+  /** AdCP skill parsed from an A2A SendMessage request, when available. */
+  requestAdcpSkill?: string;
   status: number;
   headers: Record<string, string>;
   body: string;
@@ -26,6 +30,13 @@ export interface RawHttpCapture {
 interface CaptureSlot {
   captures: RawHttpCapture[];
   maxBodyBytes: number;
+  /** Optional ceiling on recorded exchanges; overflow is marked, not silent. */
+  maxCaptures?: number;
+  /** Optional ceiling on total recorded body bytes across all exchanges. */
+  maxTotalBodyBytes?: number;
+  totalBodyBytes: number;
+  /** Set when a ceiling was hit, so callers can fail closed. */
+  overflowed?: 'captures' | 'bytes';
 }
 
 // Counted as UTF-16 code units (string.length), not UTF-8 bytes. Close
@@ -48,15 +59,18 @@ export const rawResponseCaptureStorage = globalAsyncLocalStorage<CaptureSlot>('r
  */
 export async function withRawResponseCapture<T>(
   fn: () => Promise<T>,
-  options: { maxBodyBytes?: number } = {}
-): Promise<{ result: T; captures: RawHttpCapture[] }> {
+  options: { maxBodyBytes?: number; maxCaptures?: number; maxTotalBodyBytes?: number } = {}
+): Promise<{ result: T; captures: RawHttpCapture[]; overflowed?: 'captures' | 'bytes' }> {
   const slot: CaptureSlot = {
     captures: [],
     maxBodyBytes: options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+    ...(options.maxCaptures !== undefined ? { maxCaptures: options.maxCaptures } : {}),
+    ...(options.maxTotalBodyBytes !== undefined ? { maxTotalBodyBytes: options.maxTotalBodyBytes } : {}),
+    totalBodyBytes: 0,
   };
   try {
     const result = await rawResponseCaptureStorage.run(slot, fn);
-    return { result, captures: slot.captures };
+    return { result, captures: slot.captures, ...(slot.overflowed ? { overflowed: slot.overflowed } : {}) };
   } catch (err) {
     if (err && typeof err === 'object') {
       try {
@@ -66,6 +80,14 @@ export async function withRawResponseCapture<T>(
           configurable: true,
           writable: true,
         });
+        if (slot.overflowed) {
+          Object.defineProperty(err, 'capturesOverflowed', {
+            value: slot.overflowed,
+            enumerable: false,
+            configurable: true,
+            writable: true,
+          });
+        }
       } catch {
         // Frozen / sealed errors won't accept the property — drop the
         // captures rather than crash on a defineProperty TypeError.
@@ -73,6 +95,15 @@ export async function withRawResponseCapture<T>(
     }
     throw err;
   }
+}
+
+/** Read the capture-overflow marker attached to a thrown error, if any. */
+export function getCaptureOverflowFromError(err: unknown): 'captures' | 'bytes' | undefined {
+  if (err && typeof err === 'object') {
+    const marker = (err as { capturesOverflowed?: unknown }).capturesOverflowed;
+    if (marker === 'captures' || marker === 'bytes') return marker;
+  }
+  return undefined;
 }
 
 /** Type guard for errors carrying partial captures from `withRawResponseCapture`. */
@@ -113,6 +144,7 @@ export function wrapFetchWithCapture(upstream: typeof fetch): typeof fetch {
 
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    const requestMetadata = extractSafeRequestMetadata(init?.body, slot.maxBodyBytes);
     const startedAt = Date.now();
     const response = await upstream(input, init);
     const latencyMs = Date.now() - startedAt;
@@ -127,12 +159,28 @@ export function wrapFetchWithCapture(upstream: typeof fetch): typeof fetch {
       headers[key] = REDACTED_HEADER_NAMES.has(lower) ? REDACTED_PLACEHOLDER : value;
     });
 
+    // Ceilings are opt-in: without them this stays the historical unbounded
+    // recorder, so ordinary MCP behaviour is unchanged unless a caller asked
+    // for a bound. When one is hit the slot is marked so the caller can fail
+    // closed rather than reason about a silently truncated log.
+    if (slot.maxCaptures !== undefined && slot.captures.length >= slot.maxCaptures) {
+      slot.overflowed ??= 'captures';
+      return response;
+    }
+    const redactedBody = redactBearerInBody(body);
+    if (slot.maxTotalBodyBytes !== undefined && slot.totalBodyBytes + redactedBody.length > slot.maxTotalBodyBytes) {
+      slot.overflowed ??= 'bytes';
+      return response;
+    }
+    slot.totalBodyBytes += redactedBody.length;
+
     slot.captures.push({
       url,
       method,
+      ...requestMetadata,
       status: response.status,
       headers,
-      body: redactBearerInBody(body),
+      body: redactedBody,
       latencyMs,
       timestamp: new Date(startedAt).toISOString(),
       bodyTruncated,
@@ -141,6 +189,55 @@ export function wrapFetchWithCapture(upstream: typeof fetch): typeof fetch {
     return response;
   };
   return wrapped;
+}
+
+/**
+ * Retain only the non-secret identifiers needed to correlate a captured A2A
+ * response with its request. The request payload itself can contain account
+ * data and credentials, so it is deliberately never stored in the capture.
+ */
+function extractSafeRequestMetadata(
+  body: BodyInit | null | undefined,
+  maxBodyBytes: number
+): Pick<RawHttpCapture, 'requestJsonRpcMethod' | 'requestAdcpSkill'> {
+  if (typeof body !== 'string' || body.length > maxBodyBytes) return {};
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return {};
+  }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+
+  const envelope = parsed as { method?: unknown; params?: unknown };
+  const requestJsonRpcMethod = typeof envelope.method === 'string' ? envelope.method : undefined;
+  let requestAdcpSkill: string | undefined;
+  const params =
+    envelope.params != null && typeof envelope.params === 'object' && !Array.isArray(envelope.params)
+      ? (envelope.params as { message?: unknown })
+      : undefined;
+  const message =
+    params?.message != null && typeof params.message === 'object' && !Array.isArray(params.message)
+      ? (params.message as { parts?: unknown })
+      : undefined;
+  if (Array.isArray(message?.parts)) {
+    for (const part of message.parts) {
+      if (part == null || typeof part !== 'object' || Array.isArray(part)) continue;
+      const data = (part as { data?: unknown }).data;
+      if (data == null || typeof data !== 'object' || Array.isArray(data)) continue;
+      const skill = (data as { skill?: unknown }).skill;
+      if (typeof skill === 'string') {
+        requestAdcpSkill = skill;
+        break;
+      }
+    }
+  }
+
+  return {
+    ...(requestJsonRpcMethod !== undefined && { requestJsonRpcMethod }),
+    ...(requestAdcpSkill !== undefined && { requestAdcpSkill }),
+  };
 }
 
 /**

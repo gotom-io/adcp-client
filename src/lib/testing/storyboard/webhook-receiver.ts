@@ -16,15 +16,18 @@
  *     proxy-URL mode swaps in an operator-supplied public base.
  */
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { randomUUID } from 'node:crypto';
-import type { AddressInfo } from 'node:net';
+import { isIP, type AddressInfo } from 'node:net';
+import { getSchemaValidatorByRef } from '../../validation/schema-loader';
 
 /**
  * Size cap on any single webhook body. A non-conformant sender retrying
  * with oversize payloads shouldn't be able to exhaust the runner's memory.
  */
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB
+const MAX_CHALLENGE_BODY_BYTES = 16_384; // 16 KiB; challenge envelopes are tiny
 
 /**
  * Caps on cumulative capture state. `MAX_CAPTURED_TOTAL` bounds the total
@@ -66,7 +69,7 @@ const SECRET_HEADER_PATTERN =
  * advertise an `http://169.254.169.254`, `file://…`, or header-splitting
  * URL that would then be embedded in outbound `push_notification_config.url`.
  */
-function validateProxyUrl(raw: string): string {
+function validateProxyUrl(raw: string, allowHttp: boolean): string {
   if (/[\r\n\x00]/.test(raw)) {
     throw new Error('webhook_receiver.public_url must not contain CR/LF/NUL');
   }
@@ -79,10 +82,16 @@ function validateProxyUrl(raw: string): string {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`webhook_receiver.public_url must be http(s); got ${parsed.protocol}`);
   }
+  if (parsed.protocol === 'http:' && !allowHttp) {
+    throw new Error('webhook_receiver.public_url must use https (set allowHttp only for controlled local development)');
+  }
   if (parsed.username || parsed.password) {
     throw new Error('webhook_receiver.public_url must not include userinfo');
   }
-  return raw.replace(/\/$/, '');
+  if (parsed.search || parsed.hash) {
+    throw new Error('webhook_receiver.public_url must not include a query string or fragment');
+  }
+  return raw.replace(/\/+$/, '');
 }
 
 export interface CapturedWebhook {
@@ -111,8 +120,30 @@ export interface CapturedWebhook {
   response_status: number;
 }
 
+/** Proof-of-control challenge retained separately from event deliveries. */
+export interface CapturedWebhookChallenge {
+  id: string;
+  step_id: string;
+  operation_id: string;
+  received_at: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  raw_body: string;
+  body: Record<string, unknown>;
+  response_status: 200;
+}
+
 /** Match predicate applied when waiting for a webhook. */
 export interface WebhookFilter {
+  /** Millisecond observation boundary captured before the triggering request. */
+  received_at_or_after?: number;
+  /** Exact registered path, including query, relative to the receiver base. */
+  path?: string;
+  /** Internal observation guard: previously observed account/change identities. */
+  exclude_account_changes?: ReadonlySet<string>;
+  /** Body paths that must exist with a non-null value (published wildcard selector). */
+  present?: readonly string[];
   /** Restrict matches to this step id's URL. */
   step_id?: string;
   /** Restrict matches to this operation id. */
@@ -137,8 +168,12 @@ export interface WebhookReceiver {
   readonly base_url: string;
   /** Whether the receiver is in loopback-mock or proxy-url mode. */
   readonly mode: 'loopback_mock' | 'proxy_url';
+  /** Local address the listener is bound to. */
+  readonly bind_host?: string;
   /** All webhooks captured so far, in arrival order. */
   all(): CapturedWebhook[];
+  /** Schema-valid proof-of-control challenges, kept separate from event deliveries. */
+  challenges(): CapturedWebhookChallenge[];
   /** Webhooks matching a filter, in arrival order. */
   matching(filter: WebhookFilter): CapturedWebhook[];
   /**
@@ -167,6 +202,19 @@ export interface CreateWebhookReceiverOptions {
   port?: number;
   /** Public URL to advertise when `mode: 'proxy_url'`. */
   public_url?: string;
+  /**
+   * Permit an HTTP public URL for controlled local-development topologies.
+   */
+  allowHttp?: boolean;
+  /**
+   * TLS material for serving HTTPS directly. Omit when HTTPS terminates at a
+   * tunnel or reverse proxy in front of this listener.
+   */
+  tls?: {
+    cert: string | Buffer;
+    key: string | Buffer;
+    passphrase?: string;
+  };
 }
 
 interface RetryKey {
@@ -185,19 +233,26 @@ export async function createWebhookReceiver(options: CreateWebhookReceiverOption
   }
 
   const host = options.host ?? '127.0.0.1';
-  // A loopback_mock receiver bound on 0.0.0.0 is publicly reachable from any
-  // interface — which would turn a CI runner into an open POST endpoint.
-  // Operators who genuinely want public exposure use mode=proxy_url.
-  if (mode === 'loopback_mock' && (host === '0.0.0.0' || host === '::')) {
+  // Keep loopback_mock literal: aliases for wildcard addresses (including
+  // expanded IPv6 forms) must not turn a CI runner into an open POST endpoint.
+  // Operators who genuinely want non-loopback exposure use mode=proxy_url.
+  if (mode === 'loopback_mock' && !isLoopbackHost(host)) {
     throw new Error(
       `webhook_receiver host ${host} is not permitted in loopback_mock mode. ` +
         'Use mode=proxy_url with an explicit public_url for publicly-reachable runs.'
     );
   }
   const port = options.port ?? 0;
-  const proxyBase = mode === 'proxy_url' ? validateProxyUrl(options.public_url!) : undefined;
+  const proxyBase =
+    mode === 'proxy_url' ? validateProxyUrl(options.public_url!, options.allowHttp === true) : undefined;
+  if (options.tls && proxyBase && new URL(proxyBase).protocol !== 'https:') {
+    throw new Error('webhook_receiver.public_url must use https when local TLS is configured');
+  }
+  const publicRouteSuffix = mode === 'proxy_url' ? `/_adcp_receiver/${randomUUID()}` : '';
+  const routePrefix = proxyBase ? `${new URL(proxyBase).pathname.replace(/\/+$/, '')}${publicRouteSuffix}` : '';
 
   const captured: CapturedWebhook[] = [];
+  const challenges: CapturedWebhookChallenge[] = [];
   const waiters: Array<{
     filter: WebhookFilter;
     resolve: (result: WebhookWaitResult) => void;
@@ -210,11 +265,29 @@ export async function createWebhookReceiver(options: CreateWebhookReceiverOption
   }> = [];
   const retryPolicies = new Map<string, { policy: RetryReplayPolicy; delivered: number }>();
   const deliveryCounts = new Map<string, number>();
+  const challengeCounts = new Map<string, number>();
   let closed = false;
 
-  const server = createServer((req, res) =>
-    handleRequest(req, res, { captured, waiters, retryPolicies, deliveryCounts })
-  );
+  const requestListener = (req: IncomingMessage, res: ServerResponse) =>
+    handleRequest(req, res, {
+      captured,
+      challenges,
+      waiters,
+      retryPolicies,
+      deliveryCounts,
+      challengeCounts,
+      routePrefix,
+    });
+  const server = options.tls
+    ? createHttpsServer(
+        {
+          cert: options.tls.cert,
+          key: options.tls.key,
+          ...(options.tls.passphrase !== undefined && { passphrase: options.tls.passphrase }),
+        },
+        requestListener
+      )
+    : createServer(requestListener);
   // Transport-level hardening — trim Node's generous defaults so a slow /
   // hostile publisher can't wedge the runner.
   server.headersTimeout = HEADERS_TIMEOUT_MS;
@@ -233,12 +306,16 @@ export async function createWebhookReceiver(options: CreateWebhookReceiverOption
   });
 
   const bound = server.address() as AddressInfo;
-  const base_url = proxyBase ?? `http://${formatHost(bound.address)}:${bound.port}`;
+  const base_url = proxyBase
+    ? `${proxyBase}${publicRouteSuffix}`
+    : `${options.tls ? 'https' : 'http'}://${formatHost(bound.address)}:${bound.port}`;
 
   return {
     base_url,
     mode,
+    bind_host: host,
     all: () => captured.slice(),
+    challenges: () => challenges.slice(),
     matching: filter => captured.filter(w => matchesFilter(w, filter)),
     set_retry_replay: (key, policy) => {
       retryPolicies.set(retryKeyString(key), { policy, delivered: 0 });
@@ -259,12 +336,21 @@ export async function createWebhookReceiver(options: CreateWebhookReceiverOption
   };
 }
 
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  if (normalized === 'localhost') return true;
+  if (isIP(host) === 4) return /^127(?:\.\d{1,3}){3}$/.test(host);
+  if (isIP(host) === 6) return normalized === '::1' || /^(?:0:){7}1$/.test(normalized);
+  return false;
+}
+
 // ────────────────────────────────────────────────────────────
 // Request handling
 // ────────────────────────────────────────────────────────────
 
 interface HandlerState {
   captured: CapturedWebhook[];
+  challenges: CapturedWebhookChallenge[];
   waiters: Array<{
     filter: WebhookFilter;
     resolve: (r: WebhookWaitResult) => void;
@@ -272,6 +358,8 @@ interface HandlerState {
   }>;
   retryPolicies: Map<string, { policy: RetryReplayPolicy; delivered: number }>;
   deliveryCounts: Map<string, number>;
+  challengeCounts: Map<string, number>;
+  routePrefix: string;
 }
 
 function handleRequest(req: IncomingMessage, res: ServerResponse, state: HandlerState): void {
@@ -281,13 +369,13 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: Handler
     return;
   }
 
-  const pathParts = parseStepPath(req.url ?? '');
+  const pathParts = parseStepPath(req.url ?? '', state.routePrefix);
   if (!pathParts) {
     res.statusCode = 404;
     res.end();
     return;
   }
-  const { step_id, operation_id } = pathParts;
+  const { step_id, operation_id, logical_path } = pathParts;
 
   let size = 0;
   const chunks: Buffer[] = [];
@@ -313,6 +401,54 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: Handler
     }
     const raw = Buffer.concat(chunks).toString('utf8');
     const headers = normalizeHeaders(req.headers);
+    const parsedBody = parseBody(raw, headers['content-type']);
+
+    // Notification-config proof is POSTed to the configured webhook URL
+    // itself. Validate the complete protocol envelope, echo only the
+    // challenge field, and retain the request separately so conformance
+    // checks can inspect its RFC 9421 headers without treating it as an
+    // event delivery.
+    if (isWebhookChallenge(parsedBody.body)) {
+      if (Buffer.byteLength(raw, 'utf8') > MAX_CHALLENGE_BODY_BYTES) {
+        res.statusCode = 413;
+        res.end();
+        return;
+      }
+      const challenge = parsedBody.body.challenge;
+      const schemaRef =
+        parsedBody.body.scope === 'agent' ? 'core/agent-webhook-challenge.json' : 'core/webhook-challenge.json';
+      const validate = getSchemaValidatorByRef(schemaRef);
+      if (!validate || !validate(parsedBody.body) || typeof challenge !== 'string') {
+        res.statusCode = 400;
+        res.end();
+        return;
+      }
+      const key = retryKeyString({ step_id, operation_id });
+      const perKey = state.challengeCounts.get(key) ?? 0;
+      if (state.captured.length + state.challenges.length >= MAX_CAPTURED_TOTAL || perKey >= MAX_CAPTURED_PER_KEY) {
+        res.statusCode = 429;
+        res.setHeader('retry-after', '1');
+        res.end();
+        return;
+      }
+      state.challengeCounts.set(key, perKey + 1);
+      state.challenges.push({
+        id: randomUUID(),
+        step_id,
+        operation_id,
+        received_at: Date.now(),
+        method: req.method ?? 'POST',
+        path: logical_path,
+        headers: redactHeaders(headers),
+        raw_body: raw,
+        body: parsedBody.body as Record<string, unknown>,
+        response_status: 200,
+      });
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ challenge }));
+      return;
+    }
 
     const key = retryKeyString({ step_id, operation_id });
     const deliveryIndex = (state.deliveryCounts.get(key) ?? 0) + 1;
@@ -323,7 +459,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: Handler
     // here masks the policy's eventual 2xx forever and can amplify a sender's
     // retries after the runner has already reached its memory bound (#2653).
     const perKey = state.deliveryCounts.get(key) ?? 0;
-    if (state.captured.length >= MAX_CAPTURED_TOTAL || perKey >= MAX_CAPTURED_PER_KEY) {
+    if (state.captured.length + state.challenges.length >= MAX_CAPTURED_TOTAL || perKey >= MAX_CAPTURED_PER_KEY) {
       res.statusCode = status;
       if (status === 429 || status >= 500) res.setHeader('retry-after', '1');
       res.end();
@@ -339,10 +475,10 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: Handler
       delivery_index: deliveryIndex,
       received_at: Date.now(),
       method: req.method ?? 'POST',
-      path: req.url ?? '/',
+      path: logical_path,
       headers: redactHeaders(headers),
       raw_body: raw,
-      ...parseBody(raw, headers['content-type']),
+      ...parsedBody,
       response_status: status,
     };
     state.captured.push(webhook);
@@ -370,12 +506,34 @@ function handleRequest(req: IncomingMessage, res: ServerResponse, state: Handler
   });
 }
 
-function parseStepPath(reqUrl: string): { step_id: string; operation_id: string } | undefined {
+function isWebhookChallenge(
+  body: unknown
+): body is { type: 'webhook.challenge'; challenge: unknown } & Record<string, unknown> {
+  return (
+    body !== null &&
+    typeof body === 'object' &&
+    !Array.isArray(body) &&
+    (body as Record<string, unknown>).type === 'webhook.challenge'
+  );
+}
+
+function requestPathname(reqUrl: string): string {
   const q = reqUrl.indexOf('?');
-  const pathname = q === -1 ? reqUrl : reqUrl.slice(0, q);
-  const match = STEP_PATH_RE.exec(pathname);
+  return q === -1 ? reqUrl : reqUrl.slice(0, q);
+}
+
+function parseStepPath(
+  reqUrl: string,
+  routePrefix: string
+): { step_id: string; operation_id: string; logical_path: string } | undefined {
+  const pathname = requestPathname(reqUrl);
+  if (routePrefix && !pathname.startsWith(`${routePrefix}/`)) return undefined;
+  const logicalPath = routePrefix ? pathname.slice(routePrefix.length) : pathname;
+  const match = STEP_PATH_RE.exec(logicalPath);
   if (!match) return undefined;
-  return { step_id: match[1]!, operation_id: match[2]! };
+  const queryIndex = reqUrl.indexOf('?');
+  const query = queryIndex === -1 ? '' : reqUrl.slice(queryIndex);
+  return { step_id: match[1]!, operation_id: match[2]!, logical_path: `${logicalPath}${query}` };
 }
 
 function normalizeHeaders(raw: IncomingMessage['headers']): Record<string, string> {
@@ -411,8 +569,17 @@ function parseBody(raw: string, contentType: string | undefined): Pick<CapturedW
 // ────────────────────────────────────────────────────────────
 
 function matchesFilter(webhook: CapturedWebhook, filter: WebhookFilter): boolean {
+  if (filter.received_at_or_after !== undefined && webhook.received_at < filter.received_at_or_after) return false;
+  if (filter.path !== undefined && webhook.path !== filter.path) return false;
   if (filter.step_id && webhook.step_id !== filter.step_id) return false;
   if (filter.operation_id && webhook.operation_id !== filter.operation_id) return false;
+  if (
+    filter.exclude_account_changes?.has(
+      JSON.stringify([resolveDottedPath(webhook.body, 'account_id'), resolveDottedPath(webhook.body, 'change_id')])
+    )
+  )
+    return false;
+  if (filter.present?.some(key => resolveDottedPath(webhook.body, key) == null)) return false;
   if (filter.body && Object.keys(filter.body).length > 0) {
     if (webhook.body === undefined) return false;
     for (const [path, expected] of Object.entries(filter.body)) {
@@ -542,7 +709,7 @@ function waitAll(
 // ────────────────────────────────────────────────────────────
 
 function closeServer(
-  server: Server,
+  server: HttpServer | HttpsServer,
   captured: CapturedWebhook[],
   waiters: Array<{ filter: WebhookFilter; resolve: (r: WebhookWaitResult) => void; timer: NodeJS.Timeout }>,
   waitAllTimers: Array<{

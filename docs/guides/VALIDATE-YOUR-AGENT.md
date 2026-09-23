@@ -78,6 +78,30 @@ npx @adcp/sdk@adcp-3.1 storyboard run http://localhost:3001/mcp --file ./my-wip.
 npx @adcp/sdk@adcp-3.1 storyboard run http://localhost:3001/mcp --json > report.json
 ```
 
+For a publisher split across sales, signals, governance, or creative tenants,
+provide an agents map and omit the storyboard ID to assess the whole topology:
+
+```yaml
+# publisher.yaml
+agents:
+  sales:
+    url: https://sales.example.com/mcp
+  signals:
+    url: https://signals.example.com/mcp
+default_agent: sales
+```
+
+```bash
+adcp storyboard run --agents-map ./publisher.yaml --json > report.json
+adcp storyboard run --agents-map ./publisher.yaml --format junit > report.xml
+```
+
+The runner discovers every tenant, selects the union of storyboards applicable
+to their declared capabilities, and evaluates `required_tools` against the
+whole topology. JSON reports group executed results by tenant, with storyboards
+that touch multiple tenants under `cross-tenant-topology`. JUnit uses the same
+group as the suite package and name prefix.
+
 Storyboard `response_schema` checks use strict JSON Schema validation for
 grading by default, matching the hosted compliance grader. A strict failure
 therefore fails the owning step even when the generated lenient Zod projection
@@ -103,6 +127,9 @@ temporary legacy compatibility harnesses rather than routine compliance runs.
 - `--brief <text>` — custom product-discovery brief (default varies by storyboard)
 - `--auth <token>` — bearer token (also accepts `$ADCP_AUTH_TOKEN`)
 - `--oauth` — run the browser OAuth flow inline when the saved alias has no valid tokens (MCP only; equivalent to `adcp --save-auth <alias> <url> --oauth` then re-running)
+- `--signing-transport raw|mcp|a2a` — how the `signed_requests` conformance vectors are framed on the wire. Not the same as `--transport`/`--protocol`. Default: inferred from the resolved protocol
+- `--signing-skip-vectors <ids>` — comma-separated vector ids to exclude (graded `operator_skip`); unknown ids are rejected
+- `--signing-skip-rate-abuse` — skip the rate-abuse vector, which floods cap+1 requests at the agent (bare flag; `=false` is rejected, not read as "off")
 
 **Authoring webhook assertions.** Webhook storyboard pseudo-steps share the
 receiver URL and filter contract. Use `triggered_by` to scope the observation
@@ -262,6 +289,32 @@ npx @adcp/sdk@adcp-3.1 grade request-signing https://sandbox.agent.example/mcp -
 # Isolate a single vector
 npx @adcp/sdk@adcp-3.1 grade request-signing https://sandbox.agent.example/mcp --only 016-replayed-nonce
 ```
+
+#### Same vectors inside `storyboard run`
+
+The `signed_requests` storyboard synthesizes one step per vector and grades them through the same engine. `storyboard run` exposes the knobs that matter there:
+
+```bash
+# Per-operation HTTP endpoints instead of a single MCP mount
+npx @adcp/sdk@adcp-3.1 storyboard run https://sandbox.agent.example/adcp signed_requests \
+  --signing-transport raw --auth $TOKEN
+
+# Drop a vector your deployment can't satisfy, and the cap+1 flood
+npx @adcp/sdk@adcp-3.1 storyboard run https://sandbox.agent.example/mcp signed_requests \
+  --signing-skip-vectors 025-jwk-alg-crv-mismatch --signing-skip-rate-abuse --auth $TOKEN
+```
+
+- **`--signing-transport` is not `--transport`.** `--transport`/`--protocol` selects how the storyboard talks to your agent; `--signing-transport` selects how the conformance vectors are framed. Mirrors `adcp grade request-signing --transport`.
+- **Leave it unset by default.** The vector transport is inferred from the resolved protocol: MCP frames each vector as a `tools/call` envelope; A2A signs the exact request emitted by the official `@a2a-js/sdk` client after Agent Card discovery.
+- **A2A discovery fails closed.** If the Agent Card cannot resolve to a supported JSON-RPC interface, networked vectors skip with detailed reason `signing_transport_unavailable`; the storyboard cannot pass, the `security_transport` track stays `partial`, and the command exits 3. Publish a resolvable modern or legacy Agent Card, or grade an MCP/REST binding. Do not use `--soft-fail` to dismiss actual A2A verifier failures: once discovery succeeds, they are real grades.
+- **The in-library vector remains transport-independent.** `025-jwk-alg-crv-mismatch` is decided against the SDK verifier with no wire exchange, so its result does not grade your agent.
+- **Vectors excluded on their own terms say so, on every protocol.** `026-non-ascii-host` reports `transport_ungradable` (no HTTP client can carry a non-ASCII authority — `fetch` punycodes it first). `028-unsigned-protocol-method-required` reports `capability_profile_mismatch` unless your `get_adcp_capabilities` declares `request_signing.protocol_methods_required_for` — **this applies on MCP runs too, not just A2A**: previously the storyboard dispatched 028 at every agent, so one that never claimed the JSON-RPC bucket could fail it. Declare the bucket (e.g. `['tasks/cancel']`) if you verify signatures on protocol methods; a declaration your AdCP line's schema rejects is discarded rather than treated as "not declared", so it cannot suppress the vector. Note `adcp grade request-signing` does not read your advertisement — it uses the profile you pass it — so the two commands can disagree about 028 by design.
+- **A run that graded nothing exits nonzero.** Skipped steps are `passed: true`, so a coverage gap used to exit 0. `adcp storyboard step` now exits 3 when the runner could not dispatch the step, and the full assessment exits 3 when a storyboard's signing coverage went unverified — including when your own `--signing-skip-vectors` removed every vector, which is the other way to end up with nothing graded. The message names which of the two happened. Everything else keeps exit 0: other `partial` runs, legacy fixture gaps, and single steps you excluded yourself. `--soft-fail` works on both commands and reports the gap while exiting 0.
+- **Library callers get the same knobs.** `comply(agentUrl, { request_signing: { transport: 'mcp', skipVectors: [...], onlyVectors: [...], skipRateAbuse: true, rateAbuseCap: 5 } })` from `@adcp/sdk/testing` mirrors the CLI, plus `onlyVectors`/`rateAbuseCap`, which have no flag yet. `adcp grade request-signing` spells the same knobs `--transport`, `--skip`, `--only`, `--skip-rate-abuse`, `--rate-abuse-cap`; `storyboard run` prefixes them because `--transport` is already taken by the storyboard's own transport.
+- **Mistyped flag values are rejected.** `--signing-skip-vectors` validates every id against the shipped vector set (a typo silently skipped nothing before), and `--signing-skip-rate-abuse` refuses a value — `=false` used to read as "on".
+- **Vector `025-jwk-alg-crv-mismatch` is graded in-library.** It publishes a malformed JWK your agent never serves, so there is no HTTP exchange: the step asserts the grader's verdict (`probe_passed`), not a 401.
+
+> **Published 3.0 line.** These fixes ship on the 3.1+/prerelease line. The `adcp-3.0` dist-tag (`@adcp/sdk@7.11.x`) still defaults the vector transport to `raw` and has no `--signing-*` flags; an MCP-only agent must grade `signed_requests` from the 3.1 CLI (or drive `runStoryboard` with `request_signing: { transport: 'mcp' }`) until that line takes a backport.
 
 ### Multi-instance testing
 
@@ -629,6 +682,12 @@ Hints also land in machine-readable output:
 |---|---|
 | `storyboard run` skips steps with "no webhook_receiver_runner" | Add `--webhook-receiver` |
 | `storyboard run` fails on `security_baseline` | You skipped `authenticate` in `serve()` — see [build-seller-agent/SKILL.md § signed-requests](../../skills/build-seller-agent/SKILL.md) |
+| `None of the required contributions were recorded: ["auth_mechanism_verified"]` | No auth mechanism could be verified. If your steps also show task `mcp_session_probe`, your read surface is outside the probe allowlist and the runner fell back to the MCP session probe — see the next rows |
+| `Skipped (not_applicable / session_probe_ungradable)` | The runner prints the full reason and remedy on the line directly below. Four causes: (1) you advertise no **canonical AdCP** read task the probe can call with an empty body — tool names you invented are not eligible, and public-tier (`get_adcp_capabilities`, `get_products`, `list_products`, `list_creative_formats`) and mutating tools are excluded by design; (2) the step is a positive static-credential probe the session probe cannot grade; (3) the run signs functional dispatch and your `request_signing` advertisement covers every target the probe could call; (4) the run passed a `-H` header the runner can classify neither as a credential nor as routing — that one is about how the run was invoked, not about your agent, and the detail names the header. **A static-credential-only agent with no allowlisted read tool cannot be certified**: the positive probe asserts an AdCP response body no protocol operation produces, so its branch's contribution gate stays closed. Two remedies: advertise one allowlisted read tool (`list_creatives`, `get_media_buy_delivery`, `list_authorized_properties`, `get_signals`, `list_property_lists`, `list_collection_lists`, `list_content_standards`, `list_accounts`) — the durable fix — or serve RFC 9728 metadata and run with `--oauth` so the OAuth branch is verified instead |
+| `Error: MCP session auth probe is inconclusive: …` | A rejection is auth evidence only when a valid credential of the **same kind** reaches the same protected tool. The message names what is missing: no OAuth access token for this run (run with `--oauth`), no API key / Basic credential configured, the valid credential was refused too, or the agent refused the *shape* of the call (advertise a tool that accepts an empty request body) |
+| `Error: MCP session auth probe refuses this as auth evidence: …` | The probe's bad or absent credential got a successful payload from your protected tool — it is serving tenant-scoped data to anyone — or a valid credential failed to reach it |
+| `Error: MCP session probe could not run: …` | Not an authentication result at all: a wire version this SDK does not implement, a response shape the official MCP client rejects, or an exchange that never completed. Nothing was learned about your credentials; fix the named protocol problem and re-run |
+| `extraction.note` reads `MCP session probe graded <tool> at <stage>` | Which protected tool the verdict rests on, and where the agent decided (`initialize` for session-boundary auth, `tools/call` for per-operation auth). The verdict is evidence that the mechanism is enforced **at that tool** — it is not a claim that every tool enforces auth |
 | `storyboard run` reports `Agent requires OAuth` / exits without running | Save tokens once with `adcp --save-auth <alias> <url> --oauth`, or pass `--oauth` to `storyboard run` to complete auth inline |
 | `storyboard run` prints `💡 Hint: Rejected …` below an error | Catalog inconsistency between the two tools — see [§ Reading hint lines](#reading--hint-lines-context-value-rejections) above |
 | `fuzz` reports `500` status with stack trace | Validate inputs and return `adcpError('REFERENCE_NOT_FOUND', ...)` instead |

@@ -12,6 +12,77 @@ describe('Zod Schema Validation', () => {
     assert.ok(schemas, 'Schemas should be importable');
   });
 
+  test('reporting delivery uses the reporting file-transfer schema', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+
+    const reportingTransfer = {
+      pattern: 'file_transfer',
+      transport: 'sftp',
+      orchestration: 'producer_managed',
+      destination: {
+        mode: 'existing',
+        destination_ref: 'reporting-destination-1',
+      },
+      format: 'parquet',
+    };
+    const audienceTransfer = {
+      pattern: 'file_transfer',
+      transport: 's3',
+      vendor: { domain: 'storage.example' },
+    };
+
+    assert.equal(schemas.ReportingDeliveryMethodSchema.safeParse(reportingTransfer).success, true);
+    assert.equal(schemas.ReportingDeliveryMethodSchema.safeParse(audienceTransfer).success, false);
+  });
+
+  test('reporting file manifests reject unknown fields at every normative closed boundary', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+
+    const manifest = {
+      manifest_version: '1.0',
+      complete: true,
+      reporting_revision_id: 'revision-1',
+      reporting_obligation_id: 'obligation-1',
+      reporting_materialization_id: 'materialization-1',
+      period: {
+        start: '2026-09-02T00:00:00.000Z',
+        end: '2026-09-03T00:00:00.000Z',
+        source_timezone: 'UTC',
+      },
+      format: 'jsonl',
+      compression: 'none',
+      files: [
+        {
+          object_ref: 'reports/2026-09-02.jsonl',
+          size_bytes: 1,
+          sha256: 'a'.repeat(64),
+          row_count: 0,
+        },
+      ],
+      total_size_bytes: 1,
+      row_count: 0,
+      control_totals: [{ name: 'impressions', value: '0', value_type: 'integer' }],
+      created_at: '2026-09-03T00:00:00.000Z',
+    };
+
+    assert.equal(schemas.ReportingFileManifestSchema.safeParse(manifest).success, true);
+    for (const invalid of [
+      { ...manifest, not_in_protocol: true },
+      { ...manifest, period: { ...manifest.period, not_in_protocol: true } },
+      { ...manifest, files: [{ ...manifest.files[0], not_in_protocol: true }] },
+      {
+        ...manifest,
+        control_totals: [{ ...manifest.control_totals[0], not_in_protocol: true }],
+      },
+    ]) {
+      assert.equal(
+        schemas.ReportingFileManifestSchema.safeParse(invalid).success,
+        false,
+        `manifest should reject ${JSON.stringify(invalid)}`
+      );
+    }
+  });
+
   test('ESM package entry can be imported', async () => {
     const sdk = await import('../../dist/lib/index.mjs');
     assert.equal(typeof sdk.ADCP_VERSION, 'string', 'package root should expose its version');
@@ -165,6 +236,46 @@ describe('Zod Schema Validation', () => {
     assert.equal(
       schemas.CanonicalProposalSchema.safeParse({ ...proposal, forecast: { method: 'modeled', currency: 'USD' } })
         .success,
+      false
+    );
+    const proposalWithSignalTargeting = signalSourceUrl => ({
+      ...proposal,
+      commercial_terms: {
+        ...proposal.commercial_terms,
+        purchases: [
+          {
+            ...proposal.commercial_terms.purchases[0],
+            targeting_overlay: {
+              signal_targeting_groups: {
+                operator: 'all',
+                groups: [
+                  {
+                    operator: 'any',
+                    signals: [
+                      {
+                        signal_ref: {
+                          scope: 'signal_source',
+                          signal_source_url: signalSourceUrl,
+                          signal_id: 'segment_1',
+                        },
+                        value_type: 'binary',
+                        value: true,
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    });
+    const validSignalTargeting = schemas.CanonicalProposalSchema.safeParse(
+      proposalWithSignalTargeting('http://[v1.fe80::a+en1]/')
+    );
+    assert.equal(validSignalTargeting.success, true, JSON.stringify(validSignalTargeting.error?.issues));
+    assert.equal(
+      schemas.CanonicalProposalSchema.safeParse(proposalWithSignalTargeting('https://example.com/%zz')).success,
       false
     );
   });
@@ -397,6 +508,43 @@ describe('Zod Schema Validation', () => {
     }
   });
 
+  test('audio VAST preserves source-schema exclusions and duration item constraints', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+    const schema = schemas.CanonicalFormatVASTAudioSchema.strict();
+    const valid = {
+      vast_versions: ['4.1'],
+      media_file_requirements: {
+        mime_types: ['audio/mpeg', 'Audio/AAC'],
+        min_bitrate_kbps: 64,
+      },
+      duration_ms_range: [0, 30_000],
+    };
+
+    assert.equal(schema.safeParse(valid).success, true);
+    for (const invalid of [
+      { vast_version: '4.1', vast_versions: ['4.1'] },
+      { media_file_requirements: { mime_types: ['video/mp4'] } },
+      { media_file_requirements: { mime_types: ['audio/mpeg', 'video/mp4'] } },
+      { media_file_requirements: { min_width: 1 } },
+      { media_file_requirements: { max_width: 1 } },
+      { media_file_requirements: { min_height: 1 } },
+      { media_file_requirements: { max_height: 1 } },
+      { duration_ms_range: [-1, 1000] },
+      { duration_ms_range: [1.5, 1000] },
+      { duration_ms_range: [0] },
+      { duration_ms_range: [0, 1000, 2000] },
+    ]) {
+      assert.equal(
+        schemas.CanonicalFormatVASTAudioSchema.safeParse(invalid).success,
+        false,
+        `passthrough audio VAST must reject ${JSON.stringify(invalid)}`
+      );
+      assert.equal(schema.safeParse(invalid).success, false, `audio VAST must reject ${JSON.stringify(invalid)}`);
+    }
+  });
+
   test('placement presentation documents preserve their closed declarative boundary', async () => {
     if (!schemas) {
       schemas = await import('../../dist/lib/types/schemas.generated.js');
@@ -451,6 +599,19 @@ describe('Zod Schema Validation', () => {
     assert.strictEqual(schemas.CanonicalFormatHostedVideoSchema.safeParse({ max_file_size_mb: 1.5 }).success, false);
     assert.strictEqual(schemas.CanonicalFormatHostedAudioSchema.safeParse({ max_file_size_mb: 0.5 }).success, true);
     assert.strictEqual(schemas.CanonicalFormatHostedAudioSchema.safeParse({ max_file_size_mb: 0 }).success, false);
+  });
+
+  test('legacy structured format references preserve RFC 3986 URI semantics', async () => {
+    if (!schemas) schemas = await import('../../dist/lib/types/schemas.generated.js');
+    const formatReference = agent_url => ({ agent_url, id: 'display_static' });
+    assert.equal(
+      schemas.FormatReferenceStructuredObjectSchema.safeParse(formatReference('http://[v1.fe80::a+en1]/')).success,
+      true
+    );
+    assert.equal(
+      schemas.FormatReferenceStructuredObjectSchema.safeParse(formatReference('https://example.com/%zz')).success,
+      false
+    );
   });
 
   test('CreativeBriefSchema requires at least one required disclosure when present', async () => {
@@ -786,6 +947,18 @@ describe('Zod Schema Validation', () => {
     assert.ok(schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.shape);
     assert.ok(schemas.CanonicalFormatCoordinatedPlacementsSchema.shape);
     assert.ok(schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse(stateful).success);
+    const deeplyNestedValue = {};
+    let cursor = deeplyNestedValue;
+    for (let depth = 0; depth < 4000; depth += 1) {
+      cursor.next = {};
+      cursor = cursor.next;
+    }
+    assert.doesNotThrow(() =>
+      schemas.CanonicalFormatSellerRenderedStatefulDisplaySchema.safeParse({
+        ...stateful,
+        slots: [{ asset_group_id: 'body', asset_type: 'text', max_size_kb: deeplyNestedValue }],
+      })
+    );
     for (const invalid of [
       { ...stateful, experimental: 'wrong' },
       { ...stateful, v1_translatable: 42 },
@@ -948,6 +1121,24 @@ describe('Zod Schema Validation', () => {
     assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ system: 'zip' }).success);
     assert.ok(schemas.PostalCountrySystemSchema.safeParse({ country: 'US', system: 'zip' }).success);
     assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ country: 'US', system: 'outward' }).success);
+    assert.ok(schemas.PostalCountrySystemSchema.safeParse({ country: 'PT', system: 'postal_code' }).success);
+    assert.ok(schemas.PostalCountrySystemSchema.safeParse({ country: 'PT', system: 'custom' }).success);
+    assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ country: 'US', system: 'custom' }).success);
+    assert.ok(!schemas.PostalCountrySystemSchema.safeParse({ country: 'DE', system: 'custom' }).success);
+    assert.ok(
+      schemas.PostalAreaSchema.safeParse({
+        country: 'PT',
+        system: 'postal_code',
+        values: ['1000-001'],
+      }).success
+    );
+
+    const cjsPublicSchemas = require('@adcp/sdk/schemas');
+    const esmPublicSchemas = await import('@adcp/sdk/schemas');
+    for (const publicSchemas of [cjsPublicSchemas, esmPublicSchemas]) {
+      assert.ok(publicSchemas.PostalCountrySystemSchema.safeParse({ country: 'PT', system: 'custom' }).success);
+      assert.ok(!publicSchemas.PostalCountrySystemSchema.safeParse({ country: 'US', system: 'custom' }).success);
+    }
   });
 
   test('Trusted Match request schemas reject unexpected privacy-boundary fields', async () => {
@@ -1201,6 +1392,31 @@ describe('Zod Schema Validation', () => {
     assert.ok(
       typeof schemas.CreativeAssetSchema.safeParse === 'function',
       'CreativeAssetSchema should have safeParse method'
+    );
+  });
+
+  test('macro-bearing URL aliases preserve their primitive string runtime shape', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    const url = 'https://tracker.example/pixel?cb=%%CACHEBUSTER%%';
+    const aliases = Object.entries(schemas).filter(([name]) => /^MacroBearingURL\d+Schema$/.test(name));
+    assert.ok(aliases.length > 0, 'expected generated macro-bearing URL aliases');
+
+    for (const [name, schema] of aliases) {
+      assert.strictEqual(schema.safeParse(url).success, true, `${name} must accept macro-bearing URL strings`);
+      assert.strictEqual(schema.safeParse({}).success, false, `${name} must remain a primitive string schema`);
+    }
+
+    assert.strictEqual(
+      schemas.DAASTAssetSchema.safeParse({
+        asset_type: 'daast',
+        delivery_type: 'url',
+        url,
+      }).success,
+      true,
+      'URL-delivered DAAST assets must accept macro-bearing URL strings'
     );
   });
 
@@ -1993,6 +2209,90 @@ describe('Zod Schema Validation', () => {
 
     const result = schemas.AudienceSelectorSchema.safeParse(catSelector);
     assert.ok(result.success, `Categorical signal selector should validate: ${JSON.stringify(result.error?.issues)}`);
+  });
+
+  test('SignalTargetingExpressionSchema preserves every discriminated branch', async () => {
+    if (!schemas) {
+      schemas = await import('../../dist/lib/types/schemas.generated.js');
+    }
+
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'intent' },
+        value_type: 'binary',
+        value: true,
+      }).success,
+      true,
+      'binary true must satisfy the binary branch'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'intent' },
+        value_type: 'binary',
+        value: false,
+      }).success,
+      false,
+      'binary false must not fall through an open-object codegen branch'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'segment' },
+        value_type: 'categorical',
+        values: ['sports'],
+      }).success,
+      true,
+      'a non-empty categorical selector must satisfy the categorical branch'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'segment' },
+        value_type: 'categorical',
+        values: [],
+      }).success,
+      false,
+      'categorical selectors require at least one value'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'age' },
+        value_type: 'numeric',
+        min_value: 25,
+      }).success,
+      true,
+      'a lower-bounded numeric branch must remain available after code generation'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'age' },
+        value_type: 'numeric',
+        max_value: 54,
+      }).success,
+      true,
+      'an upper-bounded numeric branch must remain available after code generation'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'age' },
+        value_type: 'numeric',
+      }).success,
+      false,
+      'a numeric expression must declare at least one bound'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({
+        signal_ref: { scope: 'product', signal_id: 'age' },
+        value_type: 'numeric',
+        min_value: 55,
+        max_value: 54,
+      }).success,
+      false,
+      'numeric bounds must be ordered'
+    );
+    assert.equal(
+      schemas.SignalTargetingExpressionSchema.safeParse({ arbitrary: true }).success,
+      false,
+      'unrelated objects must not satisfy the targeting expression union'
+    );
   });
 
   test('AudienceConstraintsSchema validates include/exclude arrays', async () => {

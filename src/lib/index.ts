@@ -144,13 +144,16 @@ export type {
 // ====== BRAND JSON HELPERS ======
 export {
   COMMON_LOGO_SLOTS,
+  BrandDomainValidationError,
   applyBrandAssetMappings,
   checkLogoSlotCoverage,
   extractBrandWebsiteAliasDomains,
   extractBrandWebsiteAliases,
+  isDevelopmentBrandDomain,
   selectLogoForSlot,
   updateBrandJsonFromMappings,
   validateBrandAssetMappings,
+  validateBrandDomain,
 } from './brand';
 export type {
   AppliedBrandAssetMapping,
@@ -168,6 +171,7 @@ export type {
   BrandWebsiteAliasRelationship,
   BrandWebsiteAliasSource,
   BrandJsonRecord,
+  BrandDomainValidationCode,
   BrandLogoBackground,
   BrandLogoOrientation,
   BrandLogoProposal,
@@ -180,6 +184,7 @@ export type {
   SkippedBrandAssetMapping,
   UpdateBrandJsonFromMappingsOptions,
   UpdateBrandJsonFromMappingsResult,
+  ValidateBrandDomainOptions,
 } from './brand';
 
 // ====== PROPERTY DISCOVERY (AdCP v2.2.0) ======
@@ -277,6 +282,8 @@ export {
   UnsupportedFeatureError,
 } from './core/SingleAgentClient';
 export type {
+  CapabilityEvidenceScope,
+  CapabilityEvidenceSnapshot,
   ClientProductPropertyPolicy,
   CreativeDeliveryTaskOptions,
   SingleAgentClientConfig,
@@ -284,6 +291,7 @@ export type {
   VerifyAndParseWebhookOptions,
   WebhookHandlerAdapter,
   WebhookHandlerRequest,
+  WebhookRequestContext,
   WebhookParseErrorCode,
   WebhookParseFailure,
   WebhookParseResult,
@@ -298,7 +306,21 @@ export {
   type WebhookRegistrationStore,
 } from './core/webhook-registration';
 export {
+  pgWebhookRegistrationStore,
+  getWebhookRegistrationMigration,
+  WEBHOOK_REGISTRATION_MIGRATION,
+  cleanupExpiredWebhookRegistrations,
+  type PgWebhookRegistrationStoreOptions,
+  type CleanupExpiredWebhookRegistrationsOptions,
+} from './core/postgres-webhook-registration-store';
+export {
+  redisWebhookRegistrationStore,
+  type RedisWebhookRegistrationStoreOptions,
+} from './core/redis-webhook-registration-store';
+export type { DelegatedOperatorAuthorizationContext } from './signing/agent-resolver';
+export {
   AgentClient,
+  CapabilityPreflightError,
   type CanonicalGetProductsResponse,
   type CanonicalProjectionTaskOptions,
   type ProposalRefinementTaskOptions,
@@ -306,8 +328,12 @@ export {
   type TaskRequestTypeMap,
   type TaskRequestFor,
   type AdcpTaskName,
+  type CapabilityPreflightContext,
+  type CapabilityPreflightErrorCode,
+  type CapabilityPreflightLoader,
   type InProcessAgentClientConfig,
 } from './core/AgentClient';
+export * from './principal';
 export {
   MediaBuyLifecycleCoordinator,
   MediaBuyLifecycleCompatibilityError,
@@ -404,7 +430,12 @@ export {
   type CreativeAgentClientConfig,
   type LegacyCreativeFormat,
 } from './core/CreativeAgentClient';
-export { TaskExecutor } from './core/TaskExecutor';
+export {
+  TaskExecutor,
+  DeferredSettlementOwnershipError,
+  DirectContinuationRecoveryError,
+  type DirectContinuationRecoveryFailure,
+} from './core/TaskExecutor';
 export { match, attachMatch } from './core/match';
 export type { MatchHandlers, PartialMatchHandlers } from './core/match';
 export { ProtocolResponseParser, responseParser, ADCP_STATUS, type ADCPStatus } from './core/ProtocolResponseParser';
@@ -429,6 +460,8 @@ export type {
   TaskResultIntermediate,
   TaskResultFailure,
   TaskResultMetadata,
+  DeferredContinuation,
+  DirectPauseRecoveryRequest,
   TaskState,
   TaskStatus,
   ConversationConfig,
@@ -508,6 +541,7 @@ export {
   isAlwaysBlocked,
   isLikelyPrivateUrl,
   type SsrfRefusedCode,
+  type SsrfDnsLookup,
   type SsrfFetchOptions,
   type SsrfFetchResult,
 } from './net';
@@ -540,6 +574,46 @@ export {
   type FormatSchemaReferenceResult,
   type PlatformExtensionsReferenceResult,
 } from './canonical-references';
+
+// ====== ACCEPTANCE-POLICY DISCOVERY ======
+// Advisory buyer guidance from a seller's digest-pinned policy catalog.
+export {
+  assessAcceptancePolicy,
+  createAcceptancePolicyCatalogResolver,
+  resolveAcceptancePolicyCatalog,
+  resolveAcceptancePolicyProfiles,
+  resolveVerifiedAcceptancePolicyProfiles,
+  type AcceptancePolicyCatalog,
+  type AcceptancePolicyCatalogErrorCode,
+  type AcceptancePolicyCatalogFailure,
+  type AcceptancePolicyCatalogIssue,
+  type AcceptancePolicyCatalogResolver,
+  type AcceptancePolicyCatalogResult,
+  type AcceptancePolicyCatalogSuccess,
+  type AcceptancePolicyDiscoveryCapability,
+  type AcceptancePolicyProfile,
+  type AcceptancePolicyProfileResolution,
+  type AcceptancePolicyRegistryPolicy,
+  type AcceptancePolicyRegistryResolver,
+  type AcceptancePolicyReference,
+  type AcceptancePolicyRequirement,
+  type AcceptancePolicyRule,
+  type AcceptancePolicySurface,
+  type RegistryAcceptancePolicyProfileReference,
+  type ResolveAcceptancePolicyCatalogOptions,
+  type ResolveVerifiedAcceptancePolicyProfilesOptions,
+  type ResolvedAcceptancePolicyDefault,
+  type VerifiedAcceptancePolicyProfilesResult,
+  type VerifiedAcceptancePolicyProfilesSuccess,
+} from './acceptance-policy';
+export {
+  type AcceptancePolicyAssessment,
+  type AcceptancePolicyAssessmentDiagnostic,
+  type AcceptancePolicyAssessmentDiagnosticCode,
+  type AcceptancePolicyMatchedRule,
+  type AcceptancePolicyOutcome,
+  type AssessAcceptancePolicyInput,
+} from './acceptance-policy/evaluator';
 export type {
   BuildGovernanceExecutionRequestInput,
   BuildGovernanceIntentRequestInput,
@@ -594,6 +668,7 @@ export type {
   UpdateMediaBuyStatusChangeHandler,
   SyncCreativesStatusChangeHandler,
   GetProductsStatusChangeHandler,
+  ListProductsStatusChangeHandler,
 } from './core/AsyncHandler';
 export {
   AsyncHandler,
@@ -650,6 +725,7 @@ export {
   MissingInputHandlerError,
   InvalidContextError,
   ConfigurationError,
+  AuthenticationCredentialsRejectedError,
   AuthenticationRequiredError,
   FeatureUnsupportedError,
   ProtocolFeatureUnsupportedError,
@@ -692,10 +768,12 @@ export type {
   DecomposedUpdateMediaBuyMutation,
   LegacyCoarseAction,
   MediaBuyActionContext,
+  MediaBuyActionId,
   MediaBuyActionMode,
   MediaBuyAvailableAction,
   MediaBuyMutationDirection,
   MediaBuyMutationScope,
+  MediaBuyUpdateFieldAction,
   MediaBuyValidAction,
   ModeMismatchRecovery,
   PreflightAllowed,
@@ -714,6 +792,9 @@ export type {
   ResolvedAction,
   SLAWindow,
   SlaWindow,
+  StructuredOnlyMediaBuyAction,
+  ResolvedTargetingInput,
+  TargetingInputFor,
   ValidateProductsAgainstPropertyPolicyOptions,
   UpdateFieldEntry,
   UpdateMediaBuyRequestLike,
@@ -721,7 +802,11 @@ export type {
 export {
   ACTIONS_BY_FIELD,
   LEGACY_COARSE_ACTIONS,
+  STRUCTURED_ONLY_MEDIA_BUY_ACTIONS,
   UPDATE_FIELDS_BY_ACTION,
+  applyTargetingInput,
+  hasTargetingClears,
+  resolveTargetingInput,
   canAddPackages,
   canCancel,
   canDecreaseBudget,
@@ -770,6 +855,12 @@ export { rollupOptimizationMetricsFromProducts } from './utils/capability-rollup
 
 // ====== PROPOSAL NEGOTIATION (AdCP 3.2) ======
 export * from './negotiation';
+// Resolve the intentional name overlap with the wire-level response exported
+// from `@adcp/sdk/types`; the root keeps its richer negotiation helper types.
+export type { RefineProposalsRequest, RefineProposalsResponse } from './negotiation';
+
+// ====== RELIABLE REPORTING RECONCILIATION (AdCP 3.2 experimental) ======
+export * from './reporting';
 
 // ====== CORE TYPES ======
 export * from './types';
@@ -972,6 +1063,7 @@ export type {
   BuildCreativeResponse as LegacyBuildCreativeResponse,
   BuildCreativeSuccess as LegacyBuildCreativeSuccess,
   BuildCreativeMultiSuccess as LegacyBuildCreativeMultiSuccess,
+  BuildCreativeVariantSuccess as LegacyBuildCreativeVariantSuccess,
   BuildCreativeError as LegacyBuildCreativeError,
   PreviewCreativeRequest as LegacyPreviewCreativeRequest,
   PreviewCreativeResponse as LegacyPreviewCreativeResponse,
@@ -1002,6 +1094,9 @@ export type {
   GetCreativeDeliveryResponse as LegacyGetCreativeDeliveryResponse,
   // Account Domain
   Account,
+  AccountChange,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
   ListAccountsRequest,
   ListAccountsResponse,
   SyncAccountsRequest,
@@ -1162,6 +1257,15 @@ export type {
 export type { BrandJson, AdagentsJson } from './types/wellknown-schemas.generated';
 export { BrandJsonSchema, AdagentsJsonSchema } from './types/wellknown-schemas.generated';
 
+// ====== PLACEMENT PRESENTATION ======
+// These boundary validators are explicit root-level exceptions to the general
+// @adcp/sdk/schemas-only policy below. Consumers fetch presentation_ref from a
+// publisher-controlled URL, so keeping the canonical validation path visible
+// alongside ssrfSafeFetch and resolvePreviewAuthority avoids unsupported deep
+// imports or locally copied schemas.
+export type { PlacementPresentationDocument, PlacementPresentationReference } from './types/core.generated';
+export { PlacementPresentationDocumentSchema, PlacementPresentationReferenceSchema } from './types/schemas.generated';
+
 // ====== ERROR CODES ======
 // Standard error code vocabulary for programmatic error handling
 export type { Error as TaskErrorDetail } from './types/core.generated';
@@ -1271,6 +1375,7 @@ export {
   createA2AAdapter,
   A2AInvocationError,
   MCP_APP_RESOURCE_MIME_TYPE,
+  ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY,
 } from './server';
 export type {
   AdcpErrorOptions,
@@ -1306,6 +1411,8 @@ export type {
   AdcpServerToolName,
   AdcpCapabilitiesConfig,
   LegacyAdcpCustomToolConfig,
+  LegacyAdcpCustomToolHandler,
+  LegacyAdcpCustomToolHandlerExtra,
   McpAppUiMeta,
   McpAppMeta,
   AdcpMcpResourceDefinition,
@@ -1330,6 +1437,10 @@ export type {
   AdcpTestRequest,
   AdcpTestToolsCallRequest,
   AdcpTestResponse,
+  AdcpInvokeOptions,
+  StructuredContentFallbackTransport,
+  StructuredContentTextFallback,
+  StructuredContentTextFallbackContext,
   CheckGovernanceOptions,
   GovernanceCallResult,
   GovernanceApproved,
@@ -1390,6 +1501,7 @@ export type {
   LegacyListCreativeFormatsServerPayload,
   LegacyBuildCreativePayload,
   LegacyBuildCreativeMultiPayload,
+  LegacyBuildCreativeVariantPayload,
   LegacyPreviewCreativePayload,
   SyncCreativesPayload,
   SyncCreativesSuccessPayload,
@@ -1492,6 +1604,7 @@ export {
 export {
   NeedsAuthorizationError,
   discoverAuthorizationRequirements,
+  hasValidatedMcpAuthorizationRequirements,
   createFileOAuthStorage,
   bindAgentStorage,
   getAgentStorage,
@@ -1532,11 +1645,14 @@ export {
   ProtocolClient,
   callMCPTool,
   callA2ATool,
+  createA2AClientFromCardUrl,
   createMCPClient,
   createA2AClient,
   closeMCPConnections,
   closeOAuthConnections,
   bundleSupportsAdcpVersionField,
+  BODY_SNIPPET_TIMEOUT_MS,
+  OBSERVER_FLUSH_TIMEOUT_MS,
   sanitizeTransportHeaders,
   sanitizeTransportUrl,
 } from './protocols';
@@ -1553,6 +1669,7 @@ export type {
   TransportActivityContext,
   TransportActivityHandler,
   TransportOptions,
+  A2ALegacyCompatOptions,
 } from './protocols';
 
 // ====== WIRE VERSION HELPERS (NAMESPACE) ======
@@ -1839,17 +1956,19 @@ export type {
 } from './utils/signal-discovery-helpers';
 
 // ====== BUILD CREATIVE RETURN BUILDERS ======
-// Typed factories for the four return shapes accepted by the framework
+// Typed factories for the five return shapes accepted by the framework
 // from `build_creative` handlers. `.single` / `.multi` emit bare manifests
 // the framework auto-wraps; `.singleEnveloped` / `.multiEnveloped` emit
 // the shaped envelope when the handler needs to attach `sandbox` /
-// `expires_at` / `preview`. SHAPE-GOTCHAS §5.
+// `expires_at` / `preview`; `.variantEnveloped` preserves multiplicity.
+// SHAPE-GOTCHAS §5.
 export {
   buildCreativeReturn,
   singleBuildCreativeReturn,
   multiBuildCreativeReturn,
   singleEnvelopedBuildCreativeReturn,
   multiEnvelopedBuildCreativeReturn,
+  variantEnvelopedBuildCreativeReturn,
 } from './utils/build-creative-return-builders';
 
 // ====== PREVIEW CREATIVE BUILDERS ======
@@ -2104,9 +2223,13 @@ export {
   // Roster-backed AccountStore — Shape C factory for publisher-curated explicit platforms
   createRosterAccountStore,
   type RosterAccountStoreOptions,
-  // Derived AccountStore — Shape D factory for single-tenant `resolution: 'derived'` agents
+  // Derived AccountStore — Shape D factory for `resolution: 'derived'` agents
+  // fronting an upstream-managed account namespace
   createDerivedAccountStore,
   type DerivedAccountStoreOptions,
+  type DerivedAccountStoreBaseOptions,
+  type DerivedSingletonAccountStoreOptions,
+  type DerivedRosterAccountStoreOptions,
 } from './adapters';
 
 // ====== BACKWARD COMPATIBILITY & ENVIRONMENT LOADING ======
@@ -2236,3 +2359,25 @@ export type {
   RateLimitTripStructuredResult,
   RateLimitTripTaskOptions,
 } from './testing/index';
+export * from './client/account-change-cursor';
+export * from './client/account-changes';
+export * from './client/account-change-subscription';
+export * from './notifications/account-change-recorded';
+export type { AccountChangeFeedCapabilities } from './utils/capabilities';
+
+export * from './media-buy/actions';
+export { mediaBuyActionResolver } from './server/media-buy-action-resolver';
+export type {
+  SellerActionDecision,
+  SellerActionResolutionOptions,
+  SellerActionResolution,
+} from './server/media-buy-action-resolver';
+
+// Authoritative supply-path evidence and the canonical registry wrapper.
+export * from './supply-path';
+export type {
+  AuthorizationCollectionSelector,
+  ProductCollectionSelector,
+  CollectionDistribution,
+  DiscoveryCollection,
+} from './discovery/types';

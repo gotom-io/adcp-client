@@ -81,6 +81,10 @@ export type {
   NoticeSeverity,
 } from './types';
 export { WEBHOOK_IDEMPOTENCY_KEY_PATTERN } from './types';
+// Report consumers key on `StoryboardStepResult.task`; the MCP session auth
+// probe is runner-native, so its task name ships as a constant rather than a
+// magic string operators have to copy (adcp-client#2940).
+export { MCP_SESSION_PROBE_TASK } from './types';
 
 // Cross-step assertion registry (adcontextprotocol/adcp#2639)
 export {
@@ -97,6 +101,7 @@ export type { AssertionSpec, AssertionContext, RegisterAssertionOptions } from '
 export { createWebhookReceiver } from './webhook-receiver';
 export type {
   CapturedWebhook,
+  CapturedWebhookChallenge,
   CreateWebhookReceiverOptions,
   RetryReplayPolicy,
   WebhookFilter,
@@ -127,7 +132,7 @@ export {
 } from './runner';
 
 // Parser (single-file load for spec evolution / targeted testing)
-export { parseStoryboard, loadStoryboardFile } from './loader';
+export { parseStoryboard, loadStoryboardFile, normalizeValidationOnlyTasks, VALIDATION_ONLY_TASK } from './loader';
 
 // AdCP 3.2 fixture-handle resolution
 export {

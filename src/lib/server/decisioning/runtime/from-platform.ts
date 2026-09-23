@@ -20,7 +20,8 @@
  *   - HITL path: framework detects the `TaskHandoff` marker, allocates
  *     `taskId`, returns the submitted envelope to the buyer immediately,
  *     then runs the handoff function in background. The function's return
- *     value becomes the task's terminal `result`; thrown `AdcpError` becomes
+ *     value becomes the task's terminal `result`; `taskCtx.reject(...)`
+ *     becomes a business `rejected` result, and thrown `AdcpError` becomes
  *     the terminal `error`.
  *
  * Generic thrown errors (`Error`, `TypeError`) fall through to the
@@ -42,9 +43,8 @@
  * via `NoAccountCtx<TCtxMeta>` — handlers receive `ctx.account: Account |
  * undefined` and must narrow before reading `ctx_metadata`.
  *
- * Status: Preview / 6.0. Not yet exported from the public `./server`
- * subpath; reach in via `@adcp/sdk/server/decisioning/runtime` for
- * spike experimentation only.
+ * Status: Preview / 6.0. Exported from the canonical `@adcp/sdk/server`
+ * entry point; the decisioning implementation remains preview until GA.
  *
  * @public
  */
@@ -72,12 +72,16 @@ import type { DecisioningPlatform, RequiredPlatformsFor, RequiredCapabilitiesFor
 import type { ComplianceTestingCapabilities } from '../capabilities';
 import { normalizeTargetingCapabilities } from '../capabilities';
 import { isAdcpVersionAtLeast } from '../../../utils/adcp-version-config';
-import type { Account, ResolvedAuthInfo, ResolveContext } from '../account';
+import type { Account, AccountResolutionMode, ResolvedAuthInfo, ResolveContext } from '../account';
 import {
   AccountNotFoundError,
+  normalizeAccountResolution,
   refAccountId,
+  refHasNaturalKey,
   toWireAccount,
   toWireSyncAccountRow,
+  type WireSyncAccountRow,
+  type WireSyncGovernanceRow,
   toWireSyncGovernanceRow,
   type SyncAccountsResultRow,
 } from '../account';
@@ -105,8 +109,10 @@ import type {
   BrandReference,
   BuildCreativeMultiSuccess,
   BuildCreativeSuccess,
+  BuildCreativeVariantSuccess,
   CreativeManifest,
   GetAdCPCapabilitiesResponse,
+  ListAccountChangesRequest,
   PaymentTerms,
   SyncGovernanceRequest,
 } from '../../../types/tools.generated';
@@ -117,7 +123,7 @@ import { resolveCredentialPolicyForTool, scanArgsForCredentials, type Credential
 import { validatePlatform, PlatformConfigError } from './validate-platform';
 import { validateSpecialismRequiredTools, formatSpecialismIssue } from '../validate-specialisms';
 import type { AdcpLogger } from '../../create-adcp-server';
-import { buildRequestContext, buildHandoffContext } from './to-context';
+import { buildExternalHandoffContext, buildRequestContext, buildHandoffContext } from './to-context';
 import {
   type CtxMetadataStore,
   type ResourceKind,
@@ -136,14 +142,31 @@ import type {
   UpdateMediaBuyInputForStore,
   GetMediaBuysResultForStore,
 } from '../../media-buy-store';
-import { createPostgresTaskRegistry, getDecisioningTaskRegistryMigration } from './postgres-task-registry';
+import { createPostgresTaskRegistry, getDecisioningTaskRegistryBootstrap } from './postgres-task-registry';
 import type { PgQueryable } from '../../postgres-task-store';
-import { isTaskHandoff, _extractHandoffEntry, type TaskHandoff } from '../async-outcome';
+import {
+  isTaskHandoff,
+  isTaskHandoffRejection,
+  _extractHandoffEntry,
+  type ExternalTaskHandoffContext,
+  type TaskHandoff,
+} from '../async-outcome';
 import { _extractResponseSummaryEntry } from '../response-summary';
 import { productsResponse } from '../../responses';
 import { TOOL_ENTITY_FIELDS } from './entity-hydration.generated';
 import { z } from 'zod';
-import { createInMemoryTaskRegistry, type TaskRegistry, type TaskRecord, type TaskStatus } from './task-registry';
+import {
+  _sanitizeStoredTaskResultForWire,
+  createInMemoryTaskRegistry,
+  sanitizeTaskProgressForStorage,
+  sanitizeTaskResultForWire,
+  taskRecordMatchesScope,
+  type ScopedTaskRef,
+  type TaskRegistry,
+  type TaskRecord,
+  type TaskRegistryScope,
+  type TaskStatus,
+} from './task-registry';
 import { protocolForTool, SPEC_WEBHOOK_TASK_TYPES } from './protocol-for-tool';
 
 /**
@@ -161,8 +184,24 @@ const DEFAULT_FRAMEWORK_LOGGER: AdcpLogger = {
   // eslint-disable-next-line no-console
   error: console.error.bind(console),
 };
+
+function withImmutableServedAdcpVersion<T extends object>(context: T, servedAdcpVersion?: string): T {
+  if (servedAdcpVersion !== undefined) {
+    Object.defineProperty(context, 'servedAdcpVersion', {
+      value: servedAdcpVersion,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return context;
+}
 import { createInMemoryStatusChangeBus, type StatusChangeBus, type PublishStatusChangeOpts } from '../status-changes';
-import { createComplyController, type ComplyControllerConfig } from '../../../testing/comply-controller';
+import {
+  _handleComplyControllerWithResolvedAuthority,
+  createComplyController,
+  type ComplyControllerConfig,
+} from '../../../testing/comply-controller';
 import type { TestControllerBridge } from '../../test-controller-bridge';
 import { mergeSeedProduct } from '../../../testing/seed-merge';
 import {
@@ -200,7 +239,7 @@ import type {
   CanonicalListCreativesRequest,
   CanonicalUpdateMediaBuyRequest,
 } from '../../../v2/projection/creative-delivery';
-import { toCanonicalOnlyResponse } from '../../../v2/projection/augment-response';
+import { projectionDiagnosticToError, toCanonicalOnlyResponse } from '../../../v2/projection/augment-response';
 import {
   CanonicalFormatLegacyResolutionError,
   projectV2ProductToV1,
@@ -1740,50 +1779,59 @@ function asProductResponseForWire<T extends { products?: unknown[] }>(
     );
   }
   if (!Array.isArray(canonicalResponse.products)) return canonicalResponse;
-  const products = canonicalResponse.products.map(product => {
+  const products: V1Product[] = [];
+  const diagnostics: ProjectionDiagnostic[] = [];
+  for (const product of canonicalResponse.products) {
     const projected = projectV2ProductToV1(product as V2Product, { canonicalFormatLegacyResolver });
-    if (projected.diagnostics.length > 0) {
-      const first = projected.diagnostics[0]!;
-      throw new AdcpError('INVALID_REQUEST', {
-        message: 'get_products returned a canonical format that cannot be represented on the configured legacy wire.',
-        field: first.field,
-        suggestion:
-          'Add an explicit legacy format mapping to the canonical declaration, or configure this server for AdCP 3.1 or newer.',
-      });
-    }
-    return projected.v1;
-  });
-  return { ...canonicalResponse, products } as T;
+    diagnostics.push(...projected.diagnostics);
+    if (projected.v1.format_ids.length > 0) products.push(projected.v1);
+  }
+  const responseErrors = (canonicalResponse as T & { errors?: unknown }).errors;
+  const errors = Array.isArray(responseErrors)
+    ? [...responseErrors, ...diagnostics.map(projectionDiagnosticToError)]
+    : responseErrors === undefined
+      ? diagnostics.map(projectionDiagnosticToError)
+      : responseErrors;
+  return {
+    ...canonicalResponse,
+    products,
+    ...(Array.isArray(errors) && errors.length > 0 ? { errors } : {}),
+  } as T;
 }
 
 /**
- * Enforce the documented inline-`account_id` refusal for resolution modes
- * that declare the field meaningless on the wire — `'implicit'` (since
- * #1364) and `'derived'` (since adcp-client#1468). Both modes share the
- * same wire contract: the buyer does not pass `account_id` inline; the
- * framework derives the tenant from the authenticated principal (after a
- * `sync_accounts` step for `'implicit'`; directly for `'derived'`).
+ * Enforce the account-reference shape each resolution mode declares durable
+ * on the wire, before the adopter's `accounts.resolve` runs. Keeps one
+ * consistent envelope across modes instead of every adopter reimplementing
+ * `if (ref?.account_id) return null`.
  *
- * Throws `AdcpError('INVALID_REQUEST')` before reaching the adopter's
- * `accounts.resolve`, so each adopter doesn't reimplement the same
- * `if (ref?.account_id) return null` branch and the wire response is
- * consistent across both modes. The brand+operator union arm is
- * permitted — only `account_id`-shaped references are refused.
+ * - `'implicit'` (#1364) — buyer-declared accounts. The `{ brand, operator }`
+ *   natural key is the durable reference; inline `account_id` is refused
+ *   (`field: 'account.account_id'`) with `sync_accounts`-first guidance.
+ * - `'derived'` (#1647, upstream adcp#5062) — an upstream-managed account-id
+ *   namespace. `account_id` is the durable reference and is **accepted**;
+ *   the natural-key arm is refused (`field: 'account.brand'`) because
+ *   `(brand, operator)` is not a key into a roster this agent doesn't own.
+ *   Buyers recover with `list_accounts`.
+ * - `'explicit'` — seller-owned namespace; no shape constraint, both arms
+ *   reach the resolver.
  *
- * Mode-specific message and suggestion: `'implicit'` adopters get the
- * `sync_accounts`-first guidance; `'derived'` adopters get the single-
- * tenant explanation (no `sync_accounts` step exists in derived mode —
- * the auth principal alone identifies the tenant).
+ * Before SDK 14 this function refused `account_id` for `'derived'` too. That
+ * was the inverted contract corrected by adcp-client#1647: it made the mode
+ * unusable for the adapters it exists for (the upstream hands out ids; the
+ * buyer had no way to send one back) and left `list_accounts` results
+ * un-referenceable.
  *
- * Documented at `AccountStore.resolution` in `account.ts`.
+ * Throws `AdcpError('INVALID_REQUEST')`. Documented at
+ * `AccountStore.resolution` in `account.ts`.
  */
-function refuseInlineAccountIdWhenForbidden(
-  resolution: 'explicit' | 'implicit' | 'derived' | undefined,
+function enforceAccountRefShapeForResolution(
+  resolution: AccountResolutionMode | undefined,
   ref: AccountReference | undefined
 ): void {
-  if (resolution !== 'implicit' && resolution !== 'derived') return;
-  if (refAccountId(ref) === undefined) return;
-  if (resolution === 'implicit') {
+  const mode = normalizeAccountResolution(resolution);
+  if (mode === 'implicit') {
+    if (refAccountId(ref) === undefined) return;
     throw new AdcpError('INVALID_REQUEST', {
       message:
         'This platform resolves accounts from the authenticated principal — call sync_accounts first; do not pass account.account_id inline.',
@@ -1792,12 +1840,107 @@ function refuseInlineAccountIdWhenForbidden(
         'Call sync_accounts to associate accounts with your principal, then omit account_id on subsequent calls.',
     });
   }
+  // 'derived' — upstream-managed account-id namespace. Branch explicitly
+  // rather than as an `else`: an unrecognized mode must not inherit this
+  // enforcement (it normalizes to `'explicit'`, which constrains nothing).
+  if (mode !== 'derived') return;
+  if (refAccountId(ref) !== undefined) return;
+  if (!refHasNaturalKey(ref)) return;
   throw new AdcpError('INVALID_REQUEST', {
     message:
-      'This single-tenant agent identifies the tenant from the authenticated principal alone — do not pass account.account_id inline; the field is meaningless on the wire for derived-resolution agents.',
-    field: 'account.account_id',
-    suggestion: 'Omit the account field; the framework derives the tenant from your authenticated credential.',
+      'This agent fronts an upstream-managed account namespace: accounts are addressed by account.account_id, ' +
+      'not by the brand + operator natural key. The upstream owns the roster, so (brand, operator) is not a ' +
+      'durable reference here.',
+    field: 'account.brand',
+    suggestion:
+      'Call list_accounts to discover the account_id visible to your credential, then send account: { account_id }.',
   });
+}
+
+/**
+ * Recovery hint for an unresolved account, by resolution mode. The envelope
+ * itself stays the spec's fixed `ACCOUNT_NOT_FOUND` (no signal about whether
+ * the named account exists); only the remedy differs, and on an
+ * upstream-managed namespace the remedy is always the same one sentence.
+ */
+function accountNotFoundSuggestion(resolution: AccountResolutionMode | undefined): string | undefined {
+  switch (normalizeAccountResolution(resolution)) {
+    case 'derived':
+      return 'Call list_accounts to discover the accounts your credential can reach, then send account: { account_id }.';
+    case 'implicit':
+      return 'Call sync_accounts to associate this brand + operator with your principal first.';
+    default:
+      return undefined;
+  }
+}
+
+const ACCOUNT_VIA_RESOURCE_TOOLS = new Set(['refine_proposals', 'decline_proposals']);
+
+function accountRequiredSuggestion(toolName: string, resolution: AccountResolutionMode | undefined): string {
+  const viaResource = ACCOUNT_VIA_RESOURCE_TOOLS.has(toolName);
+  switch (normalizeAccountResolution(resolution)) {
+    case 'implicit':
+      return 'Call sync_accounts to associate an account with this authenticated principal, then retry without an inline account_id.';
+    case 'derived':
+      return viaResource
+        ? 'Provide a context_id or proposal reference whose owning account the seller can resolve; use list_accounts to discover reachable accounts.'
+        : 'Call list_accounts to discover the accounts your credential can reach, then retry with account: { account_id }.';
+    default:
+      return viaResource
+        ? 'Provide a context_id or proposal reference whose owning account the seller can resolve.'
+        : 'Pass the account reference required by this seller; use list_accounts to discover available accounts when supported.';
+  }
+}
+
+function missingAccountError(toolName: string, resolution: AccountResolutionMode | undefined): AdcpError {
+  const asyncDiscovery = toolName === 'get_products' || toolName === 'get_signals';
+  return new AdcpError('ACCOUNT_REQUIRED', {
+    message: asyncDiscovery
+      ? `Async ${toolName} and push_notification_config require an account selection, but the request and authentication did not identify one`
+      : `${toolName} requires an account selection, but the request and referenced resources did not identify one`,
+    recovery: 'correctable',
+    field: ACCOUNT_VIA_RESOURCE_TOOLS.has(toolName) ? 'context_id' : 'account',
+    suggestion: accountRequiredSuggestion(toolName, resolution),
+  });
+}
+
+/**
+ * Defense in depth for `resolution: 'derived'`: the account a resolver hands
+ * back for a buyer-named `{ account_id }` MUST be that account.
+ *
+ * On an upstream-managed namespace the id is a buyer-supplied claim, so
+ * verification is the resolver's job — but "verify the ref" is a contract an
+ * adopter can forget, and the pre-SDK-14 shape of this mode actively taught
+ * the opposite (the framework refused `account_id`, so ignoring `ref` and
+ * returning the one account was safe). An un-updated resolver would
+ * otherwise serve caller A's request against whatever account it returns,
+ * silently, the first time a deployment holds more than one.
+ *
+ * A mismatch resolves to `null`, which the callers map to the spec's fixed
+ * `ACCOUNT_NOT_FOUND` envelope — no signal about whether the named account
+ * exists. `createDerivedAccountStore` already fails closed here; this makes
+ * hand-rolled stores fail closed too.
+ */
+function assertResolvedAccountMatchesRef<T extends { id: string }>(
+  resolution: AccountResolutionMode | undefined,
+  ref: AccountReference | undefined,
+  account: T | null,
+  logger: AdcpLogger
+): T | null {
+  if (account == null) return null;
+  if (normalizeAccountResolution(resolution) !== 'derived') return account;
+  const requestedId = refAccountId(ref);
+  if (requestedId === undefined || account.id === requestedId) return account;
+  if (process.env.NODE_ENV !== 'production') {
+    logger.warn(
+      `[adcp/sdk] accounts.resolve returned account '${account.id}' for a request naming ` +
+        `'${requestedId}' on a resolution: 'derived' platform. The framework is refusing it with ` +
+        `ACCOUNT_NOT_FOUND. A 'derived' resolver must look the buyer-supplied account_id up against ` +
+        `what the caller's credential can reach and return null on a miss — see AccountStore.resolve, ` +
+        `or use createDerivedAccountStore which does it for you.`
+    );
+  }
+  return null;
 }
 
 /**
@@ -1895,7 +2038,8 @@ export interface DecisioningObservabilityHooks {
 
   /**
    * Fired when a task transitions to a terminal state (`completed`,
-   * `failed`, or `failed-write` when the registry write itself fails).
+   * `failed`, `rejected`, or `failed-write` when the registry write itself
+   * fails).
    * `durationMs` is from create → terminal. `errorCode` is the structured
    * error code for the failure cases — pre-bucketed for metric tags
    * (matches `ErrorCode` enum + the framework-synthetic
@@ -1905,7 +2049,7 @@ export interface DecisioningObservabilityHooks {
     taskId: string;
     tool: string;
     accountId: string;
-    status: 'completed' | 'failed';
+    status: 'completed' | 'failed' | 'rejected';
     durationMs: number;
     errorCode?: string;
   }): void;
@@ -1940,13 +2084,18 @@ export interface DecisioningObservabilityHooks {
   onStatusChangePublish?(info: { accountId: string; resourceType: string; resourceId: string }): void;
 }
 
-export type LegacyDecisioningHandlerGroups = Pick<
-  AdcpServerConfig,
-  'mediaBuy' | 'creative' | 'governance' | 'brandRights'
+/** Resolved account type carried by a DecisioningPlatform. @public */
+export type AccountOf<P extends DecisioningPlatform<any, any>> = NonNullable<
+  Awaited<ReturnType<P['accounts']['resolve']>>
 >;
 
-export interface CreateAdcpServerFromPlatformOptions extends Omit<
-  AdcpServerConfig,
+export type LegacyDecisioningHandlerGroups<TAccount = unknown> = Pick<
+  AdcpServerConfig<TAccount>,
+  'mediaBuy' | 'creative' | 'governance' | 'brandRights' | 'signals'
+>;
+
+export interface CreateAdcpServerFromPlatformOptions<TAccount = unknown> extends Omit<
+  AdcpServerConfig<TAccount>,
   'resolveAccount' | 'capabilities' | 'name' | 'version' | 'mediaBuy' | 'creative' | 'governance' | 'brandRights'
 > {
   name: string;
@@ -1954,10 +2103,13 @@ export interface CreateAdcpServerFromPlatformOptions extends Omit<
   /**
    * Explicit compatibility seam for raw protocol handlers that have not yet
    * migrated to canonical DecisioningPlatform methods. Wire support remains
-   * available through AdCP 3.x, but raw creative identity must never look like
+   * available through AdCP 3.x. A legacy `signals.getSignals` handler supplied
+   * here (or through the inherited `opts.signals` compatibility field) satisfies
+   * signal-specialism platform validation without requiring an invented
+   * `activateSignal` implementation. Raw creative identity must never look like
    * a primary platform hook.
    */
-  legacyHandlers?: LegacyDecisioningHandlerGroups;
+  legacyHandlers?: LegacyDecisioningHandlerGroups<TAccount>;
   /**
    * Convert seller/creative-agent-specific legacy format refs before modern
    * platform handlers run. Known AAO formats are normalized automatically;
@@ -1984,6 +2136,18 @@ export interface CreateAdcpServerFromPlatformOptions extends Omit<
    * (gated by NODE_ENV — see `buildDefaultTaskRegistry`).
    */
   taskRegistry?: TaskRegistry;
+  /**
+   * Trusted tenant/deployment namespace for the `pool` task-registry shortcut.
+   * Required when `pool` supplies the registry. Use the same value with the
+   * migration helper so legacy rows remain reachable after upgrade.
+   */
+  taskRegistryNamespace?: string;
+  /**
+   * Stable, non-secret identity for the physical database/schema used by the
+   * pooled task registry. Required only when its scoped refs will be settled
+   * by an out-of-process worker after restart.
+   */
+  taskRegistryStorageId?: string;
   /**
    * Override the framework's status-change event bus for this server.
    * Defaults to a fresh per-server `createInMemoryStatusChangeBus()` so
@@ -2108,8 +2272,10 @@ export interface CreateAdcpServerFromPlatformOptions extends Omit<
    * explicitly keep override priority — the explicit values win, and the
    * pool fills only the unset ones.
    *
-   * Run `getAllAdcpMigrations()` once per database to create the three
-   * required tables (idempotency cache, ctx-metadata cache, task registry).
+   * Use `getAllAdcpMigrations({ taskRegistryNamespace })` while provisioning a
+   * new database to create the three required tables (idempotency cache,
+   * ctx-metadata cache, task registry). Populated legacy task tables require
+   * the explicit scope-v1 operator upgrade.
    *
    * @example
    * ```ts
@@ -2120,12 +2286,15 @@ export interface CreateAdcpServerFromPlatformOptions extends Omit<
    * } from '@adcp/sdk/server';
    *
    * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-   * await pool.query(getAllAdcpMigrations());
+   * const taskRegistryNamespace = 'tenant:my-agent';
+   * await pool.query(getAllAdcpMigrations({ taskRegistryNamespace }));
    *
    * const server = createAdcpServerFromPlatform(myPlatform, {
    *   name: 'my-agent',
    *   version: '1.0.0',
    *   pool,                                // wires all three persistence stores
+   *   taskRegistryNamespace,
+   *   taskRegistryStorageId: 'prod-eu1:primary-db',
    * });
    * ```
    *
@@ -2336,8 +2505,8 @@ export interface CreateAdcpServerFromPlatformOptions extends Omit<
 export type RequiredOptsFor<P extends DecisioningPlatform<any, any>> = P extends {
   capabilities: { compliance_testing: ComplianceTestingCapabilities };
 }
-  ? CreateAdcpServerFromPlatformOptions & { complyTest: ComplyControllerConfig }
-  : CreateAdcpServerFromPlatformOptions;
+  ? CreateAdcpServerFromPlatformOptions<AccountOf<P>> & { complyTest: ComplyControllerConfig }
+  : CreateAdcpServerFromPlatformOptions<AccountOf<P>>;
 
 /**
  * Adcp server returned by `createAdcpServerFromPlatform`. Adds task-state
@@ -2347,28 +2516,21 @@ export type RequiredOptsFor<P extends DecisioningPlatform<any, any>> = P extends
 export interface DecisioningAdcpServer extends AdcpServer {
   /**
    * Read the current lifecycle state for a HITL task. Returns `null` if the
-   * `taskId` is unknown OR (when `expectedAccountId` is supplied) the
-   * task's owning account doesn't match.
-   *
-   * **Multi-tenant isolation: pass `expectedAccountId` whenever the caller
-   * has a buyer-derived account in scope.** Adopters wrapping this method
-   * in a `tasks/get` wire handler MUST pass `ctx.account.id` to scope reads
-   * — without it, any caller with a known `task_id` reads any tenant's
-   * task lifecycle, including its `result` and `error` payloads. The
-   * unscoped form (single-arg) is for ops / test harnesses that hold no
-   * buyer account in scope.
+   * `taskId` is unknown or the account/principal scope does not match.
    *
    * Async to accommodate storage-backed task registries
    * (`createPostgresTaskRegistry`); the in-memory impl resolves synchronously.
    */
-  getTaskState<TResult = unknown>(taskId: string, expectedAccountId?: string): Promise<TaskRecord<TResult> | null>;
+  getTaskState<TResult = unknown>(taskId: string, scope: TaskRegistryScope): Promise<TaskRecord<TResult> | null>;
   /**
    * Await any in-flight background completion for `taskId` (HITL handoff
    * function still running). Resolves immediately if the task is terminal
    * or has no registered background. Used by tests + the `tasks/get` wire
    * path for deterministic settlement.
    */
-  awaitTask(taskId: string): Promise<void>;
+  awaitTask(taskId: string, scope: TaskRegistryScope): Promise<void>;
+  /** Administrative/test wait across all scopes with this task_id. Never expose to buyer traffic. */
+  awaitTaskUnsafe(taskId: string): Promise<void>;
   /**
    * Per-server status-change bus. Delegates to the same internal bus the
    * framework uses for MCP Resources subscription projection.
@@ -2405,17 +2567,24 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // public type exposes these raw handler groups only under legacyHandlers;
   // retaining the hidden fallback avoids turning a type migration into an
   // abrupt wire-support break for untyped deployments.
-  const runtimeLegacyOptions = opts as typeof opts & Partial<LegacyDecisioningHandlerGroups>;
-  const legacyHandlers: LegacyDecisioningHandlerGroups = {
+  const runtimeLegacyOptions = opts as typeof opts & Partial<LegacyDecisioningHandlerGroups<AccountOf<P>>>;
+  const legacyHandlers: LegacyDecisioningHandlerGroups<AccountOf<P>> = {
     mediaBuy: opts.legacyHandlers?.mediaBuy ?? runtimeLegacyOptions.mediaBuy,
     creative: opts.legacyHandlers?.creative ?? runtimeLegacyOptions.creative,
     governance: opts.legacyHandlers?.governance ?? runtimeLegacyOptions.governance,
     brandRights: opts.legacyHandlers?.brandRights ?? runtimeLegacyOptions.brandRights,
+    signals: opts.legacyHandlers?.signals ?? runtimeLegacyOptions.signals,
   };
+  // Runtime adapters normalize account values to `Account<any>`. Preserve
+  // the platform's exact account type on the public migration seam while
+  // keeping that historical internal boundary localized here.
+  const runtimeOpts = opts as unknown as CreateAdcpServerFromPlatformOptions<Account>;
+  const runtimeLegacyHandlers = legacyHandlers as unknown as LegacyDecisioningHandlerGroups<Account>;
   validatePlatform(platform, {
     creative: legacyHandlers.creative,
     campaignGovernance: legacyHandlers.governance,
     brandRights: legacyHandlers.brandRights,
+    signals: legacyHandlers.signals,
   });
 
   // Specialism→required-tools coverage check (adcp-client#1299).
@@ -2442,6 +2611,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       creative: platform.creative ?? legacyHandlers.creative,
       governance: legacyHandlers.governance,
       brandRights: platform.brandRights ?? legacyHandlers.brandRights,
+      signals: platform.signals ?? legacyHandlers.signals,
     };
     const issues = validateSpecialismRequiredTools(effectiveSpecialismSurface, specialisms);
     if (issues.length > 0) {
@@ -2456,6 +2626,36 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       // eslint-disable-next-line no-console
       for (const message of messages) console.warn(message);
     }
+  }
+
+  // Upstream-managed account namespaces must expose account discovery.
+  //
+  // `resolution: 'derived'` declares "the platform I front owns the account
+  // roster; buyers address accounts by `account_id`". `list_accounts` is the
+  // only way a buyer can learn those ids, so it is the discovery contract
+  // for the mode, not optional polish (adcp#5062; adcp-client#1647). A
+  // credential bound to exactly one account still lists it — one row — so
+  // buyer SDKs can auto-select and send an explicit ref on required-account
+  // tasks.
+  //
+  // Checked here rather than in `validatePlatform` because `list_accounts`
+  // can legitimately be served from the merge seam
+  // (`opts.accounts.listAccounts`) instead of the platform interface.
+  //
+  // If your ids are only ever handed out out-of-band and there is nothing to
+  // enumerate, you are a seller-defined account-id namespace: declare
+  // `'explicit'`. `createDerivedAccountStore` wires `list` for you.
+  if (
+    normalizeAccountResolution(platform.accounts.resolution) === 'derived' &&
+    platform.accounts.list == null &&
+    runtimeOpts.accounts?.listAccounts == null
+  ) {
+    throw new PlatformConfigError(
+      `accounts.resolution: 'derived' requires list_accounts — it is the discovery contract for an ` +
+        `upstream-managed account namespace (buyers cannot learn an account_id otherwise). Wire ` +
+        `accounts.list (or opts.accounts.listAccounts), use createDerivedAccountStore (which provides it), ` +
+        `or declare resolution: 'explicit' if account ids are only issued out-of-band.`
+    );
   }
 
   // Compliance-testing capability/adapter consistency.
@@ -2534,13 +2734,31 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     opts.pool && opts.ctxMetadata === undefined
       ? createCtxMetadataStore({ backend: pgCtxMetadataStore(opts.pool) })
       : undefined;
+  if (opts.pool && opts.taskRegistry === undefined && opts.taskRegistryNamespace === undefined) {
+    throw new PlatformConfigError(
+      'taskRegistryNamespace is required when opts.pool supplies the task registry. ' +
+        'Use the same trusted namespace with getAllAdcpMigrations({ taskRegistryNamespace }) or ' +
+        'getDecisioningTaskRegistryBootstrap({ namespace }).'
+    );
+  }
   const pooledTaskRegistry: TaskRegistry | undefined =
-    opts.pool && opts.taskRegistry === undefined ? createPostgresTaskRegistry({ pool: opts.pool }) : undefined;
+    opts.pool && opts.taskRegistry === undefined
+      ? createPostgresTaskRegistry({
+          pool: opts.pool,
+          namespace: opts.taskRegistryNamespace!,
+          ...(opts.taskRegistryStorageId !== undefined && { storageId: opts.taskRegistryStorageId }),
+        })
+      : undefined;
 
   // Effective resolved values. Explicit > pooled > default.
   const effectiveIdempotency: IdempotencyStore | 'disabled' | undefined = opts.idempotency ?? pooledIdempotency;
   const effectiveCtxMetadata: CtxMetadataStore | undefined = opts.ctxMetadata ?? pooledCtxMetadata;
   const taskRegistry = opts.taskRegistry ?? pooledTaskRegistry ?? buildDefaultTaskRegistry();
+  if (taskRegistry.scopeVersion !== 1) {
+    throw new PlatformConfigError(
+      'taskRegistry.scopeVersion must be 1. Migrate custom registries to the account/principal-scoped TaskRegistry signatures before use.'
+    );
+  }
   const baseBus = opts.statusChangeBus ?? createInMemoryStatusChangeBus();
   const taskWebhookEmit = opts.taskWebhookEmitter?.emit;
 
@@ -2585,6 +2803,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // empty support list as a positive 3.1 metric-optimization declaration.
   const som = somCandidate != null && somCandidate.length > 0 ? somCandidate : undefined;
   const fc = platform.capabilities.frequency_capping;
+  const reportingDelivery = platform.reporting?.capabilities;
   const targeting = platform.capabilities.targeting
     ? normalizeTargetingCapabilities(platform.capabilities.targeting)
     : undefined;
@@ -2609,6 +2828,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     cs != null ||
     som != null ||
     fc != null ||
+    reportingDelivery != null ||
     targeting != null ||
     supportsProposals !== undefined;
   // App `version` / capability `build_version` are deployment metadata and
@@ -2622,6 +2842,31 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       `Configured AdCP version '${configuredAdcpVersion}' is not a valid release identifier`
     );
   }
+  if (reportingDelivery && !isAdcpVersionAtLeast(configuredAdcpVersion, '3.2.0-rc.4')) {
+    throw new PlatformConfigError('Reliable Reporting Core requires an AdCP 3.2.0-rc.4 or newer schema pin');
+  }
+  // Reliable Reporting renders one frozen protocol contract. A multi-release
+  // server may continue serving older releases for its other tools, but it
+  // must not advertise the mounted reporting composition on those releases:
+  // the reporting handler, capability declaration, and validator all share
+  // `configuredAdcpVersion`. Bind the reporting-only tools to that exact pin.
+  // `get_media_buy_delivery` stays multi-release when a live sales/lifecycle
+  // implementation owns cumulative reads; the reporting ledger then handles
+  // only the exact-revision arm available on its pinned schema.
+  const liveMediaBuyDelivery = platform.mediaBuyLifecycle?.getMediaBuyDelivery ?? platform.sales?.getMediaBuyDelivery;
+  const exactReportingRange = { min: configuredAdcpVersion, max: configuredAdcpVersion } as const;
+  const effectiveToolVersions = reportingDelivery
+    ? {
+        ...runtimeOpts.toolVersions,
+        get_reporting_status: exactReportingRange,
+        ...(platform.reporting?.syncReportingStatus !== undefined && {
+          sync_reporting_status: exactReportingRange,
+        }),
+        ...(liveMediaBuyDelivery === undefined && {
+          get_media_buy_delivery: exactReportingRange,
+        }),
+      }
+    : runtimeOpts.toolVersions;
   for (const advertisedVersion of platform.capabilities.supported_versions ?? []) {
     const advertisedRelease = parseAdcpRelease(advertisedVersion);
     if (!advertisedRelease) {
@@ -2650,6 +2895,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     ...(cs != null && { content_standards: cs }),
     ...(som != null && { supported_optimization_metrics: som }),
     ...(fc != null && { frequency_capping: fc }),
+    ...(reportingDelivery != null && { reporting_delivery: reportingDelivery }),
     ...(targeting != null && { execution: { targeting } }),
     ...(supportsProposals !== undefined && { supports_proposals: supportsProposals }),
     features: {
@@ -2689,9 +2935,15 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // Account-mode capability projection. Two redundant adopter signals
   // resolve into the same wire bit:
   //   - `capabilities.requireOperatorAuth: true` — explicit override
-  //   - `accounts.resolution: 'explicit'` — derived from the account-store
-  //     model (operators authenticate independently with the seller; the
-  //     buyer discovers accounts via `list_accounts`, NOT `sync_accounts`).
+  //   - an account-id-namespace `accounts.resolution` — `'explicit'`
+  //     (seller-owned ids) or `'derived'` (upstream-managed roster,
+  //     discovered via `list_accounts`). In both, operators authenticate
+  //     independently and account-scoped calls carry `{ account_id }`
+  //     rather than provisioning by natural key through `sync_accounts`.
+  //     Per adcp#5062 `require_operator_auth: true` is the capability bit
+  //     for account-id namespaces; only `'implicit'` (buyer-declared
+  //     accounts) projects false. Derived joined this branch in
+  //     adcp-client#1647.
   // Either, taken alone, projects to `account.require_operator_auth: true`.
   // The conformance storyboard runner reads this bit at step time and
   // grades `sync_accounts` steps as `'not_applicable'` (rather than the
@@ -2703,7 +2955,16 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // operator (retail-media model) or the buying agent (pass-through). Without
   // the projection, retail-media adopters that declared `['operator']` saw
   // their buyers default-route to agent-billed flows.
-  const requireOperatorAuth = platform.capabilities.requireOperatorAuth ?? platform.accounts.resolution === 'explicit';
+  // Only an explicitly declared account-id-namespace mode projects the bit;
+  // an omitted `resolution` keeps the pre-existing "no projection" behavior
+  // even though it defaults to `'explicit'` for dispatch purposes. Adopters
+  // who want the capability emitted declare the mode (or set
+  // `capabilities.requireOperatorAuth`) rather than inheriting it silently.
+  const declaredResolution =
+    platform.accounts.resolution === undefined ? undefined : normalizeAccountResolution(platform.accounts.resolution);
+  const requireOperatorAuth =
+    platform.capabilities.requireOperatorAuth ??
+    (declaredResolution === 'explicit' || declaredResolution === 'derived');
   const supportedBillings = platform.capabilities.supportedBillings;
   const hasAccountProjection = requireOperatorAuth === true || (supportedBillings?.length ?? 0) > 0;
   // Schema requires `supported_billing` (minItems: 1) whenever the account
@@ -2817,6 +3078,19 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   const adopterExtensionsSupported = platform.capabilities.extensions_supported;
   const adopterCapabilityExt = platform.capabilities.ext;
   const adopterOverrides = platform.capabilities.overrides;
+  const adopterExperimentalFeatures = (adopterOverrides?.experimental_features ?? []) as readonly string[];
+  if (
+    reportingDelivery &&
+    !adopterExperimentalFeatures.includes('media_buy.reporting_delivery') &&
+    adopterExperimentalFeatures.length >= 32
+  ) {
+    throw new PlatformConfigError(
+      'Reliable Reporting Core cannot be added because experimental_features already contains 32 entries'
+    );
+  }
+  const experimentalFeatures = reportingDelivery
+    ? Array.from(new Set([...adopterExperimentalFeatures, 'media_buy.reporting_delivery']))
+    : adopterOverrides?.experimental_features;
   const adopterSupportedVersions = platform.capabilities.supported_versions;
   const hasOverridesObject = hasOverridesProjection || adopterOverrides !== undefined;
 
@@ -2851,6 +3125,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
         }),
         ...(hasComplianceTestingProjection &&
           complianceTestingOverrides != null && { compliance_testing: complianceTestingOverrides }),
+        ...(experimentalFeatures !== undefined && { experimental_features: experimentalFeatures }),
       },
     }),
   };
@@ -2861,16 +3136,17 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // (TenantRegistry) get one closure per server, so per-tenant store
   // routing is preserved.
   const ctxFor = makeCtxFor(effectiveCtxMetadata);
+  const taskPushOptions = {
+    allowPrivateWebhookUrls: opts.allowPrivateWebhookUrls === true,
+    autoEmitCompletionWebhooks: opts.autoEmitCompletionWebhooks === true,
+  };
   const platformProposalNegotiation = buildProposalNegotiationHandlers(
     platform,
     taskRegistry,
     taskWebhookEmit,
     observability,
     fwLogger,
-    {
-      allowPrivateWebhookUrls: opts.allowPrivateWebhookUrls === true,
-      autoEmitCompletionWebhooks: opts.autoEmitCompletionWebhooks === true,
-    },
+    taskPushOptions,
     ctxFor
   );
   if (platformProposalNegotiation && opts.proposalNegotiation) {
@@ -2919,7 +3195,8 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // advertised when the framework wires them on the adopter's behalf.
 
   const config: AdcpServerConfig<Account> = {
-    ...opts,
+    ...runtimeOpts,
+    ...(effectiveToolVersions !== undefined && { toolVersions: effectiveToolVersions }),
     requireCompactMutationAccountScope: true,
     taskRegistry,
     ...(autoSeedStore != null && { testController: makeAutoSeedBridge(autoSeedStore) }),
@@ -2951,6 +3228,19 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     // cross-credential collisions without reopening a duplicate-buy window
     // on create_media_buy/update_media_buy. Explicit adopter resolvers still
     // win for every tool.
+    // A service-installed reporting platform names the consumer a receipt is
+    // deposited for; scope that tool's replay by the same value rather than by
+    // the caller's credential, which two operator seats can share.
+    ...((opts.resolveReportingConsumerId ?? platform.reporting?.resolveConsumerId)
+      ? {
+          resolveReportingConsumerId:
+            opts.resolveReportingConsumerId ??
+            ((ctx, params) =>
+              platform.reporting!.resolveConsumerId!(
+                ctxFor(ctx as HandlerContext<Account>, params) as RequestContext<Account>
+              )),
+        }
+      : {}),
     resolveIdempotencyPrincipal:
       opts.resolveIdempotencyPrincipal ??
       ((ctx, _params, toolName) =>
@@ -2963,15 +3253,19 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       let resolvedAccountId: string | undefined;
       try {
         // Enforce the JSDoc contract documented at `AccountStore.resolution`:
-        // implicit-mode and derived-mode platforms refuse inline `account_id`
-        // references. Implicit: buyers call sync_accounts first, then the
-        // framework resolves from the auth principal. Derived: single-tenant;
-        // the principal alone identifies the tenant. The brand+operator union
-        // arm is permitted (implicit's sync_accounts onboarding flow); only
-        // the `{ account_id }` arm is refused. Closes adcp-client#1364
-        // (implicit) and adcp-client#1468 (derived).
-        refuseInlineAccountIdWhenForbidden(platform.accounts.resolution, ref);
-        const account = await platform.accounts.resolve(ref, toResolveCtx(ctx, ctx.toolName, ctx.input));
+        // each mode declares one durable reference shape and the framework
+        // refuses the other before the adopter's resolver runs. Implicit
+        // (#1364): natural key is durable, inline `account_id` refused.
+        // Derived (#1647): `account_id` is durable (discovered via
+        // `list_accounts` on the upstream-managed roster), natural key
+        // refused. Explicit: no constraint.
+        enforceAccountRefShapeForResolution(platform.accounts.resolution, ref);
+        const account = assertResolvedAccountMatchesRef(
+          platform.accounts.resolution,
+          ref,
+          await platform.accounts.resolve(ref, toResolveCtx(ctx, ctx.toolName, ctx.input)),
+          fwLogger
+        );
         resolved = account != null;
         resolvedAccountId = account?.id;
         return account;
@@ -2999,7 +3293,9 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     // with `undefined` ref + `authInfo` available — adopters of any
     // `resolution` mode can return a non-null Account here:
     //
-    //   - `'derived'` — return the singleton.
+    //   - `'derived'` — return the one account the caller's credential
+    //     reaches; `null` when it reaches several (ambiguity is not a
+    //     default) or none.
     //   - `'implicit'` — look up by `ctx.authInfo.clientId`.
     //   - `'explicit'` — also handle the `undefined` ref branch by
     //     looking up via `ctx.authInfo.clientId` (or whichever principal
@@ -3007,20 +3303,41 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     //     regardless of declared `resolution` mode; only adopters who
     //     intentionally don't model these tools return null.
     //
-    // A `null` return is legal — handler runs with `ctx.account`
-    // undefined. Appropriate for tools that don't need tenant scoping
-    // (publisher-wide format catalogs).
+    // A `null` return is legal for tools that don't need tenant scoping
+    // (publisher-wide format catalogs). Authenticated compact mutations
+    // instead get the mode-aware ACCOUNT_REQUIRED envelope below; anonymous
+    // calls fall through so the dispatcher's AUTH_MISSING gate keeps priority.
     resolveAccountFromAuth: async ctx => {
       const start = Date.now();
       let resolved = false;
       let resolvedAccountId: string | undefined;
+      const compactAccountRequired =
+        COMPACT_MEDIA_BUY_MUTATION_TOOLS.has(ctx.toolName) && authenticatedPrincipalFor(ctx) !== undefined;
       try {
         const account = await platform.accounts.resolve(undefined, toResolveCtx(ctx, ctx.toolName, ctx.input));
         resolved = account != null;
         resolvedAccountId = account?.id;
+        if (account == null && compactAccountRequired) {
+          throw missingAccountError(ctx.toolName, platform.accounts.resolution);
+        }
         return account;
       } catch (err) {
-        if (err instanceof AccountNotFoundError) return null;
+        if (err instanceof AccountNotFoundError) {
+          if (compactAccountRequired) {
+            throw missingAccountError(ctx.toolName, platform.accounts.resolution);
+          }
+          return null;
+        }
+        if (
+          err instanceof AdcpError &&
+          err.code === 'ACCOUNT_NOT_FOUND' &&
+          COMPACT_MEDIA_BUY_MUTATION_TOOLS.has(ctx.toolName)
+        ) {
+          if (compactAccountRequired) {
+            throw missingAccountError(ctx.toolName, platform.accounts.resolution);
+          }
+          return null;
+        }
         throw err;
       } finally {
         safeFire(
@@ -3043,17 +3360,14 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     // See `CreateAdcpServerFromPlatformOptions` JSDoc for the migration-seam
     // contract.
     mediaBuy: mergeMediaBuyHandlers(
-      legacyHandlers.mediaBuy,
+      runtimeLegacyHandlers.mediaBuy,
       buildMediaBuyHandlers(
         platform,
         taskRegistry,
         taskWebhookEmit,
         observability,
         fwLogger,
-        {
-          allowPrivateWebhookUrls: opts.allowPrivateWebhookUrls === true,
-          autoEmitCompletionWebhooks: opts.autoEmitCompletionWebhooks === true,
-        },
+        taskPushOptions,
         ctxFor,
         effectiveCtxMetadata,
         opts.mediaBuyStore,
@@ -3079,21 +3393,19 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       ),
       'mediaBuy',
       mergeOpts,
-      defaultCreativeWireMode
+      defaultCreativeWireMode,
+      platform.mediaBuyLifecycle?.getMediaBuyDelivery !== undefined || platform.sales?.getMediaBuyDelivery !== undefined
     ),
     proposalNegotiation: platformProposalNegotiation ?? opts.proposalNegotiation,
     creative: mergeHandlers(
-      legacyHandlers.creative,
+      runtimeLegacyHandlers.creative,
       buildCreativeHandlers(
         platform,
         taskRegistry,
         taskWebhookEmit,
         observability,
         fwLogger,
-        {
-          allowPrivateWebhookUrls: opts.allowPrivateWebhookUrls === true,
-          autoEmitCompletionWebhooks: opts.autoEmitCompletionWebhooks === true,
-        },
+        taskPushOptions,
         ctxFor,
         opts.legacyCreativeFormatConverter,
         opts.canonicalFormatLegacyResolver,
@@ -3109,17 +3421,14 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       mergeOpts
     ),
     signals: mergeHandlers(
-      opts.signals,
+      runtimeLegacyHandlers.signals,
       buildSignalsHandlers(
         platform,
         taskRegistry,
         taskWebhookEmit,
         observability,
         fwLogger,
-        {
-          allowPrivateWebhookUrls: opts.allowPrivateWebhookUrls === true,
-          autoEmitCompletionWebhooks: opts.autoEmitCompletionWebhooks === true,
-        },
+        taskPushOptions,
         ctxFor,
         effectiveCtxMetadata
       ),
@@ -3133,14 +3442,22 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       mergeOpts
     ),
     governance: mergeHandlers(
-      legacyHandlers.governance,
+      runtimeLegacyHandlers.governance,
       buildGovernanceHandlers(platform, ctxFor),
       'governance',
       mergeOpts
     ),
-    accounts: mergeHandlers(opts.accounts, buildAccountHandlers(platform, ctxFor), 'accounts', mergeOpts),
+    accounts: (() => {
+      const platformAccountHandlers = buildAccountHandlers(platform, ctxFor, fwLogger);
+      const merged = mergeHandlers(opts.accounts, platformAccountHandlers, 'accounts', mergeOpts);
+      return guardDerivedSyncGovernance(
+        guardAdopterSyncAccounts(merged, platform, platformAccountHandlers, fwLogger),
+        platform,
+        fwLogger
+      );
+    })(),
     brandRights: mergeHandlers(
-      legacyHandlers.brandRights,
+      runtimeLegacyHandlers.brandRights,
       buildBrandRightsHandlers(platform, ctxFor, effectiveCtxMetadata, fwLogger),
       'brandRights',
       mergeOpts
@@ -3154,7 +3471,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
         taskRegistry,
         platform.agentRegistry,
         fwLogger,
-        opts.resolveSessionKey,
+        runtimeOpts.resolveSessionKey,
         opts.credentialPolicy
       );
       return {
@@ -3198,11 +3515,11 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     }
   };
 
-  const resolveComplyControllerVisible = async (
+  const resolveComplyPrincipalAuthority = async (
     extra: McpExtra,
     toolName?: string,
     input?: Readonly<Record<string, unknown>>
-  ): Promise<boolean> => {
+  ): Promise<{ agent?: BuyerAgent; principalAccount: Account | null }> => {
     const agent = await resolveComplyBuyerAgent(extra, input);
     let principalAccount: Account | null = null;
     try {
@@ -3220,7 +3537,10 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     } catch {
       principalAccount = null;
     }
+    return { ...(agent !== undefined && { agent }), principalAccount };
+  };
 
+  const isComplyControllerVisible = (principalAccount: Account | null): boolean => {
     recordResolvedAccountMode(principalAccount);
 
     if (isSandboxOrMockAccount(principalAccount)) return true;
@@ -3238,6 +3558,15 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     }
 
     return false;
+  };
+
+  const resolveComplyControllerVisible = async (
+    extra: McpExtra,
+    toolName?: string,
+    input?: Readonly<Record<string, unknown>>
+  ): Promise<boolean> => {
+    const { principalAccount } = await resolveComplyPrincipalAuthority(extra, toolName, input);
+    return isComplyControllerVisible(principalAccount);
   };
 
   if (hasComplianceTestingProjection) {
@@ -3294,30 +3623,16 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       // when the adopter didn't wire explicit ones. Explicit adapters win — the
       // spread only fills the undefined slots.
       //
-      // **Namespace key: raw `account.account_id`.** The adapter does NOT call
-      // `platform.accounts.resolve` even though that would seem symmetric with
-      // the bridge's `ctx.account?.id` read — calling resolve here without
-      // `authInfo` (which `ComplyControllerContext` doesn't expose) lets a
-      // caller spoof `account.account_id: 'victim'` and have a non-validating
-      // resolver write seeds into the victim's resolved namespace. Raw id is
-      // the safe choice: a caller can only write to their own claimed id, and
-      // the sandboxGate already filters non-sandbox traffic.
-      //
-      // **Trade-off.** Adopters whose resolver maps `account_id` to a distinct
-      // internal id (e.g., `acc_1` → `tenant_a:acc_1`) will see seeded fixtures
-      // disappear — the adapter writes to `acc_1`, the bridge reads
-      // `tenant_a:acc_1`, no match. That's a documented limitation, not a
-      // security issue: silent test loss, not cross-tenant pollution. The
-      // architectural fix (widen `ComplyControllerContext` to expose the
-      // framework-resolved account so writes match reads even under mapping
-      // resolvers) is tracked at #1216. Mapping-resolver adopters wire
-      // explicit seed adapters today.
+      // Namespace writes with the same trusted account id the framework used
+      // for the sandbox gate. The raw account reference remains only as a
+      // compatibility fallback for custom transports that do not provide
+      // resolved authority to the controller.
       const explicitSeed = opts.complyTest.seed ?? {};
       const autoSeed = { ...explicitSeed };
 
       if (!explicitSeed.product) {
         autoSeed.product = async (params, ctx) => {
-          const accountId = readAutoSeedAccountId(ctx.input);
+          const accountId = ctx.account?.id ?? readAutoSeedAccountId(ctx.input);
           if (accountId == null) {
             fwLogger.warn(
               '[adcp/auto-seed] seed_product fired without `account.account_id`; dropping write. ' +
@@ -3335,7 +3650,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
 
       if (!explicitSeed.pricing_option) {
         autoSeed.pricing_option = async (params, ctx) => {
-          const accountId = readAutoSeedAccountId(ctx.input);
+          const accountId = ctx.account?.id ?? readAutoSeedAccountId(ctx.input);
           if (accountId == null) {
             fwLogger.warn(
               '[adcp/auto-seed] seed_pricing_option fired without `account.account_id`; dropping write. ' +
@@ -3438,8 +3753,12 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
           description: controller.toolDefinition.description,
           inputSchema: gatedInputSchema,
         },
-        (async (input: Record<string, unknown>, extra: { authInfo?: ResolvedAuthInfo } | undefined) => {
-          if (!(await resolveComplyControllerVisible(extra, 'comply_test_controller', input))) {
+        (async (
+          input: Record<string, unknown>,
+          extra: { authInfo?: ResolvedAuthInfo; readonly servedAdcpVersion?: string } | undefined
+        ) => {
+          const principalAuthority = await resolveComplyPrincipalAuthority(extra, 'comply_test_controller', input);
+          if (!isComplyControllerVisible(principalAuthority.principalAccount)) {
             throw new McpError(ErrorCode.MethodNotFound, 'Method not found');
           }
 
@@ -3454,14 +3773,26 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
           const refFromContext = (input.context as { account?: AccountReference } | undefined)?.account;
           const accountRef = refFromTop ?? refFromContext;
 
+          // Same per-mode reference-shape contract the buyer-facing
+          // dispatchers enforce. Outside the try below on purpose: a refused
+          // reference is a buyer-fixable INVALID_REQUEST, not a resolver
+          // failure to swallow. This call site historically skipped the
+          // check; with `'derived'` now accepting `{ account_id }`, the
+          // controller must not be the one path where a reference bypasses
+          // it.
+          enforceAccountRefShapeForResolution(platform.accounts.resolution, accountRef);
+
           let resolvedAccount: Account | null = null;
+          const agent = principalAuthority.agent;
           try {
-            const agent = await resolveComplyBuyerAgent(extra, input);
             resolvedAccount = await platform.accounts.resolve(
               accountRef,
               toResolveCtx(
                 {
                   ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
+                  ...(extra?.servedAdcpVersion !== undefined && {
+                    servedAdcpVersion: extra.servedAdcpVersion,
+                  }),
                   ...(agent !== undefined && { agent }),
                 },
                 'comply_test_controller',
@@ -3473,6 +3804,12 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
             // Treat as "no account resolved" — fail-closed by default unless a
             // fallback admits.
           }
+          resolvedAccount = assertResolvedAccountMatchesRef(
+            platform.accounts.resolution,
+            accountRef,
+            resolvedAccount,
+            fwLogger
+          );
 
           // Record the resolved account's explicit mode (if any). Used by the
           // env-fallback fail-closed guard below.
@@ -3485,7 +3822,18 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
           // returned `null` — if the resolver names the account, the
           // resolver wins. The buyer's wire claim never overrides a
           // resolved live account.
-          const refSandbox = (accountRef as { sandbox?: unknown } | undefined)?.sandbox === true;
+          //
+          // The fallback is scoped to refs that name no account: a buyer who
+          // DID name an account and had it refused by the resolver must not
+          // re-admit themselves by asserting `sandbox: true` alongside it.
+          // Fail-closed resolvers (`createDerivedAccountStore` and any
+          // verified `'derived'` store) make `resolvedAccount == null`
+          // reachable on demand — without this scoping, naming another
+          // tenant's account id plus `sandbox: true` would admit the
+          // controller with no framework account authority attached.
+          const refSandbox =
+            (accountRef as { sandbox?: unknown } | undefined)?.sandbox === true &&
+            refAccountId(accountRef) === undefined;
           const envSandbox = process.env.ADCP_SANDBOX === '1';
 
           const wouldAdmitOnlyViaEnv = envSandbox && !accountIsSandbox && !(resolvedAccount == null && refSandbox);
@@ -3550,7 +3898,70 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
             return response;
           }
 
-          return controller.handle(input);
+          const controllerParams =
+            input.params !== null && typeof input.params === 'object'
+              ? (input.params as { task_id?: unknown })
+              : undefined;
+          const controllerTaskId = controllerParams?.task_id;
+          const taskLookupParams =
+            input.scenario === 'force_task_completion' &&
+            typeof controllerTaskId === 'string' &&
+            controllerTaskId.length > 0 &&
+            controllerTaskId.length <= 255
+              ? { task_id: controllerTaskId }
+              : undefined;
+          let sessionKey: string | undefined;
+          if (opts.resolveSessionKey !== undefined && resolvedAccount !== null && taskLookupParams !== undefined) {
+            try {
+              sessionKey = await opts.resolveSessionKey(
+                withImmutableServedAdcpVersion(
+                  {
+                    // Resolve exactly the scope the framework's tasks/get path
+                    // would authorize for this task-oriented controller action.
+                    toolName: 'tasks_get' as AdcpServerToolName,
+                    params: taskLookupParams,
+                    account: resolvedAccount,
+                    ...(agent !== undefined && { agent }),
+                  },
+                  extra?.servedAdcpVersion
+                )
+              );
+            } catch (err) {
+              fwLogger.warn?.('Session key resolution failed during comply controller dispatch', {
+                error: redactCredentialPatterns(err instanceof Error ? err.message : String(err)),
+              });
+              return adcpError('SERVICE_UNAVAILABLE', {
+                message: 'Session key resolution failed',
+                recovery: 'transient',
+              });
+            }
+          }
+
+          let taskScope: Readonly<TaskRegistryScope> | undefined;
+          if (resolvedAccount !== null) {
+            const ownerCtx: HandlerContext<Account> = withImmutableServedAdcpVersion(
+              {
+                store: {} as HandlerContext<Account>['store'],
+                account: resolvedAccount,
+                ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
+                ...(agent !== undefined && { agent }),
+                ...(sessionKey !== undefined && { sessionKey }),
+              },
+              extra?.servedAdcpVersion
+            );
+            taskScope = Object.freeze({
+              accountId: resolvedAccount.id,
+              ownerScope: taskOwnerScopeFor(ownerCtx, resolvedAccount.id),
+              ...(taskRegistry.registryId !== undefined && { registryId: taskRegistry.registryId }),
+            });
+          }
+
+          return _handleComplyControllerWithResolvedAuthority(controller, input, {
+            ...(resolvedAccount !== null && { account: resolvedAccount }),
+            ...(agent !== undefined && { agent }),
+            ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
+            ...(taskScope !== undefined && { taskScope }),
+          });
         }) as Parameters<typeof mcp.registerTool>[2]
       );
 
@@ -3601,20 +4012,13 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   return Object.assign(server, {
     getTaskState: async <TResult = unknown>(
       taskId: string,
-      expectedAccountId?: string
+      scope: TaskRegistryScope
     ): Promise<TaskRecord<TResult> | null> => {
-      const record = await taskRegistry.getTask<TResult>(taskId);
-      if (record == null) return null;
-      // Tenant boundary: if caller specified the expected account and the
-      // task's owner doesn't match, treat as not-found. Returning null
-      // here mirrors the "not-found / cross-tenant" envelope and avoids
-      // principal-enumeration via task_id probing.
-      if (expectedAccountId !== undefined && record.accountId !== expectedAccountId) {
-        return null;
-      }
-      return record;
+      const record = await taskRegistry.getTask<TResult>(taskId, scope);
+      return record && taskRecordMatchesScope(record, scope) ? record : null;
     },
-    awaitTask: (taskId: string): Promise<void> => taskRegistry.awaitTask(taskId),
+    awaitTask: (taskId: string, scope: TaskRegistryScope): Promise<void> => taskRegistry.awaitTask(taskId, scope),
+    awaitTaskUnsafe: (taskId: string): Promise<void> => taskRegistry._awaitTaskUnsafe(taskId),
     statusChange: statusChangeBus,
   });
 }
@@ -3624,7 +4028,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
 // ---------------------------------------------------------------------------
 
 /**
- * Custom tool exposing `taskRegistry.getTask(taskId)` over the wire so
+ * Custom tool exposing a scoped `taskRegistry.getTask(taskId, scope)` over the wire so
  * buyer agents can poll HITL task state. Snake-case `tasks_get` (MCP tool
  * names disallow `/`) approximates the spec's `tasks/get` method.
  *
@@ -3634,27 +4038,24 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
  * handles the protocol-level `tasks/get` natively. Until then, this
  * custom tool is the buyer-facing polling surface.
  *
- * **Tenant scoping.** The tool reads from `taskRegistry.getTask`
- * directly. Adopters with multi-tenant deployments MUST pass `account`
- * in the request so the framework's account-resolution flow scopes the
- * read; the handler then verifies `record.accountId` matches the
- * resolved account before returning the task. Single-tenant agents
- * (`resolution: 'derived'`) get scoping for free via the auth-derived
- * resolver.
+ * **Tenant scoping.** The handler resolves both the trusted account and
+ * authenticated owner scope before the registry read. Postgres-backed
+ * deployments additionally isolate each server/tenant through the registry
+ * namespace configured by `taskRegistryNamespace`.
  */
 function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
   platform: P,
   taskRegistry: TaskRegistry,
   agentRegistry: BuyerAgentRegistry | undefined,
   logger: AdcpLogger,
-  resolveSessionKey: AdcpServerConfig['resolveSessionKey'] | undefined,
+  resolveSessionKey: AdcpServerConfig<Account>['resolveSessionKey'] | undefined,
   credentialPolicy: CredentialPolicy | undefined
 ) {
   const credentialPolicyPatterns =
     credentialPolicy === undefined || typeof credentialPolicy === 'string' ? undefined : credentialPolicy.patterns;
   const credentialPolicyError = (
     args: Record<string, unknown>,
-    extra: { authInfo?: ResolvedAuthInfo } | undefined
+    extra: { authInfo?: ResolvedAuthInfo; servedAdcpVersion?: string } | undefined
   ): AdcpErrorResponse | undefined => {
     if (credentialPolicy === undefined) return undefined;
     const effectivePolicy = resolveCredentialPolicyForTool(credentialPolicy, 'tasks_get');
@@ -3732,6 +4133,8 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
       .boolean()
       .optional()
       .describe('Include a canonical terminal artifact for completed, failed, or rejected tasks.'),
+    adcp_version: z.string().optional().describe('Requested AdCP release for response negotiation.'),
+    adcp_major_version: z.number().int().optional().describe('Requested AdCP major version.'),
   };
   return {
     description:
@@ -3754,8 +4157,14 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
     // resolver and reads tenant B's task. Same threading as the regular
     // `resolveAccount` dispatch flow in `create-adcp-server.ts:2380-2398`.
     handler: async (
-      args: { task_id: string; account?: { account_id?: string }; include_result?: boolean },
-      extra: { authInfo?: ResolvedAuthInfo }
+      args: {
+        task_id: string;
+        account?: { account_id?: string };
+        include_result?: boolean;
+        adcp_version?: string;
+        adcp_major_version?: number;
+      },
+      extra: { authInfo?: ResolvedAuthInfo; readonly servedAdcpVersion?: string }
     ) => {
       const policyError = credentialPolicyError(args as Record<string, unknown>, extra);
       if (policyError) return policyError;
@@ -3812,22 +4221,38 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
           });
         }
       }
-      const resolveCtx = {
-        ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
-        toolName: 'tasks_get',
-        ...(agent !== undefined && { agent }),
-      };
+      const resolveCtx = withImmutableServedAdcpVersion(
+        {
+          ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
+          toolName: 'tasks_get',
+          ...(agent !== undefined && { agent }),
+        },
+        extra?.servedAdcpVersion
+      );
       let resolvedAccountId: string | undefined;
       let resolvedAccount: Account | undefined;
       if (ref) {
-        refuseInlineAccountIdWhenForbidden(platform.accounts.resolution, ref as AccountReference);
+        enforceAccountRefShapeForResolution(platform.accounts.resolution, ref as AccountReference);
         try {
-          const resolved = await platform.accounts.resolve(ref as AccountReference, resolveCtx);
+          const resolved = assertResolvedAccountMatchesRef(
+            platform.accounts.resolution,
+            ref as AccountReference,
+            await platform.accounts.resolve(ref as AccountReference, resolveCtx),
+            logger
+          );
           if (resolved) {
             resolvedAccountId = resolved.id;
             resolvedAccount = resolved;
           }
         } catch (err) {
+          if (err instanceof AdcpError) {
+            // Typed adopter/framework errors carry their own buyer-facing
+            // verdict — `AUTH_REQUIRED` from a credential-gated store is the
+            // common one. Mapping those to SERVICE_UNAVAILABLE told an
+            // unauthenticated poller "server problem" instead of
+            // "authenticate", which is what the main dispatcher does.
+            throw err;
+          }
           if (!(err instanceof AccountNotFoundError)) {
             logger.error?.('Account resolution failed during tasks_get poll', {
               error: err instanceof Error ? err.message : String(err),
@@ -3836,9 +4261,11 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
           }
         }
         if (!resolvedAccountId) {
+          const suggestion = accountNotFoundSuggestion(platform.accounts.resolution);
           return adcpError('ACCOUNT_NOT_FOUND', {
             message: 'The specified account does not exist',
             field: 'account',
+            ...(suggestion !== undefined && { suggestion }),
           });
         }
       } else {
@@ -3849,6 +4276,15 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
             resolvedAccount = resolved;
           }
         } catch (err) {
+          if (err instanceof AdcpError && err.code === 'ACCOUNT_NOT_FOUND') {
+            const missing = missingAccountError('tasks_get', platform.accounts.resolution);
+            return adcpError(missing.code, {
+              message: missing.message,
+              recovery: missing.recovery,
+              field: missing.field,
+              suggestion: missing.suggestion,
+            });
+          }
           if (!(err instanceof AccountNotFoundError)) {
             logger.error?.('Auth-derived account resolution failed during tasks_get poll', {
               error: err instanceof Error ? err.message : String(err),
@@ -3860,12 +4296,17 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
       let sessionKey: string | undefined;
       if (resolveSessionKey !== undefined) {
         try {
-          sessionKey = await resolveSessionKey({
-            toolName: 'tasks_get' as AdcpServerToolName,
-            params: args,
-            ...(resolvedAccount !== undefined && { account: resolvedAccount }),
-            ...(agent !== undefined && { agent }),
-          });
+          sessionKey = await resolveSessionKey(
+            withImmutableServedAdcpVersion(
+              {
+                toolName: 'tasks_get' as AdcpServerToolName,
+                params: args,
+                ...(resolvedAccount !== undefined && { account: resolvedAccount }),
+                ...(agent !== undefined && { agent }),
+              },
+              extra?.servedAdcpVersion
+            )
+          );
         } catch (err) {
           logger.error?.('Session key resolution failed during tasks_get poll', {
             error: err instanceof Error ? err.message : String(err),
@@ -3876,9 +4317,33 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
         }
       }
 
+      if (resolvedAccountId === undefined) {
+        const missing = missingAccountError('tasks_get', platform.accounts.resolution);
+        return adcpError(missing.code, {
+          message: missing.message,
+          recovery: missing.recovery,
+          field: missing.field,
+          suggestion: missing.suggestion,
+        });
+      }
+      const ownerCtx: HandlerContext<Account> = withImmutableServedAdcpVersion(
+        {
+          store: {} as HandlerContext<Account>['store'],
+          ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
+          ...(agent !== undefined && { agent }),
+          ...(sessionKey !== undefined && { sessionKey }),
+          account: resolvedAccount ?? ({ id: resolvedAccountId } as Account),
+        },
+        extra?.servedAdcpVersion
+      );
+      const expectedOwnerScope = taskOwnerScopeFor(ownerCtx, resolvedAccountId);
+
       let record;
       try {
-        record = await taskRegistry.getTask(args.task_id);
+        record = await taskRegistry.getTask(args.task_id, {
+          accountId: resolvedAccountId,
+          ownerScope: expectedOwnerScope,
+        });
       } catch (err) {
         logger.error?.('Task registry read failed during tasks_get poll', {
           error: err instanceof Error ? err.message : String(err),
@@ -3891,50 +4356,22 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
           field: 'task_id',
         });
       }
-      // Tenant boundary. Two checks to close the auth-derived bypass:
-      //   1. If we resolved an account, the task's owning account must match.
-      //   2. If we did NOT resolve an account but the task IS owned by an
-      //      account, refuse to leak. This catches the unauthenticated /
-      //      `'explicit'`-mode-misconfigured caller that hits the auth-derived
-      //      branch and would otherwise read any task by id.
-      if (resolvedAccountId === undefined && record.accountId) {
+      if (
+        !taskRecordMatchesScope(record, {
+          accountId: resolvedAccountId,
+          ownerScope: expectedOwnerScope,
+        })
+      ) {
         return adcpError('REFERENCE_NOT_FOUND', {
           message: `Task ${args.task_id} not found`,
           field: 'task_id',
         });
       }
-      if (resolvedAccountId !== undefined && record.accountId !== resolvedAccountId) {
-        return adcpError('REFERENCE_NOT_FOUND', {
-          message: `Task ${args.task_id} not found`,
-          field: 'task_id',
-        });
-      }
-      if (resolvedAccountId !== undefined) {
-        const ownerCtx: HandlerContext<Account> = {
-          store: {} as HandlerContext<Account>['store'],
-          ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
-          ...(agent !== undefined && { agent }),
-          ...(sessionKey !== undefined && { sessionKey }),
-          account: resolvedAccount ?? ({ id: resolvedAccountId } as Account),
-        };
-        const expectedOwnerScope = taskOwnerScopeFor(ownerCtx, resolvedAccountId);
-        if (
-          record.ownerScope === undefined
-            ? expectedOwnerScope !== `account:${resolvedAccountId}`
-            : record.ownerScope !== expectedOwnerScope
-        ) {
-          return adcpError('REFERENCE_NOT_FOUND', {
-            message: `Task ${args.task_id} not found`,
-            field: 'task_id',
-          });
-        }
-      }
-
       // Spec shape: `tasks-get-response.json` requires task_id, task_type,
-      // status, created_at, updated_at, protocol. Optional: completed_at
-      // (terminal states), error (failed tasks — top-level, NOT inside
-      // result), result (success-arm body for completed tasks),
-      // has_webhook (whether buyer wired push_notification_config).
+      // status, created_at, updated_at, protocol. Optional: progress/message
+      // (live work), completed_at (terminal states), error (failed tasks —
+      // top-level, NOT inside result), result (success-arm body for completed
+      // tasks), has_webhook (whether buyer wired push_notification_config).
       const payload: Record<string, unknown> = {
         task_id: record.taskId,
         task_type: record.tool,
@@ -3945,19 +4382,42 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
         updated_at: record.updatedAt,
       };
       // Terminal states get `completed_at` per spec (covers completed,
-      // failed, canceled). The framework writes terminal-state transitions
+      // failed, rejected, canceled). The framework writes terminal-state transitions
       // by stamping `updated_at`, so the two coincide today.
-      if (record.status === 'completed' || record.status === 'failed' || record.status === 'canceled') {
+      if (
+        record.status === 'completed' ||
+        record.status === 'failed' ||
+        record.status === 'rejected' ||
+        record.status === 'canceled'
+      ) {
         payload.completed_at = record.updatedAt;
       }
       if (record.statusMessage) payload.message = record.statusMessage;
+      if (record.progress !== undefined) {
+        try {
+          payload.progress = sanitizeTaskProgressForStorage(record.progress);
+        } catch {
+          // Legacy/custom registries may contain progress written before the
+          // current validation and secret-stripping boundary existed. Omit
+          // malformed or oversized data rather than exposing it or failing
+          // an otherwise valid scoped lifecycle poll.
+          logger.warn?.('Omitting unsafe stored task progress during tasks_get poll');
+        }
+      }
       if (record.ext !== undefined) payload.ext = record.ext;
       if (
         args.include_result === true &&
         (record.status === 'completed' || record.status === 'failed' || record.status === 'rejected') &&
         record.result !== undefined
       ) {
-        payload.result = record.result;
+        const result = _sanitizeStoredTaskResultForWire(record.result, {
+          taskId: record.taskId,
+          accountId: resolvedAccountId,
+          ownerScope: expectedOwnerScope,
+          ...(taskRegistry.registryId !== undefined && { registryId: taskRegistry.registryId }),
+        });
+        if (result !== undefined) payload.result = result;
+        else logger.warn?.('Omitting unsafe stored task result during tasks_get poll');
       }
       if (record.status === 'failed' && record.error) {
         // Spec shape: top-level `error: { code, message, details? }` —
@@ -4033,7 +4493,11 @@ function mergeHandlers<T extends object>(
   custom: T | undefined,
   platform: T | undefined,
   domain: string,
-  opts: { mode: MergeSeamMode; logger: AdcpLogger }
+  opts: { mode: MergeSeamMode; logger: AdcpLogger },
+  // Keys the caller composes into a single routed handler instead of letting
+  // one side shadow the other. They are not a migration-seam collision, so
+  // strict mode must not reject them.
+  composedKeys: ReadonlySet<string> = new Set()
 ): T | undefined {
   if (!custom && !platform) return undefined;
   if (!custom) return platform;
@@ -4042,6 +4506,7 @@ function mergeHandlers<T extends object>(
   if (opts.mode !== 'silent') {
     const collisions: string[] = [];
     for (const key of Object.keys(platform)) {
+      if (composedKeys.has(key)) continue;
       if (key in (custom as Record<string, unknown>)) collisions.push(key);
     }
     if (collisions.length > 0) {
@@ -4083,12 +4548,43 @@ function mergeMediaBuyHandlers(
   platform: MediaBuyHandlers<Account> | undefined,
   domain: string,
   opts: { mode: MergeSeamMode; logger: AdcpLogger },
-  fallbackWireMode: 'canonical' | 'legacy'
+  fallbackWireMode: 'canonical' | 'legacy',
+  platformServesCumulativeDelivery: boolean
 ): MediaBuyHandlers<Account> | undefined {
-  const merged = mergeHandlers(custom, platform, domain, opts);
+  // Decide the composition first so collision enforcement can see it: a
+  // reporting-only platform contributes `getMediaBuyDelivery` solely for exact
+  // revision reads, which is a deliberate split of one tool across two owners
+  // rather than an un-migrated override for strict mode to reject.
+  const composesDelivery =
+    !platformServesCumulativeDelivery &&
+    typeof custom?.getMediaBuyDelivery === 'function' &&
+    typeof platform?.getMediaBuyDelivery === 'function';
+  const merged = mergeHandlers(
+    custom,
+    platform,
+    domain,
+    opts,
+    composesDelivery ? new Set(['getMediaBuyDelivery']) : undefined
+  );
   if (!custom || !platform || !merged) return merged;
 
   const routed = { ...merged } as Record<string, unknown>;
+  // Installing reporting makes the platform emit `getMediaBuyDelivery` purely to
+  // serve exact revision reads. On a reporting-only platform that key would
+  // otherwise shadow an adopter's still-current cumulative handler and answer
+  // UNSUPPORTED_FEATURE, so route unbound reads back to the adopter. The custom
+  // handler keeps receiving the raw HandlerContext it is written against.
+  const customDelivery = custom.getMediaBuyDelivery;
+  const platformDelivery = platform.getMediaBuyDelivery;
+  if (composesDelivery && typeof customDelivery === 'function' && typeof platformDelivery === 'function') {
+    routed.getMediaBuyDelivery = (...args: unknown[]) => {
+      const revisionId = (args[0] as { reporting_revision_id?: unknown } | undefined)?.reporting_revision_id;
+      const exactRevisionRead = typeof revisionId === 'string' && revisionId.length > 0;
+      return exactRevisionRead
+        ? Reflect.apply(platformDelivery, platform, args)
+        : Reflect.apply(customDelivery, custom, args);
+    };
+  }
   for (const key of ['createMediaBuy', 'updateMediaBuy', 'getMediaBuys'] as const) {
     const customHandler = (custom as Record<string, unknown>)[key];
     const platformHandler = (platform as Record<string, unknown>)[key];
@@ -4231,28 +4727,40 @@ function wrapBusWithObservability(bus: StatusChangeBus, observability: Decisioni
 /**
  * Combined DDL for all framework persistence tables: idempotency cache,
  * ctx-metadata cache, and decisioning task registry. Run once per database
- * during deployment / boot. Idempotent — safe to re-run.
+ * while provisioning a new database. It is bootstrap DDL, not an in-place
+ * upgrade path for a populated legacy task registry.
  *
  * Use with the `pool` shortcut on `createAdcpServerFromPlatform`:
  *
  * ```ts
  * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- * await pool.query(getAllAdcpMigrations());
+ * const taskRegistryNamespace = 'tenant:my-agent';
+ * await pool.query(getAllAdcpMigrations({ taskRegistryNamespace }));
  *
  * createAdcpServerFromPlatform(myPlatform, {
  *   name: '...', version: '...',
  *   pool,
+ *   taskRegistryNamespace,
  * });
  * ```
  *
  * Adopters who don't use the `pool` shortcut should call the per-store
  * migration helpers (`getIdempotencyMigration`, `getCtxMetadataMigration`,
- * `getDecisioningTaskRegistryMigration`) only for the stores they wire.
+ * `getDecisioningTaskRegistryBootstrap`) only for the stores they wire.
  *
  * @public
  */
-export function getAllAdcpMigrations(): string {
-  return [getIdempotencyMigration(), getCtxMetadataMigration(), getDecisioningTaskRegistryMigration()].join('\n\n');
+export function getAllAdcpMigrations(options: { taskRegistryNamespace: string }): string {
+  if (!options) {
+    throw new PlatformConfigError(
+      'getAllAdcpMigrations requires { taskRegistryNamespace }; use a stable, trusted deployment or tenant namespace.'
+    );
+  }
+  return [
+    getIdempotencyMigration(),
+    getCtxMetadataMigration(),
+    getDecisioningTaskRegistryBootstrap({ namespace: options.taskRegistryNamespace }),
+  ].join('\n\n');
 }
 
 function buildDefaultTaskRegistry(): TaskRegistry {
@@ -4264,9 +4772,9 @@ function buildDefaultTaskRegistry(): TaskRegistry {
       'createAdcpServerFromPlatform: in-memory task registry refused outside ' +
         '{NODE_ENV=test, NODE_ENV=development}. Production deployments need a ' +
         'durable task registry — pick one of:\n' +
-        '  1. (Recommended) Pass `taskRegistry: createPostgresTaskRegistry({ pool })` ' +
-        'to keep HITL tasks across restarts. See `@adcp/sdk/server/decisioning` ' +
-        'for `getDecisioningTaskRegistryMigration()` — run it once against your DB.\n' +
+        '  1. (Recommended) Pass `taskRegistry: createPostgresTaskRegistry({ pool, namespace: tenantId })` ' +
+        'to keep HITL tasks across restarts. See `@adcp/sdk/server` ' +
+        'for `getDecisioningTaskRegistryBootstrap({ namespace })` on a new DB (use the scope-v1 operator upgrade for populated legacy tables).\n' +
         '  2. Pass `taskRegistry: createInMemoryTaskRegistry()` explicitly if you ' +
         'accept that in-flight tasks are lost on process restart. The explicit ' +
         'pass-in is the contract — saying "yes I want in-memory in production" ' +
@@ -4462,10 +4970,11 @@ async function projectSync<TResult, TWire, TCtxMeta = unknown>(
  *
  * **Webhook delivery on terminal state.** When the buyer passed
  * `push_notification_config: { url, token? }` in the request and the host
- * wired `webhooks` on `serve()`, the framework emits a signed RFC 9421
+ * wired an `emitWebhook` callback (normally by configuring `webhooks` on
+ * `serve()`), the framework emits a signed RFC 9421
  * webhook to that URL on terminal state with the task lifecycle payload.
  * Buyers don't need to poll — they receive completion via push. Polling via
- * `server.getTaskState(taskId)` continues to work for harnesses + the
+ * `server.getTaskState(taskId, scope)` continues to work for harnesses + the
  * forthcoming wire-level `tasks/get`.
  */
 interface DispatchHitlOpts {
@@ -4483,6 +4992,58 @@ interface DispatchHitlOpts {
   autoEmitCompletion?: boolean;
 }
 
+function refuseTaskWebhookHandoff(opts: DispatchHitlOpts, message: string, suggestion: string): never {
+  try {
+    opts.logger.warn(
+      '[adcp/decisioning] refusing push-enabled TaskHandoff before task creation: configure SDK webhooks for framework ' +
+        'settlement, or remove push_notification_config and retry with a new idempotency_key.'
+    );
+  } catch {
+    // Logging is adopter-controlled diagnostics. It must not replace the
+    // structured protocol error that protects this pre-create boundary.
+  }
+  throw new AdcpError('UNSUPPORTED_FEATURE', {
+    recovery: 'correctable',
+    field: 'push_notification_config',
+    message,
+    suggestion,
+    details: { feature: 'task_webhook_delivery' },
+  });
+}
+
+function resolveTaskWebhookDelivery(opts: DispatchHitlOpts, settlement: 'framework' | 'external'): boolean {
+  // This value is populated only by extractPushConfig after URL validation.
+  // A malformed or missing URL cannot turn an accepted task into has_webhook.
+  if (opts.pushNotificationUrl === undefined) return false;
+  // Request-schema validation may be disabled by an adopter. Keep the
+  // beta.5+ operation-id requirement at this pre-create seam so a task cannot
+  // start and later fail only while constructing its terminal webhook.
+  if (opts.pushNotificationOperationId === undefined && isAdcpVersionAtLeast(opts.servedAdcpVersion, '3.2.0-beta.5')) {
+    throw new AdcpError('INVALID_REQUEST', {
+      message: 'push_notification_config.operation_id is required for webhook delivery',
+      field: 'push_notification_config.operation_id',
+    });
+  }
+  // An external producer has no SDK-owned terminal webhook delivery path.
+  // Do not let a framework emitter make its submitted task claim delivery it
+  // will never receive; polling-only external settlement remains supported.
+  if (settlement === 'external') {
+    return refuseTaskWebhookHandoff(
+      opts,
+      'This seller cannot submit an externally settled task with push_notification_config because the SDK cannot deliver its terminal webhook. ' +
+        'Remove push_notification_config to use polling, or use framework task settlement with configured task webhooks.',
+      'Remove push_notification_config and retry with a new idempotency_key, or ask the seller to use framework task settlement with task webhooks.'
+    );
+  }
+  if (typeof opts.emitWebhook === 'function') return true;
+  return refuseTaskWebhookHandoff(
+    opts,
+    'This seller cannot submit a task with push_notification_config because no task webhook delivery path is configured. ' +
+      'Remove push_notification_config to use polling, or configure task webhooks on the seller.',
+    'Remove push_notification_config and retry with a new idempotency_key, or ask the seller to configure task webhooks.'
+  );
+}
+
 function taskOwnerScopeFor(ctx: HandlerContext<Account>, accountId: string): string {
   if (ctx.sessionKey !== undefined) return `session:${ctx.sessionKey}`;
   if (ctx.agent?.agent_url) return `agent:${ctx.agent.agent_url}`;
@@ -4496,7 +5057,7 @@ function taskOwnerScopeFor(ctx: HandlerContext<Account>, accountId: string): str
   return `account:${accountId}`;
 }
 
-function authenticatedPrincipalFor(ctx: HandlerContext<Account>): string | undefined {
+function authenticatedPrincipalFor(ctx: Pick<HandlerContext<Account>, 'agent' | 'authInfo'>): string | undefined {
   if (ctx.agent?.agent_url) return `agent:${ctx.agent.agent_url}`;
   const credential = ctx.authInfo?.credential;
   if (credential?.kind === 'http_sig') return `http_sig:${credential.agent_url}`;
@@ -4571,7 +5132,11 @@ async function routeIfHandoff<TInner, TWire>(
   taskRegistry: TaskRegistry,
   opts: DispatchHitlOpts,
   result: TInner | TaskHandoff<TInner>,
-  project: (inner: TInner) => TWire | Promise<TWire>
+  project: (inner: TInner) => TWire | Promise<TWire>,
+  lifecycle?: {
+    onHandoffSuccess?(inner: TInner): void | Promise<void>;
+    onHandoffFailure?(error: unknown): void | Promise<void>;
+  }
 ): Promise<TWire | SubmittedEnvelope> {
   const rejectResponseSummary = (value: unknown): void => {
     if (_extractResponseSummaryEntry(value)) {
@@ -4589,17 +5154,58 @@ async function routeIfHandoff<TInner, TWire>(
       return await project(result as unknown as TInner);
     }
     const { fn: taskFn, options } = entry;
-    return dispatchHitl(
-      taskRegistry,
-      opts,
-      async taskId => {
-        const inner = await taskFn(buildHandoffContext(taskRegistry, taskId));
-        rejectResponseSummary(inner);
-        return await project(inner);
-      },
-      options?.task_id,
-      options?.ext
-    );
+    if (options && 'settlement' in options && options.settlement === 'external') {
+      // `_extractHandoffEntry` retains the broad framework callback type for
+      // its opaque marker. The external option was validated at construction,
+      // and its public overload supplies this narrower context at runtime.
+      const externalTaskFn = taskFn as (taskCtx: ExternalTaskHandoffContext) => Promise<unknown>;
+      return dispatchHitl(
+        taskRegistry,
+        opts,
+        async taskRef => {
+          await externalTaskFn(buildExternalHandoffContext(taskRegistry, taskRef, opts.servedAdcpVersion));
+        },
+        options.task_id,
+        'external',
+        options.ext
+      );
+    }
+    let handoffTaskStarted = false;
+    try {
+      return await dispatchHitl(
+        taskRegistry,
+        opts,
+        async taskRef => {
+          handoffTaskStarted = true;
+          let inner: TInner;
+          try {
+            inner = await taskFn(buildHandoffContext(taskRegistry, taskRef, opts.servedAdcpVersion));
+          } catch (error) {
+            // A business rejection still abandons proposal-backed work. The
+            // callback releases the reservation before the rejection signal
+            // escapes to dispatchHitl, which recognizes it and writes a
+            // rejected (not failed) terminal task.
+            await lifecycle?.onHandoffFailure?.(error);
+            throw error;
+          }
+          // Once adopter work reports success, never release the reservation:
+          // a finalization/projection failure may follow a real media-buy side
+          // effect, and reopening the proposal would permit duplicate spend.
+          rejectResponseSummary(inner);
+          await lifecycle?.onHandoffSuccess?.(inner);
+          return await project(inner);
+        },
+        options?.task_id,
+        'framework',
+        options?.ext
+      );
+    } catch (error) {
+      // Allocation/registration failures happen before the background task
+      // callback starts. Release any proposal reservation so a retry is not
+      // permanently fenced by a task that was never created.
+      if (!handoffTaskStarted) await lifecycle?.onHandoffFailure?.(error);
+      throw error;
+    }
   }
   rejectHandRolledSubmitted(result);
   rejectResponseSummary(result);
@@ -4609,18 +5215,63 @@ async function routeIfHandoff<TInner, TWire>(
 async function dispatchHitl<TResult>(
   taskRegistry: TaskRegistry,
   opts: DispatchHitlOpts,
-  taskFn: (taskId: string) => Promise<TResult>,
+  taskFn: (taskRef: ScopedTaskRef) => Promise<TResult>,
   overrideTaskId?: string,
+  settlement: 'framework' | 'external' = 'framework',
   ext?: Record<string, unknown>
 ): Promise<SubmittedEnvelope> {
+  // Fail before task creation, external producer callbacks, or any terminal
+  // state can be persisted. A buyer gets Submitted only after a validated
+  // destination has exactly one terminal-delivery owner.
+  const hasWebhook = resolveTaskWebhookDelivery(opts, settlement);
+  if (settlement === 'external' && taskRegistry.durability !== 'durable') {
+    throw new Error('External task settlement requires a durable task registry with a stable identity');
+  }
+  if (
+    settlement === 'external' &&
+    (typeof taskRegistry.registryId !== 'string' || taskRegistry.registryId.length === 0)
+  ) {
+    throw new Error('External task settlement requires a durable task registry with a stable identity');
+  }
   const createStart = Date.now();
-  const { taskId } = await taskRegistry.create({
+  const createdRef = await taskRegistry.create({
     tool: opts.tool,
     accountId: opts.accountId,
     ownerScope: opts.ownerScope ?? `account:${opts.accountId}`,
-    hasWebhook: opts.pushNotificationUrl !== undefined,
+    // `tasks_get.has_webhook` promises a validated destination with an actual
+    // owner, not merely buyer intent.
+    hasWebhook,
     ...(overrideTaskId !== undefined && { overrideTaskId }),
   });
+  if (
+    createdRef == null ||
+    typeof createdRef !== 'object' ||
+    typeof createdRef.taskId !== 'string' ||
+    createdRef.taskId.length === 0 ||
+    typeof createdRef.accountId !== 'string' ||
+    createdRef.accountId.length === 0 ||
+    typeof createdRef.ownerScope !== 'string' ||
+    createdRef.ownerScope.length === 0 ||
+    (createdRef.registryId !== undefined &&
+      (typeof createdRef.registryId !== 'string' || createdRef.registryId.length === 0))
+  ) {
+    throw new Error(
+      'TaskRegistry.create() must return a complete ScopedTaskRef with non-empty taskId, accountId, and ownerScope'
+    );
+  }
+  const expectedOwnerScope = opts.ownerScope ?? `account:${opts.accountId}`;
+  if (createdRef.accountId !== opts.accountId || createdRef.ownerScope !== expectedOwnerScope) {
+    throw new Error(
+      'TaskRegistry.create() must return accountId and ownerScope exactly matching the trusted request scope'
+    );
+  }
+  if (settlement === 'external' && createdRef.registryId !== taskRegistry.registryId) {
+    throw new Error(
+      'TaskRegistry.create() returned a registryId that does not match the durable external-settlement registry'
+    );
+  }
+  const taskRef: ScopedTaskRef = createdRef;
+  const { taskId } = taskRef;
   safeFire(
     opts.observability?.onTaskCreate,
     {
@@ -4635,7 +5286,7 @@ async function dispatchHitl<TResult>(
   const taskStart = Date.now();
 
   // Single helper for the four `onTaskTransition` fire sites.
-  const fireTransition = (status: 'completed' | 'failed', errorCode?: string): void => {
+  const fireTransition = (status: 'completed' | 'failed' | 'rejected', errorCode?: string): void => {
     safeFire(
       opts.observability?.onTaskTransition,
       {
@@ -4651,6 +5302,27 @@ async function dispatchHitl<TResult>(
     );
   };
 
+  if (settlement === 'external') {
+    if (typeof taskRef.registryId !== 'string' || taskRef.registryId.length === 0) {
+      throw new Error('External task settlement requires a durable task registry with a stable identity');
+    }
+    try {
+      // The callback owns the durable application-queue write. Do not tell the
+      // buyer that the task was submitted until that write has committed.
+      await taskFn(taskRef);
+    } catch (taskFnError) {
+      opts.logger.error(
+        `[adcp/decisioning] external task producer for ${taskId} (${opts.tool}) failed before durable handoff. ` +
+          `Task remains submitted internally; no terminal state, webhook, or buyer acknowledgment was written. ` +
+          `Error type: ${taskFnError instanceof Error ? 'Error' : typeof taskFnError}`
+      );
+      // Keep the adopter's private queue error out of the wire response. The
+      // server's ordinary error projection turns this into SERVICE_UNAVAILABLE.
+      throw new Error('External task producer failed before durable handoff');
+    }
+    return { status: 'submitted', task_id: taskId };
+  }
+
   // Three failure surfaces:
   //   1. taskFn throws → record failure → emit failed webhook
   //   2. taskFn succeeds but registry write fails (DB outage) → log only;
@@ -4663,12 +5335,50 @@ async function dispatchHitl<TResult>(
   // Webhook delivery is gated on the registry write succeeding so the
   // buyer's view (via webhook OR getTaskState) is always consistent.
   const completion: Promise<void> = (async () => {
+    const registryScope = taskRef;
     let result: TResult | undefined;
     let taskFnError: unknown;
     try {
-      result = await taskFn(taskId);
+      result = await taskFn(taskRef);
     } catch (err) {
       taskFnError = err;
+    }
+
+    if (taskFnError instanceof Error && isTaskHandoffRejection(taskFnError)) {
+      // Keep business-rejection artifacts on the exact same wire-sanitization
+      // boundary as normal completions before either durable storage or an
+      // optional buyer webhook sees them.
+      const rejectionResult = sanitizeTaskResultForWire(taskFnError.result, taskRef);
+      try {
+        if (typeof taskRegistry.reject !== 'function') {
+          throw new Error(
+            'TaskRegistry does not implement reject(). Upgrade the custom registry before using taskCtx.reject().'
+          );
+        }
+        const outcome = await taskRegistry.reject(taskId, registryScope, rejectionResult, taskFnError.reason);
+        if (outcome?.outcome === 'not_found_in_scope') {
+          throw new Error('Scoped task registry rejection matched no task');
+        }
+        if (outcome?.outcome === 'already_terminal') return;
+      } catch (registryErr) {
+        opts.logger.error(
+          `[adcp/decisioning] task ${taskId} (${opts.tool}) rejected but registry write failed — ` +
+            `manual reconciliation required. Webhook not emitted; buyer state will diverge until resolved. ` +
+            `Error type: ${registryErr instanceof Error ? 'Error' : typeof registryErr}`
+        );
+        fireTransition('failed', 'REGISTRY_WRITE_FAILED');
+        return;
+      }
+      fireTransition('rejected');
+      await emitTaskWebhook(opts, {
+        task: {
+          task_id: taskId,
+          status: 'rejected',
+          result: rejectionResult,
+          ...(taskFnError.reason !== undefined && { message: taskFnError.reason }),
+        },
+      });
+      return;
     }
 
     if (taskFnError === undefined) {
@@ -4680,17 +5390,18 @@ async function dispatchHitl<TResult>(
       // sync arm. Without this strip, ctx_metadata + implementation_config
       // ride to the buyer via the HITL completion path even though the
       // sync path is clean — surfaced by security review on PR #1562.
-      if (result != null && typeof result === 'object') {
-        stripCtxMetadata(result as Record<string, unknown>);
-        stripImplementationConfig(result as Record<string, unknown>);
-      }
+      sanitizeTaskResultForWire(result, taskRef);
       try {
-        await taskRegistry.complete(taskId, result as TResult);
+        const outcome = await taskRegistry.complete(taskId, registryScope, result as TResult);
+        if (outcome?.outcome === 'not_found_in_scope') {
+          throw new Error('Scoped task registry completion matched no task');
+        }
+        if (outcome?.outcome === 'already_terminal') return;
       } catch (registryErr) {
         opts.logger.error(
           `[adcp/decisioning] task ${taskId} (${opts.tool}) completed but registry write failed — ` +
             `manual reconciliation required. Webhook not emitted; buyer state will diverge until resolved. ` +
-            `Error: ${registryErr instanceof Error ? registryErr.message : String(registryErr)}`
+            `Error type: ${registryErr instanceof Error ? 'Error' : typeof registryErr}`
         );
         fireTransition('failed', 'REGISTRY_WRITE_FAILED');
         return;
@@ -4714,12 +5425,16 @@ async function dispatchHitl<TResult>(
     );
     const failureArtifact = { errors: [structured] };
     try {
-      await taskRegistry.fail(taskId, structured, failureArtifact);
+      const outcome = await taskRegistry.fail(taskId, registryScope, structured, failureArtifact);
+      if (outcome?.outcome === 'not_found_in_scope') {
+        throw new Error('Scoped task registry failure write matched no task');
+      }
+      if (outcome?.outcome === 'already_terminal') return;
     } catch (registryErr) {
       opts.logger.error(
         `[adcp/decisioning] task ${taskId} (${opts.tool}) failed AND registry fail-write also failed — ` +
           `manual reconciliation required. Webhook not emitted. ` +
-          `taskFn error: ${structured.message}; registry error: ${registryErr instanceof Error ? registryErr.message : String(registryErr)}`
+          `Task error code: ${structured.code}; registry error type: ${registryErr instanceof Error ? 'Error' : typeof registryErr}`
       );
       fireTransition('failed', 'REGISTRY_WRITE_FAILED');
       return;
@@ -4729,7 +5444,7 @@ async function dispatchHitl<TResult>(
       task: { task_id: taskId, status: 'failed', result: failureArtifact, error: structured },
     });
   })();
-  taskRegistry._registerBackground(taskId, completion);
+  taskRegistry._registerBackground(taskId, taskRef, completion);
 
   return { status: 'submitted', task_id: taskId, ...(ext !== undefined && { ext }) };
 }
@@ -4754,7 +5469,7 @@ function buildTaskWebhookPayload(
   opts: DispatchHitlOpts,
   taskId: string,
   status: TaskStatus,
-  artifact: { result?: unknown; error?: AdcpStructuredError }
+  artifact: { result?: unknown; error?: AdcpStructuredError; message?: string }
 ): Record<string, unknown> {
   const idempotencyKey = randomUUID();
   const payload: Record<string, unknown> = {
@@ -4775,11 +5490,14 @@ function buildTaskWebhookPayload(
   if (opts.pushNotificationToken !== undefined) {
     payload.token = opts.pushNotificationToken;
   }
-  // `result` is the AdCP async-response-data union — for completed it's
-  // the success-arm body; for failed it carries `errors: AdcpStructuredError[]`
-  // alongside the empty success shape.
-  if (status === 'completed' && artifact.result !== undefined) {
+  // `result` is the AdCP async-response-data union — for completed and
+  // rejected it is the terminal artifact; for failed it carries
+  // `errors: AdcpStructuredError[]` alongside the empty success shape.
+  if ((status === 'completed' || status === 'rejected') && artifact.result !== undefined) {
     payload.result = artifact.result;
+  }
+  if (status === 'rejected' && artifact.message !== undefined) {
+    payload.message = artifact.message;
   }
   if (status === 'failed' && artifact.error !== undefined) {
     payload.result = artifact.result ?? { errors: [artifact.error] };
@@ -4809,7 +5527,15 @@ function resolveWebhookDeliveryId(opts: DispatchHitlOpts, taskId: string): strin
 
 async function emitTaskWebhook(
   opts: DispatchHitlOpts,
-  source: { task: { task_id: string; status: 'completed' | 'failed'; result?: unknown; error?: AdcpStructuredError } }
+  source: {
+    task: {
+      task_id: string;
+      status: 'completed' | 'failed' | 'rejected';
+      result?: unknown;
+      error?: AdcpStructuredError;
+      message?: string;
+    };
+  }
 ): Promise<void> {
   if (!opts.emitWebhook || !opts.pushNotificationUrl) return;
   const taskId = source.task.task_id;
@@ -4830,6 +5556,7 @@ async function emitTaskWebhook(
   const wirePayload = buildTaskWebhookPayload(opts, taskId, source.task.status, {
     ...(source.task.result !== undefined && { result: source.task.result }),
     ...(source.task.error !== undefined && { error: source.task.error }),
+    ...(source.task.message !== undefined && { message: source.task.message }),
   });
   const start = Date.now();
   let success = false;
@@ -4947,16 +5674,19 @@ function makeCtxFor(ctxMetadataStore?: CtxMetadataStore): CtxForFn {
  * can use `'authInfo' in ctx` as a presence check.
  */
 function toResolveCtx(
-  ctx: { authInfo?: ResolvedAuthInfo; agent?: BuyerAgent },
+  ctx: { authInfo?: ResolvedAuthInfo; agent?: BuyerAgent; servedAdcpVersion?: string },
   toolName: string | undefined,
   input?: Readonly<Record<string, unknown>>
 ): ResolveContext {
-  return {
-    ...(ctx.authInfo !== undefined && { authInfo: ctx.authInfo }),
-    ...(toolName !== undefined && { toolName }),
-    ...(ctx.agent != null && { agent: ctx.agent }),
-    ...(input != null && { input }),
-  };
+  return withImmutableServedAdcpVersion(
+    {
+      ...(ctx.authInfo !== undefined && { authInfo: ctx.authInfo }),
+      ...(toolName !== undefined && { toolName }),
+      ...(ctx.agent != null && { agent: ctx.agent }),
+      ...(input != null && { input }),
+    },
+    ctx.servedAdcpVersion
+  );
 }
 
 /**
@@ -5364,11 +6094,13 @@ export const INTENTIONALLY_UNHYDRATED_ENTITIES: ReadonlySet<string> = new Set([
   'advertiser_brand', // Same as above.
   'transformer', // Creative build capability catalog entry; no ctx-metadata ResourceKind yet.
   'build_variant', // Build lineage/refinement handle; no ctx-metadata ResourceKind yet.
+  'served_variant', // Agent-scoped delivery execution; creative delivery/preview owns its lookup semantics.
   'task', // Protocol task reconciliation id; task registry handles lookup, not ctx_metadata hydration.
   'proposal', // ProposalStore owns proposal lifecycle/CAS; ctx-metadata hydration would bypass those controls.
   'governance_adjustment', // Durable governance receipt identifier; no SDK ResourceKind/store yet.
   'governance_outcome', // Durable governance receipt identifier; no SDK ResourceKind/store yet.
   'seller_adjustment', // Seller-authored adjustment reference; resolved by governance workflows, not ctx metadata.
+  'reporting_revision', // Reporting status/receipt handlers own revision lookup; no ctx-metadata ResourceKind yet.
 ]);
 
 /**
@@ -5461,8 +6193,8 @@ async function hydrateForTool(
  *    (10/8, 172.16/12, 192.168/16), link-local (169.254/16, fe80::/10),
  *    loopback (127/8, ::1), CGNAT (100.64/10), and unspecified addresses
  *    (0.0.0.0, ::). Rejects bare hostnames `localhost` / `0`.
- * 3. **Token shape**: rejects tokens longer than 255 chars or containing
- *    control characters. Tokens past 255 chars combined with a malicious
+ * 3. **Token shape**: enforces the protocol's 16–4096 character bounds and
+ *    rejects control characters. Oversized tokens combined with a malicious
  *    URL would inflate webhook payload size; control characters break log
  *    redaction.
  *
@@ -5493,32 +6225,51 @@ function extractPushConfig(
 ): { url?: string; token?: string; operationId?: string } {
   if (!params || typeof params !== 'object') return {};
   const cfg = (params as { push_notification_config?: unknown }).push_notification_config;
-  if (!cfg || typeof cfg !== 'object') return {};
+  // `undefined` is the one supplied value that preserves the absent-config
+  // polling semantics. Every other supplied shape is an attempt to opt into
+  // terminal delivery and must fail visibly instead of being silently
+  // reinterpreted as polling-only when request validation is disabled.
+  if (cfg === undefined) return {};
+  if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    throw new AdcpError('INVALID_REQUEST', {
+      message: 'push_notification_config must be an object',
+      field: 'push_notification_config',
+    });
+  }
   const cfgObj = cfg as { url?: unknown; token?: unknown; operation_id?: unknown };
   const rawUrl = cfgObj.url;
   const rawToken = cfgObj.token;
   const rawOperationId = cfgObj.operation_id;
 
-  let url: string | undefined;
-  if (typeof rawUrl === 'string') {
-    const validation = validatePushNotificationUrl(rawUrl, { allowPrivate: opts.allowPrivateWebhookUrls === true });
-    if (!validation.ok) {
-      // Fail fast: buyers thought they wired push and never saw it under
-      // the previous silent-skip posture. Rejecting upfront with
-      // `INVALID_REQUEST` and `field: 'push_notification_config.url'`
-      // surfaces the problem at the request boundary so buyers can fix
-      // their config before relying on webhooks. Buyers can still poll
-      // via `tasks_get` if they need a fallback path.
-      throw new AdcpError('INVALID_REQUEST', {
-        message: `push_notification_config.url rejected: ${validation.reason}`,
-        field: 'push_notification_config.url',
-      });
-    }
-    url = rawUrl;
+  if (typeof rawUrl !== 'string') {
+    throw new AdcpError('INVALID_REQUEST', {
+      message: 'push_notification_config.url rejected: url must be a string',
+      field: 'push_notification_config.url',
+    });
   }
+  const validation = validatePushNotificationUrl(rawUrl, { allowPrivate: opts.allowPrivateWebhookUrls === true });
+  if (!validation.ok) {
+    // Fail fast: buyers thought they wired push and never saw it under
+    // the previous silent-skip posture. Rejecting upfront with
+    // `INVALID_REQUEST` and `field: 'push_notification_config.url'`
+    // surfaces the problem at the request boundary so buyers can fix
+    // their config before relying on webhooks. Buyers can still poll
+    // via `tasks_get` if they need a fallback path.
+    throw new AdcpError('INVALID_REQUEST', {
+      message: `push_notification_config.url rejected: ${validation.reason}`,
+      field: 'push_notification_config.url',
+    });
+  }
+  const url = rawUrl;
 
   let token: string | undefined;
-  if (typeof rawToken === 'string') {
+  if (Object.prototype.hasOwnProperty.call(cfgObj, 'token')) {
+    if (typeof rawToken !== 'string') {
+      throw new AdcpError('INVALID_REQUEST', {
+        message: 'push_notification_config.token rejected: token must be a string',
+        field: 'push_notification_config.token',
+      });
+    }
     const validation = validatePushNotificationToken(rawToken);
     if (!validation.ok) {
       throw new AdcpError('INVALID_REQUEST', {
@@ -5671,13 +6422,14 @@ function validatePushNotificationUrl(rawUrl: string, opts: { allowPrivate?: bool
   return { ok: true };
 }
 
-const TOKEN_MAX_LENGTH = 255;
+const TOKEN_MIN_LENGTH = 16;
+const TOKEN_MAX_LENGTH = 4096;
 const TOKEN_CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 const PUSH_OPERATION_ID_RE = /^[A-Za-z0-9_.:-]{1,255}$/;
 
 function validatePushNotificationToken(token: string): UrlValidationResult {
-  if (token.length === 0) {
-    return { ok: false, reason: 'token is empty' };
+  if (token.length < TOKEN_MIN_LENGTH) {
+    return { ok: false, reason: `token shorter than ${TOKEN_MIN_LENGTH} chars` };
   }
   if (token.length > TOKEN_MAX_LENGTH) {
     return { ok: false, reason: `token longer than ${TOKEN_MAX_LENGTH} chars` };
@@ -5701,7 +6453,10 @@ function buildProposalNegotiationHandlers<P extends DecisioningPlatform<any, any
   taskWebhookEmit: NonNullable<HandlerContext<Account>['emitWebhook']> | undefined,
   observability: DecisioningObservabilityHooks | undefined,
   logger: AdcpLogger,
-  pushOpts: { allowPrivateWebhookUrls: boolean; autoEmitCompletionWebhooks: boolean },
+  pushOpts: {
+    allowPrivateWebhookUrls: boolean;
+    autoEmitCompletionWebhooks: boolean;
+  },
   ctxFor: CtxForFn
 ): ProposalNegotiationHandlers<Account> | undefined {
   const lifecycle = platform.mediaBuyLifecycle;
@@ -5717,10 +6472,7 @@ function buildProposalNegotiationHandlers<P extends DecisioningPlatform<any, any
     resolveScope: ctx => {
       const accountId = ctx.account?.id;
       if (!accountId) {
-        throw new AdcpError('ACCOUNT_NOT_FOUND', {
-          message: 'refine_proposals requires an authenticated account scope',
-          recovery: 'correctable',
-        });
+        throw missingAccountError('refine_proposals', platform.accounts.resolution);
       }
       const principalId = authenticatedPrincipalFor(ctx);
       if (!principalId) {
@@ -5735,10 +6487,7 @@ function buildProposalNegotiationHandlers<P extends DecisioningPlatform<any, any
       const request = params as unknown as Readonly<Record<string, unknown>>;
       const reqCtx = ctxFor(ctx, request);
       if (!reqCtx.account?.id) {
-        throw new AdcpError('ACCOUNT_NOT_FOUND', {
-          message: 'refine_proposals requires an authenticated account scope',
-          recovery: 'correctable',
-        });
+        throw missingAccountError('refine_proposals', platform.accounts.resolution);
       }
       return projectSync(
         async () => {
@@ -5777,7 +6526,10 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
   taskWebhookEmit: NonNullable<HandlerContext<Account>['emitWebhook']> | undefined,
   observability: DecisioningObservabilityHooks | undefined,
   logger: AdcpLogger,
-  pushOpts: { allowPrivateWebhookUrls: boolean; autoEmitCompletionWebhooks: boolean },
+  pushOpts: {
+    allowPrivateWebhookUrls: boolean;
+    autoEmitCompletionWebhooks: boolean;
+  },
   ctxFor: CtxForFn,
   ctxMetadataStore: CtxMetadataStore | undefined,
   mediaBuyStore: MediaBuyStore | undefined,
@@ -5790,12 +6542,14 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
 ): MediaBuyHandlers<Account> | undefined {
   const sales = platform.sales;
   const lifecycle = platform.mediaBuyLifecycle;
-  const getMediaBuyDelivery = lifecycle?.getMediaBuyDelivery ?? sales?.getMediaBuyDelivery;
+  const reporting = platform.reporting;
+  const liveMediaBuyDelivery = lifecycle?.getMediaBuyDelivery ?? sales?.getMediaBuyDelivery;
+  const getMediaBuyDelivery = liveMediaBuyDelivery ?? reporting?.getMediaBuyDelivery;
   const getMediaBuys = lifecycle?.getMediaBuys ?? sales?.getMediaBuys;
   const proposalManager = (platform as { proposalManager?: import('../proposal').ProposalManager }).proposalManager;
   // Without a legacy sales surface, compact lifecycle, or proposal manager,
   // there's nothing to dispatch.
-  if (!sales && !lifecycle && !proposalManager) return undefined;
+  if (!sales && !lifecycle && !proposalManager && !reporting) return undefined;
 
   const dispatchCompactMutation = async <TResult>(
     tool: string,
@@ -5813,10 +6567,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
         }
         const accountId = ctx.account?.id;
         if (!accountId) {
-          throw new AdcpError('ACCOUNT_NOT_FOUND', {
-            message: `${tool} requires a resolved account scope`,
-            recovery: 'correctable',
-          });
+          throw missingAccountError(tool, platform.accounts.resolution);
         }
         const principalId = authenticatedPrincipalFor(ctx);
         if (!principalId) {
@@ -5856,6 +6607,21 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
       },
       value => value
     );
+  };
+
+  const reportingContext = (
+    tool: 'get_media_buy_delivery' | 'get_reporting_status' | 'sync_reporting_status',
+    params: Readonly<Record<string, unknown>>,
+    ctx: HandlerContext<Account>
+  ): RequestContext<Account> => {
+    if (ctx.authInfo === undefined && ctx.agent === undefined) {
+      throw new AdcpError('AUTH_MISSING', {
+        message: `${tool} requires an authenticated buyer principal`,
+        recovery: 'correctable',
+      });
+    }
+    if (!ctx.account?.id) throw missingAccountError(tool, platform.accounts.resolution);
+    return ctxFor(ctx, params);
   };
 
   // Core lifecycle methods are optional on the SalesPlatform interface
@@ -5916,6 +6682,27 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
         );
         const canonicalParams = asCanonicalGetProductsRequest(params as unknown as Record<string, unknown>);
         const reqCtx = ctxFor(ctx, params as Readonly<Record<string, unknown>>);
+        // Validate once before either proposal-finalize interception or normal
+        // getProducts dispatch. Finalization is adopter-controlled and can
+        // commit side effects, so malformed/unsafe buyer delivery config must
+        // not reach it.
+        const pushOrError = await projectSync<
+          ReturnType<typeof extractPushConfig>,
+          ReturnType<typeof extractPushConfig>
+        >(
+          async () =>
+            extractPushConfig(params, logger, {
+              allowPrivateWebhookUrls: pushOpts.allowPrivateWebhookUrls,
+            }),
+          value => value
+        );
+        // The interception branch is outside its normal projectSync wrapper;
+        // preserve the extractor's structured request error there too.
+        if ('isError' in pushOrError && pushOrError.isError === true) return pushOrError;
+        // `AdcpErrorResponse` carries an open wire shape, so TypeScript cannot
+        // narrow the successful extractor result from the property check even
+        // though projectSync returns it only on the error path.
+        const push = pushOrError as ReturnType<typeof extractPushConfig>;
         // v1.5 seam: intercept refine[i].action='finalize' before
         // dispatching to the manager / sales. When the framework
         // commits the proposal inline, project the response directly.
@@ -5949,9 +6736,6 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
             // requires propagating an AbortSignal into the projection
             // — framework-level work tracked separately, not finalize-
             // specific.
-            const push = extractPushConfig(params, logger, {
-              allowPrivateWebhookUrls: pushOpts.allowPrivateWebhookUrls,
-            });
             const out = await routeIfHandoff(
               taskRegistry,
               {
@@ -5984,9 +6768,6 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                 recovery: 'correctable',
               });
             }
-            const push = extractPushConfig(params, logger, {
-              allowPrivateWebhookUrls: pushOpts.allowPrivateWebhookUrls,
-            });
             // Pick dispatch target: ProposalManager (when wired) takes
             // ownership of get_products; sales is the v1 fallback.
             // Refine routing per Python's _select_proposal_method:
@@ -6085,11 +6866,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
             }
             const accountId = reqCtx.account?.id;
             if (accountId === undefined) {
-              throw new AdcpError('INVALID_REQUEST', {
-                message: 'Async get_products and push_notification_config require account-scoped discovery.',
-                field: 'account',
-                recovery: 'correctable',
-              });
+              throw missingAccountError('get_products', platform.accounts.resolution);
             }
             return routeIfHandoff(
               taskRegistry,
@@ -6137,6 +6914,9 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
           logger,
           legacyFormatConverter
         );
+        const push = extractPushConfig(params, logger, {
+          allowPrivateWebhookUrls: pushOpts.allowPrivateWebhookUrls,
+        });
         // v1.5 seam: when the request carries a proposal_id, reserve
         // the proposal (atomic CAS COMMITTED → CONSUMING), validate
         // expiry + capability overlap, hydrate ctx.recipes. The
@@ -6156,9 +6936,6 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
         }
         return projectSync(
           async () => {
-            const push = extractPushConfig(params, logger, {
-              allowPrivateWebhookUrls: pushOpts.allowPrivateWebhookUrls,
-            });
             let result: Awaited<ReturnType<NonNullable<typeof sales.createMediaBuy>>>;
             try {
               result = await sales!.createMediaBuy!(params as unknown as CanonicalCreateMediaBuyRequest, reqCtx);
@@ -6194,11 +6971,9 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
               );
             }
             // Inline-success path: promote CONSUMING → CONSUMED with the
-            // adapter's media_buy_id. HITL handoff: the proposal stays
-            // CONSUMING until the handoff completes — wiring the
-            // post-completion commit hook is a v1.6 follow-up; for now
-            // adopters using HITL accept the reservation lingers until
-            // eviction. Most adopters use inline create_media_buy.
+            // adapter's media_buy_id. Framework-settled handoffs finalize in
+            // routeIfHandoff's lifecycle hook after the task produces its
+            // terminal success value.
             if (reservation && proposalStore && !isTaskHandoff(result)) {
               const mediaBuyId = (result as { media_buy_id?: string }).media_buy_id;
               if (mediaBuyId) {
@@ -6208,6 +6983,23 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                   mediaBuyId,
                 });
               }
+            }
+            const handoffEntry = isTaskHandoff(result) ? _extractHandoffEntry(result) : undefined;
+            if (
+              reservation &&
+              proposalStore &&
+              handoffEntry?.options &&
+              'settlement' in handoffEntry.options &&
+              handoffEntry.options.settlement === 'external'
+            ) {
+              await releaseProposalReservation({ store: proposalStore, record: reservation, logger });
+              throw new AdcpError('INVALID_REQUEST', {
+                recovery: 'correctable',
+                field: 'proposal_id',
+                message:
+                  'Proposal-backed create_media_buy does not support external task settlement; ' +
+                  'use a framework-settled handoff so proposal consumption can be finalized atomically.',
+              });
             }
             return routeIfHandoff(
               taskRegistry,
@@ -6234,7 +7026,25 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                   canonicalFormatLegacyResolver,
                   responseWireMode
                 );
-              }
+              },
+              reservation && proposalStore
+                ? {
+                    onHandoffSuccess: async r => {
+                      const mediaBuyId = (r as { media_buy_id?: string }).media_buy_id;
+                      if (!mediaBuyId) {
+                        throw new Error('Proposal-backed create_media_buy handoff completed without media_buy_id.');
+                      }
+                      await finalizeProposalConsumption({
+                        store: proposalStore,
+                        record: reservation,
+                        mediaBuyId,
+                      });
+                    },
+                    onHandoffFailure: async () => {
+                      await releaseProposalReservation({ store: proposalStore, record: reservation, logger });
+                    },
+                  }
+                : undefined
             );
           },
           r => r
@@ -6401,7 +7211,20 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
         ...[params, ctx]: Parameters<NonNullable<MediaBuyHandlers<Account>['getMediaBuyDelivery']>>
       ) => {
         const responseWireMode = creativeWireModeForRequest(ctx, creativeWireMode, params);
-        const reqCtx = ctxFor(ctx, params);
+        const requestedRevisionId = (params as { reporting_revision_id?: unknown }).reporting_revision_id;
+        // One predicate decides routing, auth scope, and the raw-passthrough
+        // gate. Routing on mere presence sent `reporting_revision_id: null` to
+        // the ledger as if it were an exact read — where it is not one — so a
+        // cumulative request answered SERVICE_UNAVAILABLE wherever request
+        // validation is off. It also must not rest on handler identity alone:
+        // an adopter may wire one function into both the sales and reporting
+        // slots, and an unbound read would inherit the exact-revision bypass.
+        const exactRevisionRead = typeof requestedRevisionId === 'string' && requestedRevisionId.length > 0;
+        const exactRevisionRequested = exactRevisionRead;
+        const reportingRevisionRequested = exactRevisionRequested && reporting !== undefined;
+        const reqCtx = reportingRevisionRequested
+          ? reportingContext('get_media_buy_delivery', params, ctx)
+          : ctxFor(ctx, params);
         // v1.5 seam: hydrate ctx.recipes for delivery reads. Per
         // Resolutions §5, recipe-driven delivery aggregation needs the
         // same recipe view the originating createMediaBuy used.
@@ -6424,7 +7247,32 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
         }
         return projectSync(
           async () => {
-            const result = await getMediaBuyDelivery(asValidatedDomainRequest(params), reqCtx);
+            const selectedDelivery = exactRevisionRequested
+              ? (reporting?.getMediaBuyDelivery ?? liveMediaBuyDelivery)
+              : liveMediaBuyDelivery;
+            if (!selectedDelivery) {
+              throw new AdcpError('UNSUPPORTED_FEATURE', {
+                message: 'This reporting-only platform does not provide cumulative delivery reads',
+                recovery: 'correctable',
+              });
+            }
+            const servedByReportingLedger =
+              exactRevisionRead &&
+              reporting?.getMediaBuyDelivery !== undefined &&
+              selectedDelivery === reporting.getMediaBuyDelivery;
+            const result = await selectedDelivery(asValidatedDomainRequest(params), reqCtx);
+            if (servedByReportingLedger) {
+              // An exact reporting revision is hash-bound: its rows are an
+              // opaque payload carried under the revision's RFC 8785 JCS
+              // SHA-256 digest, not creative-bearing media-buy delivery.
+              // Creative-format projection would rewrite row content without
+              // updating that digest, and it rejects a perfectly legitimate
+              // row whose columns happen to be named `creative_id` and
+              // `format_kind` with INVALID_REQUEST. Return the bytes the
+              // ledger bound. `projectSync` still applies the ctx_metadata /
+              // implementation_config leak strip around this.
+              return result;
+            }
             warnIfTruncatedMultiIdResponse(
               'getMediaBuyDelivery',
               'media_buy_ids',
@@ -6443,6 +7291,26 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
           actuals => actuals
         );
       },
+    }),
+
+    ...(reporting?.getReportingStatus && {
+      getReportingStatus: async (
+        ...[params, ctx]: Parameters<NonNullable<MediaBuyHandlers<Account>['getReportingStatus']>>
+      ) =>
+        projectSync(
+          () => reporting.getReportingStatus(params, reportingContext('get_reporting_status', params, ctx)),
+          value => value
+        ),
+    }),
+
+    ...(reporting?.syncReportingStatus && {
+      syncReportingStatus: async (
+        ...[params, ctx]: Parameters<NonNullable<MediaBuyHandlers<Account>['syncReportingStatus']>>
+      ) =>
+        projectSync(
+          () => reporting.syncReportingStatus!(params, reportingContext('sync_reporting_status', params, ctx)),
+          value => value
+        ),
     }),
 
     // Optional methods — return UNSUPPORTED_FEATURE when the platform omits
@@ -6587,12 +7455,14 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
 
 /**
  * Project an adopter `buildCreative` return value into the wire response
- * shape. Handles the four legal adopter shapes per `BuildCreativeReturn`:
+ * shape. Handles the five legal adopter shapes per `BuildCreativeReturn`:
  *
  *   - Already-shaped Single envelope (`creative_manifest` field present) →
  *     passthrough. Adopter set `sandbox` / `expires_at` / `preview` themselves.
  *   - Already-shaped Multi envelope (`creative_manifests` field present) →
  *     passthrough. Same metadata-controlled case for multi-format requests.
+ *   - Already-shaped multiplicity envelope (`creatives` field present) →
+ *     passthrough. Used for best-of-N, variant-axis, and catalog fan-out.
  *   - Bare array → wrap as `{ creative_manifests: <array> }` (multi, no metadata).
  *   - Plain `CreativeManifest` → wrap as `{ creative_manifest: <obj> }`
  *     (single, no metadata).
@@ -6603,8 +7473,11 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
  * `{ creative_manifest: { creative_manifest, sandbox: true } }`. Same
  * concern applies symmetrically for Multi.
  */
-function projectBuildCreativeReturn(ret: unknown): BuildCreativeSuccess | BuildCreativeMultiSuccess {
+function projectBuildCreativeReturn(
+  ret: unknown
+): BuildCreativeSuccess | BuildCreativeMultiSuccess | BuildCreativeVariantSuccess {
   if (ret != null && typeof ret === 'object' && !Array.isArray(ret)) {
+    if ('creatives' in ret) return ret as BuildCreativeVariantSuccess;
     if ('creative_manifest' in ret) return ret as BuildCreativeSuccess;
     if ('creative_manifests' in ret) return ret as BuildCreativeMultiSuccess;
   }
@@ -6620,7 +7493,10 @@ function buildCreativeHandlers<P extends DecisioningPlatform<any, any>>(
   taskWebhookEmit: NonNullable<HandlerContext<Account>['emitWebhook']> | undefined,
   observability: DecisioningObservabilityHooks | undefined,
   logger: AdcpLogger,
-  pushOpts: { allowPrivateWebhookUrls: boolean; autoEmitCompletionWebhooks: boolean },
+  pushOpts: {
+    allowPrivateWebhookUrls: boolean;
+    autoEmitCompletionWebhooks: boolean;
+  },
   ctxFor: CtxForFn,
   legacyFormatConverter: LegacyFormatConverter | undefined,
   canonicalFormatLegacyResolver: CanonicalFormatLegacyResolver | undefined,
@@ -6855,7 +7731,7 @@ function buildEventTrackingHandlers<P extends DecisioningPlatform<any, any>>(
     handlers.logEvent = async (params, ctx) => {
       const reqCtx = ctxFor(ctx, params);
       return projectSync(
-        () => sales.logEvent!(params, reqCtx),
+        () => sales.logEvent!(asValidatedDomainRequest(params), reqCtx),
         r => r
       );
     };
@@ -6880,7 +7756,10 @@ function buildSignalsHandlers<P extends DecisioningPlatform<any, any>>(
   taskWebhookEmit: NonNullable<HandlerContext<Account>['emitWebhook']> | undefined,
   observability: DecisioningObservabilityHooks | undefined,
   logger: AdcpLogger,
-  pushOpts: { allowPrivateWebhookUrls: boolean; autoEmitCompletionWebhooks: boolean },
+  pushOpts: {
+    allowPrivateWebhookUrls: boolean;
+    autoEmitCompletionWebhooks: boolean;
+  },
   ctxFor: CtxForFn,
   ctxMetadataStore: CtxMetadataStore | undefined
 ): SignalsHandlers<Account> | undefined {
@@ -6942,11 +7821,7 @@ function buildSignalsHandlers<P extends DecisioningPlatform<any, any>>(
           }
           const accountId = reqCtx.account?.id;
           if (accountId === undefined) {
-            throw new AdcpError('INVALID_REQUEST', {
-              message: 'Async get_signals and push_notification_config require account-scoped discovery.',
-              field: 'account',
-              recovery: 'correctable',
-            });
+            throw missingAccountError('get_signals', platform.accounts.resolution);
           }
           return routeIfHandoff(
             taskRegistry,
@@ -7436,6 +8311,473 @@ function entryHasAccountId(entry: SyncAccountsEntry): boolean {
   return entry.account !== undefined && refAccountId(entry.account) !== undefined;
 }
 
+/**
+ * Per-entry refusal for `sync_accounts` against an upstream-managed
+ * account-id namespace (`resolution: 'derived'`), per adcp#5062.
+ *
+ * Natural-key provisioning — `{ brand, operator, billing }` at the entry
+ * root, or a settings-update entry whose `account` ref is the natural key —
+ * is out of scope for a namespace this agent doesn't own: there is nothing
+ * for the seller to provision and `(brand, operator)` doesn't address an
+ * upstream row. The spec's per-entry code for "the seller does not support
+ * the mode this entry requested" is `UNSUPPORTED_PROVISIONING`.
+ *
+ * Settings-update entries keyed by `account: { account_id }` are NOT
+ * refused: #5062 keeps that mode available when the seller exposes it, so
+ * an adopter who wires `accounts.upsert` still receives them. This is the
+ * narrower rule that replaced "derived forbids sync_accounts outright".
+ */
+/**
+ * Per-entry `UNSUPPORTED_PROVISIONING` for natural-key provisioning against
+ * an upstream-managed account namespace. Spec code for "the seller does not
+ * support the `sync_accounts` mode this entry requested" (adcp#5062).
+ */
+function buildUnsupportedProvisioningError(index: number): AdcpStructuredError {
+  return new AdcpError('UNSUPPORTED_PROVISIONING', {
+    message:
+      'This agent fronts an upstream-managed account namespace: sync_accounts cannot provision ' +
+      'accounts by the brand + operator natural key. Accounts are created on the upstream platform and ' +
+      'discovered through list_accounts.',
+    recovery: 'correctable',
+    field: `accounts[${index}].brand`,
+    suggestion:
+      'Call list_accounts to discover the account_id, then re-issue settings-update entries as ' +
+      'account: { account_id } — or drop the entry if you only meant to provision.',
+  }).toStructuredError();
+}
+
+/**
+ * Normalize a `sync_accounts` entry to the single account reference it
+ * carries — or report that it carries none, or more than one.
+ *
+ * The schema models entry keys as a per-entry `oneOf` (provisioning trio at
+ * the root XOR an `account` ref), but request validation is relaxable, and a
+ * gate that reads one location while a later step reads another is a
+ * bypass: an entry carrying a root `account_id` *and* a nested
+ * `account: { brand, operator }` would be accepted on the id it never uses
+ * and then written against the natural key nobody verified. So the
+ * reference location is resolved exactly once, here, and anything
+ * ambiguous is refused rather than disambiguated by precedence.
+ */
+function normalizeSyncAccountsReference(
+  entry: SyncAccountsEntry
+):
+  | { kind: 'account_id'; accountId: string }
+  | { kind: 'natural_key_provisioning' }
+  | { kind: 'natural_key_reference' }
+  | { kind: 'ambiguous' }
+  | { kind: 'none' } {
+  const rootAccountId = refAccountId(entry);
+  const rootNaturalKey = entry.brand !== undefined || entry.operator !== undefined;
+  const nested = entry.account;
+  const nestedAccountId = refAccountId(nested);
+  const nestedNaturalKey = refHasNaturalKey(nested);
+
+  const locations = [rootAccountId !== undefined, rootNaturalKey, nested !== undefined].filter(Boolean).length;
+  if (locations > 1) return { kind: 'ambiguous' };
+  if (nestedAccountId !== undefined && nestedNaturalKey) return { kind: 'ambiguous' };
+
+  if (rootAccountId !== undefined) return { kind: 'account_id', accountId: rootAccountId };
+  if (rootNaturalKey) return { kind: 'natural_key_provisioning' };
+  if (nestedAccountId !== undefined) return { kind: 'account_id', accountId: nestedAccountId };
+  if (nestedNaturalKey) return { kind: 'natural_key_reference' };
+  return { kind: 'none' };
+}
+
+/**
+ * Classify one `sync_accounts` entry against the upstream-managed
+ * (`resolution: 'derived'`) account model, per adcp#5062.
+ *
+ * - exactly one `account_id` (root or under `account`) — settings-update
+ *   mode. Accepted; the seller's own `upsert` decides whether it supports
+ *   the write. The resolved id is returned so the reachability check reads
+ *   the same reference this classification accepted.
+ * - flat `{ brand, operator, billing }` — natural-key provisioning. Refused
+ *   with the spec's per-entry `UNSUPPORTED_PROVISIONING`: there is nothing
+ *   to provision in a namespace the agent doesn't own.
+ * - `account: { brand, operator }` — a natural-key *reference* into an
+ *   account-id namespace. Refused as `INVALID_REQUEST` (not
+ *   `UNSUPPORTED_PROVISIONING`, which is about the mode, not the ref shape)
+ *   with the same field pointer discipline as the task-level refusal.
+ * - more than one reference, or none — malformed against the request
+ *   schema's per-entry `oneOf`. `INVALID_REQUEST`, raised at operation level
+ *   when no response row can be built for it (`sync-accounts-response.json`
+ *   requires `brand` + `operator` on every row).
+ */
+function classifyUpstreamManagedSyncEntry(
+  entry: SyncAccountsEntry,
+  index: number
+): { accepted: true; accountId: string } | { accepted: false; error: AdcpStructuredError } {
+  const reference = normalizeSyncAccountsReference(entry);
+
+  switch (reference.kind) {
+    case 'account_id':
+      return { accepted: true, accountId: reference.accountId };
+
+    case 'natural_key_reference':
+      return {
+        accepted: false,
+        error: new AdcpError('INVALID_REQUEST', {
+          message:
+            'This agent fronts an upstream-managed account namespace: accounts are addressed by ' +
+            'account.account_id, not by the brand + operator natural key.',
+          recovery: 'correctable',
+          field: `accounts[${index}].account.brand`,
+          suggestion: 'Call list_accounts to discover the account_id, then send account: { account_id }.',
+        }).toStructuredError(),
+      };
+
+    case 'natural_key_provisioning':
+      if (entryBrandOperator(entry) === undefined) {
+        // Half a natural key (brand without operator, or vice versa). That's
+        // a malformed entry, not an unsupported mode — and no response row
+        // can be built for it, so it's operation-level.
+        throw new AdcpError('INVALID_REQUEST', {
+          message: `sync_accounts entry ${index} carries an incomplete natural key: brand and operator are both required.`,
+          recovery: 'correctable',
+          field: `accounts[${index}]`,
+          suggestion: 'Send account: { account_id } — this agent addresses accounts by id.',
+        });
+      }
+      return { accepted: false, error: buildUnsupportedProvisioningError(index) };
+
+    case 'ambiguous':
+      // Never disambiguate by precedence — the entry claims two account
+      // references and we cannot know which one the buyer meant to write to.
+      throw new AdcpError('INVALID_REQUEST', {
+        message:
+          `sync_accounts entry ${index} carries more than one account reference. Send exactly one: either ` +
+          `a brand + operator natural key at the entry root, or account: { account_id }.`,
+        recovery: 'correctable',
+        field: `accounts[${index}]`,
+        suggestion: 'Drop the extra reference — this agent addresses accounts by account.account_id.',
+      });
+
+    default:
+      throw new AdcpError('INVALID_REQUEST', {
+        message: `sync_accounts entry ${index} carries neither a brand + operator natural key nor an account reference.`,
+        recovery: 'correctable',
+        field: `accounts[${index}]`,
+        suggestion: 'Send account: { account_id } — this agent addresses accounts by id.',
+      });
+  }
+}
+
+/**
+ * Verify every accepted (`account_id`-keyed) `sync_accounts` entry against
+ * what the caller's credential can actually reach, before any write runs.
+ *
+ * `sync_accounts` and `sync_governance` are the two account-scoped surfaces
+ * that never called `accounts.resolve` — the account reference travels
+ * inside the batch rather than as the request's `account`. On an
+ * upstream-managed namespace `account_id` is now the *only* accepted entry
+ * shape, so without this every accepted entry would be an unverified,
+ * buyer-chosen write target (settings, payment terms, notification webhook
+ * destinations) on someone else's account.
+ *
+ * Operation-level `ACCOUNT_NOT_FOUND` rather than a per-entry row: the
+ * response row schema requires `brand` + `operator`, which by definition we
+ * don't have for an account we just refused to resolve. Failing the batch
+ * also means no partial writes ran before the refusal.
+ */
+async function assertDerivedSyncAccountEntriesReachable(
+  accounts: DecisioningPlatform<any, any>['accounts'],
+  entries: readonly SyncAccountsEntry[],
+  resolveCtx: ResolveContext,
+  logger: AdcpLogger
+): Promise<void> {
+  for (const [index, entry] of entries.entries()) {
+    // Re-normalize rather than trusting a caller-passed id: this and the
+    // classification above must read the same reference, or the gate can
+    // accept on one claim and write against another.
+    const verdict = classifyUpstreamManagedSyncEntry(entry, index);
+    if (!verdict.accepted) {
+      // Unreachable via the two call sites (both filter refusals out first);
+      // fail closed rather than silently skipping an unverified entry.
+      throw new AdcpError(verdict.error.code, {
+        message: verdict.error.message,
+        recovery: verdict.error.recovery,
+        ...(verdict.error.field !== undefined && { field: verdict.error.field }),
+        ...(verdict.error.suggestion !== undefined && { suggestion: verdict.error.suggestion }),
+      });
+    }
+    let resolved: Account | null = null;
+    try {
+      resolved = assertResolvedAccountMatchesRef(
+        accounts.resolution,
+        { account_id: verdict.accountId },
+        await accounts.resolve({ account_id: verdict.accountId }, resolveCtx),
+        logger
+      );
+    } catch (err) {
+      if (!(err instanceof AccountNotFoundError)) throw err;
+      resolved = null;
+    }
+    if (resolved == null) {
+      // Unindexed pointer on purpose: this helper sees the post-refusal
+      // subset, so an index here would not be the buyer's request index.
+      throw new AdcpError('ACCOUNT_NOT_FOUND', {
+        message: 'The specified account does not exist',
+        recovery: 'terminal',
+        field: 'accounts[].account.account_id',
+        suggestion: 'Call list_accounts to discover the accounts your credential can reach.',
+      });
+    }
+  }
+}
+
+/**
+ * Apply the upstream-managed account gate to an **adopter-supplied**
+ * `sync_accounts` handler (`opts.accounts.syncAccounts` at the merge seam).
+ *
+ * The platform-derived handler applies the same rules inside
+ * `enforceSyncAccountsCommercialPolicy`, where it can keep per-entry error
+ * indices aligned with the buyer's request. This wrapper exists because the
+ * merge seam is a documented wiring: gating only the platform path left an
+ * adopter handler receiving natural-key provisioning entries the contract
+ * says it never sees.
+ *
+ * Refused entries never reach the inner handler — the refusal is a key-shape
+ * verdict, so no provisioning side effects may run for them. Their rows are
+ * spliced back at their original request indices so the response stays
+ * positionally aligned with `accounts[]`. The inner handler sees a filtered
+ * array, so any index it reports in its own per-entry errors is relative to
+ * that array; adopters who need request-aligned indices should key errors
+ * off the entry's account reference instead.
+ */
+function guardAdopterSyncAccounts<TAccount>(
+  handlers: AccountHandlers<TAccount> | undefined,
+  platform: DecisioningPlatform<any, any>,
+  platformDerived: AccountHandlers<Account>,
+  logger: AdcpLogger
+): AccountHandlers<TAccount> | undefined {
+  const inner = handlers?.syncAccounts;
+  if (handlers === undefined || inner === undefined) return handlers;
+  if (normalizeAccountResolution(platform.accounts.resolution) !== 'derived') return handlers;
+  // Platform-derived handler won the merge — its own policy pass already
+  // applies the gate with request-aligned indices. Don't double-wrap.
+  if ((inner as unknown) === (platformDerived.syncAccounts as unknown)) return handlers;
+
+  return {
+    ...handlers,
+    syncAccounts: async (params, ctx) => {
+      const entries = (Array.isArray(params.accounts) ? params.accounts : []) as SyncAccountsEntry[];
+      const refusedRows = new Map<number, WireSyncAccountRow>();
+      const accepted: SyncAccountsEntry[] = [];
+      entries.forEach((entry, index) => {
+        const verdict = classifyUpstreamManagedSyncEntry(entry, index);
+        if (verdict.accepted) {
+          accepted.push(entry);
+          return;
+        }
+        refusedRows.set(index, toWireSyncAccountRow(failedSyncAccountRow(entry, verdict.error)));
+      });
+
+      const resolveCtx = toResolveCtx(ctx, 'sync_accounts', params as Record<string, unknown>);
+      await assertDerivedSyncAccountEntriesReachable(platform.accounts, accepted, resolveCtx, logger);
+
+      if (refusedRows.size === 0) return inner(params, ctx);
+
+      const dryRun = (params as { dry_run?: unknown }).dry_run === true;
+      if (accepted.length === 0) {
+        return {
+          ...(dryRun && { dry_run: true }),
+          accounts: entries.map((_entry, index) => refusedRows.get(index)!),
+        } as Awaited<ReturnType<NonNullable<AccountHandlers<TAccount>['syncAccounts']>>>;
+      }
+
+      const result = await inner({ ...params, accounts: accepted } as typeof params, ctx);
+      const rows = readSyncAccountRows(result);
+      if (rows === undefined) {
+        // The inner handler already failed the operation (error envelope) —
+        // there is nothing to splice into and the whole batch failed anyway;
+        // surface its verdict unchanged.
+        if (isErrorShapedResult(result)) return result;
+        throw new Error(
+          'sync_accounts: cannot apply the upstream-managed account gate — the handler returned no accounts[] ' +
+            'array to merge the per-entry refusal rows into.'
+        );
+      }
+      if (rows.length !== accepted.length) {
+        throw new Error(
+          `sync_accounts: handler returned ${rows.length} row(s) for ${accepted.length} accepted entry/entries; ` +
+            'cannot realign the per-entry refusal rows with the request.'
+        );
+      }
+      let acceptedIndex = 0;
+      const combined = entries.map((_entry, index) => refusedRows.get(index) ?? rows[acceptedIndex++]!);
+      // New objects throughout: adopter handlers legitimately return cached
+      // or frozen results (the standard idempotency-replay shape), and
+      // splicing into their array would corrupt the cache.
+      return withSyncAccountRows(result, combined);
+    },
+  };
+}
+
+/**
+ * Apply the upstream-managed account gate to the merged `sync_governance`
+ * handler (`resolution: 'derived'` only).
+ *
+ * Same reasoning as `sync_accounts`: the account reference travels inside
+ * the batch, so `accounts.resolve` never ran for it, and `sync_governance`
+ * writes the governance agent that authorizes spend on the account. Every
+ * entry is therefore verified against what the caller's credential can
+ * reach before the seller persists anything.
+ *
+ * Per-entry here (unlike `sync_accounts`) because the response row echoes
+ * the `account` reference — `sync-governance-response.json` needs no
+ * natural key — so a refusal is expressible without inventing one. Refused
+ * entries never reach the inner handler; their rows are spliced back at
+ * their original request indices.
+ */
+function guardDerivedSyncGovernance<TAccount>(
+  handlers: AccountHandlers<TAccount> | undefined,
+  platform: DecisioningPlatform<any, any>,
+  logger: AdcpLogger
+): AccountHandlers<TAccount> | undefined {
+  const inner = handlers?.syncGovernance;
+  if (handlers === undefined || inner === undefined) return handlers;
+  if (normalizeAccountResolution(platform.accounts.resolution) !== 'derived') return handlers;
+
+  return {
+    ...handlers,
+    syncGovernance: async (params, ctx) => {
+      const entries = (Array.isArray(params.accounts) ? params.accounts : []) as SyncGovernanceRequest['accounts'];
+      const resolveCtx = toResolveCtx(ctx, 'sync_governance', params as Record<string, unknown>);
+      const refusedRows = new Map<number, WireSyncGovernanceRow>();
+      const accepted: SyncGovernanceRequest['accounts'] = [];
+
+      for (const [index, entry] of entries.entries()) {
+        const ref = entry.account as AccountReference | undefined;
+        const accountId = refAccountId(ref);
+        // An entry claiming both arms is refused rather than resolved by
+        // precedence: we would verify the id while the adopter routes on the
+        // natural key (or vice versa). Same rule as `sync_accounts`.
+        if (accountId !== undefined && refHasNaturalKey(ref)) {
+          refusedRows.set(index, {
+            account: ref as WireSyncGovernanceRow['account'],
+            status: 'failed',
+            errors: [
+              new AdcpError('INVALID_REQUEST', {
+                message:
+                  `sync_governance entry ${index} carries both an account_id and a brand + operator natural ` +
+                  `key. Send exactly one — this agent addresses accounts by account_id.`,
+                recovery: 'correctable',
+                field: `accounts[${index}].account`,
+                suggestion: 'Drop the brand + operator fields and send account: { account_id }.',
+              }).toStructuredError(),
+            ],
+          });
+          continue;
+        }
+        if (accountId === undefined) {
+          refusedRows.set(index, {
+            account: ref as WireSyncGovernanceRow['account'],
+            status: 'failed',
+            errors: [
+              new AdcpError('INVALID_REQUEST', {
+                message:
+                  'This agent fronts an upstream-managed account namespace: accounts are addressed by ' +
+                  'account.account_id, not by the brand + operator natural key.',
+                recovery: 'correctable',
+                field: `accounts[${index}].account.brand`,
+                suggestion: 'Call list_accounts to discover the account_id, then send account: { account_id }.',
+              }).toStructuredError(),
+            ],
+          });
+          continue;
+        }
+        let resolved: Account | null = null;
+        try {
+          resolved = assertResolvedAccountMatchesRef(
+            platform.accounts.resolution,
+            { account_id: accountId },
+            await platform.accounts.resolve({ account_id: accountId }, resolveCtx),
+            logger
+          );
+        } catch (err) {
+          if (!(err instanceof AccountNotFoundError)) throw err;
+        }
+        if (resolved == null) {
+          refusedRows.set(index, {
+            account: ref as WireSyncGovernanceRow['account'],
+            status: 'failed',
+            errors: [
+              new AdcpError('ACCOUNT_NOT_FOUND', {
+                message: 'The specified account does not exist',
+                recovery: 'terminal',
+                field: `accounts[${index}].account.account_id`,
+                suggestion: 'Call list_accounts to discover the accounts your credential can reach.',
+              }).toStructuredError(),
+            ],
+          });
+          continue;
+        }
+        accepted.push(entry);
+      }
+
+      if (refusedRows.size === 0) return inner(params, ctx);
+      if (accepted.length === 0) {
+        return { accounts: entries.map((_entry, index) => refusedRows.get(index)!) } as Awaited<
+          ReturnType<NonNullable<AccountHandlers<TAccount>['syncGovernance']>>
+        >;
+      }
+
+      const result = await inner({ ...params, accounts: accepted } as typeof params, ctx);
+      const rows = readSyncAccountRows(result);
+      if (rows === undefined) {
+        if (isErrorShapedResult(result)) return result;
+        throw new Error(
+          'sync_governance: cannot apply the upstream-managed account gate — the handler returned no accounts[] ' +
+            'array to merge the per-entry refusal rows into.'
+        );
+      }
+      if (rows.length !== accepted.length) {
+        throw new Error(
+          `sync_governance: handler returned ${rows.length} row(s) for ${accepted.length} accepted entry/entries; ` +
+            'cannot realign the per-entry refusal rows with the request.'
+        );
+      }
+      let acceptedIndex = 0;
+      const combined = entries.map((_entry, index) => refusedRows.get(index) ?? rows[acceptedIndex++]!);
+      return withSyncAccountRows(result, combined);
+    },
+  };
+}
+
+/**
+ * Read the `accounts[]` row array off a `sync_accounts` handler result —
+ * either a bare result object or an MCP tool response carrying
+ * `structuredContent`.
+ */
+function readSyncAccountRows(result: unknown): readonly unknown[] | undefined {
+  if (!isPlainObject(result)) return undefined;
+  if (Array.isArray(result.accounts)) return result.accounts;
+  const structured = (result as { structuredContent?: unknown }).structuredContent;
+  if (isPlainObject(structured) && Array.isArray(structured.accounts)) return structured.accounts;
+  return undefined;
+}
+
+/** Rebuild a handler result with a replacement `accounts[]` array. */
+function withSyncAccountRows<T>(result: T, rows: readonly unknown[]): T {
+  if (!isPlainObject(result)) return result;
+  if (Array.isArray(result.accounts)) return { ...result, accounts: [...rows] } as T;
+  const structured = (result as { structuredContent?: unknown }).structuredContent;
+  if (isPlainObject(structured) && Array.isArray(structured.accounts)) {
+    return { ...result, structuredContent: { ...structured, accounts: [...rows] } } as T;
+  }
+  return result;
+}
+
+/** True when a handler result is already an error envelope. */
+function isErrorShapedResult(result: unknown): boolean {
+  if (!isPlainObject(result)) return false;
+  if (result.isError === true) return true;
+  if (result.adcp_error !== undefined) return true;
+  const structured = (result as { structuredContent?: unknown }).structuredContent;
+  return isPlainObject(structured) && structured.adcp_error !== undefined;
+}
+
 function failedSyncAccountRow(entry: SyncAccountsEntry, error: AdcpStructuredError): SyncAccountsResultRow {
   const key = entryBrandOperator(entry);
   if (key === undefined) {
@@ -7499,7 +8841,22 @@ function enforceSyncAccountsCommercialPolicy<P extends DecisioningPlatform<any, 
   const failedRows = new Map<number, SyncAccountsResultRow>();
   const acceptedEntries: SyncAccountsEntry[] = [];
 
+  const isUpstreamManagedNamespace = normalizeAccountResolution(platform.accounts.resolution) === 'derived';
+
   entries.forEach((entry, index) => {
+    // Account-model gate first: an entry is refused on its key shape
+    // regardless of whether its billing values would have passed. Per-entry
+    // (not operation-level) so a mixed batch still applies the entries the
+    // seller can honor, and evaluated here — inside the policy pass — so the
+    // `accounts[i]` pointers stay aligned with the buyer's request array.
+    if (isUpstreamManagedNamespace) {
+      const verdict = classifyUpstreamManagedSyncEntry(entry, index);
+      if (!verdict.accepted) {
+        failedRows.set(index, failedSyncAccountRow(entry, verdict.error));
+        return;
+      }
+    }
+
     const hasBillableFields =
       entry.billing !== undefined || entry.payment_terms !== undefined || entry.billing_entity !== undefined;
     if (hasBillableFields && entryBrandOperator(entry) === undefined && !entryHasAccountId(entry)) {
@@ -7558,7 +8915,8 @@ function enforceSyncAccountsCommercialPolicy<P extends DecisioningPlatform<any, 
 
 function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
   platform: P,
-  ctxFor: CtxForFn
+  ctxFor: CtxForFn,
+  logger: AdcpLogger = DEFAULT_FRAMEWORK_LOGGER
 ): AccountHandlers<Account> {
   const accounts = platform.accounts;
 
@@ -7578,6 +8936,9 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
     handlers.syncAccounts = async (params, ctx) => {
       const resolveCtx = toResolveCtx(ctx, 'sync_accounts', params);
       const policy = enforceSyncAccountsCommercialPolicy(platform, params as Record<string, unknown>, resolveCtx);
+      if (normalizeAccountResolution(accounts.resolution) === 'derived') {
+        await assertDerivedSyncAccountEntriesReachable(accounts, policy.acceptedEntries, resolveCtx, logger);
+      }
       const dispatchCtx =
         policy.failedRows.size === 0 ? resolveCtx : toResolveCtx(ctx, 'sync_accounts', policy.acceptedParams);
       return projectSync(
@@ -7596,7 +8957,10 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
             );
           }
           if (policy.failedRows.size === 0) {
-            return { accounts: rows.map(toWireSyncAccountRow) };
+            return {
+              ...(params.dry_run === true && { dry_run: true }),
+              accounts: rows.map(toWireSyncAccountRow),
+            };
           }
           const combined: SyncAccountsResultRow[] = [];
           let acceptedIndex = 0;
@@ -7610,7 +8974,10 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
               acceptedIndex += 1;
             }
           }
-          return { accounts: combined.map(toWireSyncAccountRow) };
+          return {
+            ...(params.dry_run === true && { dry_run: true }),
+            accounts: combined.map(toWireSyncAccountRow),
+          };
         }
       );
     };
@@ -7659,6 +9026,36 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
     };
   }
 
+  if (accounts.listChanges) {
+    handlers.listAccountChanges = async (params, ctx) => {
+      const request = params as ListAccountChangesRequest;
+      const resolveCtx = toResolveCtx(ctx, 'list_account_changes', params);
+      const accountRef = asValidatedDomainRequest<AccountReference>(params.account);
+      enforceAccountRefShapeForResolution(accounts.resolution, accountRef);
+      const resolved = assertResolvedAccountMatchesRef(
+        accounts.resolution,
+        accountRef,
+        await accounts.resolve(accountRef, resolveCtx),
+        logger
+      );
+      if (!resolved) {
+        const suggestion = accountNotFoundSuggestion(accounts.resolution);
+        throw new AdcpError('ACCOUNT_NOT_FOUND', {
+          message: 'Account not found',
+          recovery: 'terminal',
+          ...(suggestion !== undefined && { suggestion }),
+        });
+      }
+      const account = cloneAccountForRequest(resolved);
+      const toolCtx = { ...resolveCtx, account };
+      return projectSync(
+        () => accounts.listChanges!(request, toolCtx),
+        page => page,
+        accounts.refreshToken ? { account, fn: accounts.refreshToken.bind(accounts) } : undefined
+      );
+    };
+  }
+
   if (accounts.reportUsage) {
     handlers.reportUsage = async (params, ctx) => {
       const resolveCtx = toResolveCtx(ctx, 'report_usage', params);
@@ -7677,12 +9074,19 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
       // having to re-resolve from `params.account`.
       const resolveCtx = toResolveCtx(ctx, 'get_account_financials', params);
       const accountRef = asValidatedDomainRequest<AccountReference | undefined>(params.account);
-      refuseInlineAccountIdWhenForbidden(accounts.resolution, accountRef);
-      const resolved = await accounts.resolve(accountRef, resolveCtx);
+      enforceAccountRefShapeForResolution(accounts.resolution, accountRef);
+      const resolved = assertResolvedAccountMatchesRef(
+        accounts.resolution,
+        accountRef,
+        await accounts.resolve(accountRef, resolveCtx),
+        logger
+      );
       if (!resolved) {
+        const suggestion = accountNotFoundSuggestion(accounts.resolution);
         throw new AdcpError('ACCOUNT_NOT_FOUND', {
           message: 'Account not found',
           recovery: 'terminal',
+          ...(suggestion !== undefined && { suggestion }),
         });
       }
       // Request-local clone: refreshToken mutates account.authInfo before the
@@ -7711,13 +9115,9 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
 // when `ctx.account?.id` is absent — i.e., the framework didn't
 // pre-resolve the account on a custom dispatcher path).
 //
-// Write-side rationale: the adapter cannot reach the framework-resolved
-// `ctx.account.id` (the comply-controller's `ComplyControllerContext`
-// only exposes `{ input }`), and calling `platform.accounts.resolve`
-// here without `authInfo` would let a caller spoof `account.account_id`
-// and write into another tenant's resolved namespace. The architectural
-// fix (widen `ComplyControllerContext` to surface the resolved account)
-// is tracked at #1216 — until then, raw id is the secure choice.
+// Framework-managed writes and reads prefer `ctx.account.id`. This extractor
+// remains only for custom controller paths that cannot supply resolved
+// authority and therefore must stay in the caller-provided namespace.
 function readAutoSeedAccountId(input: Record<string, unknown>): string | undefined {
   const account = input.account;
   if (account == null || typeof account !== 'object') return undefined;

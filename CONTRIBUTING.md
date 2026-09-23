@@ -38,6 +38,10 @@ npm test
 npm run build
 ```
 
+If your change depends on schemas from an unreleased protocol pull request,
+follow [the immutable protocol bundle workflow](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/development/PROTOCOL-PR-BUNDLES.md)
+so local generation and CI use the same commit-addressed artifact.
+
 #### npm-only workspaces
 
 This repo is an npm workspace with two packages — the SDK at the root (`@adcp/sdk`) and the legacy-name compat shim under `packages/client-shim/` (`@adcp/client`). The root `package.json` lists `workspaces: [".", "packages/*"]`, with the leading `"."` so the shim can resolve the root package as a workspace member rather than reaching for the registry.
@@ -91,12 +95,34 @@ That `"."` entry is supported by **npm only** — pnpm rejects it, and Yarn beha
 # Run all tests
 npm test
 
-# Run specific test file
-npm test test/client.test.js
+# Run a specific test file
+npm run test:file -- test/client.test.js
+
+# Override the conservative local worker limit (default: 2; slow suite: 1)
+TEST_CONCURRENCY=4 npm test
 
 # Run tests with coverage
 npm run test:coverage
 ```
+
+The Node test runner otherwise derives concurrency from the machine CPU count. That is
+too aggressive on developer workstations because several test files launch their own
+TypeScript compiler or CLI subprocesses. The repository runner therefore caps local
+fast suites at two workers and runs the slow group serially. CI keeps its existing
+machine-derived concurrency and splits the fast suite into three shards. Those CI
+shards use per-file durations recorded by the latest successful `main` run and a
+deterministic longest-first assignment. A new or renamed test uses the median known
+duration; when no history is available, all files use an equal one-second weight.
+Pull requests may restore this history but cannot publish it, so untrusted or failed
+runs cannot poison future shard assignments. Each shard uploads its assignment
+manifest with the timing artifact for debugging.
+
+`npm test` and `npm run test:lib` build the library once before starting their test
+groups, then every test reads that completed `dist/` tree. Set `TEST_CONCURRENCY=1`
+for the lowest-impact local run. Run `npm run build:lib` before `npm run test:file`
+when library source has changed; focused tests intentionally skip the full pretest
+build for a faster edit-test loop. Do not rebuild `dist/` while another test process
+is reading it.
 
 #### Debugging a hung test
 
@@ -203,7 +229,9 @@ Your PR will be reviewed for:
 
 ✅ **Compatibility**
 
-- Works with Node.js >=20.0.0
+- Works with Node.js ^20.19.0 or >=22.12.0
+- The supported Node/Undici matrix is documented in
+  [`docs/guides/NODE-UNDICI-COMPATIBILITY.md`](./docs/guides/NODE-UNDICI-COMPATIBILITY.md).
 - Compatible with both CommonJS and ESM
 - No breaking changes without major version bump
 - Backward compatible when possible
@@ -240,6 +268,7 @@ When introducing support for a new AdCP specialism (`governance-spend-authority`
 ### 1. Mock-server with deterministic-seeded fixtures
 
 Add `src/lib/mock-server/<specialism>/`:
+
 - `server.ts` — boots an HTTP server that mirrors a real upstream's wire shape (GAM-shape for guaranteed, walled-garden CAPI-shape for social, etc.).
 - `seed-data.ts` — fixture state. Seeds must be **deterministic** so storyboard replay is stable. Brand names in seed data MUST be fictional (`acme-outdoor.example`, NOT `tiktok_test_*`).
 - Per-route traffic counters at `/_debug/traffic` for the façade gate.
@@ -251,6 +280,7 @@ Wire into `src/lib/mock-server/index.ts` `bootMockServer({specialism})`.
 `examples/hello_<role>_adapter_<specialism>.ts` — where `<role>` is the AdCP protocol layer (`seller` for `media-buy`, `creative` for `creative`, `signals` for `signals`, `governance` for `governance`, `brand` for `brand`) and `<specialism>` is the part of the specialism name AFTER the role-implied prefix (so `creative-template` → `_template`, `sales-guaranteed` → `_guaranteed`).
 
 The adapter:
+
 - Wraps the mock-server upstream via `createUpstreamHttpClient`.
 - Implements the typed platform interface(s) for the specialism (per `RequiredPlatformsFor<S>`).
 - Marks every upstream call with a `// SWAP:` comment — the seam adopters replace.
@@ -262,6 +292,7 @@ The adapter:
 `test/examples/hello-<role>-adapter-<specialism>.test.js` using the `runHelloAdapterGates()` helper from `test/examples/_helpers/`.
 
 Three gates per [`docs/guides/EXAMPLE-TEST-CONTRACT.md`](docs/guides/EXAMPLE-TEST-CONTRACT.md):
+
 1. **Strict tsc** — `--strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --noPropertyAccessFromIndexSignature` + 2 other hardening flags.
 2. **Storyboard runner** — zero failed steps against the published storyboard.
 3. **Façade gate** — every expected upstream route shows ≥1 hit at `/_debug/traffic` after the run.
@@ -271,6 +302,7 @@ Each gate fires for a distinct regression class. **Adversarially validate** by s
 ### 4. Skill update — fork-target pointer, NOT inline pattern
 
 Update the per-specialism skill file (`skills/build-<role>-agent/SKILL.md` or `skills/build-<role>-agent/specialisms/<specialism>.md`) to:
+
 - Open with a "**Fork target**: `examples/hello_<role>_adapter_<specialism>.ts`" pointer.
 - Cover only this-specialism deltas: what's different from the role's baseline, which `RequiredPlatformsFor<S>` slot it fills, this-specialism storyboard's specific assertions.
 - NOT teach the wire pattern inline. The example does that.
@@ -382,7 +414,7 @@ const agent = { agent_uri: 'https://hardcoded.example.com' };
 - **Discord**: Join our [Discord server](https://discord.gg/adcp) for real-time help
 - **Issues**: Use GitHub issues for bugs and feature requests
 - **Email**: Contact maintainers at [maintainers@adcontextprotocol.org](mailto:maintainers@adcontextprotocol.org)
-- **Documentation**: Check the [API docs](./API.md) and [examples](./examples/)
+- **Documentation**: Check the [API docs](https://adcontextprotocol.github.io/adcp-client/api/) and [examples](./examples/)
 
 ## Code of Conduct
 

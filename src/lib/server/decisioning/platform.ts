@@ -33,6 +33,7 @@ import type { CampaignGovernancePlatform } from './specialisms/campaign-governan
 import type { ContentStandardsPlatform } from './specialisms/content-standards';
 import type { BrandRightsPlatform } from './specialisms/brand-rights';
 import type { PropertyListsPlatform, CollectionListsPlatform } from './specialisms/lists';
+import type { ReliableReportingPlatform } from './specialisms/reporting';
 import type { AdCPSpecialism } from '../../types/tools.generated';
 
 /**
@@ -236,6 +237,8 @@ export interface DecisioningPlatform<TConfig = unknown, TCtxMeta = Record<string
   creative?: CreativeBuilderPlatform<TCtxMeta> | CreativeAdServerPlatform<TCtxMeta>;
   audiences?: AudiencePlatform<TCtxMeta>;
   signals?: SignalsPlatform<TCtxMeta>;
+  /** Reliable Reporting Core lifecycle, normally installed by `createReliableReportingService`. */
+  reporting?: ReliableReportingPlatform<TCtxMeta>;
   /**
    * Sponsored Intelligence implementation. In AdCP 3.1 this field is required
    * when the agent claims the `sponsored-intelligence` specialism. The
@@ -308,9 +311,11 @@ export interface DecisioningPlatform<TConfig = unknown, TCtxMeta = Record<string
 //  - **Proposal mode** is a hybrid — only `getProducts` is required; the rest
 //    of the lifecycle flows through notification channels.
 //
-// Wired per the AdCP 3.0 GA enum; preview specialisms (sales-streaming-tv,
+// Wired per the AdCP enum. `sales-dooh` (AdCP 3.1.19, adcp#6619) is a
+// non-guaranteed channel profile over the ordinary media-buy lifecycle, so it
+// shares the core requirement. Preview specialisms (sales-streaming-tv,
 // sales-exchange, sales-retail-media) get added when they land in spec.
-type SalesCoreSpecialism = 'sales-non-guaranteed' | 'sales-guaranteed' | 'sales-broadcast-tv';
+type SalesCoreSpecialism = 'sales-non-guaranteed' | 'sales-guaranteed' | 'sales-broadcast-tv' | 'sales-dooh';
 type SalesCatalogSpecialism = 'sales-catalog-driven';
 type SalesIngestionSpecialism = 'sales-social';
 type SalesProposalSpecialism = 'sales-proposal-mode';

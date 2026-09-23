@@ -60,6 +60,7 @@ import type {
   ServerPayload,
   CheckGovernancePayload,
   GetSignalsHandlerResult,
+  ExternalTaskHandoffContext,
 } from './index';
 import type { OperationalContext, OperationalPlatform } from '../operational-platform';
 import {
@@ -72,10 +73,13 @@ import {
   defineAudiencePlatform,
   defineSignalsPlatform,
   definePlatformWithCompliance,
+  createAdcpServerFromPlatform,
+  createTenantRegistry,
 } from './index';
 import type { ComplyControllerConfig } from '../../testing/comply-controller';
 import type { CanonicalListCreativesResponse } from '../../v2/projection/creative-delivery';
 import type { PostalArea } from '../../types/core.generated';
+import type { BuildCreativeVariantSuccess, TransformerParam } from '../../types/tools.generated';
 import { getAccountMode } from '../account-mode';
 
 // ── AdcpError construction ────────────────────────────────────────────
@@ -213,6 +217,101 @@ function _account_typed_meta_rejects_wrong_field(account: Account<GAMAccountMeta
   return account.ctx_metadata.googleAdvertiserId;
 }
 
+const _mixed_generic_platform = {
+  capabilities: { specialisms: ['sales-non-guaranteed'] as const, config: {} },
+  accounts: {
+    resolve: async (): Promise<Account<GAMAccountMeta>> => ({
+      id: 'acct-typed',
+      name: 'Typed account',
+      status: 'active',
+      ctx_metadata: { networkId: 'network-1', advertiserId: 'advertiser-1' },
+    }),
+  },
+  sales: {
+    getProducts: async (_request, ctx) => {
+      const advertiserId: string = ctx.account.ctx_metadata.advertiserId;
+      void advertiserId;
+      return { products: [], cache_scope: 'account' as const };
+    },
+    createMediaBuy: async () => ({ media_buy_id: 'mb-typed', confirmed_at: null, revision: 1, packages: [] }),
+    updateMediaBuy: async () => ({ media_buy_id: 'mb-typed', revision: 2 }),
+    getMediaBuys: async () => ({ media_buys: [] }),
+    getMediaBuyDelivery: async () => ({
+      reporting_period: { start: '2026-01-01', end: '2026-01-02' },
+      currency: 'USD',
+      media_buy_deliveries: [],
+    }),
+  },
+} satisfies DecisioningPlatform<unknown, GAMAccountMeta>;
+
+// Gradual migration keeps the platform's resolved account type in raw
+// legacy handler groups as well as native platform methods.
+createAdcpServerFromPlatform(_mixed_generic_platform, {
+  name: 'typed-mixed-migration',
+  version: '1.0.0',
+  legacyHandlers: {
+    mediaBuy: {
+      getMediaBuys: async (_req, ctx) => {
+        const networkId: string = ctx.account!.ctx_metadata.networkId;
+        void networkId;
+        return { media_buys: [] };
+      },
+    },
+  },
+});
+
+const _legacy_only_generic_platform: DecisioningPlatform<unknown, GAMAccountMeta> = {
+  capabilities: { specialisms: [] as const, config: {} },
+  accounts: _mixed_generic_platform.accounts,
+  statusMappers: {},
+};
+
+createAdcpServerFromPlatform(_legacy_only_generic_platform, {
+  name: 'typed-legacy-only-migration',
+  version: '1.0.0',
+  legacyHandlers: {
+    mediaBuy: {
+      getMediaBuys: async (_req, ctx) => {
+        const advertiserId: string = ctx.account!.ctx_metadata.advertiserId;
+        void advertiserId;
+        return { media_buys: [] };
+      },
+    },
+  },
+});
+
+const _typed_tenant_registry = createTenantRegistry<Account<GAMAccountMeta>>({
+  defaultServerOptions: {
+    name: 'typed-tenant-registry',
+    version: '1.0.0',
+    legacyHandlers: {
+      mediaBuy: {
+        getMediaBuys: async (_req, ctx) => {
+          const networkId: string = ctx.account!.ctx_metadata.networkId;
+          void networkId;
+          return { media_buys: [] };
+        },
+      },
+    },
+  },
+});
+
+_typed_tenant_registry.register('typed-tenant', {
+  agentUrl: 'https://typed-tenant.example',
+  platform: _mixed_generic_platform,
+  serverOptions: {
+    legacyHandlers: {
+      signals: {
+        getSignals: async (_req, ctx) => {
+          const advertiserId: string = ctx.account!.ctx_metadata.advertiserId;
+          void advertiserId;
+          return { signals: [] };
+        },
+      },
+    },
+  },
+});
+
 // ── refreshToken hook receives Account<TCtxMeta> typed (#1168) ───────────
 
 // Adopter declares an AccountStore for their typed metadata. The
@@ -241,7 +340,7 @@ function _account_not_found_throw_pattern(): Promise<Account<GAMAccountMeta> | n
   throw new AccountNotFoundError();
 }
 
-// ── AccountStore.resolution is 'explicit' | 'implicit' (or absent) ────
+// ── AccountStore.resolution modes ────────────────────────────────────
 
 function _account_store_resolution_implicit(): Pick<AccountStore<GAMAccountMeta>, 'resolution'> {
   return { resolution: 'implicit' };
@@ -254,6 +353,14 @@ function _account_store_resolution_derived(): Pick<AccountStore<GAMAccountMeta>,
 function _account_store_resolution_invalid_value(): Pick<AccountStore<GAMAccountMeta>, 'resolution'> {
   // @ts-expect-error — only 'explicit' | 'implicit' | 'derived' allowed.
   return { resolution: 'auto' };
+}
+
+function _account_store_resolution_rejects_namespace_aliases(): Pick<AccountStore<GAMAccountMeta>, 'resolution'> {
+  // @ts-expect-error — 'derived' has exactly one spelling. No
+  // 'account-id-namespace' (it doesn't discriminate 'explicit' from
+  // 'derived') and no 'upstream-managed' (a second spelling silently
+  // defeats adopter `resolution === 'derived'` comparisons).
+  return { resolution: 'upstream-managed' };
 }
 
 // ── Signals-only platforms omit media-buy fields ─────────────────────
@@ -488,7 +595,8 @@ function _sales_platform_payload_returns_do_not_require_protocol_status() {
 function _sales_platform_handler_results_accept_task_handoff() {
   const sales: SalesCorePlatform<_SocialMeta> & SalesIngestionPlatform<_SocialMeta> = {
     getProducts: async (_req, ctx) => ctx.handoffToTask(async () => ({ products: [], cache_scope: 'account' })),
-    createMediaBuy: async (_req, ctx) => ctx.handoffToTask(async () => _createBuyPayload()),
+    createMediaBuy: async (_req, ctx) =>
+      ctx.handoffToTask(async taskCtx => taskCtx.reject(_createBuyPayload(), 'Business approval declined')),
     updateMediaBuy: async (_buyId, _patch, ctx) => ctx.handoffToTask(async () => _updateBuyPayload()),
     getMediaBuyDelivery: async () => ({
       reporting_period: { start: '2026-01-01', end: '2026-01-31' },
@@ -507,6 +615,37 @@ function _sales_platform_handler_results_accept_task_handoff() {
   void updateResult;
   void syncResult;
   return sales;
+}
+
+function _sales_platform_handler_results_accept_external_task_handoff() {
+  const sales: SalesCorePlatform<_SocialMeta> & SalesIngestionPlatform<_SocialMeta> = {
+    getProducts: async (_req, ctx) =>
+      ctx.handoffToTask(
+        async taskCtx => {
+          void taskCtx.taskRef;
+          // @ts-expect-error the external overload must not expose in-process rejection
+          taskCtx.reject({ decision: 'declined' }, 'External producer cannot settle');
+        },
+        { settlement: 'external' }
+      ),
+    createMediaBuy: async (_req, ctx) =>
+      ctx.handoffToTask(async taskCtx => void taskCtx.taskRef, { settlement: 'external' }),
+    updateMediaBuy: async (_buyId, _patch, ctx) =>
+      ctx.handoffToTask(async taskCtx => void taskCtx.taskRef, { settlement: 'external' }),
+    getMediaBuyDelivery: async () => ({
+      reporting_period: { start: '2026-01-01', end: '2026-01-31' },
+      media_buy_deliveries: [],
+    }),
+    getMediaBuys: async () => ({ media_buys: [] }),
+    syncCreatives: async (_creatives, ctx) =>
+      ctx.handoffToTask(async taskCtx => void taskCtx.taskRef, { settlement: 'external' }),
+  };
+  return sales;
+}
+
+function _external_handoff_context_cannot_reject(taskCtx: ExternalTaskHandoffContext) {
+  // @ts-expect-error external settlement must be performed by a trusted worker
+  taskCtx.reject({ decision: 'declined' }, 'External producer cannot settle');
 }
 
 function _get_products_handler_accepts_sdk_owned_response_summary() {
@@ -837,12 +976,17 @@ function _define_platform_with_compliance_rejects_missing_ct() {
 
 // Positive: RequiredOptsFor resolves to base options when P has no compliance_testing.
 type _opts_no_ct = RequiredOptsFor<_PlatformBase>;
-const _check_opts_no_ct: _opts_no_ct extends CreateAdcpServerFromPlatformOptions ? true : false = true;
+const _check_opts_no_ct: _opts_no_ct extends CreateAdcpServerFromPlatformOptions<Account<Record<string, unknown>>>
+  ? true
+  : false = true;
 
 const _explicit_legacy_handler_options: CreateAdcpServerFromPlatformOptions = {
   name: 'legacy-handler-fixture',
   version: '1.0.0',
-  legacyHandlers: { mediaBuy: {} },
+  legacyHandlers: {
+    mediaBuy: {},
+    signals: { getSignals: async () => ({ signals: [] }) },
+  },
 };
 const _primary_looking_raw_handler_options: CreateAdcpServerFromPlatformOptions = {
   name: 'raw-handler-fixture',
@@ -1085,8 +1229,30 @@ function _build_creative_return_factories_pin_arm(): void {
   const enveloped = buildCreativeReturn.singleEnveloped({ manifest: m, sandbox: true });
   void bare;
   void enveloped;
+  const variants: BuildCreativeVariantSuccess = {} as BuildCreativeVariantSuccess;
+  const variantEnvelope = buildCreativeReturn.variantEnveloped(variants);
+  void variantEnvelope;
   // @ts-expect-error — `creative_manifest` is the wire field, not the helper input.
   singleEnvelopedBuildCreativeReturn({ creative_manifest: m });
+}
+
+function _transformer_param_accepts_json_values(): void {
+  const param: TransformerParam = {
+    field: 'voice',
+    type: 'string',
+    value_source: 'enumerable',
+    default: null,
+    options: [{ value: ['voice-a', { locale: 'en-GB', weight: 1 }, true, null] }],
+  };
+  void param;
+  const invalid: TransformerParam = {
+    field: 'voice',
+    type: 'string',
+    value_source: 'enumerable',
+    // @ts-expect-error — functions are JavaScript values, not JSON values.
+    default: () => true,
+  };
+  void invalid;
 }
 
 function _media_buy_delivery_notification_factories_inject_discriminator(): void {

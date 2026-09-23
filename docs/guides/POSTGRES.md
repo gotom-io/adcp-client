@@ -12,9 +12,16 @@ When you wire `pool` on `createAdcpServerFromPlatform`, the framework creates an
 | `adcp_ctx_metadata` | Adapter-internal state round-trip cache | Lifetime of referenced resource (often months) | Bounded by your active product / media-buy / creative count |
 | `adcp_decisioning_tasks` | HITL task lifecycle (submitted → working → completed/failed) | Until terminal + manual cleanup | Bounded by HITL request volume |
 
-**Run `getAllAdcpMigrations()` once per database at deploy time.** Idempotent: safe to re-run on every boot.
+**Use `getAllAdcpMigrations({ taskRegistryNamespace })` only to bootstrap new framework tables.** The namespace must be stable and unique per hosted tenant. Re-running the bootstrap against an already-current schema is harmless, but it does not upgrade a populated legacy task registry. Use the explicit operator runbook below for that cutover.
 
-`getAllAdcpMigrations()` installs one default idempotency table. The official
+If out-of-process workers will settle scoped task refs after restart, also set
+`taskRegistryStorageId` on the `pool` shortcut (or `storageId` on
+`createPostgresTaskRegistry`). It must be a stable, non-secret identifier that
+is unique to the physical database/schema and environment. The SDK combines it
+with table and namespace in the serialized handle; without it, strict worker
+settlement fails closed while ordinary registry access remains compatible.
+
+`getAllAdcpMigrations({ taskRegistryNamespace })` installs one default idempotency table. The official
 `serve()` path automatically includes its canonical, server-controlled host in
 every resolved idempotency principal, so multiple hosted agents remain isolated
 when they share that table. Low-level integrations that do not enter through
@@ -87,13 +94,15 @@ CREATE INDEX idx_adcp_ctx_metadata_expires_at
 
 ### `adcp_decisioning_tasks`
 
-This DDL is returned by `getDecisioningTaskRegistryMigration()` (exported from `@adcp/sdk/server/decisioning`). Call `await pool.query(getDecisioningTaskRegistryMigration())` once at boot — it is idempotent (`CREATE TABLE IF NOT EXISTS`). Pass `{ tableName: 'your_tasks' }` to override the default `adcp_decisioning_tasks` name; constraint and index names derive from the table name automatically. Use `getAllAdcpMigrations()` from `@adcp/sdk/server` when you want one call to install all three SDK tables at once.
+This bootstrap DDL is returned by `getDecisioningTaskRegistryBootstrap()` (exported from `@adcp/sdk/server`). Run it while provisioning a new/empty database, using the same stable trusted namespace passed to the registry. Pass `{ tableName: 'your_tasks', namespace: taskRegistryNamespace }` to override the default table name. Use `getAllAdcpMigrations({ taskRegistryNamespace })` from `@adcp/sdk/server` when provisioning all three SDK tables at once. The deprecated `getDecisioningTaskRegistryMigration()` now throws so a populated legacy table cannot appear successfully migrated; choose bootstrap or the phased upgrade explicitly.
 
 ```sql
 CREATE TABLE adcp_decisioning_tasks (
-  task_id        TEXT PRIMARY KEY,
+  registry_namespace TEXT NOT NULL,
+  task_id        TEXT NOT NULL,
   tool           TEXT NOT NULL,
   account_id     TEXT NOT NULL,
+  owner_scope    TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'submitted',
   status_message TEXT,
   result         JSONB,
@@ -103,21 +112,48 @@ CREATE TABLE adcp_decisioning_tasks (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT adcp_decisioning_tasks_valid_status CHECK (
-    status IN ('submitted', 'working', 'completed', 'failed')
-  )
+    status IN (
+      'submitted', 'working', 'input-required', 'completed', 'canceled',
+      'failed', 'rejected', 'auth-required', 'unknown'
+    )
+  ),
+  PRIMARY KEY (registry_namespace, account_id, owner_scope, task_id)
 );
 CREATE INDEX idx_adcp_decisioning_tasks_account_id ON adcp_decisioning_tasks(account_id);
 CREATE INDEX idx_adcp_decisioning_tasks_status_created ON adcp_decisioning_tasks(status, created_at);
 ```
 
-The four-value status constraint is intentionally narrow. The five additional spec-defined states (`input-required`, `canceled`, `rejected`, `auth-required`, `unknown`) are reserved for adopter-emitted transitions via a forthcoming `taskRegistry.transition()` API; a migration will widen this constraint when that API ships.
+The status constraint admits all nine AdCP `TaskStatus` values. Built-in registries write `submitted`, `working`, `completed`, `failed`, and the business-decision terminal state `rejected`; custom registries can persist the remaining spec states.
 
-- **PK on `task_id`** — primary lookup path.
-- **Index on `account_id`** — tenant-scoped reads (`getTaskState(taskId, expectedAccountId)` and ops queries).
+- **Composite PK on registry namespace, account, owner, and task ID** — prevents task identifiers from crossing hosted-tenant, account, or authenticated-principal boundaries.
+- **Index on `account_id`** — tenant-scoped operational queries.
 - **Index on `(status, created_at)`** — "pending tasks oldest first" queue queries for cron / monitoring.
-- **CHECK constraint on status** — guards against invalid transitions writing bad rows.
+- **CHECK constraint on status** — guards against invalid status writes while preserving the full AdCP enum.
 
-**Sizing.** Bounded by HITL traffic. Tasks accumulate forever unless adopter prunes — the SDK doesn't auto-delete completed tasks. Run a periodic `DELETE FROM adcp_decisioning_tasks WHERE status IN ('completed', 'failed') AND updated_at < NOW() - INTERVAL '30 days'`.
+**Sizing.** Bounded by HITL traffic. Tasks accumulate forever unless adopter prunes — the SDK doesn't auto-delete completed tasks. Run a periodic `DELETE FROM adcp_decisioning_tasks WHERE status IN ('completed', 'failed', 'rejected') AND updated_at < NOW() - INTERVAL '30 days'`.
+
+### Widening the status CHECK on an existing scoped table
+
+Existing tables bootstrapped by earlier SDK versions reject `rejected` rows. Before deploying `reject()` or `rejectScopedPushTask()`, run the idempotent operator migration once against the same table:
+
+```ts
+await pool.query(getDecisioningTaskRegistryStatusWidenV61Migration({
+  tableName: 'adcp_decisioning_tasks',
+  lockTimeoutMs: 5_000,
+  statementTimeoutMs: 30_000,
+}));
+```
+
+The helper replaces only the named status CHECK with the full nine-value enum; it does not rewrite rows. It uses a transaction-scoped advisory lock plus bounded lock and statement timeouts, and is safe to rerun after a successful or interrupted attempt. `ALTER TABLE` needs an `ACCESS EXCLUSIVE` lock, so run it outside application boot during a brief maintenance window: it can block reads and writers until commit, and it fails rather than waiting indefinitely when `lockTimeoutMs` elapses.
+
+### Upgrading a populated pre-scope task table
+
+Do not run primary-key replacement in application startup. Generate the phased
+`getDecisioningTaskRegistryScopeV1Upgrade({ namespace })` plan and follow
+[`migration-task-registry-scoping.md`](../migration-task-registry-scoping.md#populated-postgresql-upgrade).
+The runbook covers preflight queries, old/new deployment order, bounded lock and
+statement timeouts, concurrent index construction, the brief locking cutover,
+interruption recovery, ambiguous tenant ownership, and rollback limits.
 
 ## Connection pool sizing
 
@@ -138,11 +174,13 @@ Each request does at most 2 PG queries (idempotency check + write). HITL request
 pool.on('error', (err) => console.error('pg pool error', err));
 ```
 
-The framework's PG backends issue zero-row shape probes via `probe()` to
-surface bad credentials and stale migrations at boot rather than on the first
-mutating request. The idempotency probe names every runtime-required column,
-including `retain_until`; a reachable table with an older column shape therefore
-fails readiness instead of advertising idempotency that cannot be persisted.
+The idempotency and context-metadata PG backends expose zero-row shape probes via
+`probe()` to surface bad credentials and stale migrations at boot rather than on
+the first mutating request. The idempotency probe names every runtime-required
+column, including `retain_until`; a reachable table with an older column shape
+therefore fails readiness instead of advertising idempotency that cannot be
+persisted. Run the decisioning task-registry migration plan's `verifySql` during
+deployment; `TaskRegistry` does not expose a boot-time probe.
 
 ## Statement timeout
 

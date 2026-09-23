@@ -181,6 +181,13 @@ describe('Storyboard.requires gate (#1626)', () => {
   });
 
   test('requires: [multi_agent] stays unmet when routes resolve to one distinct key', async () => {
+    // Topology is statically determined from the `agents` map plus the
+    // storyboard's declared route keys, so this storyboard — which authors no
+    // root capability predicate — is gated BEFORE discovery and reports the
+    // requirement rather than an unreachable-route failure. Storyboards that
+    // do author a capability predicate defer the gate until after discovery,
+    // per AdCP 3.2's applicability order; that case is covered in
+    // `storyboard-capability-rollup.test.js`.
     const sb = buildStoryboard({
       requires: ['multi_agent'],
       phases: [
@@ -206,6 +213,25 @@ describe('Storyboard.requires gate (#1626)', () => {
     assert.equal(step.skip.requirement, 'multi_agent');
     assert.match(step.skip.detail, /Resolved route keys: \[sales\]/);
     assert.match(step.skip.detail, /Available agents: \[sales, signals\]/);
+    // Unreachable routes are never dialed: the gate precedes discovery.
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.overall_passed, true);
+  });
+
+  test('requires: [multi_agent] with a one-agent map and an unreachable route stays a neutral skip', async () => {
+    const sb = buildStoryboard({ requires: ['multi_agent'] });
+    const result = await runStoryboard('', sb, {
+      allow_http: true,
+      agents: { sales: { url: 'http://127.0.0.1:1/sales/mcp' } },
+      default_agent: 'sales',
+    });
+
+    const step = result.phases[0].steps[0];
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'requirement_unmet');
+    assert.equal(step.skip.requirement, 'multi_agent');
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.overall_passed, true);
   });
 
   test('multiple requires: first unmet wins', async () => {
@@ -221,7 +247,7 @@ describe('Storyboard.requires gate (#1626)', () => {
     assert.equal(step.skip.requirement, 'controller', 'first unmet requirement is reported');
   });
 
-  test('mixed requires: multi_agent passes through to controller gate', async () => {
+  test('mixed requires: routed controller availability must be discovered despite caller agentTools', async () => {
     const sb = buildStoryboard({
       requires: ['multi_agent', 'controller'],
       phases: [
@@ -243,8 +269,10 @@ describe('Storyboard.requires gate (#1626)', () => {
     });
 
     const step = result.phases[0].steps[0];
-    assert.equal(step.skip_reason, 'missing_test_controller');
-    assert.equal(step.skip.requirement, 'controller');
+    assert.equal(step.passed, false);
+    assert.equal(step.skipped, false);
+    assert.equal(result.overall_passed, false);
+    assert.match(step.error, /discovery failed/i);
   });
 
   test('unknown requires values load and skip with requirement_unmet at runtime', async () => {
@@ -1117,5 +1145,186 @@ describe('Storyboard.required_any_of_tools gate (#1642)', () => {
       () => validateStoryboardShape(buildStoryboard({ required_any_of_tools: [{ tools: ['sync_accounts'] }] })),
       /must list at least two tool names/
     );
+  });
+});
+
+describe('StoryboardStep.requires_contract ordinary-task gate (#2755)', () => {
+  const contract = 'signed_responses_runner';
+  const tools = ['get_adcp_capabilities', 'comply_test_controller'];
+  const storyboard = buildStoryboard({
+    phases: [
+      {
+        id: 'contract_vectors',
+        title: 'Contract vectors',
+        steps: [
+          {
+            id: 'vector_one',
+            title: 'First controller vector',
+            task: 'comply_test_controller',
+            stateful: true,
+            requires_contract: contract,
+            sample_request: { scenario: 'signed_response_vector_one' },
+            validations: [],
+          },
+          {
+            id: 'vector_two',
+            title: 'Dependent controller vector',
+            task: 'comply_test_controller',
+            stateful: true,
+            requires_contract: contract,
+            sample_request: { scenario: 'signed_response_vector_two' },
+            validations: [],
+          },
+        ],
+      },
+    ],
+  });
+
+  function options(calls, contracts) {
+    return {
+      _profile: { name: 'contract-gate-stub', tools, raw_capabilities: {} },
+      agentTools: tools,
+      contracts,
+      _client: {
+        executeTask: async (task, params) => {
+          calls.push({ task, params });
+          return { success: true, data: { status: 'completed', success: true } };
+        },
+      },
+    };
+  }
+
+  test('skips every gated ordinary task without dispatch when the contract is absent', async () => {
+    const calls = [];
+    const result = await runStoryboard('https://contract-gate.example/mcp', storyboard, options(calls, []));
+
+    assert.deepStrictEqual(calls, [], 'no ordinary tool may dispatch outside its declared contract');
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.skipped_count, 2);
+    for (const step of result.phases[0].steps) {
+      assert.equal(step.passed, true);
+      assert.equal(step.skipped, true);
+      assert.equal(step.skip_reason, 'missing_test_kit_contract');
+      assert.equal(step.skip.reason, 'unsatisfied_contract');
+      assert.notEqual(step.skip_reason, 'prerequisite_failed');
+    }
+  });
+
+  test('dispatches gated ordinary tasks when the contract is present', async () => {
+    const calls = [];
+    const result = await runStoryboard('https://contract-gate.example/mcp', storyboard, options(calls, [contract]));
+
+    assert.deepStrictEqual(
+      calls.map(call => call.task),
+      ['comply_test_controller', 'comply_test_controller']
+    );
+    assert.equal(result.overall_passed, true, JSON.stringify(result));
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.skipped_count, 0);
+    assert.equal(result.passed_count, 2);
+  });
+});
+
+describe('parallel_dispatch_runner missing-contract grading (#2859)', () => {
+  const tools = ['get_adcp_capabilities', 'create_media_buy'];
+  const storyboard = buildStoryboard({
+    phases: [
+      {
+        id: 'parallel_dispatch',
+        title: 'Parallel dispatch',
+        steps: [
+          {
+            id: 'concurrent_create',
+            title: 'Create concurrently',
+            task: 'create_media_buy',
+            requires_contract: 'parallel_dispatch_runner',
+            sample_request: { idempotency_key: 'parallel-dispatch-regression-key' },
+            parallel_dispatch: {
+              count: 2,
+              mode: 'process_local',
+              same_idempotency_key: true,
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  function options(calls) {
+    return {
+      _profile: { name: 'parallel-dispatch-stub', tools, raw_capabilities: {} },
+      agentTools: tools,
+      contracts: [],
+      _client: {
+        executeTask: async (task, params) => {
+          calls.push({ task, params });
+          return { success: true, data: { status: 'completed' } };
+        },
+      },
+    };
+  }
+
+  function assertCanonicalNotApplicable(step) {
+    assert.equal(step.passed, true);
+    assert.equal(step.skipped, true);
+    assert.equal(step.skip_reason, 'not_applicable');
+    assert.equal(step.skip.reason, 'not_applicable');
+    assert.notEqual(step.skip.reason, 'unsatisfied_contract');
+  }
+
+  test('full runner records a canonical not_applicable skip without dispatch', async () => {
+    const calls = [];
+    const result = await runStoryboard('https://parallel-dispatch.example/mcp', storyboard, options(calls));
+
+    assert.deepStrictEqual(calls, [], 'missing contract must prevent parallel dispatch');
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.skipped_count, 1);
+    assertCanonicalNotApplicable(result.phases[0].steps[0]);
+  });
+
+  test('mixed non-failing contract skips keep a required phase passing', async () => {
+    const calls = [];
+    const mixedStoryboard = buildStoryboard({
+      phases: [
+        {
+          id: 'mixed_contract_skips',
+          title: 'Mixed contract skips',
+          steps: [
+            storyboard.phases[0].steps[0],
+            {
+              id: 'signed_response_probe',
+              title: 'Probe signed response',
+              task: 'create_media_buy',
+              requires_contract: 'signed_responses_runner',
+              sample_request: { idempotency_key: 'signed-response-regression-key' },
+            },
+          ],
+        },
+      ],
+    });
+    const result = await runStoryboard('https://parallel-dispatch.example/mcp', mixedStoryboard, options(calls));
+
+    assert.deepStrictEqual(calls, [], 'missing contracts must prevent every dispatch');
+    assert.equal(result.overall_passed, true);
+    assert.equal(result.failed_count, 0);
+    assert.equal(result.skipped_count, 2);
+    assertCanonicalNotApplicable(result.phases[0].steps[0]);
+    assert.equal(result.phases[0].steps[1].skip_reason, 'missing_test_kit_contract');
+    assert.equal(result.phases[0].steps[1].skip.reason, 'unsatisfied_contract');
+  });
+
+  test('standalone runner records the same canonical skip without dispatch', async () => {
+    const calls = [];
+    const result = await runStoryboardStep(
+      'https://parallel-dispatch.example/mcp',
+      storyboard,
+      'concurrent_create',
+      options(calls)
+    );
+
+    assert.deepStrictEqual(calls, [], 'missing contract must prevent parallel dispatch');
+    assertCanonicalNotApplicable(result);
   });
 });

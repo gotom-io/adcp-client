@@ -48,6 +48,7 @@ function run(cmd, args, options = {}) {
 }
 
 const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+const undiciOverride = process.env.ADCP_UNDICI_OVERRIDE;
 
 // Pin every REQUIRED peer to its floor, so the smoke test resolves the exact
 // minimums the export map promises — not whatever higher version npm would
@@ -68,7 +69,21 @@ try {
   // never walks up into the repo's workspace.
   writeFileSync(
     path.join(tmpDir, 'package.json'),
-    JSON.stringify({ name: 'adcp-verify-consumer', version: '1.0.0', private: true }, null, 2)
+    JSON.stringify(
+      {
+        name: 'adcp-verify-consumer',
+        version: '1.0.0',
+        private: true,
+        ...(undiciOverride
+          ? {
+              dependencies: { undici: undiciOverride },
+              overrides: { undici: '$undici' },
+            }
+          : {}),
+      },
+      null,
+      2
+    )
   );
 
   console.log('📏 Auditing publish size...');
@@ -125,7 +140,10 @@ try {
   const requiredGuides = [
     'package/docs/migration-12-to-14.md',
     'package/docs/migration-13-to-14.md',
+    'package/docs/migration-14.x-rc-worksheet.md',
     'package/docs/migration-12-to-13.md',
+    'package/docs/guides/PROPOSAL-TERMS-VERIFICATION.md',
+    'package/docs/guides/EXISTING-PLATFORM.md',
     'package/MIGRATION-v8.md',
   ];
   for (const guide of requiredGuides) {
@@ -140,12 +158,24 @@ try {
   }
   console.log('   migration guides referenced by README are present');
 
-  const runtimeFloors = ['tldts@7.0.0'];
+  const runtimeFloors = [
+    'tldts@7.0.0',
+    '@types/express@5.0.3',
+    `undici@${undiciOverride ?? rangeFloor(pkg.dependencies.undici)}`,
+  ];
   console.log(`📥 Installing tarball + runtime/peer floors:\n   ${[...runtimeFloors, ...peerFloors].join('\n   ')}`);
   run('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', tarballPath, ...runtimeFloors, ...peerFloors], {
     cwd: tmpDir,
     stdio: 'inherit',
   });
+  const installedUndiciVersion = JSON.parse(
+    readFileSync(path.join(tmpDir, 'node_modules', 'undici', 'package.json'), 'utf8')
+  ).version;
+  const expectedUndiciVersion = undiciOverride ?? rangeFloor(pkg.dependencies.undici);
+  if (installedUndiciVersion !== expectedUndiciVersion) {
+    throw new Error(`Expected consumer Undici ${expectedUndiciVersion}, installed ${installedUndiciVersion}`);
+  }
+  console.log(`   consumer resolved Undici ${installedUndiciVersion}${undiciOverride ? ' via override' : ''}`);
   const installedTldtsVersion = JSON.parse(
     readFileSync(path.join(tmpDir, 'node_modules', 'tldts', 'package.json'), 'utf8')
   ).version;
@@ -153,6 +183,96 @@ try {
     throw new Error(`expected tldts compatibility floor 7.0.0, got ${installedTldtsVersion}`);
   }
   console.log('  tldts compatibility floor 7.0.0 installed');
+
+  writeFileSync(
+    path.join(tmpDir, 'tsconfig.packed-examples.json'),
+    JSON.stringify({
+      compilerOptions: {
+        noEmit: true,
+        strict: true,
+        noUncheckedIndexedAccess: true,
+        skipLibCheck: true,
+        target: 'ES2022',
+        module: 'Node16',
+        moduleResolution: 'Node16',
+        esModuleInterop: true,
+        allowSyntheticDefaultImports: true,
+        resolveJsonModule: true,
+      },
+      include: ['node_modules/@adcp/sdk/examples/**/*.ts'],
+      exclude: [],
+    })
+  );
+  console.log('🧭 Packed examples compile against public package exports:');
+  run(
+    process.execPath,
+    [
+      '--max-old-space-size=8192',
+      path.join(REPO_ROOT, 'node_modules', 'typescript', 'bin', 'tsc'),
+      '--project',
+      'tsconfig.packed-examples.json',
+    ],
+    { cwd: tmpDir, stdio: 'inherit' }
+  );
+  console.log('  every shipped TypeScript example compiles from the installed tarball');
+
+  console.log('🚀 Compact 3.2 starter executes from the installed tarball:');
+  run(
+    path.join(REPO_ROOT, 'node_modules', '.bin', 'tsx'),
+    [path.join(tmpDir, 'node_modules', '@adcp', 'sdk', 'examples', 'seller-3.2-starter.ts')],
+    {
+      cwd: tmpDir,
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        ADCP_AUTH_TOKEN: 'package-smoke-secret',
+        ADCP_ACCOUNT_ID: 'package-smoke-account',
+        ADCP_EXAMPLE_CHECK: '1',
+      },
+    }
+  );
+  console.log('  starter initializes without source-tree access or invented inventory');
+
+  console.log('🧩 Existing-platform smoke executes from the installed tarball:');
+  run(
+    path.join(REPO_ROOT, 'node_modules', '.bin', 'tsx'),
+    [path.join(tmpDir, 'node_modules', '@adcp', 'sdk', 'examples', 'existing-platform-thin.ts')],
+    {
+      cwd: tmpDir,
+      stdio: 'inherit',
+      env: { ...process.env, ADCP_EXAMPLE_CHECK: '1' },
+    }
+  );
+  console.log('  scoped evidence and submitted-task recovery pass without provider credentials');
+
+  console.log('🏗️  Packed CLI scaffolds a clean, compilable PostgreSQL seller:');
+  const scaffoldDir = path.join(tmpDir, 'packed-seller');
+  run(
+    process.execPath,
+    [
+      path.join(tmpDir, 'node_modules', '@adcp', 'sdk', 'bin', 'adcp.js'),
+      'init',
+      'seller',
+      '--specialism',
+      'sales-non-guaranteed',
+      '--backend',
+      'postgres',
+      '--dir',
+      scaffoldDir,
+    ],
+    { cwd: tmpDir, stdio: 'inherit', env: { ...process.env, ADCP_SKIP_VERSION_CHECK: '1' } }
+  );
+  const scaffoldGitignore = readFileSync(path.join(scaffoldDir, '.gitignore'), 'utf8');
+  if (scaffoldGitignore !== '.env\nnode_modules/\ndist/\n') {
+    throw new Error('packed seller scaffold did not protect secrets and generated files in .gitignore');
+  }
+  const scaffoldPackagePath = path.join(scaffoldDir, 'package.json');
+  const scaffoldPackage = JSON.parse(readFileSync(scaffoldPackagePath, 'utf8'));
+  scaffoldPackage.dependencies['@adcp/sdk'] = `file:${tarballPath}`;
+  writeFileSync(scaffoldPackagePath, `${JSON.stringify(scaffoldPackage, null, 2)}\n`);
+  run('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: scaffoldDir, stdio: 'inherit' });
+  run('npm', ['run', 'build'], { cwd: scaffoldDir, stdio: 'inherit' });
+  console.log('  installed tarball CLI → scaffold → isolated dependency install → TypeScript build ok');
 
   // Cover the barrel, a zod-free enum entry, and the server subpath — the last
   // adds real ESM/CJS load coverage of the @a2a-js/sdk peer through a dedicated
@@ -163,7 +283,9 @@ try {
     { specifier: '@adcp/sdk/server', symbol: 'A2AInvocationError' },
     { specifier: '@adcp/sdk/signing/server', symbol: 'resolveAgent' },
     { specifier: '@adcp/sdk/testing', symbol: 'mergeSeedProductLegacy' },
-    { specifier: '@adcp/sdk/schemas', symbol: 'CreativeAssetSchema' },
+    { specifier: '@adcp/sdk/negotiation/verification', symbol: 'verifyProposalCommercialTerms' },
+    { specifier: '@adcp/sdk/schemas', symbol: 'getCanonicalToolValidator' },
+    { specifier: '@adcp/sdk/media-buy/actions', symbol: 'assessMediaBuyAction' },
   ];
 
   // Shared by both generated smoke modules. A function declaration (not an
@@ -187,7 +309,16 @@ try {
         `import * as m${i} from '${c.specifier}';\nassertion(m${i}, '${c.symbol}');\nconsole.log('  ESM ${c.specifier} → ${c.symbol} ok');`
     )
     .join('\n');
-  writeFileSync(path.join(tmpDir, 'smoke.mjs'), `${assertSource}${esmBody}\n`);
+  const canonicalSchemaSmoke = [
+    "const canonical = m6.getCanonicalToolValidator('get_reporting_status', 'sync', { adcpVersion: '3.2.0-rc.4' });",
+    "if (!canonical) throw new Error('canonical get_reporting_status schema is missing');",
+    "const validReportingFailure = { status: 'failed', view: 'summary', failure_kind: 'lookup_unavailable', errors: [{ code: 'NOT_FOUND', message: 'Reporting status resource is unavailable.' }] };",
+    "if (!canonical(validReportingFailure)) throw new Error('valid canonical control failed: ' + JSON.stringify(canonical.errors));",
+    "if (canonical({ status: 'completed', view: 'summary' })) throw new Error('invalid canonical control passed');",
+    "if (!Array.isArray(canonical.errors) || canonical.errors.length < 2) throw new Error('canonical validator did not collect all errors');",
+    '',
+  ].join('\n');
+  writeFileSync(path.join(tmpDir, 'smoke.mjs'), `${assertSource}${esmBody}\n${canonicalSchemaSmoke}`);
 
   // CJS: real `require` of every case in one module.
   const cjsBody = cases
@@ -196,12 +327,43 @@ try {
         `const m${i} = require('${c.specifier}');\nassertion(m${i}, '${c.symbol}');\nconsole.log('  CJS ${c.specifier} → ${c.symbol} ok');`
     )
     .join('\n');
-  writeFileSync(path.join(tmpDir, 'smoke.cjs'), `${assertSource}${cjsBody}\n`);
+  writeFileSync(path.join(tmpDir, 'smoke.cjs'), `${assertSource}${cjsBody}\n${canonicalSchemaSmoke}`);
 
   console.log('🔍 ESM import:');
   run('node', ['smoke.mjs'], { cwd: tmpDir, stdio: 'inherit' });
   console.log('🔍 CJS require:');
   run('node', ['smoke.cjs'], { cwd: tmpDir, stdio: 'inherit' });
+
+  // The publish artifact omits expanded bundled JSON files and restores them
+  // from one Brotli archive per wire version. Exercise all archive-backed
+  // consumers from the installed tarball, where source-tree fallback is
+  // impossible, and assert the protocol-authored bundled ID survives.
+  writeFileSync(
+    path.join(tmpDir, 'smoke-schema-archive.cjs'),
+    [
+      "const { validateRequest } = require('./node_modules/@adcp/sdk/dist/lib/validation/index.js');",
+      "const { loadRequestSchema } = require('./node_modules/@adcp/sdk/dist/lib/conformance/schemaLoader.js');",
+      "const { getToolsWithErrorArm } = require('./node_modules/@adcp/sdk/dist/lib/server/error-arm-tools.js');",
+      "const invalid = validateRequest('get_products', {}, '3.2.0-rc.4');",
+      "if (invalid.valid || !invalid.issues.some(issue => issue.pointer === '/buying_mode')) {",
+      "  throw new Error('runtime validator did not load the archived get_products schema');",
+      '}',
+      "const schema = loadRequestSchema('get_products', { version: '3.2.0-rc.4' });",
+      "if (schema.$id !== 'https://adcontextprotocol.org/schemas/3.2.0-rc.4/media-buy/get-products-request.json') {",
+      '  throw new Error(`conformance loader returned the wrong authored schema ID: ${schema.$id}`);',
+      '}',
+      'if (!schema._bundled || !schema.$defs || Object.keys(schema.$defs).length === 0) {',
+      "  throw new Error('conformance loader did not return the selected bundled schema');",
+      '}',
+      "const errorArmTools = getToolsWithErrorArm('3.2.0-rc.4');",
+      "if (!errorArmTools.has('create_media_buy')) {",
+      "  throw new Error('server error-arm discovery did not load the archived response schemas');",
+      '}',
+    ].join('\n')
+  );
+  console.log('🗜️  Archived offline schemas:');
+  run('node', ['smoke-schema-archive.cjs'], { cwd: tmpDir, stdio: 'inherit' });
+  console.log('  validation, conformance, and server discovery load schemas from the packed archives');
 
   const schemaTypeSmoke = [
     "import { CreativeAssetSchema } from '@adcp/sdk/schemas';",

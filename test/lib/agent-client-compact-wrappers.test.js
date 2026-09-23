@@ -51,6 +51,60 @@ const CASES = [
 ];
 
 describe('AgentClient compact lifecycle wrappers', () => {
+  for (const [method, taskName, params] of [
+    ['getPrincipal', 'get_principal', {}],
+    [
+      'syncPrincipal',
+      'sync_principal',
+      { idempotency_key: 'principal-operation-key', configuration: { notification_configs: [] } },
+    ],
+  ]) {
+    test(`${method} delegates to the typed single-agent principal method and retains context`, async () => {
+      const wrapper = new AgentClient(TEST_AGENT, { validateFeatures: false });
+      const calls = [];
+      const inputHandler = async () => undefined;
+      wrapper.client[method] = async (...args) => {
+        calls.push(args);
+        return {
+          success: true,
+          status: 'completed',
+          data: { status: 'completed', result: { kind: 'unconfigured' } },
+          metadata: { status: 'completed', contextId: 'ctx-principal', taskName },
+          conversation: [],
+          debug_logs: [],
+        };
+      };
+
+      await wrapper[method](params, inputHandler, { contextId: 'ctx-explicit' });
+
+      assert.deepStrictEqual(calls[0], [params, inputHandler, { contextId: 'ctx-explicit', taskId: undefined }]);
+      assert.strictEqual(wrapper.getContextId(), 'ctx-principal');
+    });
+  }
+
+  test('listAccountChanges delegates to the typed single-agent method and retains context', async () => {
+    const wrapper = new AgentClient(TEST_AGENT, { validateFeatures: false });
+    const calls = [];
+    const params = { account: { account_id: 'account-1' }, starting_position: 'latest' };
+    const inputHandler = async () => undefined;
+    wrapper.client.listAccountChanges = async (...args) => {
+      calls.push(args);
+      return {
+        success: true,
+        status: 'completed',
+        data: { changes: [], cursor: 'checkpoint', has_more: false },
+        metadata: { status: 'completed', contextId: 'ctx-feed', taskName: 'list_account_changes' },
+        conversation: [],
+        debug_logs: [],
+      };
+    };
+
+    await wrapper.listAccountChanges(params, inputHandler, { contextId: 'ctx-explicit' });
+
+    assert.deepStrictEqual(calls[0], [params, inputHandler, { contextId: 'ctx-explicit', taskId: undefined }]);
+    assert.strictEqual(wrapper.getContextId(), 'ctx-feed');
+  });
+
   test('resumeDeferredTask delegates through the owned client and retains resumed A2A session state', async () => {
     const wrapper = new AgentClient(
       {
