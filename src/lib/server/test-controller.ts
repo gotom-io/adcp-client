@@ -203,6 +203,9 @@ export const DISCOVERY_ARM_SCENARIOS = {
   FORCE_GET_SIGNALS_ARM: 'force_get_signals_arm',
 } as const;
 
+/** Reliable Reporting Core lifecycle harness extension. */
+export const REPORTING_CORE_LIFECYCLE_PROBE_SCENARIO = 'reporting_core_lifecycle_probe' as const;
+
 /**
  * Stable `SeedSuccess.message` strings the SDK's `dispatchSeed` emits.
  * Adopters who want to detect first-seed vs idempotent-replay can match
@@ -246,6 +249,8 @@ void _scenarioExhaustivenessGuard;
  * Unimplemented methods mean that scenario is not advertised in list_scenarios.
  */
 export interface TestControllerStore {
+  /** Drive a deterministic Reliable Reporting source/worker lifecycle step. */
+  reportingCoreLifecycleProbe?(params: Record<string, unknown>): Promise<SimulationSuccess>;
   /** Transition a creative to the specified status. */
   forceCreativeStatus?(
     creativeId: string,
@@ -513,7 +518,7 @@ export interface TestControllerStoreFactory {
    * this verbatim for `list_scenarios` — your `createStore` is skipped on
    * capability probes, so you don't have to load a session just to answer.
    */
-  scenarios: readonly ControllerScenario[];
+  scenarios: readonly (ControllerScenario | (string & {}))[];
 
   /**
    * Build a {@link TestControllerStore} bound to the current request. Invoked
@@ -682,6 +687,7 @@ function allScenariosFromStore(store: TestControllerStore): string[] {
   if (typeof store.forceCatalogItemStatus === 'function') out.push(FORCE_CATALOG_ITEM_STATUS_SCENARIO);
   if (typeof store.forceGetProductsArm === 'function') out.push(DISCOVERY_ARM_SCENARIOS.FORCE_GET_PRODUCTS_ARM);
   if (typeof store.forceGetSignalsArm === 'function') out.push(DISCOVERY_ARM_SCENARIOS.FORCE_GET_SIGNALS_ARM);
+  if (typeof store.reportingCoreLifecycleProbe === 'function') out.push(REPORTING_CORE_LIFECYCLE_PROBE_SCENARIO);
   return out;
 }
 
@@ -1094,7 +1100,7 @@ async function dispatchSeed(
 async function handleTestControllerRequestImpl(
   storeOrFactory: TestControllerStoreOrFactory,
   input: Record<string, unknown>,
-  options?: { seedCache?: SeedFixtureCache }
+  options?: { seedCache?: SeedFixtureCache; seedScopePrefix?: string }
 ): Promise<ComplyTestControllerResponse> {
   const scenario = input.scenario as string | undefined;
   if (!scenario) {
@@ -1387,11 +1393,17 @@ async function handleTestControllerRequestImpl(
         // sessions, or storyboard correlation buckets on one server can each
         // seed the same fixture id with divergent fixtures; without a scope
         // prefix the cache treats divergent replays as INVALID_PARAMS even when
-        // each scoped fixture is internally self-consistent. No resolver call here — test-controller is a
-        // generic helper that doesn't know about platform.accounts.resolve,
-        // and read-time misalignment is fine because the cache only governs
-        // idempotency, not user-visible state.
-        const scope = makeSeedCacheScope(input);
+        // each scoped fixture is internally self-consistent. This generic
+        // helper never resolves caller-provided account references itself; a
+        // framework wrapper can supply a trusted seedScopePrefix after its
+        // normal account/tenant authorization path.
+        const inputScope = makeSeedCacheScope(input);
+        const scope =
+          options?.seedScopePrefix === undefined
+            ? inputScope
+            : inputScope === undefined
+              ? options.seedScopePrefix
+              : `${options.seedScopePrefix}\u0000${inputScope}`;
         return await dispatchSeed(store, scenario as SeedScenario, params, options?.seedCache, scope);
       }
 
@@ -1489,6 +1501,13 @@ async function handleTestControllerRequestImpl(
         );
       }
 
+      case REPORTING_CORE_LIFECYCLE_PROBE_SCENARIO: {
+        if (!store.reportingCoreLifecycleProbe) {
+          return controllerError('UNKNOWN_SCENARIO', `Scenario not supported: ${scenario}`);
+        }
+        return wrapStoreSuccess(await store.reportingCoreLifecycleProbe((params ?? {}) as Record<string, unknown>));
+      }
+
       default:
         return controllerError('UNKNOWN_SCENARIO', 'Unrecognized scenario name');
     }
@@ -1516,7 +1535,7 @@ async function handleTestControllerRequestImpl(
 export async function handleTestControllerRequest(
   storeOrFactory: TestControllerStoreOrFactory,
   input: Record<string, unknown>,
-  options?: { seedCache?: SeedFixtureCache }
+  options?: { seedCache?: SeedFixtureCache; seedScopePrefix?: string }
 ): Promise<ComplyTestControllerResponse> {
   const ctx = input.context;
   const result = await handleTestControllerRequestImpl(storeOrFactory, input, options);
@@ -1632,7 +1651,7 @@ export const TOOL_INPUT_SHAPE = {
 export function registerTestController(
   server: AdcpServer | McpServer,
   storeOrFactory: TestControllerStoreOrFactory,
-  options?: { seedCache?: SeedFixtureCache }
+  options?: { seedCache?: SeedFixtureCache; seedScopePrefix?: string }
 ): void {
   const mcp = getSdkServer(server as AdcpServer) ?? (server as McpServer);
   // Per-registration cache so seed idempotency holds across all requests on
@@ -1670,6 +1689,7 @@ export function registerTestController(
     (async (input: Record<string, unknown>) => {
       const response = await handleTestControllerRequest(storeOrFactory, input, {
         seedCache,
+        ...(options?.seedScopePrefix !== undefined && { seedScopePrefix: options.seedScopePrefix }),
       });
       return toMcpResponse(response);
     }) as Parameters<typeof mcp.registerTool>[2]

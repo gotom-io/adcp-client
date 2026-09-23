@@ -99,6 +99,7 @@ export {
 // Compliance assessment
 export {
   comply,
+  buildComplianceBundleResults,
   formatComplianceResults,
   formatComplianceResultsJSON,
   buildComplianceSummary,
@@ -108,10 +109,13 @@ export {
   getBriefsByVertical,
   // Types
   type ComplyOptions,
+  type ComplianceBundleAssessmentOptions,
   type ComplianceTrack,
   type TrackResult,
   type TestedTrackEntry,
   type TrackStatus,
+  type ComplianceBundleResult,
+  type ComplianceBundleStatus,
   type ComplianceResult,
   type ComplianceSummary,
   type ComplianceSummaryArtifact,
@@ -251,6 +255,8 @@ export {
   // Parser (single-file load for spec evolution)
   parseStoryboard,
   loadStoryboardFile,
+  normalizeValidationOnlyTasks,
+  VALIDATION_ONLY_TASK,
   applyFixtureBindingsToRequest,
   buildFixtureResolutionSpecs,
   FixtureBindingRegistry,
@@ -390,4 +396,8 @@ export {
   type OAuthMetadataGraphVectorCorpus,
   BrandJsonSchema,
   AdagentsJsonSchema,
+  // Report consumers key on `StoryboardStepResult.task`; the MCP session auth
+  // probe is runner-native, so its task name ships as a constant rather than a
+  // magic string operators have to copy (adcp-client#2940).
+  MCP_SESSION_PROBE_TASK,
 } from './storyboard';

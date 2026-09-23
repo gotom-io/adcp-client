@@ -308,6 +308,45 @@ export class AuthenticationRequiredError extends ADCPError {
 }
 
 /**
+ * A configured non-interactive credential reached the agent and was rejected.
+ * The transport error is retained as a non-enumerable cause so reflected
+ * credential material from an untrusted 401 body cannot enter JSON reports.
+ */
+export class AuthenticationCredentialsRejectedError extends AuthenticationRequiredError {
+  readonly subCode = 'credentials_rejected' as const;
+
+  constructor(agentUrl: string, cause?: unknown) {
+    const safeAgentUrl = sanitizeAgentUrlForError(agentUrl);
+    super(
+      safeAgentUrl,
+      undefined,
+      'The agent rejected the configured credential with HTTP 401. Verify or replace the saved credential and retry.'
+    );
+    this.name = 'AuthenticationCredentialsRejectedError';
+    if (cause !== undefined) {
+      Object.defineProperty(this, 'cause', {
+        value: cause,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
+}
+
+function sanitizeAgentUrlForError(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return 'invalid_url';
+  }
+}
+
+/**
  * Build the default error message. Branches on what the 401 disclosed:
  * - non-Bearer challenge (Basic, Digest, …) → scheme-specific remediation
  * - OAuth metadata → point at the authorization endpoint
@@ -616,7 +655,7 @@ export type ActionNotAllowedAttemptedAction = string;
 
 export interface ActionNotAllowedAvailableAction {
   action: ActionNotAllowedAttemptedAction;
-  mode: 'self_serve' | 'conditional_self_serve' | 'requires_proposal' | 'requires_approval';
+  mode: 'self_serve' | 'conditional_self_serve' | 'seller_managed' | 'requires_proposal' | 'requires_approval';
   sla?: unknown;
   terms_ref?: string;
 }
@@ -624,6 +663,7 @@ export interface ActionNotAllowedAvailableAction {
 export type ActionNotAllowedRecovery =
   | { kind: 'createProposal'; message: string }
   | { kind: 'waitForApproval'; message: string }
+  | { kind: 'waitForTask'; message: string }
   | { kind: 'reissueAsDirect'; message: string };
 
 function buildActionNotAllowedMessage(details: ActionNotAllowedErrorDetails): string {
@@ -644,6 +684,11 @@ function buildModeMismatchRecovery(details: ActionNotAllowedErrorDetails): Actio
   const match = details.currently_available_actions?.find(a => a.action === details.attempted_action);
   if (!match) return undefined;
   switch (match.mode) {
+    case 'seller_managed':
+      return {
+        kind: 'waitForTask',
+        message: 'Use the declared task and follow its submitted/working/completed lifecycle.',
+      };
     case 'requires_proposal':
       return {
         kind: 'createProposal',
@@ -843,6 +888,7 @@ function isActionMode(value: string): value is ActionNotAllowedAvailableAction['
   return (
     value === 'self_serve' ||
     value === 'conditional_self_serve' ||
+    value === 'seller_managed' ||
     value === 'requires_proposal' ||
     value === 'requires_approval'
   );

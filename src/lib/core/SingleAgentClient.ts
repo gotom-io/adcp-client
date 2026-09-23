@@ -1,10 +1,14 @@
+import {
+  annotateProductsSupplyPaths,
+  type ListProductsResponseWithSupplyPath,
+  type ProductSupplyPathOptions,
+} from '../supply-path/products';
 // Main ADCP Client - Type-safe conversation-aware client for AdCP agents
 
-import { z } from 'zod';
-import * as schemas from '../types/schemas.generated';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AgentConfig } from '../types';
 import { ADCP_ENVELOPE_FIELDS } from '../types/adcp';
-import { parseAdcpMajorVersion, type AdcpVersion } from '../version';
+import { parseAdcpMajorVersion, toReleasePrecisionVersion, type AdcpVersion } from '../version';
 import {
   isAdcpVersionSupported,
   isAdcpVersionAtLeast,
@@ -18,6 +22,7 @@ import { isExternalSchemaRootActive, schemaAllowsTopLevelField } from '../valida
 import type {
   GetProductsRequest,
   GetProductsResponse,
+  ListProductsRequest,
   PropertyListReference,
   ListCreativeFormatsRequest,
   ListCreativeFormatsResponse,
@@ -50,6 +55,8 @@ import type {
   Format,
   GetAdCPCapabilitiesRequest,
   GetAdCPCapabilitiesResponse,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
   ListAccountsRequest,
   ListAccountsResponse,
   SyncAccountsRequest,
@@ -86,6 +93,10 @@ import type {
   SyncPlansResponse,
   GetPlanAuditLogsRequest,
   GetPlanAuditLogsResponse,
+  GetPrincipalRequest,
+  GetPrincipalResponse,
+  SyncPrincipalRequest,
+  SyncPrincipalResponse,
   OutcomeType,
 } from '../types/tools.generated';
 import { type MutatingRequestInput, generateIdempotencyKey, requestUsesIdempotency } from '../utils/idempotency';
@@ -120,6 +131,7 @@ import { createMCPRequestHeaders } from '../auth';
 import { isAbortOrTimeoutError } from '../protocols/abort';
 import { ProtocolClient, normalizeTransportOptions } from '../protocols';
 import {
+  AuthenticationCredentialsRejectedError,
   AuthenticationRequiredError,
   ConfigurationError,
   FeatureUnsupportedError,
@@ -131,6 +143,7 @@ import {
 import { createAgentTransportFetch, isLikelyPrivateUrl } from '../net';
 import {
   discoverAuthorizationRequirements,
+  hasValidatedMcpAuthorizationRequirements,
   NeedsAuthorizationError,
   probeAuthChallenge,
 } from '../auth/oauth/authorization-required';
@@ -144,6 +157,7 @@ import type {
   TaskInfo,
   TaskState,
   WebhookUrlTemplate,
+  DirectPauseRecoveryRequest,
 } from './ConversationTypes';
 import type { AdcpTaskName, TaskRequestFor, TaskResponseTypeMap } from './AgentClient';
 import type { DeferredTaskStorage } from '../storage/interfaces';
@@ -156,9 +170,14 @@ import {
 } from './AsyncHandler';
 import { verifyWebhookRequest, type WebhookHeaderValue, type WebhookHeadersLike } from '../webhooks';
 import {
+  canonicalDelegatedOperatorAuthorization,
   InMemoryWebhookRegistrationStore,
+  parseWebhookRegistration,
+  sameWebhookRegistration,
+  WebhookRegistrationIntegrityError,
   type WebhookRegistration,
   type WebhookRegistrationStore,
+  validateWebhookRegistrationAuthorization,
 } from './webhook-registration';
 import {
   InMemoryReplayStore,
@@ -166,6 +185,7 @@ import {
   InMemoryRevocationStore,
   type RevocationStore,
   type JwksResolver,
+  type DelegatedOperatorAuthorizationContext,
   WebhookSignatureError,
   type WebhookSignatureErrorCode,
   verifyWebhookSignature as verifyRfc9421WebhookSignature,
@@ -173,6 +193,7 @@ import {
   type ResolvedAgentJwksResolverOptions,
   canonicalTargetUri,
 } from '../signing/server';
+import { AgentResolverError } from '../signing/agent-resolver/errors';
 import { unwrapProtocolResponse } from '../utils/response-unwrapper';
 import { getLatestA2ADataPartFromTask } from '../utils/a2a-artifacts';
 import { extractAdcpTaskStatusFromPayload, isAdcpStatus } from './task-status';
@@ -192,6 +213,19 @@ import {
   throwIfAborted,
   withAbortSignal,
 } from '../protocols/abort';
+
+function presentedStaticTransportCredential(
+  authToken: string | undefined,
+  headers: Record<string, string> | undefined,
+  authProvider?: object
+): boolean {
+  if (authProvider) return false;
+  if (authToken) return true;
+  return Object.keys(headers ?? {}).some(key => {
+    const normalized = key.toLowerCase();
+    return normalized === 'authorization' || normalized === 'x-adcp-auth';
+  });
+}
 
 // v3.0 compatibility utilities
 import type { AdcpCapabilities, AdcpMajorVersion, ToolInfo, FeatureName } from '../utils/capabilities';
@@ -259,6 +293,10 @@ import { isProjectionProductInput, type V1FormatId, type V1Product } from '../v2
 import { canonicalize as canonicalizeJson } from '../utils/jcs';
 
 type ReadRequestOptions = Pick<TaskOptions, 'signal' | 'transport'>;
+type CapabilityProbeRequestOptions = Pick<
+  TaskOptions,
+  'signal' | 'transport' | 'disableWebhook' | 'delegatedOperatorAuthorization'
+>;
 type ToolSchemaMap = Map<string, Record<string, unknown>>;
 type CapabilityDiscoveryContext = {
   toolSchemas?: ToolSchemaMap;
@@ -427,6 +465,7 @@ const RECORDLESS_HMAC_READ_ONLY_TASKS = new Set([
   'media_buy_delivery',
   'get_creative_delivery',
   'get_signals',
+  'list_account_changes',
   'list_accounts',
   'get_property_list',
   'list_property_lists',
@@ -447,6 +486,13 @@ const RECORDLESS_HMAC_READ_ONLY_TASKS = new Set([
  * credentials. Map insertion order provides LRU eviction.
  */
 const TASK_SCOPED_STATE_LIMIT = 10_000;
+
+/**
+ * Automatic seller-key resolvers are cheap to recreate, so bound tuple-aware
+ * cache cardinality for long-lived shared clients. Map insertion order is the
+ * LRU order; successful lookups move their entry to the newest position.
+ */
+const WEBHOOK_JWKS_RESOLVER_LIMIT = 1_024;
 
 interface CanonicalCreativeTaskAssociation {
   taskType: string;
@@ -913,6 +959,12 @@ function snapshotTaskOptions<T extends TaskOptions | undefined>(options: T): T {
     ...options,
     ...(options.transport !== undefined && { transport: { ...options.transport } }),
     ...(options.metadata !== undefined && { metadata: structuredClone(options.metadata) }),
+    ...(options.delegatedOperatorAuthorization !== undefined && {
+      delegatedOperatorAuthorization: { ...options.delegatedOperatorAuthorization },
+    }),
+    ...(options.durableContinuationRecovery !== undefined && {
+      durableContinuationRecovery: { ...options.durableContinuationRecovery },
+    }),
   } as T;
 }
 
@@ -931,11 +983,15 @@ const PRIMARY_ADCP_TASK_NAMES = {
   list_creatives: true,
   get_media_buys: true,
   get_media_buy_delivery: true,
+  get_reporting_status: true,
+  sync_reporting_status: true,
+  sync_reporting_receipts: true,
   get_creative_delivery: true,
   provide_performance_feedback: true,
   get_signals: true,
   activate_signal: true,
   get_adcp_capabilities: true,
+  list_account_changes: true,
   list_accounts: true,
   sync_accounts: true,
   sync_audiences: true,
@@ -955,6 +1011,8 @@ const PRIMARY_ADCP_TASK_NAMES = {
   report_plan_adjustment: true,
   get_plan_audit_logs: true,
   sync_agent_notification_configs: true,
+  get_principal: true,
+  sync_principal: true,
   context_match: true,
   identity_match: true,
 } satisfies Record<AdcpTaskName, true>;
@@ -981,6 +1039,26 @@ const STANDARD_ADCP_TASK_NAMES = new Set<string>([
   'acquire_rights',
   'update_rights',
 ]);
+
+const PRINCIPAL_IDENTITY_INPUT_FIELDS = ['buyer_agent_url', 'agent_url', 'principal_id', 'connection_id'] as const;
+
+function assertNoPrincipalIdentityInput(taskType: string, params: unknown): void {
+  if (
+    (taskType !== 'get_principal' && taskType !== 'sync_principal') ||
+    params === null ||
+    typeof params !== 'object' ||
+    Array.isArray(params)
+  ) {
+    return;
+  }
+  for (const field of PRINCIPAL_IDENTITY_INPUT_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(params, field)) {
+      throw new TypeError(
+        `${taskType} refuses caller-supplied ${field}; principal identity must come from authenticated transport state.`
+      );
+    }
+  }
+}
 
 /**
  * Error class for v3 feature compatibility issues
@@ -1110,14 +1188,22 @@ export interface VerifyAndParseWebhookOptions {
   taskType?: string;
   /** Operation id from trusted routing context. Used as an A2A fallback. */
   operationId?: string;
-  /** Actual HTTP method from trusted server context. Required for RFC 9421. */
+  /** Actual HTTP method from trusted server context. Required for every registered callback. */
   requestMethod?: string;
-  /** Externally visible absolute request URL from trusted server/proxy configuration. Required for RFC 9421. */
+  /** Externally visible absolute request URL from trusted server/proxy configuration. Required for every registered callback. */
   requestUrl?: string;
   /** Explicit legacy HMAC signature header value. */
   signature?: WebhookHeaderValue;
   /** Explicit legacy HMAC timestamp header value. */
   timestamp?: WebhookHeaderValue;
+}
+
+/** Trusted HTTP request context for direct registered-webhook dispatch. */
+export interface WebhookRequestContext {
+  /** Actual HTTP method from trusted server context. */
+  requestMethod: string;
+  /** Externally visible absolute request URL from trusted server/proxy configuration. */
+  requestUrl: string;
 }
 
 export interface WebhookHandlerRequest {
@@ -1443,6 +1529,8 @@ export interface SingleAgentClientConfig extends ConversationConfig {
      * violates an exclusion for `ladbible.com`.
      */
     productPropertyPolicy?: ClientProductPropertyPolicy | false;
+    /** Opt in to computed, evidence-bearing external collection path annotations on product discovery. */
+    supplyPathVerification?: ProductSupplyPathOptions;
   };
   /** Governance configuration for buyer-side campaign governance */
   governance?: import('./GovernanceTypes').GovernanceConfig;
@@ -1457,6 +1545,47 @@ export interface SingleAgentClientConfig extends ConversationConfig {
    * discovery; use `0` to disable the SDK-imposed discovery timeout.
    */
   transport?: import('../protocols').TransportOptions;
+}
+
+/** Client-bound scope token for reusing externally observed capabilities. */
+export interface CapabilityEvidenceScope {
+  /** Exact normalized seller endpoint owned by this client. */
+  agentUri: string;
+  /** Exact AdCP release pin configured on this client. */
+  adcpVersion: string;
+  /** Opaque per-client token binding evidence to this authorization/transport instance. */
+  scopeKey: string;
+}
+
+/** Fresh, scoped capability evidence produced by an application-owned preflight. */
+export interface CapabilityEvidenceSnapshot {
+  scope: CapabilityEvidenceScope;
+  capabilities: AdcpCapabilities;
+  /** RFC 3339 timestamp when the application observed the evidence. */
+  observedAt: string;
+  /** RFC 3339 freshness deadline. Expired evidence is refused. */
+  expiresAt: string;
+  /** `tools/list` input-schema properties keyed by tool name; optional when capabilities already carry discoveredTools. */
+  toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+}
+
+function isCapabilityEvidence(value: unknown): value is AdcpCapabilities {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<AdcpCapabilities>;
+  return (
+    (candidate.version === 'v2' || candidate.version === 'v3') &&
+    Array.isArray(candidate.majorVersions) &&
+    candidate.majorVersions.length > 0 &&
+    candidate.majorVersions.every(version => version === 2 || version === 3) &&
+    Array.isArray(candidate.protocols) &&
+    candidate.protocols.every(protocol => typeof protocol === 'string') &&
+    typeof candidate.features === 'object' &&
+    candidate.features !== null &&
+    !Array.isArray(candidate.features) &&
+    Array.isArray(candidate.extensions) &&
+    candidate.extensions.every(extension => typeof extension === 'string') &&
+    typeof candidate._synthetic === 'boolean'
+  );
 }
 
 /**
@@ -1610,6 +1739,9 @@ export class SingleAgentClient {
   private canonicalBaseUrl?: string; // Cache canonical base URL (from agent card or stripped /mcp)
   private cachedCapabilities?: AdcpCapabilities; // Cache detected server capabilities
   private cachedToolSchemas?: Map<string, Record<string, unknown>>; // inputSchema.properties per tool name
+  private primedCapabilitiesExpiresAt?: number; // Freshness bound for application-owned evidence only
+  private capabilityEvidenceScopeKey = randomUUID();
+  private capabilityEvidenceAuthMaterial?: string;
   private _v2WarningFired = false; // Gate: emit the v2-sunset warning once per client instance
   private _syntheticV3WarningFired = false; // Gate: emit the synthetic-v3 warning once per client instance
   private _syntheticV2WarningFired = false; // Gate: emit the synthetic-v2 warning once per client instance
@@ -1654,7 +1786,20 @@ export class SingleAgentClient {
     // historically returns the input object unchanged for the preferred
     // `trustedFetchFn` spelling, so clone first while retaining function identity.
     const configuredTransport = config.transport === undefined ? undefined : { ...config.transport };
-    this.config = { ...config, transport: normalizeTransportOptions(configuredTransport) };
+    const configuredWebhookVerification =
+      config.webhookVerification === undefined
+        ? undefined
+        : {
+            ...config.webhookVerification,
+            ...(config.webhookVerification.resolverOptions !== undefined && {
+              resolverOptions: { ...config.webhookVerification.resolverOptions },
+            }),
+          };
+    this.config = {
+      ...config,
+      transport: normalizeTransportOptions(configuredTransport),
+      ...(configuredWebhookVerification !== undefined && { webhookVerification: configuredWebhookVerification }),
+    };
     config = this.config;
     // Validate the configured adcpVersion at construction time. Throws
     // ConfigurationError if the pin's major differs from ADCP_MAJOR_VERSION
@@ -1679,6 +1824,7 @@ export class SingleAgentClient {
 
     // Normalize agent URL for MCP protocol
     this.normalizedAgent = this.normalizeAgentConfig(this.agent);
+    this.capabilityEvidenceAuthMaterial = this.currentCapabilityEvidenceAuthMaterial();
 
     this.executor = new TaskExecutor({
       workingTimeout: config.workingTimeout || 120000, // Max 120s for working status
@@ -1756,6 +1902,7 @@ export class SingleAgentClient {
     operationId: string;
     callbackUrl: string;
     mode: WebhookRegistration['mode'];
+    delegatedOperatorAuthorization?: DelegatedOperatorAuthorizationContext;
   }): Promise<void> {
     const nowMs = this.config.webhookVerification?.now
       ? Math.floor(this.config.webhookVerification.now() * 1000)
@@ -1784,20 +1931,40 @@ export class SingleAgentClient {
     persistedAgentUrl.username = '';
     persistedAgentUrl.password = '';
     persistedAgentUrl.hash = '';
+    const delegatedOperatorAuthorization = this.effectiveDelegatedOperatorAuthorization(
+      args.delegatedOperatorAuthorization
+    );
+    const registration: WebhookRegistration = {
+      agentId: args.agent.id,
+      agentUrl: persistedAgentUrl.toString(),
+      protocol: args.agent.protocol,
+      operationId: args.operationId,
+      taskType: args.taskType,
+      callbackUrl: args.callbackUrl,
+      method: 'POST',
+      mode: args.mode,
+      authorizationContextVersion: 1,
+      ...(delegatedOperatorAuthorization !== undefined && { delegatedOperatorAuthorization }),
+      ...(previewMode && { previewMode }),
+      createdAt: nowMs,
+      expiresAt: nowMs + ttlSeconds * 1000,
+    };
+    validateWebhookRegistrationAuthorization(registration);
     try {
-      await this.webhookRegistrationStore.putIfAbsent({
-        agentId: args.agent.id,
-        agentUrl: persistedAgentUrl.toString(),
-        protocol: args.agent.protocol,
-        operationId: args.operationId,
-        taskType: args.taskType,
-        callbackUrl: args.callbackUrl,
-        method: 'POST',
-        mode: args.mode,
-        ...(previewMode && { previewMode }),
-        createdAt: nowMs,
-        expiresAt: nowMs + ttlSeconds * 1000,
-      });
+      await this.webhookRegistrationStore.putIfAbsent(registration);
+      const persisted = await this.webhookRegistrationStore.get(args.agent.id, args.operationId);
+      if (
+        !persisted ||
+        !sameWebhookRegistration(
+          parseWebhookRegistration(persisted, { agentId: args.agent.id, operationId: args.operationId }),
+          registration
+        ) ||
+        persisted.authorizationContextVersion !== 1
+      ) {
+        throw new Error(
+          'Webhook registration store did not preserve the versioned delegated-operator authorization context.'
+        );
+      }
     } catch (cause) {
       // RFC 9421 has no safe fallback without seller-pinned provenance. Legacy
       // HMAC remains verifiable from the configured global secret only for the
@@ -1811,6 +1978,40 @@ export class SingleAgentClient {
     }
   }
 
+  private configuredDelegatedOperatorAuthorization(): DelegatedOperatorAuthorizationContext | undefined {
+    const options = this.config.webhookVerification?.resolverOptions;
+    if (!options) return undefined;
+    const context: DelegatedOperatorAuthorizationContext = {
+      ...(options.requiredOperatorBrand !== undefined && { brand: options.requiredOperatorBrand }),
+      ...(options.requiredOperatorScope !== undefined && { scope: options.requiredOperatorScope }),
+      ...(options.requiredOperatorCountry !== undefined && { country: options.requiredOperatorCountry }),
+    };
+    return Object.keys(context).length > 0 ? context : undefined;
+  }
+
+  private effectiveDelegatedOperatorAuthorization(
+    perCall: DelegatedOperatorAuthorizationContext | undefined
+  ): DelegatedOperatorAuthorizationContext | undefined {
+    // A per-call tuple is deliberately whole-object precedence. Mixing its
+    // fields with client defaults can silently create an authorization tuple
+    // the caller never selected.
+    const selected = perCall ?? this.configuredDelegatedOperatorAuthorization();
+    if (selected === undefined) return undefined;
+    return { ...selected };
+  }
+
+  private delegatedOperatorAuthorizationForRegistration(
+    registration: Readonly<WebhookRegistration>
+  ): DelegatedOperatorAuthorizationContext | undefined {
+    validateWebhookRegistrationAuthorization(registration);
+    if (registration.authorizationContextVersion === 1) {
+      return registration.delegatedOperatorAuthorization === undefined
+        ? undefined
+        : { ...registration.delegatedOperatorAuthorization };
+    }
+    return undefined;
+  }
+
   private async markWebhookDurableSettlementRequired(operationId: string): Promise<void> {
     const mark = this.webhookRegistrationStore.markRequiresDurableSettlement;
     if (!mark) {
@@ -1819,17 +2020,63 @@ export class SingleAgentClient {
       );
     }
     await mark.call(this.webhookRegistrationStore, this.agent.id, operationId);
+    try {
+      const persisted = await this.webhookRegistrationStore.get(this.agent.id, operationId);
+      if (
+        !persisted ||
+        parseWebhookRegistration(persisted, { agentId: this.agent.id, operationId }).requiresDurableSettlement !== true
+      ) {
+        throw new Error('Webhook registration durable-settlement marker is missing.');
+      }
+    } catch (cause) {
+      const error = new ConfigurationError(
+        'The webhook registration store did not preserve the durable-settlement requirement.'
+      );
+      Object.defineProperty(error, 'cause', { value: cause, configurable: true });
+      throw error;
+    }
   }
 
   private webhookJwksFor(registration: Readonly<WebhookRegistration>): JwksResolver {
     const configured = this.config.webhookVerification?.jwks;
     if (configured) return configured;
-    const key = `${registration.protocol}\x00${registration.agentUrl}`;
+    if (registration.authorizationContextVersion !== 1) {
+      throw new ConfigurationError(
+        'Automatic seller-key discovery cannot verify a legacy webhook registration without a persisted authorization context.'
+      );
+    }
+    const delegatedOperatorAuthorization = this.delegatedOperatorAuthorizationForRegistration(registration);
+    const key = JSON.stringify([
+      registration.protocol,
+      registration.agentUrl,
+      registration.authorizationContextVersion ?? 0,
+      canonicalDelegatedOperatorAuthorization(delegatedOperatorAuthorization),
+    ]);
     const existing = this.webhookJwksResolvers.get(key);
-    if (existing) return existing;
+    if (existing) {
+      this.webhookJwksResolvers.delete(key);
+      this.webhookJwksResolvers.set(key, existing);
+      return existing;
+    }
 
+    const configuredResolverOptions = this.config.webhookVerification?.resolverOptions;
+    const {
+      requiredOperatorBrand: _configuredBrand,
+      requiredOperatorScope: _configuredScope,
+      requiredOperatorCountry: _configuredCountry,
+      ...resolverOptionsWithoutOperatorContext
+    } = configuredResolverOptions ?? {};
     const resolver = new ResolvedAgentJwksResolver(registration.agentUrl, registration.protocol, {
-      ...this.config.webhookVerification?.resolverOptions,
+      ...resolverOptionsWithoutOperatorContext,
+      ...(delegatedOperatorAuthorization?.brand !== undefined && {
+        requiredOperatorBrand: delegatedOperatorAuthorization.brand,
+      }),
+      ...(delegatedOperatorAuthorization?.scope !== undefined && {
+        requiredOperatorScope: delegatedOperatorAuthorization.scope,
+      }),
+      ...(delegatedOperatorAuthorization?.country !== undefined && {
+        requiredOperatorCountry: delegatedOperatorAuthorization.country,
+      }),
       fetchCapabilities: agentUrl => {
         const configuredFetch = this.config.webhookVerification?.fetchCapabilities;
         if (configuredFetch) return configuredFetch(agentUrl, registration.protocol);
@@ -1857,6 +2104,10 @@ export class SingleAgentClient {
         );
       },
     });
+    if (this.webhookJwksResolvers.size >= WEBHOOK_JWKS_RESOLVER_LIMIT) {
+      const oldest = this.webhookJwksResolvers.keys().next().value;
+      if (oldest !== undefined) this.webhookJwksResolvers.delete(oldest);
+    }
     this.webhookJwksResolvers.set(key, resolver);
     return resolver;
   }
@@ -2242,7 +2493,11 @@ export class SingleAgentClient {
   async getTaskStatus(
     taskId: string,
     transport?: import('../protocols').TransportOptions,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    wireOptions?: {
+      wireAdcpVersion?: string;
+      versionEnvelope?: import('../protocols').VersionEnvelopeMode;
+    }
   ): Promise<TaskInfo> {
     // Transport options define the outbound trust boundary. Own them before
     // endpoint discovery yields so caller mutation cannot change the fetch or
@@ -2253,7 +2508,7 @@ export class SingleAgentClient {
       this.normalizedAgent.protocol === 'a2a'
         ? await this.ensureCanonicalUrlResolved(options)
         : await this.ensureEndpointDiscovered(options);
-    return this.executor.getTaskStatus(agent, taskId, transportSnapshot, signal);
+    return this.executor.getTaskStatus(agent, taskId, transportSnapshot, signal, wireOptions);
   }
 
   /** Register durable restart/replica settlement recovery for an SDK coordinator. @internal */
@@ -2311,6 +2566,14 @@ export class SingleAgentClient {
     publishTerminalTaskStatus = true
   ): Promise<{ token: string; result: TaskResult<T> } | undefined> {
     return this.executor.recoverDeferredTaskForOperation(operationId, recoveryKey, publishTerminalTaskStatus);
+  }
+
+  /** Recover the current generation of an opt-in direct mutation pause. */
+  async recoverDirectPauseContinuation<T>(request: DirectPauseRecoveryRequest): Promise<TaskResult<T>> {
+    const recovered = await this.executor.recoverDirectPauseContinuation<T>(request);
+    return isDeferredClientFinalizationContext(recovered.clientContext)
+      ? this.finalizeTaskResult(recovered.result, recovered.clientContext)
+      : recovered.result;
   }
 
   /** Bridge a store-recovered callback into the deferred terminal checkpoint. @internal */
@@ -2684,7 +2947,9 @@ export class SingleAgentClient {
       let lastError: Error = new Error(`A2A agent card not found at ${cardUrls.join(', ')}`);
       for (const cardUrl of cardUrls) {
         try {
-          client = await withResponseSizeLimit(maxResponseBytes, () => createA2AClientFromCardUrl(cardUrl, fetchImpl));
+          client = await withResponseSizeLimit(maxResponseBytes, () =>
+            createA2AClientFromCardUrl(cardUrl, fetchImpl, transport?.legacyCompat)
+          );
           break;
         } catch (err: unknown) {
           lastError = err as Error;
@@ -2775,8 +3040,8 @@ export class SingleAgentClient {
    *
    * Special handling for authentication errors (401):
    * - If any endpoint returns 401, we know the server exists but requires auth
-   * - We fetch OAuth metadata and throw AuthenticationRequiredError
-   * - This gives consumers clear guidance on how to authenticate
+   * - A validated MCP protected-resource metadata chain yields NeedsAuthorizationError
+   * - Otherwise AuthenticationRequiredError carries the advertised challenge
    *
    * Note: This is async and called lazily on first agent interaction
    */
@@ -2887,6 +3152,7 @@ export class SingleAgentClient {
 
     // Track results and whether we got any 401s
     let got401 = false;
+    let first401Error: unknown;
     let firstWorkingUrl: string | undefined;
 
     // Test each URL
@@ -2900,6 +3166,7 @@ export class SingleAgentClient {
 
       if (result.status === 401) {
         got401 = true;
+        first401Error ??= result.error;
       }
     }
 
@@ -2910,15 +3177,18 @@ export class SingleAgentClient {
     // If we got 401 from any endpoint, throw an authentication-required error.
     // Prefer the richer NeedsAuthorizationError when we can walk the full
     // RFC 9728 chain (PRM → AS metadata → endpoints + scopes + DCR hint).
-    // Fall back to the simpler AuthenticationRequiredError with one-hop AS
-    // metadata when the walk doesn't yield enough.
+    // Fall back to AuthenticationRequiredError with the advertised challenge
+    // when the walk does not prove this MCP resource is OAuth protected.
     if (got401) {
+      if (presentedStaticTransportCredential(authToken, agentHeaders, authProvider)) {
+        throw new AuthenticationCredentialsRejectedError(providedUri, first401Error);
+      }
       const requirements = await discoverAuthorizationRequirements(providedUri, {
         allowPrivateIp: transport?.allowPrivateIp ?? isLikelyPrivateUrl(providedUri),
         fetchFn: transport?.trustedFetchFn,
         signal: options?.signal,
       });
-      if (requirements) {
+      if (requirements && hasValidatedMcpAuthorizationRequirements(requirements, providedUri)) {
         throw new NeedsAuthorizationError(requirements);
       }
       // Non-Bearer 401 (or Bearer-without-PRM). Re-probe to surface the
@@ -2930,12 +3200,7 @@ export class SingleAgentClient {
         fetchFn: transport?.trustedFetchFn,
         signal: options?.signal,
       });
-      const oauthMetadata = await discoverOAuthMetadata(providedUri, {
-        trustedFetchFn: transport?.trustedFetchFn,
-        allowPrivateIp: transport?.allowPrivateIp ?? isLikelyPrivateUrl(providedUri),
-        signal: options?.signal,
-      });
-      throw new AuthenticationRequiredError(providedUri, oauthMetadata || undefined, undefined, challenge ?? undefined);
+      throw new AuthenticationRequiredError(providedUri, undefined, undefined, challenge ?? undefined);
     }
 
     // None worked and no 401 - generic discovery failure.
@@ -3010,12 +3275,15 @@ export class SingleAgentClient {
    *
    * The method normalizes both formats so handlers receive the unwrapped
    * AdCP response data (AdCPAsyncResponseData), not the raw protocol structure.
+   * Registered callbacks require trusted HTTP method and public-URL context;
+   * use `createWebhookHandler()` or `verifyAndParseWebhook()` for those flows.
    *
    * @param payload - Protocol-specific webhook payload (MCPWebhookPayload | Task | TaskStatusUpdateEvent)
    * @param taskType - Task type (e.g create_media_buy) from url param or url part of the webhook delivery
    * @param operationId - Operation id (e.g used for client app to track the operation) from the param or url part of the webhook delivery
    * @param signature - X-ADCP-Signature header (format: "sha256=...")
    * @param timestamp - X-ADCP-Timestamp header (Unix timestamp)
+   * @param requestContext - Trusted method and public URL. Required for registered callbacks.
    * @returns Whether webhook was handled successfully
    *
    * @example
@@ -3040,7 +3308,8 @@ export class SingleAgentClient {
     operationId: string,
     signature?: WebhookHeaderValue,
     timestamp?: WebhookHeaderValue,
-    rawBody?: string | Buffer | Uint8Array
+    rawBody?: string | Buffer | Uint8Array,
+    requestContext?: WebhookRequestContext
   ): Promise<boolean> {
     const parsed = await this.verifyAndParseWebhook({
       payload,
@@ -3049,6 +3318,8 @@ export class SingleAgentClient {
       signature,
       timestamp,
       rawBody,
+      requestMethod: requestContext?.requestMethod,
+      requestUrl: requestContext?.requestUrl,
     });
     if (!parsed.ok) {
       throw new WebhookDispatchError(parsed.code, parsed.message, parsed.cause);
@@ -3067,6 +3338,8 @@ export class SingleAgentClient {
    * validates the transport envelope shape, and returns the canonicalized
    * AdCP result plus routing metadata. Legacy wire inspection is intentionally
    * confined to the transport adapter and is not returned by this primary API.
+   * Every registered callback must include its trusted HTTP method and externally
+   * visible absolute request URL so the persisted callback target is enforced.
    */
   async verifyAndParseWebhook(options: VerifyAndParseWebhookOptions): Promise<WebhookParseResult> {
     const rawBody = options.rawBody ?? rawBodyFromUnknown(options.body);
@@ -3075,9 +3348,18 @@ export class SingleAgentClient {
       options.operationId && options.operationId !== 'unknown' ? options.operationId : undefined;
     let registration: Readonly<WebhookRegistration> | undefined;
     if (trustedOperationId) {
+      let stored: Readonly<WebhookRegistration> | undefined;
       try {
-        registration = await this.webhookRegistrationStore.get(this.agent.id, trustedOperationId);
+        stored = await this.webhookRegistrationStore.get(this.agent.id, trustedOperationId);
       } catch (cause) {
+        if (cause instanceof WebhookRegistrationIntegrityError) {
+          return {
+            ok: false,
+            code: 'webhook_registration_store_unavailable',
+            message: 'Webhook registration state is invalid.',
+            cause,
+          };
+        }
         const routedTaskType = options.taskType && options.taskType !== 'unknown' ? options.taskType : undefined;
         if (
           !this.config.webhookSecret ||
@@ -3092,38 +3374,28 @@ export class SingleAgentClient {
           };
         }
       }
-    }
-    if (registration && (registration.agentId !== this.agent.id || registration.operationId !== trustedOperationId)) {
-      return {
-        ok: false,
-        code: 'webhook_registration_store_unavailable',
-        message: 'Webhook registration state is inconsistent with the trusted route.',
-      };
+      if (stored) {
+        try {
+          registration = parseWebhookRegistration(stored, {
+            agentId: this.agent.id,
+            operationId: trustedOperationId,
+          });
+        } catch (cause) {
+          // Corrupt or mismatched state is an authorization failure, not a
+          // transient read outage eligible for recordless HMAC fallback.
+          return {
+            ok: false,
+            code: 'webhook_registration_store_unavailable',
+            message: 'Webhook registration state is invalid.',
+            cause,
+          };
+        }
+      }
     }
     if (registration) {
       const nowMs = this.config.webhookVerification?.now
         ? Math.floor(this.config.webhookVerification.now() * 1000)
         : Date.now();
-      if (!Number.isFinite(registration.createdAt) || !Number.isFinite(registration.expiresAt)) {
-        return {
-          ok: false,
-          code: 'webhook_registration_store_unavailable',
-          message: 'Webhook registration state contains invalid timestamps.',
-        };
-      }
-      try {
-        const registeredAgentUrl = new URL(registration.agentUrl);
-        if (registeredAgentUrl.username || registeredAgentUrl.password) {
-          throw new TypeError('Webhook registration seller URL contains userinfo.');
-        }
-      } catch (cause) {
-        return {
-          ok: false,
-          code: 'webhook_registration_store_unavailable',
-          message: 'Webhook registration state contains an invalid seller URL.',
-          cause,
-        };
-      }
       if (registration.expiresAt <= nowMs) registration = undefined;
     }
 
@@ -3176,26 +3448,20 @@ export class SingleAgentClient {
       );
       return { ok: false, code: cause.code, message: cause.message, cause };
     }
-    if (registration?.mode === 'rfc9421') {
-      if (
-        rawBody === undefined ||
-        !options.headers ||
-        !trustedOperationId ||
-        !options.requestMethod ||
-        !options.requestUrl
-      ) {
+    if (registration) {
+      if (!options.requestMethod || !options.requestUrl) {
         return {
           ok: false,
           code: 'webhook_verification_context_missing',
           message:
-            'RFC 9421 verification requires raw body bytes, all headers, POST method, an absolute trusted public URL, and a trusted route operation id.',
+            'Registered webhook verification requires the POST method and externally visible absolute request URL from trusted server context.',
         };
       }
-      if (options.requestMethod.toUpperCase() !== 'POST') {
+      if (options.requestMethod.toUpperCase() !== registration.method) {
         return {
           ok: false,
           code: 'webhook_verification_context_missing',
-          message: 'Webhook request method must be POST.',
+          message: 'Webhook request method does not match the registered callback method.',
         };
       }
       try {
@@ -3215,13 +3481,26 @@ export class SingleAgentClient {
           cause,
         };
       }
+    }
+    if (registration?.mode === 'rfc9421') {
+      const requestMethod = options.requestMethod;
+      const requestUrl = options.requestUrl;
+      if (rawBody === undefined || !options.headers || !trustedOperationId || !requestMethod || !requestUrl) {
+        return {
+          ok: false,
+          code: 'webhook_verification_context_missing',
+          message:
+            'RFC 9421 verification requires raw body bytes, all headers, POST method, an absolute trusted public URL, and a trusted route operation id.',
+        };
+      }
       const normalizedHeaders = normalizeRfc9421WebhookHeaders(options.headers);
       if (!normalizedHeaders.ok) return normalizedHeaders.failure;
       try {
+        const delegatedOperatorAuthorization = this.delegatedOperatorAuthorizationForRegistration(registration);
         await verifyRfc9421WebhookSignature(
           {
-            method: options.requestMethod,
-            url: options.requestUrl,
+            method: requestMethod,
+            url: requestUrl,
             headers: normalizedHeaders.headers,
             body: rawBody,
           },
@@ -3231,11 +3510,25 @@ export class SingleAgentClient {
             revocationStore: this.webhookRevocationStore,
             ...(this.config.webhookVerification?.now && { now: this.config.webhookVerification.now }),
             agentUrlForKeyid: () => registration.agentUrl,
+            ...(registration.authorizationContextVersion === 1 && {
+              replayScopeBinding: `delegated-operator:v1:${crypto
+                .createHash('sha256')
+                .update(canonicalDelegatedOperatorAuthorization(delegatedOperatorAuthorization))
+                .digest('base64url')}`,
+            }),
           }
         );
       } catch (cause) {
         if (cause instanceof WebhookSignatureError) {
           return { ok: false, code: cause.code, message: cause.message, cause };
+        }
+        if (cause instanceof AgentResolverError && !cause.code.endsWith('_unreachable')) {
+          return {
+            ok: false,
+            code: 'webhook_signature_key_unknown',
+            message: 'The registered seller is not authorized to supply this webhook signing key.',
+            cause,
+          };
         }
         return {
           ok: false,
@@ -4272,6 +4565,7 @@ export class SingleAgentClient {
       skipIdempotencyAutoInject: options?.skipIdempotencyAutoInject,
       skipAccountValidation: options?.skipAccountValidation,
     });
+    if (!options?.skipRequestValidation) assertNoPrincipalIdentityInput(taskType, normalizedParams);
     this.assertRequestSupportedByConfiguredVersion(taskType, normalizedParams, options, canonicalCreativeInvocation);
     this.assertDurablePropertyListCredentialSupported(taskType, normalizedParams);
 
@@ -4291,18 +4585,16 @@ export class SingleAgentClient {
       normalizedParams = { ...normalizedParams, idempotency_key: generateIdempotencyKey() };
     }
 
-    // Validate request params against schema. When compliance testing has
-    // asked us to suppress idempotency auto-injection or account validation,
-    // skip the entire Zod schema parse — the required field is intentionally
-    // absent and Zod would fail on it too. This matches the pre-existing
-    // `skipIdempotencyAutoInject` behavior and is acceptable because both
-    // flags are @internal and only set by the storyboard runner for
-    // schema_validation steps. An explicit external schema root also skips
-    // this generated snapshot; TaskExecutor's AJV pass below validates the
-    // same request against the caller-supplied current-source bundle.
+    // Validate request params against schema. Compliance-only malformed-input
+    // vectors can skip this pass explicitly (or implicitly through the older
+    // missing-idempotency/account escape hatches) so the seller receives the
+    // request it is meant to validate. An explicit external schema root also
+    // skips this generated snapshot; TaskExecutor's AJV pass below validates
+    // the same request against the caller-supplied current-source bundle.
     if (
       !options?.skipIdempotencyAutoInject &&
       !options?.skipAccountValidation &&
+      !options?.skipRequestValidation &&
       !isExternalSchemaRootActive(this.resolvedAdcpVersion)
     ) {
       this.validateRequest(taskType, normalizedParams);
@@ -4331,9 +4623,9 @@ export class SingleAgentClient {
     // Schema-driven pre-send validation runs on the unadapted v3 shape so
     // wire-format adapters (e.g. adaptGetProductsRequestForV2) don't strip
     // v3-only fields out from under the v3 bundled schema. Skip the entire
-    // Zod parse when compliance testing has suppressed required-field
-    // validation — the missing field is intentional and Zod would reject it.
-    if (!options?.skipIdempotencyAutoInject && !options?.skipAccountValidation) {
+    // Zod parse when compliance testing has suppressed request validation —
+    // the invalid shape is intentional and must reach the seller.
+    if (!options?.skipIdempotencyAutoInject && !options?.skipAccountValidation && !options?.skipRequestValidation) {
       this.executor.validateRequest(taskType, normalizedParams);
     }
 
@@ -4512,7 +4804,7 @@ export class SingleAgentClient {
       this.rememberProductPolicyRequestParams(taskType, context.productPolicyRequest, result, resumedOptions);
     }
     this.rememberLegacyFormatConverter(taskType, finalizerLegacyFormatConverter, result, resumedOptions);
-    result = await this.applyProductPropertyPolicy(result, taskType, context.productPolicyRequest);
+    result = await this.applyProductPropertyPolicy(result, taskType, context.productPolicyRequest, options?.signal);
     throwIfAborted(options?.signal);
 
     if (context.canonical) {
@@ -4569,14 +4861,21 @@ export class SingleAgentClient {
     if (result.submitted && rawSubmittedWaitForCompletion) {
       result.submitted = {
         ...result.submitted,
-        waitForCompletion: async (pollInterval, signal) =>
-          this.finalizeTaskResult(
-            await rawSubmittedWaitForCompletion(pollInterval, signal),
+        waitForCompletion: async (pollInterval, signal) => {
+          const signals = [options?.signal, signal].filter(
+            (candidate): candidate is AbortSignal => candidate !== undefined
+          );
+          const completionSignal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+          const completionOptions = { ...(options ?? {}), ...(completionSignal ? { signal: completionSignal } : {}) };
+          const completed = await rawSubmittedWaitForCompletion(pollInterval, signal);
+          return this.finalizeTaskResult(
+            completed,
             context,
-            options,
+            completed.success && completed.status === 'completed' ? completionOptions : options,
             transformCompletedResponse,
             finalizerLegacyFormatConverter
-          ),
+          );
+        },
       };
     }
 
@@ -5065,13 +5364,33 @@ export class SingleAgentClient {
   private async applyProductPropertyPolicy<T>(
     result: TaskResult<T>,
     taskType: string,
-    requestParams: Record<string, unknown>
+    requestParams: Record<string, unknown>,
+    taskSignal?: AbortSignal
   ): Promise<TaskResult<T>> {
     // Reject non-transactable products (no pricing_options) before any
     // property-policy evaluation, regardless of whether a property policy is
     // configured. This runs on the same completion chokepoint so it covers the
     // sync, polling, track, and webhook paths uniformly.
     result = this.enforceProductPricingOptions(result, taskType);
+    if (
+      this.config.validation?.supplyPathVerification &&
+      (taskType === 'get_products' || taskType === 'list_products') &&
+      result.success &&
+      result.status === 'completed' &&
+      result.data
+    ) {
+      const data = result.data as { products?: object[] };
+      if (Array.isArray(data.products)) {
+        const configured = this.config.validation.supplyPathVerification;
+        const signals = [configured.signal, taskSignal].filter((signal): signal is AbortSignal => signal !== undefined);
+        const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+        const products = await annotateProductsSupplyPaths(data.products, this.agent.agent_uri, {
+          ...configured,
+          ...(signal ? { signal } : {}),
+        });
+        result = { ...result, data: { ...result.data, products } };
+      }
+    }
 
     const policyConfig = this.config.validation?.productPropertyPolicy;
     if (policyConfig === false || taskType !== 'get_products') return result;
@@ -5266,7 +5585,11 @@ export class SingleAgentClient {
     result: TaskResult<T>,
     options?: TaskOptions
   ): void {
-    if (taskType !== 'get_products') return;
+    if (
+      taskType !== 'get_products' &&
+      !(taskType === 'list_products' && this.config.validation?.supplyPathVerification)
+    )
+      return;
     if (result.status !== 'submitted' && result.status !== 'working') return;
 
     const keys = new Set<string>();
@@ -5350,7 +5673,13 @@ export class SingleAgentClient {
     requestParams: Record<string, unknown>,
     options?: TaskOptions
   ): TaskResult<T> {
-    if (taskType !== 'get_products' || result.status !== 'submitted' || !result.submitted) return result;
+    if (
+      (taskType !== 'get_products' &&
+        !(taskType === 'list_products' && this.config.validation?.supplyPathVerification)) ||
+      result.status !== 'submitted' ||
+      !result.submitted
+    )
+      return result;
 
     const submitted = result.submitted;
     const policyState: { request?: Readonly<Record<string, unknown>> } = {
@@ -5374,7 +5703,8 @@ export class SingleAgentClient {
           return await this.applyProductPropertyPolicyToTaskInfo(
             taskInfo,
             taskType,
-            (policyState.request ?? {}) as Record<string, unknown>
+            (policyState.request ?? {}) as Record<string, unknown>,
+            options?.signal
           );
         } finally {
           if (terminal) {
@@ -5393,7 +5723,8 @@ export class SingleAgentClient {
           return await this.applyProductPropertyPolicy(
             completed,
             taskType,
-            (policyState.request ?? {}) as Record<string, unknown>
+            (policyState.request ?? {}) as Record<string, unknown>,
+            signal ?? options?.signal
           );
         } finally {
           if (terminal) {
@@ -5414,9 +5745,16 @@ export class SingleAgentClient {
   private async applyProductPropertyPolicyToTaskInfo(
     taskInfo: TaskInfo,
     taskType: string,
-    requestParams: Record<string, unknown>
+    requestParams: Record<string, unknown>,
+    taskSignal?: AbortSignal
   ): Promise<TaskInfo> {
-    if (taskType !== 'get_products' || taskInfo.status !== 'completed' || !taskInfo.result) return taskInfo;
+    if (
+      (taskType !== 'get_products' &&
+        !(taskType === 'list_products' && this.config.validation?.supplyPathVerification)) ||
+      taskInfo.status !== 'completed' ||
+      !taskInfo.result
+    )
+      return taskInfo;
 
     const policyResult = await this.applyProductPropertyPolicy(
       attachMatch({
@@ -5435,7 +5773,8 @@ export class SingleAgentClient {
         debug_logs: [],
       }),
       taskType,
-      requestParams
+      requestParams,
+      taskSignal
     );
 
     if (policyResult.success) {
@@ -5475,7 +5814,12 @@ export class SingleAgentClient {
     result: AdCPAsyncResponseData | undefined,
     metadata: WebhookMetadata
   ): Promise<{ result: AdCPAsyncResponseData | undefined; metadata: WebhookMetadata; suppressHandler: boolean }> {
-    if (metadata.task_type !== 'get_products' || metadata.status !== 'completed' || !result) {
+    if (
+      (metadata.task_type !== 'get_products' &&
+        !(metadata.task_type === 'list_products' && this.config.validation?.supplyPathVerification)) ||
+      metadata.status !== 'completed' ||
+      !result
+    ) {
       return { result, metadata, suppressHandler: false };
     }
 
@@ -5849,6 +6193,21 @@ export class SingleAgentClient {
     );
   }
 
+  /** Discover products through the compact AdCP 3.2 catalog task. */
+  async listProducts(
+    params: ListProductsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ListProductsResponseWithSupplyPath>> {
+    return this.executeAndHandle<ListProductsResponseWithSupplyPath>(
+      'list_products',
+      'onListProductsStatusChange',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
   /** @deprecated Explicit raw-wire escape hatch for migration tooling. */
   async getProductsLegacy(
     params: GetProductsRequest,
@@ -5950,10 +6309,7 @@ export class SingleAgentClient {
       this.validateBeforeCreativeCapabilityProbe('create_media_buy', params, taskOptions);
     }
     const wireMode = hasCreativeFormatData
-      ? this.resolveCreativeFormatWireMode(
-          'create_media_buy',
-          await this.getCapabilities({ signal: taskOptions.signal, transport: taskOptions.transport })
-        )
+      ? this.resolveCreativeFormatWireMode('create_media_buy', await this.getCapabilities(taskOptions))
       : 'canonical';
     // Merge library defaults with consumer-provided reporting_webhook config
     // Library provides url/auth/frequency defaults, consumer can override any field
@@ -6128,10 +6484,7 @@ export class SingleAgentClient {
       this.validateBeforeCreativeCapabilityProbe('update_media_buy', params, taskOptions);
     }
     const wireMode = hasCreativeFormatData
-      ? this.resolveCreativeFormatWireMode(
-          'update_media_buy',
-          await this.getCapabilities({ signal: taskOptions.signal, transport: taskOptions.transport })
-        )
+      ? this.resolveCreativeFormatWireMode('update_media_buy', await this.getCapabilities(taskOptions))
       : 'canonical';
     const result = await this.executeAndHandle<UpdateMediaBuyResponse>(
       'update_media_buy',
@@ -6230,10 +6583,7 @@ export class SingleAgentClient {
       projectionCatalogs ?? this.config.projectionCatalogs
     );
     this.validateBeforeCreativeCapabilityProbe('sync_creatives', params, taskOptions);
-    const wireMode = this.resolveCreativeFormatWireMode(
-      'sync_creatives',
-      await this.getCapabilities({ signal: taskOptions.signal, transport: taskOptions.transport })
-    );
+    const wireMode = this.resolveCreativeFormatWireMode('sync_creatives', await this.getCapabilities(taskOptions));
     const configuredSelectorContainers = [
       ...((creativeFormatProjection?.selectorContainers ?? []) as ReadonlyArray<CreativeFormatSelectorContainer>),
     ];
@@ -6313,7 +6663,7 @@ export class SingleAgentClient {
 
   /** Validate malformed creative payloads before capability discovery can perform I/O. */
   private validateBeforeCreativeCapabilityProbe(taskType: string, params: unknown, options: TaskOptions): void {
-    if (options.skipIdempotencyAutoInject || options.skipAccountValidation) return;
+    if (options.skipIdempotencyAutoInject || options.skipAccountValidation || options.skipRequestValidation) return;
     let normalizedParams = normalizeRequestParams(taskType, params);
     if (
       requestUsesIdempotency(taskType, normalizedParams) &&
@@ -6678,7 +7028,7 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: TaskOptions
   ): Promise<TaskResult<GetAdCPCapabilitiesResponse>> {
-    return withTaskDeadline(options, effectiveOptions =>
+    return withTaskDeadline(snapshotTaskOptions(options), effectiveOptions =>
       this.getAdcpCapabilitiesWithinDeadline(params, inputHandler, effectiveOptions)
     );
   }
@@ -6720,6 +7070,51 @@ export class SingleAgentClient {
   }
 
   // ====== ACCOUNT & AUDIENCE TASKS ======
+
+  /** Read the durable change feed for one account. */
+  async listAccountChanges(
+    params: ListAccountChangesRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ListAccountChangesResponse>> {
+    return this.executeAndHandle<ListAccountChangesResponse>(
+      'list_account_changes',
+      'onListAccountChangesStatusChange',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Read the authenticated caller's durable principal configuration. */
+  async getPrincipal(
+    params: GetPrincipalRequest = {},
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<GetPrincipalResponse>> {
+    return this.executeAndHandle<GetPrincipalResponse>(
+      'get_principal',
+      'onGetPrincipalStatusChange',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Atomically replace selected sections of the authenticated caller's principal configuration. */
+  async syncPrincipal(
+    params: MutatingRequestInput<SyncPrincipalRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<SyncPrincipalResponse>> {
+    return this.executeAndHandle<SyncPrincipalResponse>(
+      'sync_principal',
+      'onSyncPrincipalStatusChange',
+      params,
+      inputHandler,
+      options
+    );
+  }
 
   /**
    * List accounts
@@ -7031,6 +7426,8 @@ export class SingleAgentClient {
     switch (taskName) {
       case 'get_products':
         return this.getProducts(params as CanonicalGetProductsRequest, inputHandler, options);
+      case 'list_products':
+        return this.listProducts(params as ListProductsRequest, inputHandler, options);
       case 'create_media_buy':
         return (await this.createMediaBuy(
           params as MutatingRequestInput<CanonicalCreateMediaBuyRequest>,
@@ -7057,6 +7454,10 @@ export class SingleAgentClient {
         return this.getMediaBuyDelivery(params as GetMediaBuyDeliveryRequest, inputHandler, options);
       case 'get_creative_delivery':
         return this.getCreativeDelivery(params as GetCreativeDeliveryRequest, inputHandler, options);
+      case 'get_principal':
+        return this.getPrincipal(params as GetPrincipalRequest, inputHandler, options);
+      case 'sync_principal':
+        return this.syncPrincipal(params as MutatingRequestInput<SyncPrincipalRequest>, inputHandler, options);
       case 'request_proposals':
         return guardNativeRequestProposalsCompletion(
           await this.executeTaskUnprojected(taskName, params, inputHandler, options)
@@ -7140,6 +7541,7 @@ export class SingleAgentClient {
         skipIdempotencyAutoInject: options?.skipIdempotencyAutoInject,
         skipAccountValidation: options?.skipAccountValidation,
       });
+      if (!options?.skipRequestValidation) assertNoPrincipalIdentityInput(taskName, normalizedParams);
       this.assertRequestSupportedByConfiguredVersion(taskName, normalizedParams, options);
       this.assertDurablePropertyListCredentialSupported(taskName, normalizedParams);
 
@@ -7152,9 +7554,9 @@ export class SingleAgentClient {
       // Schema-driven pre-send validation runs on the unadapted v3 shape so
       // wire-format adapters (e.g. adaptGetProductsRequestForV2) don't strip
       // v3-only fields out from under the v3 bundled schema. Skip the entire
-      // Zod parse when compliance testing has suppressed required-field
-      // validation — the missing field is intentional and Zod would reject it.
-      if (!options?.skipIdempotencyAutoInject && !options?.skipAccountValidation) {
+      // Zod parse when compliance testing has suppressed request validation —
+      // the invalid shape is intentional and must reach the seller.
+      if (!options?.skipIdempotencyAutoInject && !options?.skipAccountValidation && !options?.skipRequestValidation) {
         this.executor.validateRequest(taskName, normalizedParams);
       }
 
@@ -7242,6 +7644,7 @@ export class SingleAgentClient {
         error instanceof TaskTimeoutError ||
         error instanceof VersionUnsupportedError ||
         error instanceof FeatureUnsupportedError ||
+        (error instanceof ConfigurationError && options?.durableContinuationRecovery !== undefined) ||
         isAbortOrTimeoutError(error)
       ) {
         throw error;
@@ -7786,6 +8189,11 @@ export class SingleAgentClient {
       ...(options?.signal && { signal: options.signal }),
       ...(clientRequestTimeoutMs !== undefined && { timeout: clientRequestTimeoutMs }),
     };
+    const discoveryAdcpVersion = this.getWireAdcpVersion();
+    const mcpListParams =
+      parseAdcpMajorVersion(discoveryAdcpVersion) >= 3
+        ? { _meta: { adcp_version: toReleasePrecisionVersion(discoveryAdcpVersion) } }
+        : undefined;
     const ensureReadAuthToken = async (): Promise<string | undefined> => {
       if (!this.normalizedAgent.oauth_client_credentials) return this.normalizedAgent.auth_token;
       const { ensureClientCredentialsTokens, getAgentStorage } = await import('../auth/oauth');
@@ -7802,7 +8210,7 @@ export class SingleAgentClient {
       if (this.normalizedAgent._inProcessMcpClient) {
         const mcpClient = this.normalizedAgent._inProcessMcpClient;
         const toolsList = await withResponseSizeLimit(maxResponseBytes, () =>
-          mcpClient.listTools(undefined, mcpRequestOptions)
+          mcpClient.listTools(mcpListParams, mcpRequestOptions)
         );
         const tools = toolsList.tools.map(tool => ({
           name: tool.name,
@@ -7869,6 +8277,9 @@ export class SingleAgentClient {
           : await withResponseSizeLimit(maxResponseBytes, () =>
               tryListModernMCPTools(agent.agent_uri, readAuthToken, this.normalizedAgent.headers, {
                 authProvider,
+                ...(mcpListParams?._meta.adcp_version !== undefined && {
+                  adcpVersion: mcpListParams._meta.adcp_version,
+                }),
                 signal: options?.signal,
                 requestTimeoutMs: transport?.requestTimeoutMs,
                 fetchFn: transport?.trustedFetchFn,
@@ -7894,7 +8305,7 @@ export class SingleAgentClient {
       const { client: mcpClient } = await connectMCP(connectOptions);
       try {
         const toolsList = await withResponseSizeLimit(maxResponseBytes, () =>
-          mcpClient.listTools(undefined, mcpRequestOptions)
+          mcpClient.listTools(mcpListParams, mcpRequestOptions)
         );
 
         const tools = toolsList.tools.map(tool => ({
@@ -7951,7 +8362,9 @@ export class SingleAgentClient {
           // Wrap A2A card discovery so `transport.maxResponseBytes` applies
           // to agent-card fetches and the deferred `agentCardPromise` read
           // below — both fire fetches that would otherwise bypass the cap.
-          client = await withResponseSizeLimit(maxResponseBytes, () => createA2AClientFromCardUrl(cardUrl, fetchImpl));
+          client = await withResponseSizeLimit(maxResponseBytes, () =>
+            createA2AClientFromCardUrl(cardUrl, fetchImpl, transport?.legacyCompat)
+          );
           break;
         } catch (err: unknown) {
           lastCardError = err as Error;
@@ -8022,9 +8435,19 @@ export class SingleAgentClient {
    */
   async getCapabilities(options?: ReadRequestOptions): Promise<AdcpCapabilities> {
     throwIfAborted(options?.signal);
+    this.synchronizeCapabilityEvidenceAuthorizationScope();
     const discoveryContext = (options as InternalReadRequestOptions | undefined)?.[CAPABILITY_DISCOVERY_CONTEXT];
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
     const usesScopedFetch = transport?.trustedFetchFn !== undefined;
+    // Application-owned evidence keeps its declared freshness bound after it
+    // has been installed. Once expired, discard both capability and schema
+    // evidence and perform ordinary discovery below.
+    if (this.primedCapabilitiesExpiresAt !== undefined && this.primedCapabilitiesExpiresAt <= Date.now()) {
+      this.cachedCapabilities = undefined;
+      this.cachedToolSchemas = undefined;
+      this.primedCapabilitiesExpiresAt = undefined;
+    }
+
     // Return cached if available
     if (!usesScopedFetch && this.cachedCapabilities) {
       if (discoveryContext) discoveryContext.toolSchemas = this.cachedToolSchemas;
@@ -8069,7 +8492,28 @@ export class SingleAgentClient {
         // executor then hits ProtocolClient.callTool which reads _inProcessMcpClient directly,
         // so the sentinel adcp-in-process:// URI never reaches validateAgentUrl.
         const agent = await this.ensureEndpointDiscovered(options);
-        const result = await this.executor.executeTask<any>(agent, 'get_adcp_capabilities', {}, undefined, options);
+        // Capability discovery can run inside another task's deadline scope. Do
+        // not forward that scope's private operation ID: the probe is a
+        // separate physical task with its own webhook registration. Preserve
+        // the caller's cancellation, transport safeguards, callback policy,
+        // and callback authorization provenance. The active OpenTelemetry
+        // context remains in the async chain, correlating both physical tasks.
+        const callerOptions = options as CapabilityProbeRequestOptions | undefined;
+        const probeOptions: CapabilityProbeRequestOptions = {
+          ...(options?.signal !== undefined && { signal: options.signal }),
+          ...(options?.transport !== undefined && { transport: options.transport }),
+          ...(callerOptions?.disableWebhook !== undefined && { disableWebhook: callerOptions.disableWebhook }),
+          ...(callerOptions?.delegatedOperatorAuthorization !== undefined && {
+            delegatedOperatorAuthorization: { ...callerOptions.delegatedOperatorAuthorization },
+          }),
+        };
+        const result = await this.executor.executeTask<any>(
+          agent,
+          'get_adcp_capabilities',
+          {},
+          undefined,
+          probeOptions
+        );
         throwIfAborted(options?.signal);
         const requestTimeoutMs = resolveRequestTimeoutMs(
           options?.transport?.requestTimeoutMs ?? this.config.transport?.requestTimeoutMs
@@ -8196,6 +8640,127 @@ export class SingleAgentClient {
     const capabilities = buildSyntheticCapabilities(tools);
     if (!usesScopedFetch) this.cachedCapabilities = capabilities;
     return capabilities;
+  }
+
+  /**
+   * Return the client-bound scope required by {@link primeCapabilities}.
+   *
+   * Obtain this scope before an application-owned, tenant-scoped preflight and
+   * attach it unchanged to the resulting snapshot. The opaque key prevents a
+   * snapshot collected for another client, credential, or transport instance
+   * from being installed accidentally.
+   */
+  getCapabilityEvidenceScope(): CapabilityEvidenceScope {
+    this.synchronizeCapabilityEvidenceAuthorizationScope();
+    return Object.freeze({
+      agentUri: this.normalizedAgent.agent_uri,
+      adcpVersion: this.resolvedAdcpVersion,
+      scopeKey: this.capabilityEvidenceScopeKey,
+    });
+  }
+
+  private currentCapabilityEvidenceAuthMaterial(): string {
+    // OAuth refresh updates the normalized transport agent in place/replaces
+    // its token bundle. Bind evidence to that effective credential state,
+    // rather than the constructor argument that may now be stale.
+    const effectiveAgent = this.normalizedAgent;
+    return canonicalizeJson({
+      authToken: effectiveAgent.auth_token ?? null,
+      headers: effectiveAgent.headers ?? null,
+      oauthTokens: effectiveAgent.oauth_tokens ?? null,
+      oauthClient: effectiveAgent.oauth_client ?? null,
+      oauthResource: effectiveAgent.oauth_resource ?? null,
+      oauthClientCredentials: effectiveAgent.oauth_client_credentials ?? null,
+      oauthCodeVerifier: effectiveAgent.oauth_code_verifier ?? null,
+    });
+  }
+
+  private synchronizeCapabilityEvidenceAuthorizationScope(): void {
+    const current = this.currentCapabilityEvidenceAuthMaterial();
+    if (this.capabilityEvidenceAuthMaterial === undefined) {
+      this.capabilityEvidenceAuthMaterial = current;
+      return;
+    }
+    if (current === this.capabilityEvidenceAuthMaterial) return;
+    this.capabilityEvidenceAuthMaterial = current;
+    this.cachedCapabilities = undefined;
+    this.cachedToolSchemas = undefined;
+    this.primedCapabilitiesExpiresAt = undefined;
+    this.capabilityEvidenceScopeKey = randomUUID();
+  }
+
+  /**
+   * Reuse a fresh capability observation made by the embedding application.
+   *
+   * Returns `false` and leaves discovery cold when the scope, endpoint,
+   * configured release, or freshness window does not match. Per-call scoped
+   * transports (`trustedFetchFn`) continue to bypass this cache and discover
+   * within their own request scope.
+   */
+  primeCapabilities(snapshot: CapabilityEvidenceSnapshot): boolean {
+    const expected = this.getCapabilityEvidenceScope();
+    const scope = snapshot?.scope;
+    const capabilities = snapshot?.capabilities;
+    const observedAt = Date.parse(typeof snapshot?.observedAt === 'string' ? snapshot.observedAt : '');
+    const expiresAt = Date.parse(typeof snapshot?.expiresAt === 'string' ? snapshot.expiresAt : '');
+    const now = Date.now();
+    const matchesScope =
+      typeof scope === 'object' &&
+      scope !== null &&
+      scope.scopeKey === expected.scopeKey &&
+      scope.agentUri === expected.agentUri &&
+      scope.adcpVersion === expected.adcpVersion;
+    const isFresh =
+      Number.isFinite(observedAt) &&
+      Number.isFinite(expiresAt) &&
+      observedAt <= now &&
+      expiresAt > now &&
+      expiresAt >= observedAt;
+    const hasCapabilities = isCapabilityEvidence(capabilities);
+    const hasValidToolSchemas =
+      snapshot?.toolSchemas === undefined ||
+      (typeof snapshot.toolSchemas === 'object' &&
+        snapshot.toolSchemas !== null &&
+        Object.values(snapshot.toolSchemas).every(
+          properties => typeof properties === 'object' && properties !== null && !Array.isArray(properties)
+        ));
+    const configuredScopedFetch = normalizeTransportOptions(this.config.transport)?.trustedFetchFn !== undefined;
+    const hasToolEvidence = snapshot?.toolSchemas !== undefined || Array.isArray(capabilities?.discoveredTools);
+    if (
+      !matchesScope ||
+      !isFresh ||
+      !hasCapabilities ||
+      !hasValidToolSchemas ||
+      !hasToolEvidence ||
+      configuredScopedFetch
+    ) {
+      this.cachedCapabilities = undefined;
+      this.cachedToolSchemas = undefined;
+      this.primedCapabilitiesExpiresAt = undefined;
+      return false;
+    }
+
+    try {
+      const observedTools = [
+        ...new Set([...(capabilities.discoveredTools ?? []), ...Object.keys(snapshot.toolSchemas ?? {})]),
+      ].map(name => ({ name }));
+      this.cachedCapabilities = augmentCapabilitiesFromTools(structuredClone(capabilities), observedTools);
+      this.primedCapabilitiesExpiresAt = expiresAt;
+      this.cachedToolSchemas = snapshot.toolSchemas
+        ? new Map(
+            Object.entries(snapshot.toolSchemas).map(([tool, properties]) => [
+              tool,
+              structuredClone(properties) as Record<string, unknown>,
+            ])
+          )
+        : undefined;
+      return true;
+    } catch {
+      this.cachedCapabilities = undefined;
+      this.cachedToolSchemas = undefined;
+      this.primedCapabilitiesExpiresAt = undefined;
+      return false;
+    }
   }
 
   /**
@@ -8379,6 +8944,9 @@ export class SingleAgentClient {
    */
   async refreshCapabilities(): Promise<AdcpCapabilities> {
     this.cachedCapabilities = undefined;
+    this.cachedToolSchemas = undefined;
+    this.primedCapabilitiesExpiresAt = undefined;
+    this.capabilityEvidenceScopeKey = randomUUID();
     return this.getCapabilities();
   }
 
@@ -8793,14 +9361,10 @@ export class SingleAgentClient {
       return; // No schema available for this task type
     }
 
-    try {
-      schema.parse(params);
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        const issues = error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
-        throw new Error(`Request validation failed for ${taskType}: ${issues}`);
-      }
-      throw error;
+    const result = schema.safeParse(params);
+    if (!result.success) {
+      const issues = result.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
+      throw new Error(`Request validation failed for ${taskType}: ${issues}`);
     }
   }
 
@@ -8819,8 +9383,9 @@ export class SingleAgentClient {
    *
    * @internal
    */
-  private getRequestSchema(taskType: string): z.ZodSchema | null {
-    const schemaMap: Partial<Record<string, z.ZodSchema>> = {
+  private getRequestSchema(taskType: string) {
+    const schemas = loadClientRequestSchemas();
+    const schemaMap = {
       get_products: schemas.GetProductsRequestSchema,
       list_creative_formats: schemas.ListCreativeFormatsRequestSchema,
       create_media_buy: schemas.CreateMediaBuyRequestSchema,
@@ -8834,8 +9399,15 @@ export class SingleAgentClient {
       activate_signal: schemas.ActivateSignalRequestSchema,
     };
 
-    return schemaMap[taskType] || null;
+    return schemaMap[taskType as keyof typeof schemaMap] || null;
   }
+}
+
+let clientRequestSchemasModule: typeof import('../types/schemas.generated') | undefined;
+
+function loadClientRequestSchemas(): typeof import('../types/schemas.generated') {
+  clientRequestSchemasModule ??= require('../types/schemas.generated') as typeof import('../types/schemas.generated');
+  return clientRequestSchemasModule;
 }
 
 let hasWarnedAboutUnverifiedWebhookReceive = false;

@@ -79,13 +79,15 @@ describe('Response Unwrapper', () => {
       assert.strictEqual(result.status, undefined);
     });
 
-    test('accepts the generated ordered decline result form without an echoed proposal_id', () => {
+    test('rejects decline results without the required proposal_id', () => {
       const payload = {
         results: [{ outcome: 'declined' }],
       };
-      const result = unwrapProtocolResponse({ structuredContent: payload }, 'decline_proposals', 'mcp');
 
-      assert.deepStrictEqual(result, payload);
+      assert.throws(
+        () => unwrapProtocolResponse({ structuredContent: payload }, 'decline_proposals', 'mcp'),
+        /Response validation failed for decline_proposals/
+      );
     });
 
     test('should unwrap A2A result.artifacts response with validation', () => {
@@ -883,6 +885,7 @@ describe('Response Unwrapper', () => {
       assert.strictEqual(result.products.length, 1);
       assert.strictEqual(result.cache_scope, undefined);
       assert.strictEqual(result.status, undefined);
+      assert.strictEqual(result.adcp_version, '3.0.12');
     });
 
     test('should accept legacy 3.0 A2A get_products without cache_scope', () => {
@@ -909,6 +912,7 @@ describe('Response Unwrapper', () => {
       assert.strictEqual(result.products.length, 1);
       assert.strictEqual(result.cache_scope, undefined);
       assert.strictEqual(result.status, undefined);
+      assert.strictEqual(result.adcp_version, '3.0.12');
     });
 
     test('should reject get_products response with non-array products', () => {
@@ -1552,6 +1556,24 @@ describe('Response Unwrapper', () => {
   });
 
   describe('legacy envelope-status compat: injected status must not leak into returned data', () => {
+    test('preserves a legacy 3.0 full-semver version after validating create_media_buy', () => {
+      const response = unwrapProtocolResponse(
+        {
+          structuredContent: {
+            adcp_version: '3.0.12',
+            media_buy_id: 'buy-legacy-version',
+            buyer_ref: 'buyer-ref-legacy-version',
+            packages: [],
+            media_buy_status: 'pending_creatives',
+          },
+        },
+        'create_media_buy',
+        'mcp'
+      );
+
+      assert.strictEqual(response.adcp_version, '3.0.12');
+    });
+
     // Regression test for adcp-client#1961.
     // A 3.0.x seller emits media_buy_status without a top-level `status`.
     // The compat shim injects status:"completed" so the 3.1 Zod schema accepts

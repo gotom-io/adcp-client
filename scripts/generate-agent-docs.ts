@@ -72,6 +72,10 @@ const TOOL_GOTCHAS: Record<string, string[]> = {
     'Use the typed factories from `@adcp/sdk`: `displayRender({ role, dimensions })` for display/video; `parameterizedRender({ role })` for audio and template formats (auto-injects `parameters_from_format_id: true`).',
     'Audio formats (`type: "audio"`) have no width/height — declare `renders: [parameterizedRender({ role: "primary" })]` and encode duration/codec in `format_id.parameters` (declared via `accepts_parameters`).',
   ],
+  sync_reporting_status: [
+    'A `completed` envelope does not mean every item succeeded: inspect each per-item `result`. For a schema-valid envelope, results map one-for-one to submitted statuses in request order.',
+    '`recorded_at` is seller-authored and response-only. Never send it in `statuses[]`.',
+  ],
 };
 
 // GitHub Pages base URL for published docs
@@ -110,14 +114,34 @@ function loadIndex(): SchemaIndex {
   return JSON.parse(readFileSync(INDEX_PATH, 'utf8'));
 }
 
+function resolveSchemaFragment(schema: any, fragment: string): any {
+  if (!fragment.startsWith('#/')) return schema;
+
+  let resolved = schema;
+  for (const rawSegment of fragment.slice(2).split('/')) {
+    const segment = decodeURIComponent(rawSegment).replaceAll('~1', '/').replaceAll('~0', '~');
+    resolved = resolved?.[segment];
+    if (resolved === undefined) return null;
+  }
+  return resolved;
+}
+
 function loadSchema(ref: string): any {
   // Indexes may use either root-relative or absolute canonical schema URLs.
   // Resolve both to a cache-relative path before stripping the version.
   let rel = ref;
+  let fragment = '';
   try {
-    rel = new URL(ref).pathname;
+    const url = new URL(ref);
+    rel = url.pathname;
+    fragment = url.hash;
   } catch {
     // A relative reference is already suitable for the handling below.
+    const hashIndex = rel.indexOf('#');
+    if (hashIndex >= 0) {
+      fragment = rel.slice(hashIndex);
+      rel = rel.slice(0, hashIndex);
+    }
   }
   if (rel.startsWith('/schemas/')) {
     rel = rel.substring('/schemas/'.length);
@@ -127,8 +151,9 @@ function loadSchema(ref: string): any {
     }
   }
   const filePath = path.join(SCHEMA_CACHE_DIR, rel);
-  if (!existsSync(filePath)) return null;
-  return JSON.parse(readFileSync(filePath, 'utf8'));
+  if (!existsSync(filePath) || !statSync(filePath).isFile()) return null;
+  const schema = JSON.parse(readFileSync(filePath, 'utf8'));
+  return resolveSchemaFragment(schema, fragment);
 }
 
 function kebabToSnake(s: string): string {
@@ -152,7 +177,7 @@ function summarizeFields(schema: any): { required: string[]; optional: string[] 
     // Skip protocol-level fields that appear on every request
     if (name === 'adcp_major_version' || name === 'ext') continue;
 
-    const typeHint = fieldType(prop);
+    const typeHint = fieldType(prop, schema);
     const entry = typeHint ? `${name}: ${typeHint}` : name;
 
     if (req.has(name)) {
@@ -173,38 +198,75 @@ function summarizeFields(schema: any): { required: string[]; optional: string[] 
 function summarizeResponseFields(schema: any): { required: string[]; optional: string[] } {
   if (!schema) return { required: [], optional: [] };
 
+  const prohibitedFields = (notSchema: any): Set<string> => {
+    const prohibited = new Set<string>();
+    if (Array.isArray(notSchema?.required) && notSchema.required.length === 1) {
+      prohibited.add(notSchema.required[0]);
+    }
+    for (const member of notSchema?.anyOf || []) {
+      if (Array.isArray(member?.required) && member.required.length === 1) prohibited.add(member.required[0]);
+    }
+    return prohibited;
+  };
+
+  const summarizeBranch = (branch: any) => {
+    const prohibited = new Set([...prohibitedFields(schema.not), ...prohibitedFields(branch.not)]);
+    const properties = Object.fromEntries(
+      Object.entries({ ...(schema.properties || {}), ...(branch.properties || {}) }).filter(
+        ([name]) => !prohibited.has(name)
+      )
+    );
+    return summarizeFields({
+      ...schema,
+      ...branch,
+      properties,
+      required: [...new Set([...(schema.required || []), ...(branch.required || [])])].filter(
+        name => !prohibited.has(name)
+      ),
+    });
+  };
+
   // oneOf / anyOf — pick the success branch (doesn't require `errors`)
   if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
     const successBranch = schema.oneOf.find((b: any) => !(b.required || []).includes('errors')) ?? schema.oneOf[0];
-    return summarizeFields(successBranch);
+    return summarizeBranch(successBranch);
   }
   if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
     const successBranch = schema.anyOf.find((b: any) => !(b.required || []).includes('errors')) ?? schema.anyOf[0];
-    return summarizeFields(successBranch);
+    return summarizeBranch(successBranch);
   }
   return summarizeFields(schema);
 }
 
-function fieldType(prop: any): string {
+function fieldType(prop: any, rootSchema?: any): string {
   if (!prop) return '';
   if (prop.enum) return prop.enum.map((v: string) => `'${v}'`).join(' | ');
   if (prop.const) return `'${prop.const}'`;
   if (prop.type === 'array') {
-    const itemType = fieldType(prop.items) || 'object';
+    const itemType = fieldType(prop.items, rootSchema) || 'object';
     return itemType.includes(' | ') ? `(${itemType})[]` : `${itemType}[]`;
   }
   if (prop.type === 'object' && prop.title) return prop.title;
   if (prop.$ref) {
+    const isLocalRef = prop.$ref.startsWith('#');
+    if (isLocalRef || prop.$ref.includes('#')) {
+      const resolved = isLocalRef ? resolveSchemaFragment(rootSchema, prop.$ref) : loadSchema(prop.$ref);
+      if (resolved) return fieldType(resolved, isLocalRef ? rootSchema : resolved);
+    }
     // Extract type name from $ref path
-    const parts = prop.$ref.split('/');
+    const parts = prop.$ref.split('#')[0].split('/');
     const filename = parts[parts.length - 1].replace('.json', '');
     return kebabToTitle(filename);
+  }
+  if (Array.isArray(prop.allOf)) {
+    const structuralType = prop.allOf.map((value: any) => fieldType(value, rootSchema)).find(Boolean);
+    if (structuralType) return structuralType;
   }
   if (prop.oneOf || prop.anyOf) {
     const variants = prop.oneOf || prop.anyOf;
     if (variants.length <= 3) {
       return variants
-        .map((v: any) => v.title || v.const || fieldType(v))
+        .map((v: any) => v.title || v.const || fieldType(v, rootSchema))
         .filter(Boolean)
         .join(' | ');
     }
@@ -542,12 +604,31 @@ function generateLlmsTxt(
   ln();
 
   // --- Client vs. server routing ---
-  ln(`## Are you building a client or a server?`);
+  ln(`## Start here: SDK 14 and AdCP 3.2`);
   ln();
-  ln(`- **Client** (calling existing agents): Continue reading — the Quick Start below is for you.`);
   ln(
-    `- **Server** (implementing an agent that others call): Read \`docs/guides/BUILD-AN-AGENT.md\` and \`docs/migration-5.x-to-6.x.md\`. v6 recommended path:`
+    `SDK 14 requires Node.js \`^20.19.0 || >=22.12.0\`; install the newest v14 prerelease with \`@adcp/sdk@^14.0.0-0\`.`
   );
+  ln();
+  ln(
+    `SDK 14 is compact-lifecycle first: \`list_products → buy_products → control_media_buy\`, with \`request_proposals → refine_proposals → accept_proposal\` when terms need negotiation.`
+  );
+  ln();
+  ln(
+    '- **MediaBuy change rights:** use `assessMediaBuyAction` from `@adcp/sdk/media-buy/actions` for possible / promised / available-now assessment, and `mediaBuyActionResolver` from `@adcp/sdk/server` for explicit seller acceptance and current projection. See `docs/guides/MEDIA-BUY-ACTION-ASSESSMENT.md`.'
+  );
+  ln(`- **Buyer** (calling a seller): read \`docs/guides/BUYER-QUICKSTART-3.2.md\` first.`);
+  ln(
+    `- **Before proposal acceptance:** use \`verifyProposalCommercialTerms\` from \`@adcp/sdk/negotiation/verification\` with a complete, independently reviewed snapshot and the seller-served schema version. Never use an unreviewed candidate as its own expected terms. See \`docs/guides/PROPOSAL-TERMS-VERIFICATION.md\`.`
+  );
+  ln(
+    `- **Seller** (implementing an agent that others call): read \`docs/guides/SELLER-QUICKSTART-3.2.md\` first, then \`docs/guides/BUILD-AN-AGENT.md\` for the complete framework surface.`
+  );
+  ln(
+    `- **Upgrading an existing application:** read \`docs/migration-13-to-14.md\`; established 3.0/3.1 tools remain supported as an explicit compatibility path.`
+  );
+  ln();
+  ln(`## Server framework reference`);
   ln();
   ln('```typescript');
   ln(`import { serve } from '@adcp/sdk';`);
@@ -588,6 +669,10 @@ function generateLlmsTxt(
   );
   ln();
   ln(
+    `Standing caller- and account-level notification subscribers require a durable control plane in addition to webhook delivery. Use \`createPostgresPersistentNotificationRuntime()\` for declarative replacement, exact-tuple proof generations, write-only credential bindings, anchor-safe fanout, and live authorization before every attempt/retry. See \`docs/guides/PERSISTENT-NOTIFICATION-RUNTIME.md\`; do not implement a second subscriber writer behind the raw \`syncAgentNotificationConfigs\` hook.`
+  );
+  ln();
+  ln(
     `Lower-level option: \`createAdcpServer({ signals: { getSignals: ... } })\` from \`@adcp/sdk/server/legacy/v5\` — handler-bag API. Still fully supported, the substrate the platform path calls into. Use when you need fine control over individual handlers, mid-migration from a v5 codebase, or custom-shaped tools the platform interface doesn't yet model. \`wrapEnvelope(inner, { replayed, context, operationId })\` from \`@adcp/sdk/server\` attaches protocol envelope fields with the per-error-code allowlist (IDEMPOTENCY_CONFLICT drops \`replayed\`).`
   );
   ln();
@@ -596,7 +681,7 @@ function generateLlmsTxt(
   );
   ln();
   ln(
-    `**Typed errors instead of \`new AdcpError(code, ...)\`.** \`AuthMissingError\`, \`AuthInvalidError\`, \`PermissionDeniedError(action)\`, \`RateLimitedError(retryAfterSeconds)\`, \`ServiceUnavailableError\`, \`UnsupportedFeatureError(feature)\`, \`GovernanceDeniedError\`, \`PolicyViolationError\`, \`IdempotencyConflictError\`, \`InvalidRequestError\`, \`InvalidStateError\`, plus the not-found family (\`AccountNotFoundError\`, \`MediaBuyNotFoundError\`, \`PackageNotFoundError\`, \`ProductNotFoundError\`, \`CreativeNotFoundError\`) and the budget / state family. \`AuthRequiredError\` remains as a deprecated \`AUTH_REQUIRED\` compatibility wrapper for older sellers; new seller code should use the split auth classes. Each maps to its wire error code with \`recovery\` baked in. Throw from platform methods. In \`accounts.resolve\`, use auth errors only for inbound authentication failures; missing sync linkage or unknown account references should stay \`ACCOUNT_NOT_FOUND\` / \`null\`.`
+    `**Typed errors instead of \`new AdcpError(code, ...)\`.** \`AuthMissingError\`, \`AuthInvalidError\`, \`PermissionDeniedError(action)\`, \`RateLimitedError(retryAfterSeconds)\`, \`ServiceUnavailableError\`, \`UnsupportedFeatureError(feature)\`, \`GovernanceDeniedError\`, \`PolicyViolationError\`, \`IdempotencyConflictError\`, \`InvalidRequestError\`, \`InvalidStateError\`, plus the not-found family (\`AccountNotFoundError\`, \`MediaBuyNotFoundError\`, \`PackageNotFoundError\`, \`ProductNotFoundError\`, \`CreativeNotFoundError\`) and the budget / state family. \`AuthRequiredError\` remains as a deprecated \`AUTH_REQUIRED\` compatibility wrapper for older sellers; new seller code should use the split auth classes. Each maps to its wire error code with \`recovery\` baked in. Throw from platform methods. In \`accounts.resolve\`, use auth errors only for inbound authentication failures. Return \`null\` when auth-derived resolution cannot select an account: account-required operations emit correctable \`ACCOUNT_REQUIRED\`. Buyer-supplied unknown, unauthorized, or mismatched references stay terminal \`ACCOUNT_NOT_FOUND\`.`
   );
   ln();
   ln(
@@ -604,11 +689,11 @@ function generateLlmsTxt(
   );
   ln();
   ln(
-    `**Four reference \`AccountStore\` shapes.** Pick the one whose onboarding model matches yours. **Shape A — \`InMemoryImplicitAccountStore\`**: \`resolution: 'implicit'\`, buyer-driven \`sync_accounts\` populates the auth-principal → accounts map. **Shape B — \`createOAuthPassthroughResolver\`**: \`resolution: 'explicit'\`, returns just the \`resolve\` function for adapters fronting an upstream OAuth listing endpoint (Snap, Meta, TikTok, LinkedIn — \`extract bearer → GET /me/adaccounts → match by id\`). **Shape C — \`createRosterAccountStore\`**: \`resolution: 'explicit'\`, returns a complete \`AccountStore\` for adopters who own the roster (storefront table, admin-UI-managed JSON). Supports \`resolveWithoutRef\` for tools that send no \`account\` field on the wire (\`list_creative_formats\`, \`preview_creative\`, \`provide_performance_feedback\`) — set it to return a synthetic publisher-wide entry instead of \`null\`. **Shape D — \`createDerivedAccountStore\`**: \`resolution: 'derived'\`, single-tenant agents where there is no \`account_id\` on the wire and the auth principal alone identifies the tenant (audiostack, flashtalking, single-namespace retail-media). Provide \`toAccount(ctx)\`; the factory still emits legacy-compatible \`AUTH_REQUIRED\` on missing-credential calls and ignores buyer-supplied \`account_id\` (single-tenant by definition). Buyer code must continue to handle \`AUTH_REQUIRED\` alongside \`AUTH_MISSING\` / \`AUTH_INVALID\`. All four live at \`@adcp/sdk/server\`.`
+    `**Four reference \`AccountStore\` shapes.** Pick the one whose onboarding model matches yours. **Shape A — \`InMemoryImplicitAccountStore\`**: \`resolution: 'implicit'\`, buyer-driven \`sync_accounts\` populates the auth-principal → accounts map. **Shape B — \`createOAuthPassthroughResolver\`**: \`resolution: 'explicit'\`, returns just the \`resolve\` function for adapters fronting an upstream OAuth listing endpoint (Snap, Meta, TikTok, LinkedIn — \`extract bearer → GET /me/adaccounts → match by id\`). **Shape C — \`createRosterAccountStore\`**: \`resolution: 'explicit'\`, returns a complete \`AccountStore\` for adopters who own the roster (storefront table, admin-UI-managed JSON). Supports \`resolveWithoutRef\` for tools that send no \`account\` field on the wire (\`list_creative_formats\`, \`preview_creative\`, \`provide_performance_feedback\`) — set it to return a synthetic publisher-wide entry instead of \`null\`. **Shape D — \`createDerivedAccountStore\`**: \`resolution: 'derived'\`, an upstream-managed account-id namespace — the platform you front owns the roster (Meta / Snap ad accounts, audiostack, flashtalking, single-namespace retail-media). Buyers discover ids through \`list_accounts\` and send \`account: { account_id }\`; the framework refuses the \`{ brand, operator }\` arm for this mode and \`accounts.list\` is required (\`createAdcpServerFromPlatform\` throws \`PlatformConfigError\` without it). Provide \`toAccount(ctx)\` when a credential reaches exactly one account or \`listAccounts(ctx)\` when it reaches many (plus optional \`lookupAccount(id, ctx)\` for large rosters); the factory verifies buyer-supplied \`account_id\` against what the caller's credential can reach, returns \`null\` on a miss, auto-selects the account on ref-less tools only when exactly one is reachable, wires a filtered and paged \`list_accounts\`, and still emits legacy-compatible \`AUTH_REQUIRED\` on missing-credential calls. The framework backstops hand-rolled \`'derived'\` stores: a resolved account whose \`id\` isn't the one the buyer named is refused with \`ACCOUNT_NOT_FOUND\`, and \`sync_accounts\` / \`sync_governance\` entries are resolved against the caller's reachable set before any write. Buyer code must continue to handle \`AUTH_REQUIRED\` alongside \`AUTH_MISSING\` / \`AUTH_INVALID\`. Changed in SDK 14 (adcp-client#1647 / adcp#5062) — Shape D previously refused inline \`account_id\` and was documented as single-tenant-only. All four live at \`@adcp/sdk/server\`.`
   );
   ln();
   ln(
-    `**Stateless BYOK provider auth.** For single-account API-key or bearer-token BYOK, the provider credential can be the AdCP request credential for that endpoint: \`Authorization: Bearer <provider_api_key_or_access_token>\`. This keeps the baseline seller-agent wrapper pattern single-plane: the seller agent authenticates the request with the caller-presented provider credential, derives the account from request auth, and uses the same request-local token for upstream provider calls. No SDK-managed OAuth flow, refresh-token store, provider-token store, or callback route is required when the caller owns the provider credential lifecycle. If the provider credential can see multiple upstream accounts, use an explicit account roster pattern such as \`createOAuthPassthroughResolver\` instead of \`'derived'\`. Handlers with a resolved account should read the active token from \`ctx.account.authInfo?.token\`; refresh hooks update \`account.authInfo\`. Handlers without a resolved account can read the request token from \`ctx.authInfo.token\`. Use a stable non-secret identity such as \`ctx.authInfo.credential.key_id\`, \`ctx.authInfo.credential.client_id\`, or an adopter-supplied \`principal\` string for cache/idempotency scoping. Treat both token paths as request-local: do not copy provider tokens into persisted Account rows, \`ctx_metadata\`, \`ctx.authInfo.extra\`, request \`ext\` / body fields, or log lines. Add a separate provider-auth channel only for dual-auth proxy deployments where one request carries both caller-to-agent auth and a distinct upstream-provider credential.`
+    `**Stateless BYOK provider auth.** For single-account API-key or bearer-token BYOK, the provider credential can be the AdCP request credential for that endpoint: \`Authorization: Bearer <provider_api_key_or_access_token>\`. This keeps the baseline seller-agent wrapper pattern single-plane: the seller agent authenticates the request with the caller-presented provider credential, derives the account from request auth, and uses the same request-local token for upstream provider calls. No SDK-managed OAuth flow, refresh-token store, provider-token store, or callback route is required when the caller owns the provider credential lifecycle. If the provider credential can see multiple upstream accounts, stay in \`'derived'\` and supply \`listAccounts\` so buyers can discover and name one, or use \`createOAuthPassthroughResolver\` under \`'explicit'\` when you own the id namespace. Handlers with a resolved account should read the active token from \`ctx.account.authInfo?.token\`; refresh hooks update \`account.authInfo\`. Handlers without a resolved account can read the request token from \`ctx.authInfo.token\`. Use a stable non-secret identity such as \`ctx.authInfo.credential.key_id\`, \`ctx.authInfo.credential.client_id\`, or an adopter-supplied \`principal\` string for cache/idempotency scoping. Treat both token paths as request-local: do not copy provider tokens into persisted Account rows, \`ctx_metadata\`, \`ctx.authInfo.extra\`, request \`ext\` / body fields, or log lines. Add a separate provider-auth channel only for dual-auth proxy deployments where one request carries both caller-to-agent auth and a distinct upstream-provider credential.`
   );
   ln();
   ln(
@@ -649,9 +734,10 @@ function generateLlmsTxt(
   ln();
 
   // --- Quick start ---
-  ln(`## Quick Start (Client)`);
+  ln(`## Quick Start (Buyer)`);
   ln();
   ln('```typescript');
+  ln(`import { randomUUID } from 'node:crypto';`);
   ln(`import { ADCPMultiAgentClient } from '@adcp/sdk';`);
   ln();
   ln(`const client = ADCPMultiAgentClient.simple('https://agent.example.com/mcp/', {`);
@@ -659,19 +745,41 @@ function generateLlmsTxt(
   ln(`});`);
   ln(`const agent = client.agent('default-agent');`);
   ln();
-  ln(`// Discover products`);
-  ln(`const products = await agent.getProducts({ buying_mode: 'brief', brief: 'coffee brands' });`);
-  ln(`if (products.status === 'completed') console.log(products.data.products);`);
-  ln();
-  ln(`// Create a media buy`);
-  ln(`const buy = await agent.createMediaBuy({`);
-  ln(`  account: { account_id: 'acct_1' },`);
-  ln(`  brand: { domain: 'coffee.example.com' },`);
-  ln(`  start_time: 'asap',`);
-  ln(`  end_time: '2026-06-01T00:00:00Z',`);
-  ln(`  packages: [{ buyer_ref: 'pkg-1', product_id: 'prod_1', pricing_option_id: 'cpm_1', budget: 5000 }],`);
+  ln(`const account = { account_id: 'seller-issued-account-id' };`);
+  ln(`const listed = await agent.listProducts({`);
+  ln(`  account,`);
+  ln(`  brand: { domain: 'advertiser.example' },`);
   ln(`});`);
+  ln(`if (!listed.success || listed.status !== 'completed') throw new Error(listed.error ?? listed.status);`);
+  ln();
+  ln(`const product = listed.data!.products[0];`);
+  ln(`const pricing = product?.pricing_options?.[0];`);
+  ln(`if (!product || !pricing) throw new Error('Seller returned no purchasable products');`);
+  ln();
+  ln(`const purchaseIdempotencyKey = randomUUID(); // Persist before sending; reuse after an ambiguous timeout.`);
+  ln(`const endTime = new Date(Date.now() + 30 * 24 * 60 * 60 * 1_000).toISOString();`);
+  ln(`const bought = await agent.buyProducts({`);
+  ln(`  idempotency_key: purchaseIdempotencyKey,`);
+  ln(`  account,`);
+  ln(`  brand: { domain: 'advertiser.example' },`);
+  ln(`  feed_version: listed.data!.feed_version,`);
+  ln(`  start_time: 'asap',`);
+  ln(`  end_time: endTime,`);
+  ln(`  purchases: [{ product_id: product.product_id, pricing_option_id: pricing.pricing_option_id, budget: 5000 }],`);
+  ln(`});`);
+  ln(`const completed = bought.status === 'submitted' ? await bought.submitted!.waitForCompletion() : bought;`);
+  ln(
+    `if (!completed.success || completed.status !== 'completed') throw new Error(completed.error ?? completed.status);`
+  );
   ln('```');
+  ln();
+  ln(
+    `A submitted mutation must settle before it can be controlled; retain the task handle or configure \`push_notification_config\`. The buyer quick start shows completion, revision-aware control, readback, and correction paths.`
+  );
+  ln();
+  ln(
+    `**Existing applications.** The [thin existing-platform recipe](./guides/EXISTING-PLATFORM.md) shows one SDK task inside application-owned auth and transactions, durable submitted-task recording, the error/cancellation matrix, non-blocking bounded diagnostics, and same-instance capability evidence reuse with \`AgentClient.createWithCapabilityPreflight()\` (or the lower-level \`getCapabilityEvidenceScope()\` + \`primeCapabilities()\` pair). The SDK 14 release represented by the checkout, its registry integrity check, peer/runtime ranges, wire pin, and a historical rc.33/rc.35 → rc.36 example are generated in [the release worksheet](./migration-14.x-rc-worksheet.md).`
+  );
   ln();
 
   ln(`## Canonical Reference Resolver`);
@@ -1109,14 +1217,36 @@ function generateLlmsTxt(
   ln(`| \`PricingOption\` | Price model (CPM, vCPM, CPC, CPCV, CPV, CPP, CPA, FlatRate, Time) |`);
   ln(`| \`GovernanceConfig\` | Buyer-side governance middleware config |`);
   ln(
+    `| \`ReportingConsumerStatus\` | Consumer acknowledgement for one config/report/period; see the four-state evidence matrix below |`
+  );
+  ln(
     `| \`EstablishedProposalStore\` | Durable 3.0/3.1 proposal snapshots, atomic mutation fences, seven-day completion proofs, pruning, and submitted-task reconciliation |`
   );
   ln(
     `| \`WebhooksConfig.tenantScope\` | Explicit trusted webhook namespace for a genuinely single-tenant server; multi-tenant servers derive scope per request |`
   );
+  ln(
+    `| \`PostgresTaskSettlementCoordinator\` | Atomically commits a push task terminal state and PostgreSQL recovery-outbox checkpoint for different-process workers |`
+  );
+  ln(
+    `| \`PostgresTaskSettlementIntentQueue\` | Commits an exact terminal intent with application state, then recovers idempotent SDK task settlement after a crash |`
+  );
+  ln(
+    `| \`PostgresWebhookRuntime\` | Opinionated PostgreSQL webhook emitter, ready-to-wire server config, durable stores, migrations, probes, and bounded recovery |`
+  );
+  ln();
+  ln(
+    `\`ReportingConsumerStatus\` always carries \`reporting_status_id\`, delivery configuration identity, report definition, half-open period, \`consumer_status\`, and \`status_as_of\`. \`received\` requires obligation ID, revision ID, and observed revision SHA-256; \`obligation_missing\` forbids all three; \`revision_missing\` requires only obligation ID; \`unreadable\` requires obligation ID, revision ID, and \`failure_code\`. Snapshot ID/time are paired. Caller requests must omit seller-authored \`recorded_at\`.`
+  );
   ln();
   ln(
     `Production webhook publishers may construct an unbound emitter and call \`forTenantScope(trustedTenant)\` before every delivery. Direct unbound \`emit()\` fails before checkpointing or network access. \`createAdcpServer\` derives scope from trusted request context; configure \`webhooks.tenantScope\` only for a genuinely single-tenant factory.`
+  );
+  ln(
+    `In-process HITL callbacks can write \`return taskCtx.reject(result, reason)\` for a business decline with an artifact but no structured execution error. \`ctx.handoffToTask(producer, { settlement: 'external' })\` is polling-only and must omit \`push_notification_config\`; its external producer context intentionally has no \`reject()\` and must durably queue the complete scoped handle before returning. Workers use \`completeScopedTask()\` or \`failScopedTask()\`, acknowledging only \`applied\` or compatible \`already_terminal\` outcomes and retrying or dead-lettering scope misses and conflicts. \`createPostgresTaskSettlementCoordinator()\` with \`completeScopedPushTask()\`, \`failScopedPushTask()\`, or \`rejectScopedPushTask()\` is a lower-level application-managed push-settlement API for integrations that already create and own both the task and protected push registration outside this framework handoff path.`
+  );
+  ln(
+    `When application state commits before SDK task settlement, call \`createPostgresTaskSettlementIntentQueue().enqueue(intent, { db: tx })\` in the same domain transaction. Acknowledgement discards the payload and retains an immutable fingerprint tombstone through the configured idempotency horizon; \`pruneAcknowledged()\` removes expired tombstones in bounded batches. Recovery callbacks are at-least-once. Use \`applyTaskSettlementIntent()\` to apply and prove the exact polling or push terminal artifact before returning \`settled\`. See \`docs/guides/DURABLE-TASK-SETTLEMENT.md\` for the supported workflow and scoped dead-letter operations.`
   );
   ln();
 
@@ -1147,7 +1277,7 @@ function generateLlmsTxt(
     `AdCP tools are served over MCP (Model Context Protocol) or A2A (Agent-to-Agent). The client auto-detects based on \`AgentConfig.protocol\`. MCP endpoints end with \`/mcp/\`. Bearer auth uses \`Authorization: Bearer <token>\`; SDK clients also send the legacy \`x-adcp-auth\` header for compatibility, and servers accept it as a fallback.`
   );
   ln();
-  ln(`**Deep dive:** docs/development/PROTOCOL_DIFFERENCES.md`);
+  ln(`**Deep dive:** [protocol differences](development/PROTOCOL_DIFFERENCES.md)`);
   ln();
 
   // --- Discovery ---
@@ -1166,6 +1296,13 @@ function generateLlmsTxt(
 
   const docLinks: [string, string][] = [
     ['Full type signatures', 'TYPE-SUMMARY.md'],
+    ['Buyer quick start (AdCP 3.2)', 'guides/BUYER-QUICKSTART-3.2.md'],
+    ['Assess and resolve MediaBuy actions', 'guides/MEDIA-BUY-ACTION-ASSESSMENT.md'],
+    ['Verify proposal terms before acceptance', 'guides/PROPOSAL-TERMS-VERIFICATION.md'],
+    ['Seller quick start (AdCP 3.2)', 'guides/SELLER-QUICKSTART-3.2.md'],
+    ['Production durability checklist', 'guides/PRODUCTION-DURABILITY.md'],
+    ['Persistent notification subscriptions', 'guides/PERSISTENT-NOTIFICATION-RUNTIME.md'],
+    ['Migrating SDK 13 → 14', 'migration-13-to-14.md'],
     ['Getting started / install', 'getting-started.md'],
     ['Build a server-side agent', 'guides/BUILD-AN-AGENT.md'],
     ['Migrating 6.7 → 6.9 (skips deprecated 6.8.0; 13 additive recipes; 2 breaking)', 'migration-6.7-to-6.9.md'],
@@ -1177,9 +1314,12 @@ function generateLlmsTxt(
     ['ctx_metadata credential safety', 'guides/CTX-METADATA-SAFETY.md'],
     ['Request signing (RFC 9421) + JWKS', 'guides/SIGNING-GUIDE.md'],
     ['Conformance (property-based fuzzing)', 'guides/CONFORMANCE.md'],
+    ['Reporting source executor (seller adapters)', 'guides/REPORTING-SOURCE-EXECUTOR.md'],
+    ['Seller reporting ledger', 'guides/REPORTING-LEDGER.md'],
     ['Validate your agent (5-command checklist)', 'guides/VALIDATE-YOUR-AGENT.md'],
     ['Async patterns (polling, webhooks, deferred)', 'guides/ASYNC-DEVELOPER-GUIDE.md'],
     ['Async API reference', 'guides/ASYNC-API-REFERENCE.md'],
+    ['Durable task settlement intents', 'guides/DURABLE-TASK-SETTLEMENT.md'],
     ['Input handler patterns', 'guides/HANDLER-PATTERNS-GUIDE.md'],
     ['Webhook configuration', 'guides/PUSH-NOTIFICATION-CONFIG.md'],
     ['Real-world code examples', 'guides/REAL-WORLD-EXAMPLES.md'],
@@ -1188,7 +1328,6 @@ function generateLlmsTxt(
     ['Testing strategy', 'guides/TESTING-STRATEGY.md'],
     ['Testing `composeMethod`-wrapped handlers', 'recipes/composeMethod-testing.md'],
     ['Protocol differences (MCP vs A2A)', 'development/PROTOCOL_DIFFERENCES.md'],
-    ['TypeDoc API reference', 'api/index.html'],
   ];
 
   ln(`| Need | Local path | Hosted |`);
@@ -1196,6 +1335,7 @@ function generateLlmsTxt(
   for (const [need, docPath] of docLinks) {
     ln(`| ${need} | docs/${docPath} | [link](${DOCS_BASE_URL}/${docPath}) |`);
   }
+  ln(`| TypeDoc API reference | hosted only | [link](${DOCS_BASE_URL}/api/index.html) |`);
   ln();
   ln(`JSON schemas (source of truth): \`schemas/cache/latest/index.json\` (local only)`);
   ln();
@@ -1206,7 +1346,9 @@ function generateLlmsTxt(
   ln(`- Documentation: ${DOCS_BASE_URL}/`);
   ln(`- npm: https://www.npmjs.com/package/@adcp/sdk`);
   ln(`- Spec: https://adcontextprotocol.org`);
-  ln(`- CLI: \`npx @adcp/sdk@adcp-3.1\` for the 8.1 / AdCP 3.1 beta line`);
+  ln(
+    `- SDK 14 CLI: \`npx --package '@adcp/sdk@^14.0.0-0' adcp --help\`; use the \`adcp-3.1\` tag only for the maintained 3.1 compatibility line`
+  );
   ln();
 
   return lines.join('\n');
@@ -1233,6 +1375,37 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   );
   ln();
 
+  ln('## MediaBuy Action Assessment Types');
+  ln();
+  ln(
+    'Use `@adcp/sdk/media-buy/actions` for pure buyer assessment and `@adcp/sdk/server` for `mediaBuyActionResolver`. See [action assessment guide](guides/MEDIA-BUY-ACTION-ASSESSMENT.md).'
+  );
+  ln();
+  ln('| Type | Use |');
+  ln('| --- | --- |');
+  ln(
+    '| `MediaBuyTask` | Narrow routing union: `update_media_buy`, `control_media_buy`, `refine_proposals`, `sync_creatives`. |'
+  );
+  ln(
+    '| `ActionAvailability` | `available_now` with optional `nonDefaultRoute`, mode and authority; or `currently_unavailable` with reason, certainty and optional compatibility/constraint detail. |'
+  );
+  ln(
+    '| `ActionBuy`, `ActionProduct`, `ActionProposal` | Structural inputs for joining current accepted terms with live actions and advisory products. |'
+  );
+  ln(
+    '| `LiveMediaBuyAction` | Readable canonical or legacy entry for assessment, projection and existing preflight helpers, including rc.3 package scope. |'
+  );
+  ln(
+    '| `MediaBuyAvailableAction`, `MediaBuyValidAction` | Generated legacy wire entry / deprecated flat vocabulary; distinct from canonical helper entries. |'
+  );
+  ln(
+    '| `MediaBuyAction`, `MediaBuyActionId` | Action identifiers accepted by assessment / mutation helpers; runtime validation preserves unknown future data. |'
+  );
+  ln(
+    '| `ProposalChangeTerm`, `ChangeTermConstraints` | Negotiated term view and portable discriminated budget / flight / package-count / effective-timing constraints. |'
+  );
+  ln();
+
   // --- Client types ---
   ln(`## Client Types`);
   ln();
@@ -1247,6 +1420,79 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  oauth_resource?: string;       // Explicit RFC 8707 override retained for refresh`);
   ln(`  headers?: Record<string, string>;`);
   ln(`}`);
+  ln();
+  ln(`interface DelegatedOperatorAuthorizationContext {`);
+  ln(`  brand?: string;`);
+  ln(`  scope?: 'media_buying' | 'creative_generation' | 'rights_clearance'`);
+  ln(`        | 'governance' | 'measurement' | 'agent_operations';`);
+  ln(`  country?: string;`);
+  ln(`}`);
+  ln();
+  ln(`interface A2ALegacyCompatOptions {`);
+  ln(`  enabled: boolean; // false requires native A2A 1.0; defaults to true`);
+  ln(`}`);
+  ln();
+  ln(`interface TransportOptions {`);
+  ln(`  maxResponseBytes?: number;`);
+  ln(`  trustedFetchFn?: typeof fetch;`);
+  ln(`  allowPrivateIp?: boolean;`);
+  ln(`  requestTimeoutMs?: number;`);
+  ln(`  legacyCompat?: A2ALegacyCompatOptions; // A2A only`);
+  ln(`}`);
+  ln();
+  ln(`interface TaskOptions {`);
+  ln(`  timeout?: number;             // Absolute whole-task deadline`);
+  ln(`  signal?: AbortSignal;         // Caller cancellation`);
+  ln(`  // Direct A2A mutation route, bound to authenticated principal + account scope.`);
+  ln(`  durableContinuationRecovery?: { ownerScope: string };`);
+  ln(`  // Trusted local receiver policy; snapshotted and persisted with generated`);
+  ln(`  // webhook registrations, never inferred from or sent in task arguments.`);
+  ln(`  delegatedOperatorAuthorization?: DelegatedOperatorAuthorizationContext;`);
+  ln(`  // ...deadline, cancellation, transport, and conversation options...`);
+  ln(`}`);
+  ln();
+  ln(`interface DeferredContinuation<T> {`);
+  ln(`  token: string;`);
+  ln(`  question?: string;`);
+  ln(`  resume(input: unknown): Promise<TaskResult<T>>;`);
+  ln(`  recovery?: { operationId: string; recoveryKey: string }; // Host-only, persist once`);
+  ln(`}`);
+  ln();
+  ln(`// AgentClient public direct-mutation route recovery`);
+  ln(`agent.recoverDirectPauseContinuation<T>({ operationId, recoveryKey, ownerScope });`);
+  ln();
+  ln(`interface ValidateAdAgentsOptions {`);
+  ln(`  timeoutMs?: number;           // Per-request ceiling`);
+  ln(`  signal?: AbortSignal;         // One signal/deadline across the complete discovery flow`);
+  ln(`  maxBodyBytes?: number;`);
+  ln(`  userAgent?: string;`);
+  ln(`  logLevel?: LogLevel;`);
+  ln(`  urlForDomain?: (domain: string, path: string) => string;`);
+  ln(`}`);
+  ln();
+  ln(`interface CapabilityEvidenceScope {`);
+  ln(`  agentUri: string;`);
+  ln(`  adcpVersion: string;`);
+  ln(`  scopeKey: string;             // Opaque, client-bound authorization/transport scope`);
+  ln(`}`);
+  ln();
+  ln(`interface CapabilityEvidenceSnapshot {`);
+  ln(`  scope: CapabilityEvidenceScope;`);
+  ln(`  capabilities: AdcpCapabilities;`);
+  ln(`  observedAt: string;`);
+  ln(`  expiresAt: string;`);
+  ln(`  toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;`);
+  ln(`}`);
+  ln();
+  ln(`type CreateTargetingInput = TargetingOverlayInput | undefined; // whole field omitted / dimension null / value`);
+  ln(
+    `type UpdateTargetingInput = TargetingOverlayInput | undefined; // overlay field only; keyword deltas are siblings`
+  );
+  ln();
+  ln(`// Constructs, scopes, and primes one exact instance before first dispatch.`);
+  ln(`AgentClient.createWithCapabilityPreflight(agent, async ({ client, scope }) => ({`);
+  ln(`  ...(await loadCapabilityEvidence(client, scope)), scope,`);
+  ln(`}));`);
   ln();
   ln(`interface TaskResult<T = any> {`);
   ln(`  success: boolean;`);
@@ -1392,6 +1638,210 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln('```');
   ln();
 
+  ln(`## Durable Task Settlement Intent Queue`);
+  ln();
+  ln('```typescript');
+  ln(`interface PgQueryable {`);
+  ln(
+    `  query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;`
+  );
+  ln(`}`);
+  ln();
+  ln(`interface AdcpStructuredError {`);
+  ln(`  code: string;`);
+  ln(`  recovery: 'transient' | 'correctable' | 'terminal';`);
+  ln(`  message: string;`);
+  ln(`  field?: string;`);
+  ln(`  suggestion?: string;`);
+  ln(`  retry_after?: number;`);
+  ln(`  details?: Record<string, unknown>;`);
+  ln(`}`);
+  ln();
+  ln(`interface DurableTaskSettlementRef {`);
+  ln(`  taskId: string;`);
+  ln(`  accountId: string;`);
+  ln(`  registryId: string;`);
+  ln(`  ownerScope: string;`);
+  ln(`}`);
+  ln();
+  ln(`type TaskSettlementIntent =`);
+  ln(`  | { taskRef: DurableTaskSettlementRef; action: 'complete'; result: unknown }`);
+  ln(`  | { taskRef: DurableTaskSettlementRef; action: 'fail'; error: AdcpStructuredError; result?: unknown };`);
+  ln();
+  ln(`interface TaskSettlementIntentCheckpoint extends DurableTaskSettlementRef {`);
+  ln(`  queueNamespace: string;`);
+  ln(`  intentFingerprint: string;`);
+  ln(`}`);
+  ln();
+  ln(`function canonicalizeTaskSettlementIntent(intent: TaskSettlementIntent): TaskSettlementIntent;`);
+  ln(`function applyTaskSettlementIntent(`);
+  ln(`  intent: TaskSettlementIntent,`);
+  ln(
+    `  options: { registry: TaskRegistry } | { coordinator: PostgresTaskSettlementCoordinator; push: TaskPushSettlementConfig }`
+  );
+  ln(`): Promise<'settled'>;`);
+  ln();
+  ln(`interface TaskSettlementIntentRecoveryContext {`);
+  ln(`  attemptCount: number;`);
+  ln(`  extendLease(): Promise<boolean>;`);
+  ln(`}`);
+  ln();
+  ln(`interface TaskSettlementIntentRecoveryMetrics {`);
+  ln(`  claimed: number;`);
+  ln(`  settled: number;`);
+  ln(`  retried: number;`);
+  ln(`  deadLettered: number;`);
+  ln(`  leaseLost: number;`);
+  ln(`}`);
+  ln();
+  ln(`interface TaskSettlementIntentRecoveryErrorContext {`);
+  ln(`  attemptCount: number;`);
+  ln(`  taskRef: DurableTaskSettlementRef;`);
+  ln(`  action: 'complete' | 'fail';`);
+  ln(`  disposition: 'retry' | 'dead_letter' | 'lease_lost';`);
+  ln(`}`);
+  ln();
+  ln(`interface RecoverTaskSettlementIntentsOptions {`);
+  ln(`  settle(intent: TaskSettlementIntent, context: TaskSettlementIntentRecoveryContext): Promise<'settled'>;`);
+  ln(`  batchSize?: number;`);
+  ln(`  leaseMs?: number;`);
+  ln(`  retryAfterMs?: number;`);
+  ln(`  maxRetryAfterMs?: number;`);
+  ln(`  maxAttempts?: number;`);
+  ln(`  workerId?: string;`);
+  ln(`  onError?(error: unknown, context: TaskSettlementIntentRecoveryErrorContext): void | Promise<void>;`);
+  ln(`}`);
+  ln();
+  ln(`interface CreatePostgresTaskSettlementIntentQueueOptions {`);
+  ln(`  db: PgQueryable;`);
+  ln(`  namespace: string;`);
+  ln(`  tableName?: string;`);
+  ln(`  idempotencyHorizonMs?: number; // defaults to seven days`);
+  ln(`}`);
+  ln();
+  ln(`interface PostgresTaskSettlementIntentQueue {`);
+  ln(`  readonly durability: 'durable';`);
+  ln(
+    `  enqueue(intent: TaskSettlementIntent, options?: { db?: PgQueryable }): Promise<TaskSettlementIntentCheckpoint>;`
+  );
+  ln(`  acknowledge(checkpoint: TaskSettlementIntentCheckpoint, options?: { db?: PgQueryable }): Promise<boolean>;`);
+  ln(`  pruneAcknowledged(options?: { db?: PgQueryable; limit?: number }): Promise<number>;`);
+  ln(`  recover(options: RecoverTaskSettlementIntentsOptions): Promise<TaskSettlementIntentRecoveryMetrics>;`);
+  ln(`  probe(): Promise<void>;`);
+  ln(`}`);
+  ln();
+  ln(`const TASK_SETTLEMENT_INTENT_IDEMPOTENCY_HORIZON_MS: number; // seven days`);
+  ln();
+  ln(`const settlementIntents = createPostgresTaskSettlementIntentQueue({`);
+  ln(`  db: pool,`);
+  ln(`  namespace: 'seller-prod',`);
+  ln(`  tableName: 'seller_task_settlement_intents',`);
+  ln(`  idempotencyHorizonMs: TASK_SETTLEMENT_INTENT_IDEMPOTENCY_HORIZON_MS,`);
+  ln(`});`);
+  ln('```');
+  ln();
+  ln(
+    `The queue requires a complete \`DurableTaskSettlementRef\`, including non-empty \`registryId\`. Use \`canonicalizeTaskSettlementIntent()\` for the immediate path so it compares the same cloned, validated, wire-safe artifact that \`enqueue\` persists. Pass the active transaction client to \`enqueue(..., { db: tx })\` so the domain outcome and immutable intent commit together. Acknowledgement compacts the payload and retains the exact fingerprint for \`idempotencyHorizonMs\` (seven days by default), preventing a conflicting artifact from rebinding the scoped task during the replay window. Schedule bounded \`pruneAcknowledged()\` calls when recovery traffic can be idle. Recovery is at least once: call \`applyTaskSettlementIntent()\` and acknowledge only after it returns \`settled\`. See \`docs/guides/DURABLE-TASK-SETTLEMENT.md\` for the complete workflow plus scoped dead-letter SQL.`
+  );
+  ln();
+
+  ln(`## Crash-Safe Push Task Settlement`);
+  ln();
+  ln('```typescript');
+  ln(`interface TaskPushSettlementConfig {`);
+  ln(`  url: string;`);
+  ln(`  operationId?: string; // required for AdCP 3.2.0-beta.5+`);
+  ln(`  servedAdcpVersion?: string; // required when operationId is absent; must prove a pre-3.2 route`);
+  ln(`  token?: string; // protected at rest by WebhookAuthenticationAdapter`);
+  ln(`  authentication?: WebhookAuthentication;`);
+  ln(`}`);
+  ln(
+    `interface ExternalTaskHandoffOptions { settlement: 'external'; task_id?: string; } // polling-only; omit push_notification_config`
+  );
+  ln(
+    `interface ExternalTaskHandoffContext { id: string; taskRef: ScopedTaskRef; update(progress: TaskHandoffProgress): Promise<void>; heartbeat(): Promise<void>; /* no reject() */ }`
+  );
+  ln(`type TaskPushSettlementOutcome =`);
+  ln(`  | { outcome: 'applied'; delivery: 'durably_bound' }`);
+  ln(
+    `  | { outcome: 'already_terminal'; status: TaskStatus; compatibility: 'compatible'; delivery: 'durably_bound' | 'recoverable' | 'delivered' | 'terminal' }`
+  );
+  ln(
+    `  | { outcome: 'already_terminal'; status: TaskStatus; compatibility: 'conflicting'; delivery: 'not_applicable' }`
+  );
+  ln(`  | { outcome: 'not_found_in_scope'; delivery: 'not_applicable' };`);
+  ln(`class TaskPushSettlementConfigurationError extends Error {}`);
+  ln();
+  ln(`const settlements = createPostgresTaskSettlementCoordinator({`);
+  ln(`  registry, publisherScope, outbox: { tableName }, authenticationAdapter,`);
+  ln(`});`);
+  ln(`await completeScopedPushTask(settlements, scopedTaskRef, push, result);`);
+  ln(`await failScopedPushTask(settlements, scopedTaskRef, push, structuredError);`);
+  ln(`await rejectScopedPushTask(settlements, scopedTaskRef, push, result, 'Business policy declined the request');`);
+  ln(`// Recovery after task + outbox commit and intentional push-config deletion:`);
+  ln(`// First compare the stored terminal result/error with the intended artifact.`);
+  ln(`if (await settlements.hasTerminalCheckpoint(scopedTaskRef)) {`);
+  ln(`  // The scoped terminal task still has its durable checkpoint.`);
+  ln(`}`);
+  ln('```');
+  ln();
+  ln(
+    `The registry and outbox must share one PostgreSQL pool. Run the task-registry status-widen migration and webhook-recovery migrations before settling legacy tables. These push helpers are for an application-managed integration that independently created the task and durably registered the protected push route; they do not make \`ctx.handoffToTask(producer, { settlement: 'external' })\` push-capable. That framework handoff remains polling-only and its producer receives \`ExternalTaskHandoffContext\`, which deliberately has no \`reject()\`. Poll \`settlements.recovery\` from a worker. After intentionally deleting an application-managed settled task's push config, first compare the stored terminal result/error and rejected message with the intended artifact; then \`hasTerminalCheckpoint()\` proves that the scoped task still has its deterministic durable webhook checkpoint without reconstructing the secret route. It does not prove artifact compatibility or delivery. Reconstructed coordinators must retain the same publisher scope, registry storage ID/namespace, and outbox table, and checkpoint tombstones must remain through the intent replay horizon. See \`docs/migration-task-registry-scoping.md\`.`
+  );
+  ln();
+
+  ln(`## PostgreSQL Webhook Runtime`);
+  ln();
+  ln('```typescript');
+  ln(`const webhooks = createPostgresWebhookRuntime({`);
+  ln(`  db: pool,`);
+  ln(`  publisherScope: 'seller-production',`);
+  ln(`  deliveries: { tableName: 'seller_webhook_deliveries' },`);
+  ln(`  outbox: { tableName: 'seller_webhook_outbox' },`);
+  ln(`  signerProvider,`);
+  ln(`  authenticationAdapter,`);
+  ln(`});`);
+  ln(`for (const sql of webhooks.migrations.all) await pool.query(sql);`);
+  ln(`await webhooks.probe();`);
+  ln(`const server = createAdcpServerFromPlatform(platform, {`);
+  ln(`  name: 'seller-production', version: '1.0.0', webhooks: webhooks.serverConfig,`);
+  ln(`});`);
+  ln(`const instanceId = process.env.INSTANCE_ID;`);
+  ln(`if (!instanceId) throw new Error('Set INSTANCE_ID to a stable worker identity');`);
+  ln(`await webhooks.recoverOnce({ ownerToken: instanceId });`);
+  ln('```');
+  ln();
+  ln(
+    `\`createPostgresWebhookRuntime()\` assembles the durable delivery store, encrypted recovery outbox, emitter, ready-to-pass server configuration, probes, migrations, fenced poller, and \`WebhookEmitResult\`-to-disposition mapping. Pass \`webhooks.serverConfig\` as the framework's \`webhooks\` option and schedule bounded \`recoverOnce()\` calls. Direct multi-tenant sends bind with \`webhooks.emitter.forTenantScope(trustedTenant)\`.`
+  );
+  ln();
+
+  ln(`## Persistent Notification Subscription Runtime`);
+  ln();
+  ln('```typescript');
+  ln(`const notifications = createPostgresPersistentNotificationRuntime({`);
+  ln(`  db: pool, publisherScope: 'seller-production',`);
+  ln(`  subscriptions: { tableName: 'seller_notification_subscriptions' },`);
+  ln(`  webhooks: {`);
+  ln(`    deliveries: { tableName: 'seller_webhook_deliveries' },`);
+  ln(`    outbox: { tableName: 'seller_webhook_outbox' },`);
+  ln(`    signerProvider,`);
+  ln(`  },`);
+  ln(`  proofAdapter, credentialAdapter,`);
+  ln(`  authorizeDelivery: liveApplicationAuthorization,`);
+  ln(`  // Optional allowlist for invalidation-only later-version caller events:`);
+  ln(`  futureCallerInvalidationEventTypes: ['catalog.invalidated'],`);
+  ln(`});`);
+  ln(`for (const sql of notifications.migrations.all) await pool.query(sql);`);
+  ln(`await notifications.probe();`);
+  ln(`await notifications.recoverOnce({ ownerToken: stableWorkerId });`);
+  ln('```');
+  ln();
+  ln(
+    `The runtime keeps caller and caller+account anchors separate, applies full-set replacement with generation CAS, proves the exact normalized destination tuple before activation, and keeps legacy credentials behind an opaque application binding. Its non-secret subscription generation is stored in the webhook outbox; every live and recovered attempt re-reads subscription state and calls the required application authorization callback before network access. Pause, removal, authorization loss, or destination replacement terminally suppresses unclaimed old-generation work. \`include_future_event_types\` remains fail closed unless the server explicitly classifies invalidation-only later-version caller events with \`futureCallerInvalidationEventTypes\`. See \`docs/guides/PERSISTENT-NOTIFICATION-RUNTIME.md\`.`
+  );
+  ln();
+
   ln(`## Production Webhook Tenant Binding`);
   ln();
   ln(
@@ -1488,7 +1938,11 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
 
     for (const tool of domainTools) {
       const tsDesc = tool.reqDescription.split('.')[0].trim();
-      ln(`**\`${tool.name}\`**${tsDesc ? ` — ${tsDesc}.` : ''}`);
+      ln(`#### \`${tool.name}\``);
+      if (tsDesc) {
+        ln();
+        ln(`${tsDesc}.`);
+      }
       ln();
 
       const reqFields = [
@@ -1562,6 +2016,10 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
     ['ContentStandards', 'Brand safety config — has standards_id, name, scope, policy entries, calibration exemplars'],
     ['Catalog', 'Data feed — typed (offering, product, store, etc.) with items, URL, or inline data'],
     ['Offering', 'Promotable item with asset groups — used in sponsored intelligence and catalog creatives'],
+    [
+      'Reporting Consumer Status',
+      'Consumer acknowledgement for one config/report/half-open period — received requires obligation, revision, and observed SHA-256; obligation_missing forbids them; revision_missing requires obligation only; unreadable requires obligation, revision, and failure_code; snapshot ID/time are paired; recorded_at is response-only',
+    ],
   ];
 
   ln(`| Type | Key Fields |`);
@@ -1629,6 +2087,167 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln();
   ln(
     `Source of truth: \`schemas/cache/{version}/brand.json\` and \`adagents.json\` — regenerate with \`npm run generate-wellknown-schemas\` when the spec bumps.`
+  );
+  ln();
+
+  // --- Seller reporting source contract ---
+  ln(`## Seller Reporting Source Contract`);
+  ln();
+  ln(
+    `Import from \`@adcp/sdk/reporting/source\`. This is a provider-neutral adapter boundary; the existing buyer-side \`reconcileReporting\` API is separate.`
+  );
+  ln();
+  ln('```typescript');
+  ln(`type ReportingSourceManifestLevelV1 = 'basic' | 'evidenced';`);
+  ln(`interface ReportingSourceExecutorV1 {`);
+  ln(`  readonly capabilities: ReportingSourceCapabilitiesV1;`);
+  ln(
+    `  execute(request: ReportingSourceSliceRequestV1, context: { signal: AbortSignal; heartbeat?: () => void }): Promise<ReportingSourceExecutorResultV1>;`
+  );
+  ln(`}`);
+  ln(`interface ReportingSourceStagedObjectReaderV1 {`);
+  ln(
+    `  read(input: { objectRef: string; objectGeneration: string; sourceScope: Record<string, unknown>; account: { account_id: string }; delivery_config_id: string; delivery_config_version: number; report_definition_id: string; reporting_obligation_id: string; maxBytes: number; signal: AbortSignal }): Promise<Uint8Array>;`
+  );
+  ln(`}`);
+  ln(`type ReportingSourceExecutorResultV1 =`);
+  ln(`  | { ok: true; response: ReportingSourceExecutionResponseV1; manifestBytes: Uint8Array }`);
+  ln(`  | { ok: false; error: ReportingSourceErrorV1 };`);
+  ln(`type InlineReportingMetricEvidenceV1 =`);
+  ln(`  | { constituent_id: string; metric: string; status: 'present' | 'explicit_zero'; data_through: string }`);
+  ln(
+    `  | { constituent_id: string; metric: string; status: 'unsupported' | 'delayed' | 'partial' | 'stale' | 'missing'; reason: string; data_through?: string };`
+  );
+  ln(`interface InlineReportingAvailabilityEvidenceV1 {`);
+  ln(`  version: '1.0';`);
+  ln(`  cells: readonly InlineReportingMetricEvidenceV1[];`);
+  ln(`}`);
+  ln(
+    `// Inline callback requests include constituents: { constituent_id, media_buy_id }[]; evidence-bearing responses add availability_evidence.`
+  );
+  ln(`// validateReportingSourceExecutionV1({ level, capabilities, request, result, objectReader })`);
+  ln(`// runReportingSourceReplayConformanceV1({ level, executor, request, objectReader })`);
+  ln(`// validateReportingRevisionSequenceV1(manifests, { crossFinalityBridge })`);
+  ln(`// createInlineReportingSourceExecutor(deliveryFetch, offering) // basic compatibility adapter`);
+  ln('```');
+  ln();
+  ln(
+    `\`basic\` is the Reliable Reporting Core floor: immutable objects, hashes, coverage, finality, and completeness. \`evidenced\` additionally proves every page, async-job poll, retry, and usage count within the 1 MiB manifest bound. Identity is the caller-owned opaque \`sourceScope\` plus AdCP account/config/report/period/obligation identities.`
+  );
+  ln();
+
+  // --- Seller reporting ledger ---
+  ln(`## Seller Reporting Ledger`);
+  ln();
+  ln(
+    `Ledger symbols import from \`@adcp/sdk/reporting/ledger\`; \`createPostgresPersistentNotificationRuntime\` is a server symbol and imports from \`@adcp/sdk/server\`.`
+  );
+  ln();
+  ln('```typescript');
+  ln(`// Build the notification path first: the store must be constructed with the`);
+  ln(`// activity port, or lifecycle transitions record no activity and notify nobody.`);
+  ln(`const attemptCheckpoint = createPostgresReportingNotificationAttemptCheckpoint({`);
+  ln(`  db: pool,`);
+  ln(`  namespace: 'seller-production',`);
+  ln(`});`);
+  ln(`const notifications = createPostgresPersistentNotificationRuntime({`);
+  ln(`  db: pool,`);
+  ln(`  publisherScope: 'seller-production',`);
+  ln(`  checkpointDeliveryAttempt: attemptCheckpoint,`);
+  ln(`  subscriptions: { acknowledgeIsolatedDatabase: true },`);
+  ln(`  ...notificationOptions,`);
+  ln(`});`);
+  ln(`const reportingActivity = createPostgresReportingNotificationActivityRuntime({`);
+  ln(`  db: pool,`);
+  ln(`  notifications,`);
+  ln(`  namespace: 'seller-production',`);
+  ln(`  attemptCheckpoint,`);
+  ln(`  tenantScopeForAccount: accountId => trustedTenantDirectory.tenantFor(accountId),`);
+  ln(`});`);
+  ln();
+  ln(`// One store, wired to the activity port, used by every participant below.`);
+  ln(`const store = new PostgresReportingLedgerStore(pool, {`);
+  ln(`  acknowledgeIsolatedDatabase: true,`);
+  ln(`  notificationActivityPort: reportingActivity.port,`);
+  ln(`});`);
+  ln();
+  ln(`// Every migration this wiring needs, before probing.`);
+  ln(`await pool.query(REPORTING_LEDGER_MIGRATION);`);
+  ln(`for (const sql of notifications.migrations.all) await pool.query(sql);`);
+  ln(`for (const sql of reportingActivity.migrations.all) await pool.query(sql);`);
+  ln();
+  ln(`const producer = createReportingProducer({ store, source, offerings, contact });`);
+  ln(`await producer.planObligations();`);
+  ln(`await producer.runWorker();`);
+  ln(`const getReportingStatus = createReportingStatusHandler(store);`);
+  ln(`const getMediaBuyDelivery = createReportingDeliveryHandler(store); // exact reporting_revision_id reads`);
+  ln();
+  ln(`// AdCP 3.2.0-rc.4: identity comes from authenticated transport.`);
+  ln(`const syncReportingStatus = createSyncReportingStatusHandler(store, {`);
+  ln(`  resolveConsumerId: context => context.agent.agent_url,`);
+  ln(`});`);
+  ln();
+  ln(`await reportingActivity.probe();`);
+  ln(`// Run repeatedly from a durable scheduler; this call is bounded.`);
+  ln(`await reportingActivity.recoverOnce({ ownerToken: stableWorkerId });`);
+  ln(`const activityPage = await reportingActivity.listActivity({`);
+  ln(`  tenantId: trustedTenant,`);
+  ln(`  accountId: resolvedAccountId,`);
+  ln(`  limit: 100,`);
+  ln(`});`);
+  ln('```');
+  ln();
+  ln(
+    `The store freezes configuration lineage and period-end denominators, retains immutable RFC 8785 JCS/SHA-256-bound revisions, atomically fences lifecycle projections against their revision evidence, and provides leased production plus snapshot-stable status pagination. \`projectReportingObligationHealthV1\` implements waiting, healthy, delayed, action_required, and complete without I/O.`
+  );
+  ln();
+  ln(
+    `\`ReportingLedgerNotificationActivityPortV1<TTransaction>\` is the custom-store seam. Invoke it inside the authoritative transition transaction and fence both predecessor health and finality. The bundled PostgreSQL runtime persists exactly-once intent plus paginatable account activity, then projects health changes through \`PersistentNotificationRuntime\`; finality-only changes remain internal activity. It never owns subscriber credentials or sends webhooks itself. \`listActivity()\` is adopter-facing only because no public AdCP account-activity read task exists.`
+  );
+  ln();
+
+  // --- Reliable reporting service ---
+  ln(`## Reliable Reporting Service`);
+  ln();
+  ln(
+    `Import from \`@adcp/sdk/reporting/service\`. This is the adapter-first lifecycle owner over the source and ledger primitives; it does not introduce another store or transport.`
+  );
+  ln();
+  ln('```typescript');
+  ln(`interface ReliableReportingAdapterV1 {`);
+  ln(`  readonly sourceOffering: ReportingSourceOfferingV1;`);
+  ln(`  readonly deliveryOffering: ReportingDeliveryOffering;`);
+  ln(`  // Exactly one of fetchSlice or executor.`);
+  ln(`  readonly fetchSlice?: InlineReportingDeliveryFetchV1;`);
+  ln(`  readonly executor?: ReportingSourceWithReaderV1;`);
+  ln(`  // Opt-in bounded replay window for the inline executor; never applied`);
+  ln(`  // silently. A feed that outlives its replay ceiling needs this or a`);
+  ln(`  // durable executor.`);
+  ln(`  readonly inlineReplayRetention?: InlineReportingReplayRetentionV1;`);
+  ln(`}`);
+  ln();
+  ln(`const reporting = createReliableReportingService({`);
+  ln(`  store,`);
+  ln(`  adapters,`);
+  ln(`  contact,`);
+  ln(`  automatedRecoveryWindowSeconds,`);
+  ln(`  statusRetentionDays, // enforce this commitment in the ledger database`);
+  ln(`  resolveSource: account => ({ adapterId, sourceScope, sourceTimezone }),`);
+  ln(`  resolveCurrency: account => currency,`);
+  ln(`  resolveCoverage: account => ({ constituents }), // authorized media-buy/package denominator`);
+  ln(`  resolveConsumerId, // optional; controls consumer-status handler/capability`);
+  ln(`});`);
+  ln();
+  ln(`await pool.query(reporting.setup.migrations[0]);`);
+  ln(`const installedPlatform = reporting.install(platform);`);
+  ln(`await reporting.installConfiguration(configuration, { account: ctx.account });`);
+  ln(`await reporting.runCycle({ accountId }); // tenant-partitioned`);
+  ln(`reporting.start({ intervalMilliseconds, deploymentWide: true }); // explicit full-ledger scan`);
+  ln(`await reporting.stop();`);
+  ln('```');
+  ln();
+  ln(
+    `Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free \`sourceScope\`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply \`account\`, \`sourceScope\`, \`sourceTimezone\`, \`contract\`, \`currency\`, \`constituents\`, or \`mediaBuyIds\`; \`mediaBuyIds\` is derived from \`resolveCoverage\`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires \`platform.accounts.upsert\`, which owns the advertised \`sync_accounts\` configuration path.`
   );
   ln();
 

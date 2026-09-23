@@ -24,16 +24,17 @@ test('AdCP semver pins normalize to release-precision wire values', () => {
   assert.equal(toReleasePrecisionVersion('3.1-beta.7'), '3.1-beta.7');
 });
 
-test('3.2 beta remains exact while retaining the complete supported 3.0 and 3.1 GA lines', () => {
-  assert.equal(ADCP_VERSION, '3.2.0-beta.6');
+test('3.2 prerelease remains exact while retaining the complete supported 3.0 and 3.1 GA lines', () => {
+  assert.equal(ADCP_VERSION, '3.2.0-rc.4');
   assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.0.25'));
   assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.1.18'));
-  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.0-beta.6'));
-  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2-beta.6'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2.0-rc.4'));
+  assert.ok(COMPATIBLE_ADCP_VERSIONS.includes('3.2-rc.4'));
   assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2.0-beta.1'));
   assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2-beta.1'));
   assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2.0-beta.0'));
   assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2-beta.0'));
   assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2-beta'));
   assert.ok(!COMPATIBLE_ADCP_VERSIONS.includes('3.2'));
+  assert.ok(!COMPATIBLE_ADCP_VERSIONS.some(version => /3\.[01].*-(?:beta|rc)/.test(version)));
 });

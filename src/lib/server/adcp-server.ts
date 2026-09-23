@@ -32,6 +32,11 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { McpToolResponse } from './responses';
 import type { AdcpMcpResourceDefinition } from './mcp-app';
 import { ADCP_VERSION } from '../version';
+import {
+  applyStructuredContentTextFallback,
+  type StructuredContentTextFallback,
+  type StructuredContentTextFallbackContext,
+} from './structured-content-fallback';
 
 /**
  * Structural shape of an MCP transport the server can connect to.
@@ -114,6 +119,8 @@ export interface AdcpTestRequestExtras {
   authInfo?: AdcpAuthInfo;
   sessionId?: string;
   signal?: AbortSignal;
+  /** Override client/transport facts used by response-decoration tests. */
+  responseContext?: StructuredContentTextFallbackContext;
 }
 
 /**
@@ -137,6 +144,19 @@ export interface AdcpInvokeOptions {
   authInfo?: AdcpAuthInfo;
   /** Abort signal for cancellation; defaults to a fresh controller. */
   signal?: AbortSignal;
+  /**
+   * Require the framework to enforce the bundled request schema even when the
+   * server's general validation mode is `warn` or `off`. Transport adapters
+   * that advertise the exact official schema use this strengthening-only flag
+   * so failures retain the structured AdCP error envelope.
+   */
+  enforceRequestSchema?: true;
+  /**
+   * Transport/session facts used only after the canonical response has been
+   * finalized and cached. Omit for direct embedding; the fail-safe direct path
+   * mirrors structured content for compatibility.
+   */
+  responseContext?: StructuredContentTextFallbackContext;
 }
 
 /**
@@ -290,17 +310,27 @@ export interface AdcpServer {
   invoke(options: AdcpInvokeOptions): Promise<McpToolResponse>;
 
   /**
-   * Returns the AdCP protocol version this server is configured to speak.
+   * Returns the newest AdCP protocol version this server can serve.
    *
    * Defaults to {@link ADCP_VERSION} (the GA version the SDK ships against)
    * unless overridden via `createAdcpServer({ adcpVersion })`. This is the
    * protocol version, **not** the publisher's app version (`config.version`).
    *
    * Plumbing surface — Stage 2 of the multi-version refactor exposes the
-   * configured value but does not yet vary validator/schema selection by
+   * configured ceiling but does not yet vary validator/schema selection by
    * version. Wire-shape adapters key off this getter in subsequent stages.
    */
   getAdcpVersion(): string;
+
+  /**
+   * Returns the AdCP protocol version selected when a caller supplies no
+   * `adcp_version` or `adcp_major_version` claim.
+   *
+   * Defaults to {@link getAdcpVersion} unless the server config declares a
+   * lower `defaultAdcpVersion`. This lets one endpoint retain a conservative
+   * wire default while making newer explicitly versioned routes reachable.
+   */
+  getDefaultAdcpVersion(): string;
 }
 
 /**
@@ -342,6 +372,12 @@ export const ADCP_CAPABILITIES: unique symbol = Symbol.for('@adcp/client.capabil
 /** Per-request tool visibility policy consumed by transport adapters. @internal */
 export const ADCP_TOOL_VISIBILITY: unique symbol = Symbol.for('@adcp/client.toolVisibility');
 
+/** Framework-owned per-tool protocol-release availability. @internal */
+export const ADCP_TOOL_VERSION_AVAILABILITY: unique symbol = Symbol.for('@adcp/client.toolVersionAvailability');
+
+/** Negotiated/default AdCP release used by transport discovery. @internal */
+export const ADCP_DISCOVERY_VERSION_RESOLVER: unique symbol = Symbol.for('@adcp/client.discoveryVersionResolver');
+
 /** Resolved MCP tool catalog attached by createAdcpServer. @internal */
 export const ADCP_MCP_TOOL_PROFILE: unique symbol = Symbol.for('@adcp/client.mcpToolProfile');
 
@@ -359,9 +395,17 @@ export type AdcpToolVisibilityResolver = (options: {
 }) => boolean | Promise<boolean>;
 
 /** @internal */
+export type AdcpToolVersionAvailabilityResolver = (toolName: string, adcpVersion: string) => boolean;
+
+/** @internal */
+export type AdcpDiscoveryVersionResolver = (requestedVersion?: string) => string;
+
+/** @internal */
 export interface AdcpServerInternal extends AdcpServer {
   readonly [ADCP_SDK_SERVER]: McpServer;
   [ADCP_TOOL_VISIBILITY]?: AdcpToolVisibilityResolver;
+  [ADCP_TOOL_VERSION_AVAILABILITY]?: AdcpToolVersionAvailabilityResolver;
+  [ADCP_DISCOVERY_VERSION_RESOLVER]?: AdcpDiscoveryVersionResolver;
   [ADCP_MCP_TOOL_PROFILE]?: ResolvedAdcpMcpToolProfile;
   [ADCP_MCP_APP_RESOURCES]?: readonly AdcpMcpResourceDefinition[];
 }
@@ -381,6 +425,44 @@ export function getSdkServer(server: AdcpServer | McpServer): McpServer | undefi
 /** Attach a transport-independent per-request tool visibility policy. @internal */
 export function setToolVisibilityResolver(server: AdcpServer, resolver: AdcpToolVisibilityResolver): void {
   (server as AdcpServerInternal)[ADCP_TOOL_VISIBILITY] = resolver;
+}
+
+/** Attach framework-owned per-tool release availability for transport discovery. @internal */
+export function setToolVersionAvailabilityResolver(
+  server: AdcpServer,
+  resolver: AdcpToolVersionAvailabilityResolver
+): void {
+  Object.defineProperty(server, ADCP_TOOL_VERSION_AVAILABILITY, {
+    value: resolver,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
+
+/** Resolve whether a tool is available in a selected AdCP release. @internal */
+export function isToolAvailableForVersion(server: AdcpServer, toolName: string, adcpVersion: string): boolean {
+  const resolver = (server as AdcpServerInternal)[ADCP_TOOL_VERSION_AVAILABILITY];
+  return resolver ? resolver(toolName, adcpVersion) : true;
+}
+
+/** Attach the global-version negotiation used by transport discovery. @internal */
+export function setDiscoveryVersionResolver(server: AdcpServer, resolver: AdcpDiscoveryVersionResolver): void {
+  Object.defineProperty(server, ADCP_DISCOVERY_VERSION_RESOLVER, {
+    value: resolver,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+}
+
+/** Resolve a requested discovery version, falling back to the server default. @internal */
+export function resolveDiscoveryVersion(server: AdcpServer, requestedVersion?: string): string {
+  const resolver = (server as AdcpServerInternal)[ADCP_DISCOVERY_VERSION_RESOLVER];
+  // The getter is required on current AdcpServer instances. Keep the runtime
+  // fallback for mixed dependency graphs that pass a wrapper created by an
+  // older SDK copy, while the public type exposes the new API as required.
+  return resolver ? resolver(requestedVersion) : (server.getDefaultAdcpVersion?.() ?? server.getAdcpVersion());
 }
 
 /** Attach the resolved static MCP catalog for transport adapters. @internal */
@@ -653,10 +735,15 @@ export function wrapSdkRequestHandler(
 export function wrapMcpServer(
   inner: McpServer | AdcpServerInternal,
   compliance?: AdcpServerComplianceApi,
-  adcpVersion: string = ADCP_VERSION
+  adcpVersion: string = ADCP_VERSION,
+  options: {
+    structuredContentTextFallback?: StructuredContentTextFallback;
+    defaultAdcpVersion?: string;
+  } = {}
 ): AdcpServerInternal {
   if (isAdcpServer(inner)) return inner;
   const mcp = inner as McpServer;
+  const structuredContentTextFallback = options.structuredContentTextFallback ?? 'always';
   const resolvedCompliance: AdcpServerComplianceApi = compliance ?? {
     async reset() {
       throw new Error(
@@ -681,7 +768,12 @@ export function wrapMcpServer(
       if (!tool) {
         throw new Error(`dispatchTestRequest: tool "${params.name}" is not registered`);
       }
-      return tool.handler(params.arguments ?? {}, extra);
+      const result = await tool.handler(params.arguments ?? {}, extra);
+      return applyStructuredContentTextFallback(
+        result,
+        structuredContentTextFallback,
+        extras?.responseContext ?? { transport: 'mcp' }
+      );
     }
 
     const handler = getRequestHandler(mcp, request.method);
@@ -695,11 +787,17 @@ export function wrapMcpServer(
     if (!tool) {
       throw new Error(`AdcpServer.invoke: tool "${options.toolName}" is not registered`);
     }
-    const extra: { signal: AbortSignal; authInfo?: AdcpAuthInfo } = {
+    const extra: { signal: AbortSignal; authInfo?: AdcpAuthInfo; enforceRequestSchema?: true } = {
       signal: options.signal ?? new AbortController().signal,
     };
     if (options.authInfo) extra.authInfo = options.authInfo;
-    return (await tool.handler(options.args, extra)) as McpToolResponse;
+    if (options.enforceRequestSchema === true) extra.enforceRequestSchema = true;
+    const response = (await tool.handler(options.args, extra)) as McpToolResponse;
+    return applyStructuredContentTextFallback(
+      response,
+      structuredContentTextFallback,
+      options.responseContext ?? { transport: 'direct' }
+    );
   };
   const wrapper: AdcpServerInternal = {
     [ADCP_SDK_SERVER]: mcp,
@@ -717,6 +815,7 @@ export function wrapMcpServer(
     dispatchTestRequest: dispatch as AdcpServerInternal['dispatchTestRequest'],
     invoke,
     getAdcpVersion: () => adcpVersion,
+    getDefaultAdcpVersion: () => options.defaultAdcpVersion ?? adcpVersion,
   };
   return wrapper;
 }

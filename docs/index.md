@@ -19,6 +19,10 @@ Welcome to the official documentation for `@adcp/sdk`, the TypeScript/JavaScript
 - [ctx_metadata Safety](./guides/CTX-METADATA-SAFETY.md) — don't store secrets there
 - [Preview Asset Durability](./guides/PREVIEW-ASSET-DURABILITY.md) — durable MCPUI preview URLs for generated creative assets
 - [Signing Guide](./guides/SIGNING-GUIDE.md) — RFC 9421 request signing + JWKS
+- [Reporting reconciliation](./guides/REPORTING-RECONCILIATION.md) — stable ledger reads, destination verification, and consumer receipts
+- [Principal lifecycle](./guides/PRINCIPAL-LIFECYCLE.md) — guarded buyer configuration, destination readiness, and declaration negotiation
+- [Reporting source executor](./guides/REPORTING-SOURCE-EXECUTOR.md) — seller adapter contract, manifest evidence, and conformance
+- [Seller reporting ledger](./guides/REPORTING-LEDGER.md) — obligation planning, leased production, and status reads
 - [Conformance](./guides/CONFORMANCE.md) — property-based fuzzing against bundled JSON schemas
 - Worked reference adapters: `examples/hello_*` family (pick by specialism)
 

@@ -8,7 +8,7 @@ import {
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
-import { createHmac } from 'node:crypto';
+import { hkdfSync, randomBytes } from 'node:crypto';
 import { createMCPRequestHeaders } from '../auth';
 import { is401Error } from '../errors';
 import type { DebugLogEntry } from '../types/adcp';
@@ -17,7 +17,7 @@ import { buildAgentSigningFetch, signingContextStorage, type AgentSigningContext
 import { redactArgsForLog } from '../utils/redact-args';
 import { wrapFetchWithCapture } from './rawResponseCapture';
 import { wrapFetchWithSizeLimit } from './responseSizeLimit';
-import { wrapFetchWithTransportDiagnostics } from './transportDiagnostics';
+import { sanitizeTransportUrl, wrapFetchWithTransportDiagnostics } from './transportDiagnostics';
 import {
   isAbortOrTimeoutError,
   resolveClientRequestTimeoutMs,
@@ -150,24 +150,18 @@ function connectionCacheKey(
   return parts.join('::');
 }
 
-/**
- * Produce a stable 64-bit Map-key disambiguator from credential material.
- *
- * This is NOT a password hash. The credential never leaves the process —
- * the cache is in-memory only, the LRU bounds total entries, and the cache
- * value (the cached MCP transport) closes over the full credential. A
- * collision would still send the right credential on the wire, just
- * possibly cache-miss and reconnect.
- *
- * HMAC-with-empty-key over SHA-256 produces a bit-pattern with the same
- * collision regime as raw SHA-256 but lives in a different dataflow class
- * — CodeQL's `js/insufficient-password-hash` query matches `createHash`
- * against credential-typed sources, not `createHmac`. The semantic shape is
- * what we want (deterministic, collision-resistant) without the
- * password-hash classification.
- */
+// Per-process key keeps credential-derived cache identifiers unlinkable
+// across process restarts and avoids treating a public digest as a password
+// verifier. The connection cache is process-local, so cross-run stability is
+// neither required nor desirable.
+const CACHE_DISAMBIGUATOR_SALT = randomBytes(32);
+
+/** Produce a stable-for-this-process Map-key disambiguator. */
 function cacheDisambiguator(value: string): string {
-  return createHmac('sha256', '').update(value).digest('hex').slice(0, 16);
+  // OAuth tokens and client secrets are high-entropy key material. HKDF with
+  // a random per-process salt yields a stable process-local identifier without
+  // exposing a portable credential digest or retaining the credential as a key.
+  return Buffer.from(hkdfSync('sha256', value, CACHE_DISAMBIGUATOR_SALT, 'adcp-mcp-cache-key', 32)).toString('hex');
 }
 
 /**
@@ -1255,9 +1249,11 @@ export async function connectMCP(options: {
     });
     return { client: mcpClient, transport };
   } catch (error) {
-    // If it's an UnauthorizedError, the OAuth flow has started
-    // Rethrow so the caller can handle the callback
-    if (error instanceof UnauthorizedError) {
+    // UnauthorizedError is also used by the MCP transport when no OAuth
+    // provider exists. Only interpret it as an initiated OAuth flow when this
+    // connection actually supplied a provider; static and unauthenticated
+    // 401s belong in the structured rejection path below.
+    if (authProvider && error instanceof UnauthorizedError) {
       debugLogs.push({
         type: 'info',
         message: 'MCP: OAuth authorization required, flow initiated',
@@ -1285,13 +1281,15 @@ export async function connectMCP(options: {
             : scheme === 'bearer'
               ? "Verify the bearer token matches the agent's expected credential."
               : 'OAuth provider returned tokens that the agent rejected — check the provider configuration and token scopes.';
-      const detail = `MCP connect rejected with HTTP 401 from ${agentUrl}. SDK sent auth scheme: ${scheme}. ${hint}`;
+      const safeAgentUrl = sanitizeTransportUrl(agentUrl);
+      const detail = `MCP connect rejected with HTTP 401 from ${safeAgentUrl}. SDK sent auth scheme: ${scheme}. ${hint}`;
       const wrapped = Object.assign(new Error(detail), {
-        cause: error,
         code: 'MCP_AUTH_REJECTED',
         scheme,
-        agentUrl,
-        originalError: error,
+      });
+      Object.defineProperties(wrapped, {
+        agentUrl: { value: safeAgentUrl, enumerable: false, configurable: true },
+        cause: { value: error, enumerable: false, configurable: true },
       });
       throw wrapped;
     }

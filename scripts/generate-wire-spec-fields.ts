@@ -32,8 +32,11 @@ function getAdcpVersion(): string {
 // - `bundled/` is a compose layer that re-shapes schemas for cross-protocol
 //   convenience. Field sets diverge from the canonical schemas, which
 //   would produce false-positive collisions.
+// - `mcp/` contains model-facing projections. Security-sensitive fields can
+//   intentionally be omitted from those prompt schemas, so they are not wire
+//   contracts and must not participate in the request allowlist.
 // - underscore-prefixed dirs are codegen scratch.
-const SKIP_DIRS = new Set(['bundled']);
+const SKIP_DIRS = new Set(['bundled', 'mcp']);
 
 /**
  * Allowlist of fan-out-relevant request basenames. Restricts codegen to
@@ -61,6 +64,8 @@ const FAN_OUT_REQUEST_BASENAMES = new Set([
   'log-event-request',
   'report-usage-request',
   'report-plan-outcome-request',
+  'sync-reporting-status-request',
+  'sync-reporting-receipts-request',
   // Brand rights mutating
   'acquire-rights-request',
   'update-rights-request',
@@ -83,6 +88,7 @@ const FAN_OUT_REQUEST_BASENAMES = new Set([
   'si-send-message-request',
   // Read paths fan-out callers also need
   'get-media-buy-delivery-request',
+  'get-reporting-status-request',
 ]);
 
 function walk(dir: string, suffix: string): string[] {

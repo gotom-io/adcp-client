@@ -53,6 +53,7 @@ import { InMemoryRevocationStore, type RevocationStore } from '../../signing/rev
 import type { RequestLike } from '../../signing/canonicalize';
 import { getSchemaValidatorByRef } from '../../validation/schema-loader';
 import { ADCP_VERSION } from '../../version';
+import { ConfigurationError } from '../../errors';
 
 const RUN_STATE_REPLAY_KEY = '__webhook_signing_replay_store';
 const RUN_STATE_REVOCATION_KEY = '__webhook_signing_revocation_store';
@@ -93,10 +94,21 @@ export const WEBHOOK_ASSERTION_TASKS: Set<string> = new Set([
 
 const DEFAULT_TIMEOUT_SECONDS = 30;
 const DEFAULT_NO_WEBHOOK_TIMEOUT_SECONDS = 5;
-const DEFAULT_RETRY_REPLAY_TIMEOUT_SECONDS = 90;
+// Leave enough headroom for setup/report serialization inside the documented
+// 120-second isolated-run budget, even when a remote receiver is unreachable.
+const DEFAULT_RETRY_REPLAY_TIMEOUT_SECONDS = 60;
 const DEFAULT_RETRY_COUNT = 3;
 const DEFAULT_RETRY_HTTP_STATUS = 503;
 const DEFAULT_MIN_DELIVERIES = 2;
+
+function webhookTimeoutDetail(receiver: WebhookReceiver, base: string): string {
+  if (receiver.all().length > 0 || receiver.challenges().length > 0) return base;
+  const bindHost = receiver.bind_host ?? 'the configured local address';
+  if (receiver.mode === 'loopback_mock') {
+    return `${base} No request reached the receiver bound to ${bindHost}; an out-of-process agent must use webhook_receiver.mode="proxy_url".`;
+  }
+  return `${base} No request reached the receiver bound to ${bindHost}; verify that the advertised callback URL routes to this container and bind address.`;
+}
 const DEFAULT_WEBHOOK_SIGNING_TAG = 'adcp/webhook-signing/v1';
 
 /**
@@ -130,6 +142,7 @@ function clampRetryPolicy(spec: { count?: number; http_status?: number } | undef
 }
 
 interface WebhookAssertionRunState {
+  stepRequestStarts?: Map<string, string>;
   contributions: Set<string>;
   priorStepResults: Map<string, StoryboardStepResult>;
   priorProbes: Map<string, HttpProbeResult>;
@@ -142,6 +155,71 @@ interface FlatStep {
   step: StoryboardStep;
   phaseId: string;
   globalIndex: number;
+}
+
+function collectNotificationConfigs(
+  value: unknown,
+  configs: Record<string, unknown>[] = []
+): Record<string, unknown>[] {
+  if (!value || typeof value !== 'object') return configs;
+  if (Array.isArray(value)) {
+    for (const item of value) collectNotificationConfigs(item, configs);
+    return configs;
+  }
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.notification_configs)) {
+    for (const config of record.notification_configs) {
+      if (config && typeof config === 'object' && !Array.isArray(config)) {
+        const account = record.account as Record<string, unknown> | undefined;
+        configs.push({ ...(config as Record<string, unknown>), account_id: account?.account_id });
+      }
+    }
+  }
+  for (const nested of Object.values(record)) collectNotificationConfigs(nested, configs);
+  return configs;
+}
+
+function notificationSetupMatchesAssertion(setup: StoryboardStep, assertion: StoryboardStep): boolean {
+  const configs = collectNotificationConfigs(setup.sample_request);
+  if (configs.length === 0) return false;
+  const filter =
+    assertion.filter && typeof assertion.filter === 'object'
+      ? (assertion.filter as Record<string, unknown>)
+      : undefined;
+  const body = filter?.body && typeof filter.body === 'object' ? (filter.body as Record<string, unknown>) : undefined;
+  const subscriberId = filter?.subscriber_id ?? body?.subscriber_id;
+  const eventType = filter?.notification_type ?? body?.notification_type ?? filter?.event ?? body?.event;
+
+  // A setup failure is only an implicit prerequisite when the assertion names
+  // a subscriber or event configured by that setup. Other webhook assertions
+  // retain their own trigger dependency and cannot be masked by an unrelated
+  // failed registration elsewhere in the storyboard.
+  if (typeof subscriberId !== 'string' && typeof eventType !== 'string') return false;
+  return configs.some(config => {
+    const subscriberMatches = typeof subscriberId !== 'string' || config.subscriber_id === subscriberId;
+    const eventMatches =
+      typeof eventType !== 'string' || (Array.isArray(config.event_types) && config.event_types.includes(eventType));
+    return subscriberMatches && eventMatches;
+  });
+}
+
+function failedNotificationSetup(
+  step: StoryboardStep,
+  allSteps: FlatStep[],
+  priorStepResults: Map<string, StoryboardStepResult>
+): StoryboardStepResult | undefined {
+  const currentIndex = allSteps.find(entry => entry.step.id === step.id)?.globalIndex ?? Number.POSITIVE_INFINITY;
+  const setup = [...allSteps]
+    .reverse()
+    .find(
+      entry =>
+        entry.globalIndex < currentIndex &&
+        (entry.step.task === 'sync_accounts' || entry.step.task === 'sync_agent_notification_configs') &&
+        notificationSetupMatchesAssertion(entry.step, step)
+    );
+  if (!setup) return undefined;
+  const result = priorStepResults.get(setup.step.id);
+  return result && (result.skipped || !result.passed) ? result : undefined;
 }
 
 type GetNextPreview = (currentStepId: string) => StoryboardStepPreview | undefined;
@@ -231,6 +309,17 @@ export async function executeWebhookAssertionStep(
     });
   }
 
+  const failedSetup = failedNotificationSetup(step, allSteps, runState.priorStepResults);
+  if (failedSetup) {
+    return skippedResult(step, phaseId, context, start, {
+      skip_reason: 'prerequisite_failed',
+      detail: `Notification setup step "${failedSetup.step_id}" did not complete successfully.`,
+      extraction,
+      request: requestRecord,
+      next,
+    });
+  }
+
   // If the triggering step failed or was skipped, there's no webhook to
   // observe — surface as prerequisite_failed rather than timing out.
   if (step.triggered_by) {
@@ -251,52 +340,129 @@ export async function executeWebhookAssertionStep(
   const receiver = runState.webhookReceiver;
   const runnerVars = runState.runnerVars;
   const filter = buildFilter(step, context, runnerVars);
+  let observedChanges: Set<string> | undefined;
+  let subscriptionFailure: ReturnType<typeof singleFailure> | undefined;
+  if (
+    step.task === 'expect_webhook' &&
+    filter.body?.notification_type === 'account.change_recorded' &&
+    typeof filter.body.subscriber_id === 'string' &&
+    filter.body.subscriber_id.length > 0
+  ) {
+    const config = [...runState.priorStepResults.values()]
+      .reverse()
+      .filter(prior => prior.passed && !prior.skipped && prior.task === 'sync_accounts')
+      .flatMap(prior => collectNotificationConfigs(prior.request?.payload))
+      .find(
+        candidate =>
+          candidate.subscriber_id === filter.body!.subscriber_id &&
+          (filter.body!.account_id === undefined || candidate.account_id === filter.body!.account_id)
+      );
+    const base = receiver.base_url.replace(/\/$/, '');
+    if (
+      typeof config?.url !== 'string' ||
+      config.active === false ||
+      !Array.isArray(config.event_types) ||
+      !config.event_types.includes('account.change_recorded') ||
+      !config.url.startsWith(`${base}/step/`)
+    ) {
+      subscriptionFailure = singleFailure(
+        step,
+        'no_webhook_received',
+        'No successful account-change registration targets this receiver.',
+        'registered subscriber URL',
+        null
+      );
+    } else {
+      filter.path = config.url.slice(base.length);
+    }
+    if (step.triggered_by) {
+      const started = runState.stepRequestStarts?.get(step.triggered_by);
+      const boundary = started === undefined ? NaN : Date.parse(started);
+      if (!Number.isFinite(boundary)) {
+        subscriptionFailure = singleFailure(
+          step,
+          'no_webhook_received',
+          'The triggering request has no recorded observation boundary.',
+          'trigger request start',
+          null
+        );
+      } else filter.received_at_or_after = boundary;
+    }
+    const key = `account-change-observations:${String(filter.body.subscriber_id)}`;
+    observedChanges = runnerVars.runState.get(key) as Set<string> | undefined;
+    if (!observedChanges) runnerVars.runState.set(key, (observedChanges = new Set()));
+    filter.exclude_account_changes = observedChanges;
+  }
 
   let validations: ValidationResult[];
   let passed: boolean;
 
-  switch (step.task) {
-    case 'expect_webhook': {
-      const outcome = await runExpectWebhook(step, filter, receiver);
-      validations = outcome.validations;
-      passed = outcome.passed;
-      break;
-    }
-    case 'expect_no_webhook': {
-      const outcome = await runExpectNoWebhook(step, filter, receiver);
-      validations = outcome.validations;
-      passed = outcome.passed;
-      break;
-    }
-    case 'expect_webhook_retry_keys_stable': {
-      const outcome = await runExpectRetryKeysStable(step, filter, receiver);
-      validations = outcome.validations;
-      passed = outcome.passed;
-      break;
-    }
-    case 'expect_webhook_signature_valid': {
-      const outcome = await runExpectSignatureValid(step, filter, receiver, options, runnerVars);
-      validations = outcome.validations;
-      passed = outcome.passed;
-      // When the verifier isn't configured, the spec says not_applicable
-      // rather than fail. Return the skipped shape.
-      if (outcome.skipped) {
-        return skippedResult(step, phaseId, context, start, {
-          skip_reason: 'unsatisfied_contract',
-          detail: outcome.skipReason ?? 'Signature verifier not configured.',
-          extraction,
-          request: requestRecord,
-          next,
-        });
+  if (subscriptionFailure) {
+    validations = subscriptionFailure.validations;
+    passed = false;
+  } else
+    switch (step.task) {
+      case 'expect_webhook': {
+        const outcome = await runExpectWebhook(step, filter, receiver);
+        validations = outcome.validations;
+        passed = outcome.passed;
+        if (passed && observedChanges && outcome.webhook) {
+          const body = outcome.webhook.body as { account_id: string; change_id: string };
+          if (
+            typeof body?.account_id !== 'string' ||
+            !body.account_id ||
+            typeof body?.change_id !== 'string' ||
+            !body.change_id
+          ) {
+            passed = false;
+            validations.push(
+              ...singleFailure(
+                step,
+                'schema_violation',
+                'Account-change observations require account_id and change_id.',
+                'logical account/change identity',
+                null
+              ).validations
+            );
+          } else observedChanges.add(JSON.stringify([body.account_id, body.change_id]));
+        }
+        break;
       }
-      break;
+      case 'expect_no_webhook': {
+        const outcome = await runExpectNoWebhook(step, filter, receiver);
+        validations = outcome.validations;
+        passed = outcome.passed;
+        break;
+      }
+      case 'expect_webhook_retry_keys_stable': {
+        const outcome = await runExpectRetryKeysStable(step, filter, receiver);
+        validations = outcome.validations;
+        passed = outcome.passed;
+        break;
+      }
+      case 'expect_webhook_signature_valid': {
+        const outcome = await runExpectSignatureValid(step, filter, receiver, options, runnerVars);
+        validations = outcome.validations;
+        passed = outcome.passed;
+        // When the verifier isn't configured, the spec says not_applicable
+        // rather than fail. Return the skipped shape.
+        if (outcome.skipped) {
+          return skippedResult(step, phaseId, context, start, {
+            skip_reason: 'unsatisfied_contract',
+            detail: outcome.skipReason ?? 'Signature verifier not configured.',
+            extraction,
+            request: requestRecord,
+            next,
+          });
+        }
+        break;
+      }
+      default: {
+        // Defensive — this function is only called for tasks in WEBHOOK_ASSERTION_TASKS.
+        validations = [];
+        passed = false;
+      }
     }
-    default: {
-      // Defensive — this function is only called for tasks in WEBHOOK_ASSERTION_TASKS.
-      validations = [];
-      passed = false;
-    }
-  }
 
   return {
     step_id: step.id,
@@ -322,7 +488,9 @@ function buildFilter(step: StoryboardStep, context: StoryboardContext, runnerVar
   const filter: WebhookFilter = {};
 
   // Default: scope to the triggering step's URL. Authors can override via
-  // an explicit `filter.operation_id` (useful for fan-in tests).
+  // an explicit `filter.operation_id` (useful for fan-in tests). Persistent
+  // account subscriptions use their registered URL, not the mutation's URL.
+  // triggered_by still gates on successful execution above.
   if (step.triggered_by) {
     filter.step_id = step.triggered_by;
     const priorOpId = runnerVars.stepOperationIds.get(step.triggered_by);
@@ -337,10 +505,28 @@ function buildFilter(step: StoryboardStep, context: StoryboardContext, runnerVar
       if (typeof resolved.operation_id === 'string') {
         filter.operation_id = resolved.operation_id;
       }
+      if (resolved.notification_type === 'account.change_recorded' && typeof resolved.subscriber_id === 'string') {
+        filter.body = { notification_type: resolved.notification_type, subscriber_id: resolved.subscriber_id };
+        if (resolved.change_id === '*') filter.present = ['change_id'];
+        else if (resolved.change_id !== undefined) filter.body.change_id = resolved.change_id;
+      }
       if (resolved.body && typeof resolved.body === 'object' && !Array.isArray(resolved.body)) {
-        filter.body = resolved.body as Record<string, unknown>;
+        const body = resolved.body as Record<string, unknown>;
+        if (filter.body && Object.keys(filter.body).some(key => key in body && body[key] !== filter.body![key])) {
+          throw new ConfigurationError('Conflicting flat and nested webhook selectors.', 'filter');
+        }
+        filter.body = { ...body, ...filter.body };
       }
     }
+  }
+  if (
+    step.task === 'expect_webhook' &&
+    filter.body?.notification_type === 'account.change_recorded' &&
+    typeof filter.body.subscriber_id === 'string' &&
+    filter.body.subscriber_id.length > 0
+  ) {
+    delete filter.step_id;
+    if (step.filter?.operation_id === undefined) delete filter.operation_id;
   }
   return filter;
 }
@@ -400,7 +586,7 @@ async function runExpectWebhook(
   step: StoryboardStep,
   filter: WebhookFilter,
   receiver: WebhookReceiver
-): Promise<{ validations: ValidationResult[]; passed: boolean }> {
+): Promise<{ validations: ValidationResult[]; passed: boolean; webhook?: CapturedWebhook }> {
   const timeoutMs = clampTimeoutSeconds(step.timeout_seconds, DEFAULT_TIMEOUT_SECONDS) * 1000;
   const checkIdempotency = step.expect_idempotency_key !== false;
   const capCount = step.expect_max_deliveries_per_logical_event;
@@ -420,7 +606,7 @@ async function runExpectWebhook(
     return singleFailure(
       step,
       'no_webhook_received',
-      `No webhook matching filter arrived within ${timeoutMs}ms.`,
+      webhookTimeoutDetail(receiver, `No webhook matching filter arrived within ${timeoutMs}ms.`),
       'webhook delivery matching filter',
       null
     );
@@ -469,6 +655,7 @@ async function runExpectWebhook(
       },
     ],
     passed: true,
+    webhook: first,
   };
 }
 
@@ -490,8 +677,11 @@ async function runExpectRetryKeysStable(
     return singleFailure(
       step,
       'insufficient_retries',
-      `Observed ${matches.length} deliveries; expected at least ${minDeliveries}. ` +
-        'The sender may not be retrying on 5xx responses.',
+      webhookTimeoutDetail(
+        receiver,
+        `Observed ${matches.length} deliveries; expected at least ${minDeliveries}. ` +
+          'The sender may not be retrying on 5xx responses.'
+      ),
       `≥ ${minDeliveries} deliveries`,
       matches.length
     );
@@ -575,7 +765,7 @@ async function runExpectSignatureValid(
     return singleFailure(
       step,
       'no_webhook_received',
-      `No webhook matching filter arrived within ${timeoutMs}ms.`,
+      webhookTimeoutDetail(receiver, `No webhook matching filter arrived within ${timeoutMs}ms.`),
       'signed webhook delivery matching filter',
       null
     );

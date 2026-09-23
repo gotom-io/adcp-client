@@ -26,8 +26,12 @@ import type {
   AccountReference,
   BusinessEntity,
   ExtensionObject,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
   ListAccountsRequest,
+  NotificationConfig,
   PaymentTerms,
+  ReportingDeliveryConfigurationState,
   ListAccountsResponse,
   ReportUsageRequest,
   ReportUsageResponse,
@@ -41,7 +45,7 @@ import type {
   GetAccountFinancialsSuccess,
 } from '../../types/tools.generated';
 import type { ServerPayload } from '../../types/server-payload';
-import type { NotificationConfig } from '../../types/v3-1-beta';
+import { projectReportingDeliveryConfigStates } from '../reporting-delivery-config';
 import type { CursorPage } from './pagination';
 import type { AccountMode } from '../account-mode';
 import type { AdcpStructuredError } from './async-outcome';
@@ -69,6 +73,7 @@ type SyncAccountError = Pick<AdcpStructuredError, 'code' | 'message'> &
   Partial<Omit<AdcpStructuredError, 'code' | 'message'>>;
 
 export type ListAccountsPayload = ServerPayload<ListAccountsResponse>;
+export type ListAccountChangesPayload = ServerPayload<ListAccountChangesResponse>;
 export type SyncAccountsPayload = ServerPayload<SyncAccountsResponse>;
 export type SyncAccountsSuccessPayload = ServerPayload<SyncAccountsSuccess>;
 export type SyncAccountsRow = SyncAccountsSuccess['accounts'][number];
@@ -79,6 +84,7 @@ export type ReportUsagePayload = ServerPayload<ReportUsageResponse>;
 export type GetAccountFinancialsPayload = ServerPayload<GetAccountFinancialsResponse>;
 export type GetAccountFinancialsSuccessPayload = ServerPayload<GetAccountFinancialsSuccess>;
 export type ListAccountsHandlerResult<TCtxMeta = Record<string, unknown>> = CursorPage<Account<TCtxMeta>>;
+export type ListAccountChangesHandlerResult = ListAccountChangesPayload;
 export type SyncAccountsHandlerResult = SyncAccountsResultRow[];
 export type SyncGovernanceHandlerResult = SyncGovernanceRow[];
 export type ReportUsageHandlerResult = ReportUsagePayload;
@@ -200,8 +206,16 @@ export interface Account<TCtxMeta = Record<string, unknown>> {
   reporting_bucket?: WireAccount['reporting_bucket'];
 
   /**
+   * Resolved, caller-owned durable reporting delivery configurations. These
+   * are the secret-free state records returned after the seller validates a
+   * `sync_accounts` reporting delivery declaration; they are not a reporting
+   * ledger and do not grant access to a destination.
+   */
+  reporting_delivery_configs?: ReportingDeliveryConfigurationState[];
+
+  /**
    * Account-level webhook subscriptions registered through `sync_accounts`.
-   * Beta 3 adds wholesale product/signal feed webhooks here. The framework
+   * Wholesale product/signal feed webhooks are registered here. The framework
    * strips legacy `authentication.credentials` before emitting accounts on
    * `list_accounts`; adopters must still persist credentials server-side if
    * they accept legacy webhook auth.
@@ -372,6 +386,8 @@ export interface ResolveContext {
   authInfo?: ResolvedAuthInfo;
   /** Tool the buyer is calling — useful for tool-aware tenant routing. */
   toolName?: string;
+  /** Immutable AdCP release selected by the SDK for this request. */
+  readonly servedAdcpVersion?: string;
   /**
    * Resolved buyer agent from `BuyerAgentRegistry.resolve()`, when an
    * `agentRegistry` is configured (Phase 1 of #1269). The framework calls
@@ -452,9 +468,10 @@ export interface AccountToolContext<TCtxMeta = Record<string, unknown>> extends 
  *   2. **Auth-derived lookup** — in `accounts.resolve(undefined, ctx)`, look
  *      up by `ctx.authInfo.clientId` (or whichever principal field your auth
  *      wires) and return the matching account.
- *   3. **Error out** — throw `AdcpError({ code: 'ACCOUNT_NOT_FOUND' })` from
+ *   3. **Error out** — throw `AdcpError({ code: 'ACCOUNT_REQUIRED' })` from
  *      within the handler when `ctx.account == null` and the operation
- *      requires tenant scoping.
+ *      requires tenant scoping. The platform adapter does this automatically
+ *      for its account-required operations.
  *
  * The narrowed type catches the mismatch at authorship time — adopters who
  * forget to handle `ctx.account === undefined` get a TS error, not a runtime
@@ -495,30 +512,112 @@ export interface AuthPrincipal {
   claims?: Record<string, unknown>;
 }
 
+/**
+ * Account-reference model a seller declares on {@link AccountStore.resolution}.
+ *
+ * One spelling per model, deliberately. `'derived'` keeps its name even
+ * though adcp#5062 calls the shape an *upstream-managed account-id
+ * namespace*: `resolution` is SDK-local configuration, not a wire value, and
+ * a second spelling would silently defeat every adopter comparison written
+ * as `resolution === 'derived'` while inviting divergence from the Python
+ * SDK. `'account-id-namespace'` is rejected for the additional reason that
+ * it doesn't discriminate — under adcp#5062 both `'explicit'` and
+ * `'derived'` are account-id namespaces.
+ *
+ * @public
+ */
+export type AccountResolutionMode = 'explicit' | 'implicit' | 'derived';
+
+/**
+ * Resolution mode with the documented default applied. Distinct from
+ * {@link AccountResolutionMode} only in that it cannot be `undefined`.
+ *
+ * @public
+ */
+export type CanonicalAccountResolutionMode = AccountResolutionMode;
+
+/**
+ * Apply the documented `'explicit'` default to a declared resolution mode.
+ *
+ * Every framework read of `accounts.resolution` goes through this helper so
+ * "omitted means explicit" is stated once rather than re-derived (usually
+ * correctly, occasionally not) at each branch.
+ *
+ * @public
+ */
+export function normalizeAccountResolution(
+  resolution: AccountResolutionMode | undefined
+): CanonicalAccountResolutionMode {
+  return isAccountResolutionMode(resolution) ? resolution : 'explicit';
+}
+
+/**
+ * Runtime guard for the `resolution` union. Untyped JavaScript adopters can
+ * put anything here, and "unrecognized" must not silently inherit another
+ * mode's enforcement — `createAdcpServerFromPlatform` rejects unknown values
+ * at construction, and {@link normalizeAccountResolution} falls back to the
+ * documented `'explicit'` default if one ever reaches dispatch.
+ *
+ * @public
+ */
+export function isAccountResolutionMode(value: unknown): value is AccountResolutionMode {
+  return value === 'explicit' || value === 'implicit' || value === 'derived';
+}
+
 export interface AccountStore<TCtxMeta = Record<string, unknown>> {
   /**
-   * How buyers reference accounts on this platform.
-   * - `'explicit'` — buyer passes `account_id` inline on every request (Snap,
-   *   Meta, GAM via Network/Company id). The default.
-   * - `'implicit'` — buyer must `sync_accounts` first; subsequent requests are
-   *   resolved from the auth principal's pre-synced linkage (LinkedIn, some
-   *   retail-media operators). Framework refuses inline `account_id` references
-   *   for these platforms — emits `AdcpError('INVALID_REQUEST', { field:
-   *   'account.account_id' })` before reaching `accounts.resolve`. The
-   *   brand+operator union arm is permitted (used during the initial
-   *   `sync_accounts` flow); only `account_id`-shaped references are rejected.
-   * - `'derived'` — single-tenant agents where there is no account_id on the
-   *   wire at all and the auth principal alone identifies the tenant. Most
-   *   self-hosted broadcasters and retail-media operators in proxy mode.
-   *   Framework refuses inline `account_id` references for these platforms —
-   *   same `AdcpError('INVALID_REQUEST', { field: 'account.account_id' })`
-   *   shape as `'implicit'`, but with a single-tenant message instead of the
-   *   `sync_accounts`-first guidance (no `sync_accounts` step exists in
-   *   derived mode). The brand+operator union arm is permitted.
+   * How buyers reference accounts on this platform. Three onboarding models,
+   * aligned with the account-reference taxonomy clarified upstream in
+   * [adcp#5062](https://github.com/adcontextprotocol/adcp/pull/5062):
+   *
+   * | Mode | Roster owner | Discovery | Durable wire reference |
+   * |---|---|---|---|
+   * | `'explicit'` (default) | Seller (you) | none required — IDs issued out-of-band, or `list_accounts` when you wire it | `{ account_id }` or the `{ brand, operator }` natural key |
+   * | `'implicit'` | Buyer-declared | `sync_accounts` | `{ brand, operator }` natural key |
+   * | `'derived'` | Upstream platform you front | `list_accounts` (required) | `{ account_id }` |
+   *
+   * - `'explicit'` — a seller-owned account-id namespace. You issue the ids
+   *   (Snap, Meta, GAM via Network/Company id, a publisher storefront table).
+   *   The framework applies no reference-shape constraint: both union arms
+   *   reach `accounts.resolve`.
+   * - `'implicit'` — buyer-declared accounts. The buyer must `sync_accounts`
+   *   first; subsequent requests resolve from the auth principal's pre-synced
+   *   linkage (LinkedIn, some retail-media operators). Framework refuses
+   *   inline `account_id` references for these platforms — emits
+   *   `AdcpError('INVALID_REQUEST', { field: 'account.account_id' })` before
+   *   reaching `accounts.resolve`. The brand+operator union arm is permitted
+   *   (it is the durable key for this mode); only `account_id`-shaped
+   *   references are rejected.
+   * - `'derived'` — an **upstream-managed account-id namespace**. The agent
+   *   fronts a platform that owns its own roster (Meta / Snap business
+   *   accounts, AudioStack workspaces, a retail-media proxy). Roster size is
+   *   an operational property of the upstream, not a different SDK pattern:
+   *   N=1 and N=many adopters share one wire contract. The buyer calls
+   *   `list_accounts` to discover ids, then passes `{ account_id }` on every
+   *   account-scoped request. Framework refuses the brand+operator arm for
+   *   these platforms — `AdcpError('INVALID_REQUEST', { field:
+   *   'account.brand' })` with a `list_accounts` suggestion — because the
+   *   natural key is not a durable reference into someone else's namespace.
+   *   `accounts.list` is **required** (`createAdcpServerFromPlatform` throws
+   *   `PlatformConfigError` without it); `accounts.resolve` MUST verify that
+   *   a buyer-supplied `account_id` is one the caller's credential can
+   *   actually reach. `createDerivedAccountStore` does both for you.
+   *
+   * **Changed in SDK 14 (breaking, adcp-client#1647).** `'derived'` used to
+   * be documented as "single-tenant; no `account_id` on the wire" and the
+   * framework refused inline `account_id` for it. That was inverted: it made
+   * the mode unusable for the upstream-managed adopters it exists for, and
+   * left buyers who called `list_accounts` with ids that every subsequent
+   * call rejected. Agents that genuinely have no discoverable namespace and
+   * hand out ids out-of-band belong in `'explicit'`.
+   *
+   * The mode keeps the name `'derived'` even though the spec calls the
+   * shape an upstream-managed account-id namespace — see
+   * {@link AccountResolutionMode} for why no alias is offered.
    *
    * Defaults to `'explicit'` when omitted.
    */
-  readonly resolution?: 'explicit' | 'implicit' | 'derived';
+  readonly resolution?: AccountResolutionMode;
 
   /**
    * Resolve buyer's AccountReference into the platform's tenant model.
@@ -526,13 +625,34 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
    * `ref` is `undefined` when the wire request didn't carry an account
    * field — `provide_performance_feedback` and `list_creative_formats` are
    * the canonical examples. Per `resolution` mode:
-   * - `'derived'` (single-tenant): return the singleton account regardless.
+   * - `'derived'`: return the account the credential can reach when exactly
+   *   one is reachable (the singleton shortcut); return `null` when the
+   *   credential can reach several and the buyer named none — ambiguity is
+   *   not a default.
    * - `'implicit'`: look up the account from the auth principal.
    * - `'explicit'` (default): no account is available; either throw
    *   `AccountNotFoundError` to signal "tool requires account" OR return
    *   a synthetic singleton if the tool legitimately doesn't need
    *   tenant scoping (e.g., publisher-wide format catalog from
    *   `list_creative_formats`).
+   *
+   * **`'derived'` resolvers MUST verify the reference (tenant isolation).**
+   * A buyer-supplied `account_id` on an upstream-managed namespace is an
+   * untrusted claim: resolve it against the set the *caller's credential*
+   * can reach and return `null` on any miss. A resolver that ignores `ref`
+   * and returns a fixed account hands caller A's request to caller B's
+   * tenant the moment the deployment grows past one account. Prefer
+   * `createDerivedAccountStore`, which performs the check itself.
+   *
+   * ```ts
+   * // 'derived' — verified lookup, fail closed.
+   * resolve: async (ref, ctx) => {
+   *   const reachable = await upstream.accountsFor(ctx?.authInfo);  // credential-scoped
+   *   const id = refAccountId(ref);
+   *   if (id !== undefined) return reachable.find(a => a.id === id) ?? null;
+   *   return reachable.length === 1 ? reachable[0] : null;
+   * },
+   * ```
    *
    * `ctx.authInfo` is the caller's authenticated principal (when
    * `serve({ authenticate })` is wired). Adapters fronting an upstream
@@ -550,8 +670,11 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
    * }
    * ```
    *
-   * Two failure shapes:
-   * - **Unknown / cross-tenant reference**: return `null` (canonical) — OR
+   * Three failure shapes:
+   * - **No buyer reference and no auth-derived selection**: return `null`.
+   *   Account-required operations emit correctable `ACCOUNT_REQUIRED`; truly
+   *   publisher-wide operations may continue without `ctx.account`.
+   * - **Unknown / cross-tenant buyer reference**: return `null` (canonical) — OR
    *   throw `AccountNotFoundError` if your codebase already throws a
    *   not-found exception class. Framework emits the spec's fixed
    *   `ACCOUNT_NOT_FOUND` envelope either way. The buyer learns no detail
@@ -566,6 +689,29 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
    * sync_accounts API surface. Framework normalizes the wire request; platform
    * upserts and returns per-account result rows. `throw new AdcpError(...)`
    * for buyer-facing rejection.
+   *
+   * **`'derived'` platforms may still wire this.** Natural-key provisioning
+   * (`{ brand, operator, billing }` at the entry root) is out of scope for an
+   * upstream-managed account-id namespace — the framework fails those entries
+   * per-row with `UNSUPPORTED_PROVISIONING` before calling `upsert`, per
+   * adcp#5062. Settings-update entries keyed by `account: { account_id }`
+   * pass through, so adopters whose upstream exposes account-settings writes
+   * keep that surface.
+   *
+   * For `'derived'`, the framework additionally resolves each surviving
+   * entry's `account_id` against what the caller's credential can reach and
+   * fails the operation with `ACCOUNT_NOT_FOUND` before any write when one
+   * doesn't — `sync_accounts` is otherwise the one account-scoped surface
+   * whose reference never passes through `accounts.resolve`. That is a floor,
+   * not a substitute for your own authorization: keep any per-entry gate you
+   * already run, and note the framework performs no such check for
+   * `'explicit'` / `'implicit'`, where the entry key is buyer-declared.
+   *
+   * **Rows must carry `brand` + `operator`** (`sync-accounts-response.json`
+   * requires them on every row, including `action: 'failed'`). Echo them from
+   * your own account record on settings-update results. If your upstream
+   * accounts have no expressible natural key, don't wire this method — see
+   * adcontextprotocol/adcp#7517.
    *
    * In AdCP 3.1 beta, adopters that need settings-update entries with
    * `notification_configs[]` can read the full wire body from `ctx.input`
@@ -621,6 +767,13 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
    * adopter returns a loosely-typed row that spreads the input. Do not rely
    * on TypeScript narrowing alone — the strip is enforced at the dispatcher.
    *
+   * For `'derived'` platforms the framework resolves each entry's
+   * `account_id` against the caller's reachable set first and fails that row
+   * with `ACCOUNT_NOT_FOUND` when it doesn't resolve (natural-key references
+   * fail with `INVALID_REQUEST`), so entries reaching this method are
+   * credential-verified. That floor does not exist for `'explicit'` /
+   * `'implicit'`, where the entry key is buyer-declared.
+   *
    * `ctx.authInfo` and `ctx.agent` carry the caller's principal — same
    * threading as `upsert`. Adopters MUST gate per-entry persistence by the
    * caller's tenant: each entry's `account.operator` (or `account_id`) must
@@ -638,13 +791,46 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
   /**
    * list_accounts API surface. Framework wraps with cursor envelope.
    *
-   * **Optional.** Same rationale as `upsert` — stateless platforms can omit.
+   * **Optional for `'explicit'` / `'implicit'`.** Same rationale as `upsert`
+   * — stateless platforms can omit.
+   *
+   * **Required for `'derived'`.** It is the discovery contract for an
+   * upstream-managed namespace: without it a buyer has no way to learn the
+   * `account_id` that every account-scoped call must carry.
+   * `createAdcpServerFromPlatform` throws `PlatformConfigError` when a
+   * `'derived'` store omits it. Credential-bound singletons still expose it
+   * (one row) so buyer SDKs can auto-select — per adcp#5062, sellers SHOULD
+   * return the singleton rather than omit the tool. If your ids are only ever
+   * issued out-of-band and there is nothing to enumerate, you are an
+   * `'explicit'` seller-defined namespace, not `'derived'`.
+   *
+   * Implementations MUST scope the page to what the caller's credential can
+   * reach — this is the enumeration boundary for the whole namespace — and
+   * own filtering and paging: the framework passes `request` through
+   * verbatim and only projects the `pagination` envelope from the returned
+   * `CursorPage`. (`createDerivedAccountStore` and `createRosterAccountStore`
+   * handle that for you.)
    *
    * `ctx.authInfo` and `ctx.agent` carry the caller's principal — adopters
    * scope the listing per-principal (e.g., return only accounts visible to
    * the calling buyer agent) without re-deriving identity from the request.
    */
   list?(request: ListAccountsRequest, ctx?: ResolveContext): Promise<ListAccountsHandlerResult<TCtxMeta>>;
+
+  /**
+   * list_account_changes API surface. Returns a durable feed page whose
+   * cursor remains bound to the authenticated principal, account, and
+   * normalized filters. The framework resolves the request account before
+   * calling this method; adopters must additionally bind and validate opaque
+   * cursors against the caller identity carried by `ctx`.
+   *
+   * **Optional.** Platforms without a durable change feed leave this
+   * unimplemented and do not advertise `list_account_changes`.
+   */
+  listChanges?(
+    request: ListAccountChangesRequest,
+    ctx: AccountToolContext<TCtxMeta>
+  ): Promise<ListAccountChangesHandlerResult>;
 
   /**
    * report_usage API surface. Operator-billed platforms accept usage rows
@@ -816,6 +1002,12 @@ export interface SyncAccountsResultRow {
   /** Applied account-level webhook subscriptions; credentials are stripped on emit. */
   notification_configs?: NotificationConfig[];
   /**
+   * Resolved, secret-free durable reporting delivery configuration states.
+   * The seller returns these after validating the declaration, including for
+   * dry-run previews. This is state projection only, not ledger behavior.
+   */
+  reporting_delivery_configs?: ReportingDeliveryConfigurationState[];
+  /**
    * Caller-specific authorization metadata for this synced account, including
    * downstream grants such as advertiser-account access plus publisher
    * identity/post authorization.
@@ -884,6 +1076,11 @@ export function toWireAccount<TCtxMeta>(account: Account<TCtxMeta>): WireAccount
     wire.governance_agents = [projectGovernanceAgent(account.governance_agents[0]!)];
   }
   if (account.reporting_bucket !== undefined) wire.reporting_bucket = account.reporting_bucket;
+  if (account.reporting_delivery_configs !== undefined) {
+    (
+      wire as unknown as { reporting_delivery_configs?: ReportingDeliveryConfigurationState[] }
+    ).reporting_delivery_configs = projectReportingDeliveryConfigStates(account.reporting_delivery_configs);
+  }
   if (account.notification_configs !== undefined) {
     (wire as unknown as { notification_configs?: WireNotificationConfig[] }).notification_configs =
       account.notification_configs.map(projectNotificationConfig);
@@ -914,7 +1111,7 @@ function projectAccountAuthorization(authorization: AccountAuthorization): Accou
   return projected;
 }
 
-type WireSyncAccountRow = SyncAccountsSuccess['accounts'][number];
+export type WireSyncAccountRow = SyncAccountsSuccess['accounts'][number];
 
 /**
  * Project an adopter `SyncAccountsResultRow` to the wire shape returned by
@@ -950,6 +1147,11 @@ export function toWireSyncAccountRow(row: SyncAccountsResultRow): WireSyncAccoun
     (wire as unknown as { notification_configs?: WireNotificationConfig[] }).notification_configs =
       row.notification_configs.map(projectNotificationConfig);
   }
+  if (row.reporting_delivery_configs !== undefined) {
+    (
+      wire as unknown as { reporting_delivery_configs?: ReportingDeliveryConfigurationState[] }
+    ).reporting_delivery_configs = projectReportingDeliveryConfigStates(row.reporting_delivery_configs);
+  }
   if (row.authorization !== undefined) {
     (wire as WireSyncAccountRow & { authorization?: AccountAuthorization }).authorization = projectAccountAuthorization(
       row.authorization
@@ -968,7 +1170,7 @@ function projectNotificationConfig(config: NotificationConfig): WireNotification
   return { ...rest, authentication: authenticationWithoutCredentials };
 }
 
-type WireSyncGovernanceRow = SyncGovernanceSuccess['accounts'][number];
+export type WireSyncGovernanceRow = SyncGovernanceSuccess['accounts'][number];
 
 /**
  * Project a `sync_governance` response row to the wire shape, stripping
@@ -1061,4 +1263,25 @@ function projectGovernanceAgent(agent: WireGovernanceAgent): WireGovernanceAgent
  */
 export function refAccountId(ref?: AccountReference): string | undefined {
   return ref && 'account_id' in ref ? (ref as { account_id?: string }).account_id : undefined;
+}
+
+/**
+ * True when `ref` carries the `{ brand, operator }` natural-key arm of
+ * `AccountReference` — the durable reference shape for buyer-declared
+ * (`'implicit'`) accounts, and the shape an upstream-managed (`'derived'`)
+ * namespace refuses because the tuple is not a key into someone else's
+ * roster.
+ *
+ * Returns `false` for `undefined` refs and for `{ account_id }` refs.
+ *
+ * @public
+ */
+export function refHasNaturalKey(ref?: AccountReference): boolean {
+  if (ref === undefined) return false;
+  // Symmetric presence test on both arms. A malformed value (`brand: null`,
+  // `operator: 123`) still counts as "the buyer reached for the natural-key
+  // arm" — the modes that refuse that arm should refuse it rather than let a
+  // type-confused value slip past into the resolver when request validation
+  // is relaxed.
+  return (ref as { brand?: unknown }).brand !== undefined || (ref as { operator?: unknown }).operator !== undefined;
 }

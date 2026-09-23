@@ -3,8 +3,11 @@
 import { generate } from 'ts-to-zod';
 import $RefParser from '@apidevtools/json-schema-ref-parser';
 import { jsonSchemaToZod } from 'json-schema-to-zod';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
+import ts from 'typescript';
+import { writeFileSync, readFileSync, existsSync, readdirSync } from 'fs';
 import path from 'path';
+import { isDeepStrictEqual } from 'util';
+import { relaxArrayCardinalityTypes } from './typescript-array-cardinality';
 
 /**
  * Generate Zod v4 schemas from TypeScript types
@@ -85,6 +88,7 @@ const TS7056_SCHEMAS: Array<{
   tsType?: string;
   objectShape?: boolean;
   typeSource?: 'tools' | 'core' | 'v2-projection';
+  typedInput?: boolean;
 }> = [
   { name: 'AdCPAsyncResponseDataSchema' },
   { name: 'MCPWebhookPayloadSchema' },
@@ -99,6 +103,28 @@ const TS7056_SCHEMAS: Array<{
   { name: 'AudienceEvidenceSchema' },
   { name: 'AudienceEvidenceSelectionSchema' },
   { name: 'ProductSchema', tsType: 'Product', objectShape: true },
+  // Public creative asset schemas are loose objects at runtime, but their
+  // parse output must remain assignable to the corresponding generated
+  // protocol interfaces. Without explicit annotations, nested passthrough
+  // objects such as Provenance acquire incompatible string index signatures.
+  { name: 'ImageAssetSchema', tsType: 'ImageAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'VideoAssetSchema', tsType: 'VideoAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'AudioAssetSchema', tsType: 'AudioAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'TextAssetSchema', tsType: 'TextAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'URLAssetSchema', tsType: 'URLAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'HTMLAssetSchema', tsType: 'HTMLAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  {
+    name: 'JavaScriptAssetSchema',
+    tsType: 'JavaScriptAsset',
+    objectShape: true,
+    typeSource: 'core',
+    typedInput: true,
+  },
+  { name: 'ZipAssetSchema', tsType: 'ZipAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'WebhookAssetSchema', tsType: 'WebhookAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'CSSAssetSchema', tsType: 'CSSAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'MarkdownAssetSchema', tsType: 'MarkdownAsset', objectShape: true, typeSource: 'core', typedInput: true },
+  { name: 'CardAssetSchema', tsType: 'CardAsset', objectShape: true, typeSource: 'core', typedInput: true },
   {
     name: 'GetProductsRequestSchema',
     tsType: 'GetProductsRequest',
@@ -113,6 +139,7 @@ const TS7056_SCHEMAS: Array<{
   { name: 'PackageUpdateSchema', tsType: 'PackageUpdate', objectShape: true, typeSource: 'core' },
   { name: 'UpdateMediaBuySuccessSchema' },
   { name: 'CreativeLocalizationReadbackSchema' },
+  { name: 'SyncCreativesRequestSchema', tsType: 'SyncCreativesRequest', objectShape: true },
   { name: 'SyncCreativesSuccessSchema' },
   { name: 'GetProductsCompletionSchema' },
   { name: 'ComplianceTaskCompletionDataSchema' },
@@ -124,6 +151,8 @@ const TS7056_SCHEMAS: Array<{
   { name: 'ListedCreativeCanonicalFormatKindSchema' },
   { name: 'CreateMediaBuyRequestSchema', tsType: 'CreateMediaBuyRequest', objectShape: true },
   { name: 'CanonicalProposalSchema', tsType: 'CanonicalProposal', objectShape: true },
+  { name: 'TargetingOverlaySchema', tsType: 'TargetingOverlay', objectShape: true },
+  { name: 'TargetingOverlayInputSchema', tsType: 'TargetingOverlayInput', objectShape: true },
   { name: 'GetMediaBuysResponseMediaBuySchema' },
   { name: 'GetMediaBuysResponseSchema' },
   { name: 'WholesaleFeedWebhookSchema' },
@@ -165,7 +194,7 @@ function postProcessTS7056Annotations(content: string): string {
     core: new Set<string>(),
     v2Projection: new Set<string>(),
   };
-  for (const { name, tsType, objectShape, typeSource = 'tools' } of TS7056_SCHEMAS) {
+  for (const { name, tsType, objectShape, typeSource = 'tools', typedInput = false } of TS7056_SCHEMAS) {
     const pattern = new RegExp(`export const ${name} = `);
     if (!pattern.test(result)) {
       throw new Error(
@@ -208,7 +237,9 @@ function postProcessTS7056Annotations(content: string): string {
           name === 'ProductSchema'
             ? `ProductSchemaObject<${objectShapeType}>`
             : `z.ZodObject<${objectShapeType}, z.core.$loose>`;
-        annotation = `${objectType} & z.ZodType<${widened}, ${widened}>`;
+        annotation = typedInput
+          ? `Omit<${objectType}, keyof z.ZodType> & z.ZodType<${widened}, ${tsType}>`
+          : `${objectType} & z.ZodType<${widened}, ${widened}>`;
         const importBucket = typeSource === 'v2-projection' ? typesToImport.v2Projection : typesToImport[typeSource];
         importBucket.add(tsType);
         if (name === 'ProductSchema') typesToImport.tools.add('PublisherPropertySelector');
@@ -247,8 +278,8 @@ function postProcessTS7056Annotations(content: string): string {
     ]
       .filter(Boolean)
       .join('\n');
-    const productSchemaHelperTypes = `type ProductSchemaShape = ${productObjectShapeType};
-type ProductSchemaSafeExtendShape<
+    const productSchemaHelperTypes = `export type ProductSchemaShape = ${productObjectShapeType};
+export type ProductSchemaSafeExtendShape<
   Base extends z.core.$ZodShape,
   U extends z.core.$ZodShape,
 > = {
@@ -262,7 +293,7 @@ type ProductSchemaSafeExtendShape<
         : never
       : U[K];
 };
-type ProductSchemaObject<Shape extends z.core.$ZodShape> = {
+export type ProductSchemaObject<Shape extends z.core.$ZodShape> = {
   safeExtend<U extends z.core.$ZodShape>(
     shape: ProductSchemaSafeExtendShape<Shape, U>
   ): ProductSchemaObject<Omit<Shape, keyof U> & U>;
@@ -335,29 +366,393 @@ function postProcessLazyTypeAnnotations(content: string): string {
   return result;
 }
 
+const typePrinter = ts.createPrinter({ removeComments: true });
+function canonicalSchemaExpression(expression: string): string {
+  const sourceFile = ts.createSourceFile(
+    'zod-expression.ts',
+    `const schema = ${expression};`,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const statement = sourceFile.statements[0];
+  if (!statement || !ts.isVariableStatement(statement)) return expression;
+  const initializer = statement.declarationList.declarations[0]?.initializer;
+  return initializer ? typePrinter.printNode(ts.EmitHint.Expression, initializer, sourceFile) : expression;
+}
+
 /**
- * Post-process generated Zod schemas to convert tuple patterns to arrays.
- *
- * ts-to-zod converts TypeScript arrays with @minItems JSDoc annotations to Zod tuples:
- *   z.tuple([z.string()]).rest(z.string())
- *
- * This requires at least one element, but agents in the wild return empty arrays.
- * Convert these patterns to simple arrays that allow empty arrays:
- *   z.array(z.string())
- *
- * This is more lenient than the JSON Schema spec (which requires minItems: 1),
- * but necessary for real-world interoperability.
- *
- * LIMITATIONS: This regex handles simple patterns like z.tuple([z.string()]).rest(z.string())
- * but may not handle complex nested schemas with brackets (e.g., z.object({ ... })).
- * The [^\]]+ pattern stops at the first closing bracket, which works for primitive types
- * and simple references. If edge cases with nested objects appear, consider using an AST parser.
+ * Normalize homogeneous tuple/rest projections whose array provenance was lost
+ * during JSON Schema -> TypeScript generation (for example array branches inside
+ * patternProperties). Fixed tuples and bounded structural tuple unions are not
+ * touched. Token comparison ignores generator indentation without conflating
+ * whitespace inside string or regular-expression literals.
  */
-function postProcessTuplesToArrays(content: string): string {
-  // Match patterns like: z.tuple([SomeSchema]).rest(SomeSchema)
-  // and convert to: z.array(SomeSchema)
-  // The pattern captures the inner schema type and uses a backreference to ensure they match
-  return content.replace(/z\.tuple\(\[([^\]]+)\]\)\.rest\(\1\)/g, 'z.array($1)');
+function postProcessTupleRestArrays(content: string): string {
+  const marker = 'z.tuple(';
+  let result = '';
+  let cursor = 0;
+
+  while (cursor < content.length) {
+    const tupleStart = content.indexOf(marker, cursor);
+    if (tupleStart < 0) {
+      result += content.slice(cursor);
+      break;
+    }
+
+    result += content.slice(cursor, tupleStart);
+    const tupleCall = scanBalanced(content, tupleStart + 'z.tuple'.length);
+    const tupleArgument = tupleCall?.body.trim();
+    const tupleArray = tupleArgument?.startsWith('[') ? scanBalanced(tupleArgument, 0, '[', ']') : undefined;
+    const members =
+      tupleArray && !tupleArgument!.slice(tupleArray.end).trim() && tupleArray.body.trim()
+        ? splitTopLevelList(tupleArray.body)
+        : undefined;
+    const restStart = tupleCall?.end;
+    const restCall =
+      restStart !== undefined && content.startsWith('.rest(', restStart)
+        ? scanBalanced(content, restStart + '.rest'.length)
+        : undefined;
+
+    if (
+      members?.length === 1 &&
+      restCall &&
+      canonicalSchemaExpression(members[0]!) === canonicalSchemaExpression(restCall.body)
+    ) {
+      result += `z.array(${postProcessTupleRestArrays(members[0]!)})`;
+      cursor = restCall.end;
+      continue;
+    }
+
+    if (!tupleCall) {
+      result += marker;
+      cursor = tupleStart + marker.length;
+      continue;
+    }
+    result += `z.tuple(${postProcessTupleRestArrays(tupleCall.body)})`;
+    cursor = tupleCall.end;
+  }
+
+  return result;
+}
+
+interface ArrayMaxItemsConstraint {
+  schemaName: string;
+  path: string[];
+  maxItems: number;
+}
+
+function jsDocNumberTag(node: ts.Node, name: string): number | undefined {
+  const tag = ts.getJSDocTags(node).find(candidate => candidate.tagName.text === name);
+  if (!tag) return undefined;
+  const value = Number(String(tag.comment ?? '').trim());
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function isTupleType(type: ts.TypeNode): boolean {
+  let unwrapped = type;
+  while (ts.isParenthesizedTypeNode(unwrapped)) unwrapped = unwrapped.type;
+  return ts.isTupleTypeNode(unwrapped);
+}
+
+/**
+ * Collect maxItems annotations which survive the JSON-Schema-to-TypeScript
+ * hop as JSDoc. ts-to-zod deliberately only knows scalar/string JSDoc
+ * constraints, so arrays need this small source-aware bridge.
+ *
+ * `path` allows nested type literals to be handled without matching an
+ * unrelated same-named field elsewhere in a generated schema. An exact tuple
+ * already enforces its cardinality, and must remain a tuple for compatibility.
+ */
+function collectArrayMaxItemsConstraints(source: string): ArrayMaxItemsConstraint[] {
+  const sourceFile = ts.createSourceFile(
+    'adcp-generated-types.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const constraints: ArrayMaxItemsConstraint[] = [];
+
+  const visitType = (type: ts.TypeNode, schemaName: string, path: string[]): void => {
+    if (ts.isParenthesizedTypeNode(type)) {
+      visitType(type.type, schemaName, path);
+      return;
+    }
+    if (ts.isTypeLiteralNode(type)) {
+      for (const member of type.members) {
+        if (!ts.isPropertySignature(member) || !member.type) continue;
+        const propertyName =
+          ts.isIdentifier(member.name) || ts.isStringLiteral(member.name) || ts.isNumericLiteral(member.name)
+            ? member.name.text
+            : undefined;
+        if (!propertyName) continue;
+        collectMember(member, schemaName, [...path, propertyName]);
+      }
+      return;
+    }
+    if (ts.isArrayTypeNode(type)) {
+      visitType(type.elementType, schemaName, path);
+      return;
+    }
+    if (
+      ts.isTypeReferenceNode(type) &&
+      ts.isIdentifier(type.typeName) &&
+      (type.typeName.text === 'Array' || type.typeName.text === 'ReadonlyArray') &&
+      type.typeArguments?.[0]
+    ) {
+      visitType(type.typeArguments[0], schemaName, path);
+      return;
+    }
+    if (ts.isTupleTypeNode(type)) {
+      for (const element of type.elements) {
+        if (ts.isRestTypeNode(element)) visitType(element.type, schemaName, path);
+        else if (ts.isNamedTupleMember(element)) visitType(element.type, schemaName, path);
+        else visitType(element, schemaName, path);
+      }
+      return;
+    }
+    if (ts.isUnionTypeNode(type) || ts.isIntersectionTypeNode(type)) {
+      type.types.forEach(member => visitType(member, schemaName, path));
+    }
+  };
+
+  const collectMember = (member: ts.PropertySignature, schemaName: string, path: string[]): void => {
+    const maxItems = jsDocNumberTag(member, 'maxItems');
+    const minItems = jsDocNumberTag(member, 'minItems');
+    if (maxItems !== undefined && minItems !== maxItems && !isTupleType(member.type!)) {
+      constraints.push({ schemaName, path, maxItems });
+    }
+    visitType(member.type!, schemaName, path);
+  };
+
+  for (const statement of sourceFile.statements) {
+    if (ts.isInterfaceDeclaration(statement)) {
+      for (const member of statement.members) {
+        if (!ts.isPropertySignature(member) || !member.type) continue;
+        const propertyName =
+          ts.isIdentifier(member.name) || ts.isStringLiteral(member.name) || ts.isNumericLiteral(member.name)
+            ? member.name.text
+            : undefined;
+        if (propertyName) collectMember(member, statement.name.text, [propertyName]);
+      }
+      continue;
+    }
+    if (!ts.isTypeAliasDeclaration(statement)) continue;
+
+    const maxItems = jsDocNumberTag(statement, 'maxItems');
+    const minItems = jsDocNumberTag(statement, 'minItems');
+    if (maxItems !== undefined && minItems !== maxItems && !isTupleType(statement.type)) {
+      constraints.push({ schemaName: statement.name.text, path: [], maxItems });
+    }
+    visitType(statement.type, statement.name.text, []);
+  }
+
+  const unique = new Map<string, ArrayMaxItemsConstraint>();
+  for (const constraint of constraints) {
+    const key = `${constraint.schemaName}:${constraint.path.join('.')}`;
+    const existing = unique.get(key);
+    if (existing && existing.maxItems !== constraint.maxItems) {
+      throw new Error(`Conflicting @maxItems values for ${key}: ${existing.maxItems} and ${constraint.maxItems}.`);
+    }
+    unique.set(key, constraint);
+  }
+  return [...unique.values()];
+}
+
+function propertyNameText(name: ts.PropertyName): string | undefined {
+  return ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name) ? name.text : undefined;
+}
+
+function isZodArrayCall(node: ts.Expression): node is ts.CallExpression {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === 'array' &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'z'
+  );
+}
+
+function isZodTupleCall(node: ts.Expression): node is ts.CallExpression {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === 'tuple' &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'z'
+  );
+}
+
+/** Find the outer array base beneath chains such as `.optional()` or `.nullable()`. */
+function findZodArrayBase(node: ts.Expression): ts.CallExpression | undefined {
+  if (isZodArrayCall(node)) return node;
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+    return findZodArrayBase(node.expression.expression);
+  }
+  return undefined;
+}
+
+function fixedZodTupleLength(node: ts.Expression): number | undefined {
+  if (isZodTupleCall(node)) {
+    const values = node.arguments[0];
+    return values && ts.isArrayLiteralExpression(values) ? values.elements.length : undefined;
+  }
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+    return fixedZodTupleLength(node.expression.expression);
+  }
+  return undefined;
+}
+
+function zodArrayMaxItems(node: ts.Expression): number | undefined {
+  let current = node;
+  while (ts.isCallExpression(current) && ts.isPropertyAccessExpression(current.expression)) {
+    if (
+      current.expression.name.text === 'max' &&
+      current.arguments.length === 1 &&
+      ts.isNumericLiteral(current.arguments[0])
+    ) {
+      return Number(current.arguments[0].text);
+    }
+    current = current.expression.expression;
+  }
+  return undefined;
+}
+
+function findSchemaVariable(sourceFile: ts.SourceFile, schemaName: string): ts.Expression | undefined {
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && declaration.name.text === schemaName && declaration.initializer) {
+        return declaration.initializer;
+      }
+    }
+  }
+  return undefined;
+}
+
+function isZodObjectCall(node: ts.Node): node is ts.CallExpression {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === 'object' &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'z'
+  );
+}
+
+function collectObjectPropertyValues(expression: ts.Expression, path: readonly string[]): ts.Expression[] {
+  if (path.length === 0) return [expression];
+  const values: ts.Expression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (isZodObjectCall(node)) {
+      const shape = node.arguments[0];
+      if (shape && ts.isObjectLiteralExpression(shape)) {
+        for (const property of shape.properties) {
+          if (!ts.isPropertyAssignment(property) || propertyNameText(property.name) !== path[0]) continue;
+          if (path.length === 1) values.push(property.initializer);
+          else values.push(...collectObjectPropertyValues(property.initializer, path.slice(1)));
+        }
+      }
+      // Properties inside this object are a deeper schema level. Only enter a
+      // matching property above, after consuming the current path segment.
+      return;
+    }
+    if (ts.isObjectLiteralExpression(node)) {
+      // Object literals outside z.object() are configuration/data arguments,
+      // not schema shapes.
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(expression);
+  return values;
+}
+
+/**
+ * Restore JSON Schema maxItems as ZodArray `.max(N)` chains after ts-to-zod
+ * generation. This is intentionally source-driven rather than a list of
+ * known fields so newly added schema bounds receive runtime validation.
+ */
+function postProcessArrayMaxItems(content: string, typeSource: string): string {
+  const constraints = collectArrayMaxItemsConstraints(typeSource);
+  if (constraints.length === 0) return content;
+
+  const sourceFile = ts.createSourceFile(
+    'adcp-generated-zod.ts',
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const insertions = new Map<number, number>();
+  for (const constraint of constraints) {
+    const schema = findSchemaVariable(sourceFile, `${constraint.schemaName}Schema`);
+    if (!schema) continue; // ts-to-zod may intentionally omit unsupported declarations.
+    const values = collectObjectPropertyValues(schema, constraint.path);
+    let foundArray = false;
+    let fixedTupleSatisfiesBound = false;
+    for (const value of values) {
+      const array = findZodArrayBase(value);
+      if (!array) {
+        const tupleLength = fixedZodTupleLength(value);
+        if (tupleLength !== undefined && tupleLength <= constraint.maxItems) fixedTupleSatisfiesBound = true;
+        continue;
+      }
+      foundArray = true;
+      const existingMax = zodArrayMaxItems(value);
+      if (existingMax !== undefined) {
+        if (existingMax !== constraint.maxItems) {
+          throw new Error(
+            `Conflicting generated Zod maxItems values at ${constraint.schemaName}.${constraint.path.join('.')}: ` +
+              `${existingMax} and ${constraint.maxItems}.`
+          );
+        }
+        continue;
+      }
+      const existing = insertions.get(array.end);
+      if (existing !== undefined && existing !== constraint.maxItems) {
+        throw new Error(
+          `Conflicting generated Zod maxItems values at ${constraint.schemaName}.${constraint.path.join('.')}.`
+        );
+      }
+      insertions.set(array.end, constraint.maxItems);
+    }
+    if (!foundArray && !fixedTupleSatisfiesBound) {
+      throw new Error(
+        `Unable to restore @maxItems for ${constraint.schemaName}.${constraint.path.join('.')}: ` +
+          'the generated schema did not contain a ZodArray.'
+      );
+    }
+  }
+
+  return [...insertions.entries()]
+    .sort(([left], [right]) => right - left)
+    .reduce(
+      (result, [position, maxItems]) => result.slice(0, position) + `.max(${maxItems})` + result.slice(position),
+      content
+    );
+}
+
+/**
+ * ts-to-zod narrows `unknown` properties nested in an open object to another
+ * open object. Transformer parameter defaults and enumerable option values
+ * are explicitly arbitrary JSON, including scalars and null, so restore the
+ * TypeScript contract on this one schema.
+ */
+export function postProcessTransformerParamJsonValues(content: string): string {
+  const start = content.indexOf('export const TransformerParamSchema =');
+  if (start < 0) return content;
+  const end = content.indexOf('\nexport const ', start + 1);
+  const blockEnd = end < 0 ? content.length : end;
+  const block = content
+    .slice(start, blockEnd)
+    .replace(/value:\s*(?:z\.object\(\{\}\)\.passthrough\(\)|JsonValueSchema)/, 'value: z.json()')
+    .replace(
+      /default:\s*(?:z\.object\(\{\}\)\.passthrough\(\)|JsonValueSchema)\.optional\(\),/,
+      'default: z.json().optional(),'
+    );
+  return content.slice(0, start) + block + content.slice(blockEnd);
 }
 
 /**
@@ -517,7 +912,27 @@ function postProcessForecastRangeConstraint(content: string): string {
     }
 });`
   );
-  return content.slice(0, start) + constrained + content.slice(end);
+  const withForecastRange = content.slice(0, start) + constrained + content.slice(end);
+  const rateTarget = findSchemaExportExpressions(withForecastRange).find(
+    entry => entry.name === 'ForecastRateRangeSchema'
+  );
+  if (!rateTarget) throw new Error('Unable to locate ForecastRateRangeSchema');
+  // ts-to-zod resolves the rate scalar alias as an object, so the generated
+  // target rejects every numeric rate. ForecastRateRange intentionally shares
+  // ForecastRange's low/mid/high structure and adds the published upper bound.
+  const rateConstraint = `ForecastRangeSchema.superRefine((value, ctx) => {
+    // forecast rate JSON Schema parity
+    for (const field of ["low", "mid", "high"] as const) {
+        if (value[field] !== undefined && value[field] > 1) {
+            ctx.addIssue({ code: "custom", path: [field], message: "forecast rate values must not exceed 1" });
+        }
+    }
+})`;
+  return (
+    withForecastRange.slice(0, rateTarget.expressionStart) +
+    rateConstraint +
+    withForecastRange.slice(rateTarget.expressionEnd)
+  );
 }
 
 /** Restore the price-adjustment XOR and signed 1..20 array bounds. */
@@ -610,8 +1025,9 @@ function postProcessBeta4OfferAndOutcomeConstraints(content: string): string {
 /** Restore preview mode and batch routing constraints that TypeScript cannot encode. */
 function postProcessPreviewCreativeRequestConstraints(content: string): string {
   const schemaStart = content.indexOf('export const PreviewCreativeRequestSchema');
-  const schemaEnd = content.indexOf('\n\nexport const PreviewCreativeBatchResponseSchema = ', schemaStart);
-  if (schemaStart < 0 || schemaEnd < 0) throw new Error('Could not locate PreviewCreativeRequestSchema.');
+  if (schemaStart < 0) throw new Error('Could not locate PreviewCreativeRequestSchema.');
+  const nextSchema = content.indexOf('\n\nexport const ', schemaStart + 1);
+  const schemaEnd = nextSchema < 0 ? content.length : nextSchema;
   const block = content.slice(schemaStart, schemaEnd);
   const suffix = '}).passthrough());';
   if (!block.endsWith(suffix)) throw new Error('PreviewCreativeRequestSchema has an unexpected generated suffix.');
@@ -691,6 +1107,33 @@ function postProcessRecordIntersections(content: string): string {
   // Pass 5: Strip `.and(z.union([...]))` where content contains z.never()
   result = stripNeverUnionIntersections(result);
 
+  return result;
+}
+
+/**
+ * Collapse impossible empty-object/primitive intersections emitted for
+ * string schemas whose JSON Schema `anyOf` branches contain only lexical
+ * validators. Ajv retains the original format/pattern validation; the Zod
+ * projection must preserve the primitive runtime shape.
+ */
+function postProcessPrimitiveIntersections(content: string): string {
+  const emptyObject = String.raw`z\.object\(\{\}\)(?:\.passthrough\(\))?`;
+  const emptyObjectUnion = String.raw`z\.union\(\[\s*${emptyObject}(?:\s*,\s*${emptyObject})+\s*\]\)`;
+  const emptyObjectThenPrimitive = new RegExp(
+    String.raw`(?:${emptyObject}|${emptyObjectUnion})\.and\(z\.(string|number|boolean)\(\)\)`,
+    'g'
+  );
+  const primitiveThenEmptyObject = new RegExp(
+    String.raw`z\.(string|number|boolean)\(\)\.and\((?:${emptyObject}|${emptyObjectUnion})\)`,
+    'g'
+  );
+
+  let result = content;
+  let previous: string;
+  do {
+    previous = result;
+    result = result.replace(emptyObjectThenPrimitive, 'z.$1()').replace(primitiveThenEmptyObject, 'z.$1()');
+  } while (result !== previous);
   return result;
 }
 
@@ -814,6 +1257,48 @@ function postProcessPostalAreaValues(content: string): string {
   );
   if (correctedBlock === block) {
     throw new Error('postProcessPostalAreaValues: unable to append native values refinement.');
+  }
+  return content.slice(0, schemaStart) + correctedBlock + content.slice(schemaEnd);
+}
+
+/**
+ * Preserve the primitive `not: { enum: [...] }` fallback in
+ * PostalCountrySystem. The TypeScript projection represents JSON Schema's
+ * `not` branch as an open object, which makes the generated intersection
+ * impossible: the branch asks for an object-valued `country` while the outer
+ * schema requires the same field to be a string.
+ */
+function postProcessPostalCountrySystemSchema(content: string): string {
+  const schemaStart = content.indexOf('export const PostalCountrySystemSchema = ');
+  const schemaEnd = content.indexOf('\n\nexport const ', schemaStart + 1);
+  if (schemaStart === -1 || schemaEnd === -1) {
+    throw new Error('postProcessPostalCountrySystemSchema: unable to locate PostalCountrySystemSchema.');
+  }
+
+  const block = content.slice(schemaStart, schemaEnd);
+  const fallbackCountry = 'country: z.object({}).passthrough().optional()';
+  if (!block.includes(fallbackCountry)) {
+    throw new Error('postProcessPostalCountrySystemSchema: unable to locate the generated fallback country arm.');
+  }
+
+  const registeredCountries = [
+    ...new Set(
+      [...block.matchAll(/country: ([^\n]+)\.optional\(\),\n\s+system:/g)].flatMap(match =>
+        [...match[1].matchAll(/z\.literal\("([A-Z]{2})"\)/g)].map(countryMatch => countryMatch[1])
+      )
+    ),
+  ];
+  if (registeredCountries.length === 0) {
+    throw new Error('postProcessPostalCountrySystemSchema: unable to derive the registered-country union.');
+  }
+
+  const countryList = JSON.stringify(registeredCountries);
+  const correctedBlock = block.replace(
+    fallbackCountry,
+    `country: z.string().refine(country => !${countryList}.includes(country)).optional()`
+  );
+  if (correctedBlock === block) {
+    throw new Error('postProcessPostalCountrySystemSchema: fallback replacement did not change the schema.');
   }
   return content.slice(0, schemaStart) + correctedBlock + content.slice(schemaEnd);
 }
@@ -968,12 +1453,14 @@ function postProcessCanonicalProposalRuntimeConstraints(content: string, exactSc
   // The SDK deliberately preserves unknown extension fields on public Zod
   // objects. Keep that documented policy while retaining every other scalar,
   // cardinality, conditional, and nested commercial-term constraint.
-  const exactWithPassthrough = exactSchemaExpression.replaceAll('.strict()', '.passthrough()');
+  const exactWithPassthrough = exactSchemaExpression
+    .replaceAll('.strict()', '.passthrough()')
+    .replaceAll('.url()', '.refine(adcpJsonSchemaUri, "Invalid URI")');
   const replacement = `export const CanonicalProposalSchema = ${exactWithPassthrough};`;
   const replaced = content.slice(0, schemaStart) + replacement + content.slice(schemaEnd);
   return replaced.replace(
     'import { z } from "zod";\n',
-    `import { z } from "zod";\nimport { fullFormats as adcpJsonSchemaFormats } from "ajv-formats/dist/formats.js";\n\nconst adcpDateTimeFormat = adcpJsonSchemaFormats["date-time"] as { validate: (value: string) => boolean };\nconst adcpJsonSchemaDateTime = (value: string): boolean => adcpDateTimeFormat.validate(value);\n`
+    `import { z } from "zod";\nimport { fullFormats as adcpJsonSchemaFormats } from "ajv-formats/dist/formats.js";\n\nconst adcpDateTimeFormat = adcpJsonSchemaFormats["date-time"] as { validate: (value: string) => boolean };\nconst adcpUriFormat = adcpJsonSchemaFormats.uri as (value: string) => boolean;\nconst adcpJsonSchemaDateTime = (value: string): boolean => adcpDateTimeFormat.validate(value);\nconst adcpJsonSchemaUri = (value: string): boolean => adcpUriFormat(value);\n`
   );
 }
 
@@ -982,6 +1469,37 @@ function postProcessExactSchema(content: string, schemaName: string, exactSchema
   const target = findSchemaExportExpressions(content).find(entry => entry.name === schemaName);
   if (!target) throw new Error(`postProcessExactSchema: unable to locate ${schemaName}.`);
   return content.slice(0, target.expressionStart) + exactSchemaExpression + content.slice(target.expressionEnd);
+}
+
+/** Restore canonical cardinality constraints for signal expressions. */
+function postProcessSignalTargetingExpressionConstraints(content: string): string {
+  const target = findSchemaExportExpressions(content).find(entry => entry.name === 'SignalTargetingExpressionSchema');
+  if (!target) {
+    throw new Error('postProcessSignalTargetingExpressionConstraints: unable to locate schema.');
+  }
+  const expression = content.slice(target.expressionStart, target.expressionEnd);
+  const refined = `${expression}.superRefine((value, ctx) => {
+    if (value.value_type === "categorical" && value.values.length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["values"],
+        message: "categorical signal values must contain at least one entry",
+      });
+    }
+    if (
+      value.value_type === "numeric" &&
+      value.min_value !== undefined &&
+      value.max_value !== undefined &&
+      value.min_value > value.max_value
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["min_value"],
+        message: "min_value must be less than or equal to max_value",
+      });
+    }
+  })`;
+  return content.slice(0, target.expressionStart) + refined + content.slice(target.expressionEnd);
 }
 
 /** Add a refinement to one property schema inside a generated z.object expression. */
@@ -1228,6 +1746,763 @@ function postProcessTrustedMatchPrivacyBoundaryStrictness(content: string): stri
   return result;
 }
 
+type ReportingStatusView = 'summary' | 'periods' | 'revision';
+
+type ReportingStatusClosedObject = {
+  allowedFields: string[];
+  requiredFields: string[];
+};
+
+type ReportingStatusClosedStructures = {
+  scope: ReportingStatusClosedObject;
+  deliveryConfigGeneration: ReportingStatusClosedObject;
+  obligationCounts: ReportingStatusClosedObject;
+  pagination: ReportingStatusClosedObject;
+  paginationRequiredByView: Record<'periods' | 'revision', string[]>;
+};
+
+/**
+ * Read the required fields for each successful get_reporting_status view from
+ * the signed bundled response schema. json-schema-to-typescript currently
+ * projects the shared response object and each `allOf` view arm separately,
+ * which loses the arm's required array before ts-to-zod sees it.
+ */
+function reportingStatusViewRequiredFields(source: unknown): Record<ReportingStatusView, string[]> {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    throw new Error('get_reporting_status source schema must be an object.');
+  }
+  const root = source as Record<string, unknown>;
+  // The version/protocol envelope is composed into the response at the root.
+  // Merge its direct object requirements into every successful view arm. Do
+  // not traverse conditionals here: their requirements apply only when their
+  // own `if` predicate matches and are handled by the existing response rules.
+  const sharedRequired = (Array.isArray(root.allOf) ? root.allOf : []).flatMap(part => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return [];
+    const schema = part as Record<string, unknown>;
+    return Array.isArray(schema.required)
+      ? schema.required.filter((field): field is string => typeof field === 'string')
+      : [];
+  });
+  const requiredByView = new Map<ReportingStatusView, string[]>();
+  const views = new Set<ReportingStatusView>(['summary', 'periods', 'revision']);
+  const seen = new WeakSet<object>();
+
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+
+    const schema = value as Record<string, unknown>;
+    const view = (schema.properties as Record<string, Record<string, unknown>> | undefined)?.view?.const;
+    if (typeof view === 'string' && views.has(view as ReportingStatusView) && Array.isArray(schema.required)) {
+      const required = [
+        ...new Set([
+          ...sharedRequired,
+          ...schema.required.filter((field): field is string => typeof field === 'string'),
+        ]),
+      ];
+      const prior = requiredByView.get(view as ReportingStatusView);
+      if (prior && !isDeepStrictEqual([...prior].sort(), [...required].sort())) {
+        throw new Error(`get_reporting_status contains conflicting ${view} view required fields.`);
+      }
+      if (!prior) requiredByView.set(view as ReportingStatusView, required);
+    }
+
+    Object.values(schema).forEach(visit);
+  };
+
+  visit(source);
+
+  const result = {} as Record<ReportingStatusView, string[]>;
+  for (const view of views) {
+    const required = requiredByView.get(view);
+    if (!required?.includes('view')) {
+      throw new Error(`get_reporting_status source schema is missing the ${view} view required fields.`);
+    }
+    result[view] = required;
+  }
+  return result;
+}
+
+/**
+ * Read source-closed anonymous response structures that lose strictness when
+ * the generated response's root object is intersected with its view union.
+ */
+function reportingStatusClosedStructures(source: unknown): ReportingStatusClosedStructures {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    throw new Error('get_reporting_status source schema must be an object.');
+  }
+  const root = source as Record<string, unknown>;
+  const objectAt = (value: unknown, name: string): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`get_reporting_status source schema is missing ${name}.`);
+    }
+    return value as Record<string, unknown>;
+  };
+  const closedObject = (value: unknown, name: string): ReportingStatusClosedObject => {
+    const schema = objectAt(value, name);
+    if (schema.additionalProperties !== false) {
+      throw new Error(`get_reporting_status source schema must close ${name}.`);
+    }
+    const properties = objectAt(schema.properties, `${name}.properties`);
+    const requiredFields = Array.isArray(schema.required)
+      ? schema.required.filter((field): field is string => typeof field === 'string')
+      : [];
+    return { allowedFields: Object.keys(properties), requiredFields };
+  };
+
+  const properties = objectAt(root.properties, 'root.properties');
+  const scope = closedObject(properties.scope, 'scope');
+  const scopeProperties = objectAt(objectAt(properties.scope, 'scope').properties, 'scope.properties');
+  const deliveryConfigGenerations = objectAt(
+    scopeProperties.delivery_config_generations,
+    'scope.delivery_config_generations'
+  );
+  const deliveryConfigGeneration = closedObject(
+    deliveryConfigGenerations.items,
+    'scope.delivery_config_generations.items'
+  );
+  const obligationCounts = closedObject(properties.obligation_counts, 'obligation_counts');
+  const pagination = closedObject(properties.pagination, 'pagination');
+
+  const paginationRequiredByView = new Map<'periods' | 'revision', string[]>();
+  const seen = new WeakSet<object>();
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    const schema = value as Record<string, unknown>;
+    const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
+    const view = properties?.view?.const;
+    if ((view === 'periods' || view === 'revision') && properties) {
+      const pagination = objectAt(properties.pagination, `${view} view pagination`);
+      const required = Array.isArray(pagination.required)
+        ? pagination.required.filter((field): field is string => typeof field === 'string')
+        : [];
+      const prior = paginationRequiredByView.get(view);
+      if (prior && !isDeepStrictEqual([...prior].sort(), [...required].sort())) {
+        throw new Error(`get_reporting_status contains conflicting ${view} pagination required fields.`);
+      }
+      if (!prior) paginationRequiredByView.set(view, required);
+    }
+    Object.values(schema).forEach(visit);
+  };
+  visit(source);
+
+  const requiredByView = {} as Record<'periods' | 'revision', string[]>;
+  for (const view of ['periods', 'revision'] as const) {
+    const required = paginationRequiredByView.get(view);
+    if (!required?.includes('has_more') || !required.includes('total_count')) {
+      throw new Error(`get_reporting_status source schema is missing ${view} pagination required fields.`);
+    }
+    requiredByView[view] = required;
+  }
+  return { scope, deliveryConfigGeneration, obligationCounts, pagination, paginationRequiredByView: requiredByView };
+}
+
+/** Restore required fields lost when ts-to-zod projects reporting view allOf arms. */
+function postProcessGetReportingStatusViewRequiredFields(
+  content: string,
+  requiredByView: Record<ReportingStatusView, string[]>
+): string {
+  const schemaNames: Record<ReportingStatusView, string> = {
+    summary: 'SummaryViewSchema',
+    periods: 'PeriodsViewSchema',
+    revision: 'RevisionViewSchema',
+  };
+  let result = content;
+
+  for (const [view, schemaName] of Object.entries(schemaNames) as Array<[ReportingStatusView, string]>) {
+    const target = findSchemaExportExpressions(result).find(entry => entry.name === schemaName);
+    if (!target) throw new Error(`postProcessGetReportingStatusViewRequiredFields: ${schemaName} was not generated.`);
+    const expression = result.slice(target.expressionStart, target.expressionEnd);
+    if (!expression.includes(`view: z.literal("${view}")`)) {
+      throw new Error(`postProcessGetReportingStatusViewRequiredFields: ${schemaName} no longer represents ${view}.`);
+    }
+    if (expression.includes('// get_reporting_status view required fields')) continue;
+
+    const required = requiredByView[view];
+    if (!required.includes('view')) {
+      throw new Error(`postProcessGetReportingStatusViewRequiredFields: ${view} is missing its view discriminator.`);
+    }
+    const refinement = `.superRefine((value, ctx) => {
+        // get_reporting_status view required fields
+        for (const field of ${JSON.stringify(required)} as const) {
+            if ((value as Record<string, unknown>)[field] === undefined) {
+                ctx.addIssue({ code: "custom", path: [field], message: "Required by get_reporting_status ${view} view" });
+            }
+        }
+    })`;
+    result = result.slice(0, target.expressionStart) + expression + refinement + result.slice(target.expressionEnd);
+  }
+  return result;
+}
+
+/**
+ * Reporting evidence is a closed, audit-relevant contract. These schemas are
+ * explicitly `additionalProperties: false` in the signed source, unlike the
+ * ordinary extension-friendly AdCP payload objects handled by the global
+ * passthrough post-processor.
+ */
+function postProcessReportingEvidenceStrictness(content: string): string {
+  // Audited exhaustive named closed-evidence set for the current
+  // get_reporting_status bundle; review this list on schema-version bumps.
+  const schemaNames = [
+    'ReportingCoverageSchema',
+    'ReportingStatusIssueSchema',
+    'ReportingCanonicalContentDigestSchema',
+    'IntegerReportingControlTotalSchema',
+    'DecimalReportingControlTotalSchema',
+    'SHA256PhysicalChecksumSchema',
+    'SHA512PhysicalChecksumSchema',
+    'ReportingResourceSchema',
+    'ReportingVerificationSchema',
+    'ReportingScheduleSchema',
+    'ReportingReceiptSchema',
+    'ReportingRevisionSchema',
+    'ReportingObligationSchema',
+    'ReportingMaterializationSchema',
+  ];
+  let result = content;
+  for (const schemaName of schemaNames) {
+    const target = findSchemaExportExpressions(result).find(entry => entry.name === schemaName);
+    if (!target) throw new Error(`postProcessReportingEvidenceStrictness: ${schemaName} was not generated.`);
+    const expression = result.slice(target.expressionStart, target.expressionEnd);
+    const strict = expression.replaceAll('.passthrough()', '.strict()');
+    if (strict === expression) {
+      throw new Error(`postProcessReportingEvidenceStrictness: ${schemaName} no longer has a passthrough boundary.`);
+    }
+    result = result.slice(0, target.expressionStart) + strict + result.slice(target.expressionEnd);
+  }
+  return result;
+}
+
+/**
+ * Restore sync_reporting_status constraints that are context-sensitive in the
+ * canonical schemas and are lost by the JSON Schema -> TypeScript -> Zod
+ * projection. Keep this separate from the server's envelope-only dispatch
+ * validator: custom integrations using the public schemas need exact wire
+ * validation, while the built-in handler deliberately preserves valid
+ * siblings in a mixed batch.
+ */
+function postProcessReportingConsumerStatusConstraints(
+  content: string,
+  source = JSON.parse(
+    readFileSync(path.join(__dirname, '../schemas/cache/latest/core/reporting-consumer-status.json'), 'utf8')
+  )
+): string {
+  // Read the closed status arms from the pinned bundle. TypeScript flattens
+  // these if/then rules, so ts-to-zod alone cannot preserve their constraints.
+  const rules: Record<string, { required: string[]; forbidden: string[] }> = {};
+  const snapshotPairing = {
+    if: { required: ['seller_ledger_snapshot_id'] },
+    then: { required: ['seller_ledger_as_of'] },
+    else: { not: { required: ['seller_ledger_as_of'] } },
+  };
+  let sawSnapshotPairing = false;
+  for (const arm of source.allOf) {
+    const status = arm.if?.properties?.consumer_status?.const;
+    if (typeof status !== 'string') {
+      if (sawSnapshotPairing || !isDeepStrictEqual(arm, snapshotPairing)) {
+        throw new Error('Unsupported reporting consumer-status non-status conditional; expected snapshot pairing');
+      }
+      sawSnapshotPairing = true;
+      continue;
+    }
+    const required: string[] = arm.then.required ?? [];
+    const forbidden: string[] = arm.then.not?.anyOf
+      ? arm.then.not.anyOf.map((entry: { required: string[] }) => {
+          if (!Array.isArray(entry.required) || entry.required.length !== 1) {
+            throw new Error(`Unexpected consumer-status forbidden field group for ${status}`);
+          }
+          return entry.required[0]!;
+        })
+      : (arm.then.not?.required ?? []);
+    const expectedNot = arm.then.not?.anyOf
+      ? { anyOf: forbidden.map(field => ({ required: [field] })) }
+      : forbidden.length === 1
+        ? { required: forbidden }
+        : undefined;
+    if (
+      rules[status] ||
+      Object.keys(arm).some(key => !['if', 'then'].includes(key)) ||
+      !isDeepStrictEqual(arm.if, {
+        properties: { consumer_status: { const: status } },
+        required: ['consumer_status'],
+      }) ||
+      !isDeepStrictEqual(arm.then.not, expectedNot) ||
+      Object.keys(arm.then).some(key => !['required', 'not'].includes(key))
+    ) {
+      throw new Error(`Unexpected consumer-status conditional constraints for ${status}`);
+    }
+    rules[status] = { required, forbidden };
+  }
+  if (
+    source.additionalProperties !== false ||
+    !sawSnapshotPairing ||
+    !isDeepStrictEqual(Object.keys(rules).sort(), [...source.properties.consumer_status.enum].sort())
+  ) {
+    throw new Error('Consumer-status constraints must cover every canonical status');
+  }
+  const refine = (source: string, schemaName: string, refinement: string, preserveObjectMethods = false): string => {
+    const target = findSchemaExportExpressions(source).find(entry => entry.name === schemaName);
+    if (!target) throw new Error(`postProcessReportingConsumerStatusConstraints: ${schemaName} was not generated.`);
+    if (target.expression.includes('// reporting consumer status canonical parity')) return source;
+    const expression = preserveObjectMethods
+      ? `(() => {
+          const objectSchema = ${target.expression};
+          const exactSchema = objectSchema.superRefine(${refinement});
+          return Object.assign(exactSchema, {
+              // Zod rejects pick/omit on refined objects. Preserve that loud
+              // failure instead of silently deriving a schema that drops the
+              // published cross-field constraints.
+              pick: exactSchema.pick.bind(exactSchema),
+              omit: exactSchema.omit.bind(exactSchema),
+              extend: exactSchema.extend.bind(exactSchema),
+              safeExtend: exactSchema.safeExtend.bind(exactSchema),
+          });
+      })()`
+      : `${target.expression}.superRefine(${refinement})`;
+    return source.slice(0, target.expressionStart) + expression + source.slice(target.expressionEnd);
+  };
+
+  const itemRefinement = `(value, ctx) => {
+      // reporting consumer status canonical parity
+      const require = (field: string) => {
+          if ((value as Record<string, unknown>)[field] === undefined) {
+              ctx.addIssue({ code: "custom", path: [field], message: field + " is required" });
+          }
+      };
+      const forbid = (field: string) => {
+          if ((value as Record<string, unknown>)[field] !== undefined) {
+              ctx.addIssue({ code: "custom", path: [field], message: field + " is forbidden" });
+          }
+      };
+      const allowed = new Set(${JSON.stringify(Object.keys(source.properties))});
+      for (const field of Object.keys(value as Record<string, unknown>)) {
+          if (!allowed.has(field)) ctx.addIssue({ code: "custom", path: [field], message: "Unrecognized key" });
+      }
+      const period = (value as Record<string, unknown>).period;
+      if (period && typeof period === "object" && !Array.isArray(period)) {
+          for (const field of Object.keys(period)) {
+              if (!["start", "end", "source_timezone"].includes(field)) {
+                  ctx.addIssue({ code: "custom", path: ["period", field], message: "Unrecognized key" });
+              }
+          }
+      }
+      const rules: Record<string, { required: string[]; forbidden: string[] }> = ${JSON.stringify(rules)};
+      const rule = Object.hasOwn(rules, value.consumer_status) ? rules[value.consumer_status] : undefined;
+      if (!rule) {
+          ctx.addIssue({ code: "custom", path: ["consumer_status"], message: "Unsupported consumer status" });
+      } else {
+          rule.required.forEach(require);
+          rule.forbidden.forEach(forbid);
+      }
+      if ((value.seller_ledger_snapshot_id === undefined) !== (value.seller_ledger_as_of === undefined)) {
+          ctx.addIssue({ code: "custom", path: ["seller_ledger_snapshot_id"], message: "snapshot identity and time must be paired" });
+      }
+  }`;
+
+  let result = refine(content, 'ReportingConsumerStatusSchema', itemRefinement, true);
+  result = refine(
+    result,
+    'SyncReportingStatusRequestSchema',
+    `(value, ctx) => {
+      // reporting consumer status canonical parity
+      const allowed = new Set(["account", "idempotency_key", "statuses", "adcp_version", "adcp_major_version", "context", "ext"]);
+      for (const field of Object.keys(value as Record<string, unknown>)) {
+          if (!allowed.has(field)) ctx.addIssue({ code: "custom", path: [field], message: "Unrecognized key" });
+      }
+      if (value.statuses.length < 1) ctx.addIssue({ code: "custom", path: ["statuses"], message: "Array must contain at least 1 element(s)" });
+      value.statuses.forEach((status, index) => {
+          if ((status as Record<string, unknown>).recorded_at !== undefined) {
+              ctx.addIssue({ code: "custom", path: ["statuses", index, "recorded_at"], message: "recorded_at is response-only" });
+          }
+      });
+    }`,
+    true
+  );
+  result = refine(
+    result,
+    'SyncReportingStatusResponseSchema',
+    `(value, ctx) => {
+      // reporting consumer status canonical parity
+      if (value.status === "completed" && value.results.length < 1) {
+          ctx.addIssue({ code: "custom", path: ["results"], message: "Array must contain at least 1 element(s)" });
+      }
+      if (value.status !== "completed") return;
+      value.results.forEach((entry, index) => {
+          if (entry.result === "failed") {
+              if (entry.errors.length < 1) ctx.addIssue({ code: "custom", path: ["results", index, "errors"], message: "Array must contain at least 1 element(s)" });
+              return;
+          }
+          const status = entry.consumer_status as Record<string, unknown>;
+          if (status.recorded_at === undefined) {
+              ctx.addIssue({ code: "custom", path: ["results", index, "consumer_status", "recorded_at"], message: "recorded_at is required" });
+          }
+      });
+  }`
+  );
+  return result;
+}
+
+type ReportingFileManifestStrictnessTarget = {
+  schemaName: string;
+  path: string[];
+};
+
+type ReportingFileManifestClosedStructures = {
+  strictTargets: ReportingFileManifestStrictnessTarget[];
+};
+
+const JSON_SCHEMA_STRUCTURAL_KEYS = new Set([
+  '$schema',
+  '$id',
+  'title',
+  'description',
+  'x-status',
+  'x-adcp-validation',
+  'type',
+  'required',
+  'additionalProperties',
+  'minProperties',
+  'maxProperties',
+  'minItems',
+  'maxItems',
+  'uniqueItems',
+  'enum',
+  'const',
+  'format',
+  'pattern',
+  'minLength',
+  'maxLength',
+  'minimum',
+  'maximum',
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'multipleOf',
+  'default',
+]);
+
+function sourceSchemaDocumentsById(cacheRoot: string): Record<string, unknown> {
+  const documents: Record<string, unknown> = {};
+  const visitDirectory = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visitDirectory(absolute);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const document = JSON.parse(readFileSync(absolute, 'utf8')) as Record<string, unknown>;
+      if (typeof document.$id === 'string') documents[document.$id] = document;
+    }
+  };
+  visitDirectory(cacheRoot);
+  return documents;
+}
+
+/** Dereference canonical schema URIs exclusively from the verified local cache. */
+async function dereferenceFromVerifiedSchemaCache(source: unknown, cacheRoot: string): Promise<any> {
+  const documents = sourceSchemaDocumentsById(cacheRoot);
+  const clonedSource = structuredClone(source) as Record<string, unknown>;
+  if (typeof clonedSource.$id === 'string') documents[clonedSource.$id] = clonedSource;
+  const cacheResolver = {
+    order: 1,
+    canRead: (file: { url: string }) => Object.hasOwn(documents, file.url),
+    read: (file: { url: string }) => {
+      const document = documents[file.url];
+      if (!document) throw new Error(`Schema reference is absent from the verified cache: ${file.url}`);
+      return structuredClone(document);
+    },
+  };
+  return $RefParser.dereference(clonedSource, {
+    resolve: { file: false, http: false, cache: cacheResolver },
+  });
+}
+
+/**
+ * Map every source-closed object reachable from the reporting manifest to
+ * its generated Zod export and precise inline property path. The TypeScript
+ * intermediary loses `additionalProperties`, so this signed JSON Schema
+ * traversal is the authority. New closed references are mapped by title or
+ * cause generation to fail rather than silently becoming permissive.
+ */
+function reportingFileManifestClosedStructures(
+  manifestSource: unknown,
+  documentsById: Record<string, unknown>
+): ReportingFileManifestClosedStructures {
+  const object = (value: unknown, name: string): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`reporting-file-manifest source is missing ${name}.`);
+    }
+    return value as Record<string, unknown>;
+  };
+  const schemaName = (schema: Record<string, unknown>, label: string): string => {
+    if (typeof schema.title !== 'string' || !schema.title.trim()) {
+      throw new Error(`reporting-file-manifest source has a closed ${label} without a title.`);
+    }
+    return schema.title.replace(/[^A-Za-z0-9]/g, '');
+  };
+  const targets = new Map<string, ReportingFileManifestStrictnessTarget>();
+  const addTarget = (name: string, path: string[]): void => {
+    targets.set(`${name}:${path.join('.')}`, { schemaName: name, path });
+  };
+  const containsClosedObject = (value: unknown, seen = new WeakSet<object>()): boolean => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some(item => containsClosedObject(item, seen));
+    const schema = value as Record<string, unknown>;
+    return (
+      schema.additionalProperties === false || Object.values(schema).some(item => containsClosedObject(item, seen))
+    );
+  };
+  const collectInlineTargets = (value: unknown, name: string, path: string[]): void => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const schema = value as Record<string, unknown>;
+    if (typeof schema.$ref === 'string') return;
+    if (schema.additionalProperties === false) addTarget(name, path);
+    if (
+      schema.additionalProperties &&
+      typeof schema.additionalProperties === 'object' &&
+      containsClosedObject(schema.additionalProperties)
+    ) {
+      throw new Error(
+        `reporting-file-manifest source has an unsupported closed catchall at ${name}.${path.join('.') || '<root>'}.`
+      );
+    }
+    if (schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)) {
+      for (const [property, child] of Object.entries(schema.properties as Record<string, unknown>)) {
+        collectInlineTargets(child, name, [...path, property]);
+      }
+    }
+    for (const [key, child] of Object.entries(schema)) {
+      if (JSON_SCHEMA_STRUCTURAL_KEYS.has(key) || key === 'properties' || key === '$ref') continue;
+      if (containsClosedObject(child)) {
+        throw new Error(
+          `reporting-file-manifest source has an unsupported closed boundary at ${name}.${[...path, key].join('.')}.`
+        );
+      }
+    }
+  };
+  const visitedDocuments = new Set<string>();
+  const visitDocument = (value: unknown, label: string): void => {
+    const schema = object(value, label);
+    if (Array.isArray(schema.oneOf)) {
+      for (const [index, variant] of schema.oneOf.entries()) {
+        const variantSchema = object(variant, `${label}.oneOf[${index}]`);
+        collectInlineTargets(variantSchema, schemaName(variantSchema, `${label}.oneOf[${index}]`), []);
+      }
+    } else {
+      collectInlineTargets(schema, schemaName(schema, label), []);
+    }
+
+    const visitReferences = (candidate: unknown): void => {
+      if (!candidate || typeof candidate !== 'object') return;
+      if (Array.isArray(candidate)) {
+        candidate.forEach(visitReferences);
+        return;
+      }
+      const node = candidate as Record<string, unknown>;
+      if (typeof node.$ref === 'string') {
+        const referenced = documentsById[node.$ref];
+        if (!referenced) {
+          throw new Error(`reporting-file-manifest source cannot resolve referenced schema ${node.$ref}.`);
+        }
+        if (!visitedDocuments.has(node.$ref)) {
+          visitedDocuments.add(node.$ref);
+          visitDocument(referenced, node.$ref);
+        }
+      }
+      Object.values(node).forEach(visitReferences);
+    };
+    visitReferences(schema);
+  };
+
+  visitDocument(manifestSource, 'manifest');
+  return { strictTargets: [...targets.values()] };
+}
+
+function zodObjectBase(expression: ts.Expression): ts.CallExpression | undefined {
+  if (isZodObjectCall(expression)) return expression;
+  if (
+    ts.isCallExpression(expression) &&
+    ts.isPropertyAccessExpression(expression.expression) &&
+    expression.expression.expression
+  ) {
+    return zodObjectBase(expression.expression.expression);
+  }
+  if (ts.isParenthesizedExpression(expression)) return zodObjectBase(expression.expression);
+  return undefined;
+}
+
+/** Restore only the exact source-closed Zod objects, leaving adjacent inline extension objects loose. */
+function postProcessReportingFileManifestStrictness(
+  content: string,
+  closedStructures: ReportingFileManifestClosedStructures
+): string {
+  const sourceFile = ts.createSourceFile(
+    'adcp-generated-zod.ts',
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const replacements = new Map<number, { end: number; text: string }>();
+
+  for (const { schemaName, path } of closedStructures.strictTargets) {
+    const schema = findSchemaVariable(sourceFile, `${schemaName}Schema`);
+    if (!schema) {
+      throw new Error(`postProcessReportingFileManifestStrictness: ${schemaName}Schema was not generated.`);
+    }
+    const candidates = (path.length === 0 ? [schema] : collectObjectPropertyValues(schema, path))
+      .map(zodObjectBase)
+      .filter((candidate): candidate is ts.CallExpression => candidate !== undefined);
+    if (candidates.length !== 1) {
+      throw new Error(
+        `postProcessReportingFileManifestStrictness: expected one Zod object at ${schemaName}Schema.${path.join('.') || '<root>'}.`
+      );
+    }
+    const objectCall = candidates[0];
+    const access = objectCall.parent;
+    const call = access?.parent;
+    if (
+      ts.isPropertyAccessExpression(access) &&
+      access.expression === objectCall &&
+      ts.isCallExpression(call) &&
+      call.expression === access
+    ) {
+      if (access.name.text === 'strict') continue;
+      if (access.name.text === 'passthrough') {
+        replacements.set(objectCall.end, { end: call.end, text: '.strict()' });
+        continue;
+      }
+    }
+    throw new Error(
+      `postProcessReportingFileManifestStrictness: ${schemaName}Schema.${path.join('.') || '<root>'} is not a strict or passthrough Zod object.`
+    );
+  }
+
+  return [...replacements.entries()]
+    .sort(([left], [right]) => right - left)
+    .reduce(
+      (result, [start, replacement]) => result.slice(0, start) + replacement.text + result.slice(replacement.end),
+      content
+    );
+}
+
+/**
+ * The generated response composes the root object with the loose view union
+ * using `and()`. Zod's intersection does not retain the nested strict-object
+ * failures through that composition, so revalidate just the source-closed
+ * reporting evidence paths at the response boundary.
+ */
+function postProcessGetReportingStatusEvidenceStrictness(
+  content: string,
+  closedStructures: ReportingStatusClosedStructures
+): string {
+  const target = findSchemaExportExpressions(content).find(entry => entry.name === 'GetReportingStatusResponseSchema');
+  if (!target) throw new Error('postProcessGetReportingStatusEvidenceStrictness: response schema was not generated.');
+  const expression = content.slice(target.expressionStart, target.expressionEnd);
+  if (expression.includes('// reporting evidence strictness')) return content;
+
+  const refinement = `.superRefine((value, ctx) => {
+        // reporting evidence strictness
+        const closedStructures = ${JSON.stringify(closedStructures)} as const;
+        const addIssues = (schema: z.ZodType, candidate: unknown, path: Array<string | number>) => {
+            const parsed = schema.safeParse(candidate);
+            if (parsed.success) return;
+            for (const issue of parsed.error.issues) {
+                ctx.addIssue({ code: "custom", path: [...path, ...issue.path], message: issue.message });
+            }
+        };
+        const addClosedObjectIssues = (
+            candidate: unknown,
+            path: Array<string | number>,
+            structure: { allowedFields: readonly string[]; requiredFields: readonly string[] }
+        ) => {
+            if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+                ctx.addIssue({ code: "custom", path, message: "Expected source-closed get_reporting_status object" });
+                return;
+            }
+            const object = candidate as Record<string, unknown>;
+            for (const field of Object.keys(object)) {
+                if (!structure.allowedFields.includes(field)) {
+                    ctx.addIssue({ code: "custom", path: [...path, field], message: "Unexpected field in source-closed get_reporting_status object" });
+                }
+            }
+            for (const field of structure.requiredFields) {
+                if (object[field] === undefined) {
+                    ctx.addIssue({ code: "custom", path: [...path, field], message: "Required by source-closed get_reporting_status object" });
+                }
+            }
+        };
+        const response = value as Record<string, unknown>;
+        if (response.coverage !== undefined) addIssues(ReportingCoverageSchema, response.coverage, ["coverage"]);
+        if (Array.isArray(response.issues)) {
+            response.issues.forEach((issue, index) => addIssues(ReportingStatusIssueSchema, issue, ["issues", index]));
+        }
+        if (response.scope !== undefined) {
+            addClosedObjectIssues(response.scope, ["scope"], closedStructures.scope);
+            if (response.scope && typeof response.scope === "object" && !Array.isArray(response.scope)) {
+                const generations = (response.scope as Record<string, unknown>).delivery_config_generations;
+                if (Array.isArray(generations)) {
+                    generations.forEach((generation, index) =>
+                        addClosedObjectIssues(generation, ["scope", "delivery_config_generations", index], closedStructures.deliveryConfigGeneration)
+                    );
+                }
+            }
+        }
+        if (response.health === "complete") {
+            const scope = response.scope;
+            if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
+                ctx.addIssue({ code: "custom", path: ["scope"], message: "Complete reporting health requires a closed, complete scope" });
+            } else {
+                const completeScope = scope as Record<string, unknown>;
+                if (completeScope.scope_closed !== true) {
+                    ctx.addIssue({ code: "custom", path: ["scope", "scope_closed"], message: "Complete reporting health requires scope_closed=true" });
+                }
+                if (completeScope.coverage_complete !== true) {
+                    ctx.addIssue({ code: "custom", path: ["scope", "coverage_complete"], message: "Complete reporting health requires coverage_complete=true" });
+                }
+            }
+            if (response.view === "periods" && response.next_expected_at !== undefined) {
+                ctx.addIssue({ code: "custom", path: ["next_expected_at"], message: "Complete periods views cannot carry next_expected_at" });
+            }
+        }
+        if (response.obligation_counts !== undefined) {
+            addClosedObjectIssues(response.obligation_counts, ["obligation_counts"], closedStructures.obligationCounts);
+        }
+        if (response.pagination !== undefined) {
+            const view = response.view;
+            const requiredFields =
+                view === "periods" || view === "revision"
+                    ? closedStructures.paginationRequiredByView[view]
+                    : closedStructures.pagination.requiredFields;
+            addClosedObjectIssues(response.pagination, ["pagination"], { ...closedStructures.pagination, requiredFields });
+        }
+        const arrays: Array<[string, z.ZodType]> = [
+            ["periods", ReportingObligationSchema],
+            ["revisions", ReportingRevisionSchema],
+            ["materializations", ReportingMaterializationSchema],
+            ["receipts", ReportingReceiptSchema],
+        ];
+        for (const [field, schema] of arrays) {
+            const entries = response[field];
+            if (!Array.isArray(entries)) continue;
+            entries.forEach((entry, index) => addIssues(schema, entry, [field, index]));
+        }
+        if (response.revision !== undefined) addIssues(ReportingRevisionSchema, response.revision, ["revision"]);
+    })`;
+  return content.slice(0, target.expressionStart) + expression + refinement + content.slice(target.expressionEnd);
+}
+
 /** Preserve JSON-Schema-only creative constraints lost in TS projection. */
 function postProcessCreativeRuntimeConstraints(content: string): string {
   const schemaBlock = (schemaName: string): { start: number; end: number; block: string } => {
@@ -1329,7 +2604,7 @@ const CreativeAssetsRuntimeSchema: z.ZodType<Record<string, unknown>> = z.record
   const formatReference = schemaBlock('FormatReferenceStructuredObjectSchema');
   const strictFormatReference = formatReference.block.replace(
     'agent_url: z.string()',
-    'agent_url: z.string().regex(/^[\\x21-\\x7E]+$/).regex(/^(?:[^%]|%[0-9A-Fa-f]{2})*$/).url()'
+    'agent_url: z.string().regex(/^[\\x21-\\x7E]+$/).regex(/^(?:[^%]|%[0-9A-Fa-f]{2})*$/).refine(adcpJsonSchemaUri, "Invalid URI")'
   );
   if (strictFormatReference === formatReference.block) {
     throw new Error('Unable to apply URI validation to FormatReferenceStructuredObjectSchema.agent_url.');
@@ -1437,6 +2712,7 @@ function postProcessPlacementPresentationRuntimeConstraints(content: string): st
     const end = content.indexOf('\n\nexport const ', start + 1);
     if (start === -1 || end === -1) throw new Error(`Unable to locate generated ${schemaName} boundary.`);
     const block = content.slice(start, end);
+    if (block.includes(after) || block.includes(after.replace('z.number().int()', 'z.int()'))) return;
     const constrained = block.replace(before, after);
     if (constrained === block) throw new Error(`Unable to preserve numeric constraints on ${schemaName}.`);
     content = content.slice(0, start) + constrained + content.slice(end);
@@ -1459,6 +2735,510 @@ function postProcessPlacementPresentationRuntimeConstraints(content: string): st
   );
 
   return content;
+}
+
+/**
+ * Restore constraints from authoritative shared schemas whose JSDoc is lost
+ * when ts-to-zod encounters aliases, union members, or a duplicate transitive
+ * declaration before the canonical definition. Each rewrite is guarded so a
+ * future schema/codegen change fails generation instead of silently weakening
+ * the public validator again.
+ */
+function postProcessCanonicalSharedConstraints(content: string): string {
+  const domainPattern = '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$';
+  const signalIdPattern = '^[a-zA-Z0-9_-]+$';
+
+  const rewrite = (schemaName: string, before: string, after: string, expectedCount = 1): void => {
+    const start = content.indexOf(`export const ${schemaName} = `);
+    const end = content.indexOf('\n\nexport const ', start + 1);
+    if (start === -1 || end === -1) throw new Error(`Unable to locate generated ${schemaName} boundary.`);
+    const block = content.slice(start, end);
+    const actualCount = block.split(before).length - 1;
+    if (actualCount !== expectedCount) {
+      throw new Error(
+        `Unable to restore canonical constraints on ${schemaName}: expected ${expectedCount} occurrence(s), found ${actualCount}.`
+      );
+    }
+    content = content.slice(0, start) + block.split(before).join(after) + content.slice(end);
+  };
+
+  rewrite('PropertyIDSchema', 'z.string();', 'z.string().regex(/^[a-z0-9_]+$/);');
+  rewrite('SignalRefSchema', 'signal_id: z.string()', `signal_id: z.string().regex(/${signalIdPattern}/)`, 3);
+  rewrite(
+    'SignalRefSchema',
+    'data_provider_domain: z.string()',
+    `data_provider_domain: z.string().regex(/${domainPattern}/)`
+  );
+  rewrite(
+    'SignalRefSchema',
+    'signal_source_url: z.string()',
+    'signal_source_url: z.string().refine(adcpJsonSchemaUri, "Invalid URI")'
+  );
+  rewrite(
+    'PaginationRequestSchema',
+    'max_results: z.number().optional()',
+    'max_results: z.number().int().min(1).max(100).optional()'
+  );
+  rewrite(
+    'DeliveryForecastSchema',
+    'measurement_source: z.string().optional()',
+    'measurement_source: z.string().max(64).regex(/^[a-z0-9_]+$/).optional()'
+  );
+  rewrite(
+    'DeliveryForecastSchema',
+    'generated_at: z.string().optional()',
+    'generated_at: z.string().refine(adcpJsonSchemaDateTime, "Invalid date-time").optional()'
+  );
+  rewrite(
+    'DeliveryForecastSchema',
+    'valid_until: z.string().optional()',
+    'valid_until: z.string().refine(adcpJsonSchemaDateTime, "Invalid date-time").optional()'
+  );
+
+  for (const [schemaName, optional] of [
+    ['PlacementReferenceSchema', true],
+    ['IndicatorScopeSchema', false],
+    ['CollectionSelectorSchema', false],
+    ['PropertyReferenceSchema', false],
+  ] as const) {
+    const suffix = optional ? '.optional()' : '';
+    rewrite(
+      schemaName,
+      `publisher_domain: z.string()${suffix}`,
+      `publisher_domain: z.string().regex(/${domainPattern}/)${suffix}`
+    );
+  }
+
+  return content;
+}
+
+type CanonicalPrimitiveConstraints = {
+  integer?: true;
+  minimum?: number;
+  maximum?: number;
+  exclusiveMinimum?: number;
+  exclusiveMaximum?: number;
+  multipleOf?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  dateTime?: true;
+  uri?: true;
+};
+
+/**
+ * Reconcile primitive constraints from the canonical JSON Schema documents
+ * after every structural Zod rewrite has run. The TypeScript intermediary can
+ * lose JSDoc when a transitive occurrence wins first-definition ownership;
+ * this pass makes the canonical document authoritative without relying on a
+ * growing allowlist of field names. Array cardinality is reconciled separately
+ * by `postProcessArrayMaxItems`.
+ *
+ * Constraints are applied by property name only when every occurrence of that
+ * name inside the canonical document has the same constraint set. Ambiguous
+ * nested names are deliberately left alone rather than applying a constraint
+ * in the wrong context. Defaults are not materialized, and array cardinality
+ * is handled by the dedicated source-aware pass.
+ */
+function postProcessCanonicalPrimitiveConstraints(content: string): string {
+  const cacheRoot = path.join(__dirname, '../schemas/cache/latest');
+  const schemaFiles: string[] = [];
+  const visitDirectory = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === 'bundled') continue;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) visitDirectory(absolute);
+      else if (entry.isFile() && entry.name.endsWith('.json')) schemaFiles.push(absolute);
+    }
+  };
+  visitDirectory(cacheRoot);
+
+  const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const constraintsFor = (schema: Record<string, unknown>): CanonicalPrimitiveConstraints => {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const includes = (type: string): boolean => types.includes(type);
+    const constraints: CanonicalPrimitiveConstraints = {};
+    if (includes('integer')) constraints.integer = true;
+    if (includes('integer') || includes('number')) {
+      for (const key of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf'] as const) {
+        if (typeof schema[key] === 'number' && Number.isFinite(schema[key])) constraints[key] = schema[key];
+      }
+    }
+    if (includes('string')) {
+      if (typeof schema.minLength === 'number' && Number.isInteger(schema.minLength)) {
+        constraints.minLength = schema.minLength;
+      }
+      if (typeof schema.maxLength === 'number' && Number.isInteger(schema.maxLength)) {
+        constraints.maxLength = schema.maxLength;
+      }
+      if (typeof schema.pattern === 'string') constraints.pattern = schema.pattern;
+      if (schema.format === 'date-time') constraints.dateTime = true;
+      if (schema.format === 'uri') constraints.uri = true;
+    }
+    return constraints;
+  };
+
+  const constrainExpression = (expression: string, constraints: CanonicalPrimitiveConstraints): string => {
+    let result = expression;
+    if (result.includes('z.number()')) {
+      let suffix = '';
+      if (constraints.integer && !/z\.(?:number\(\)\.int|int)\(\)/.test(result)) suffix += '.int()';
+      if (
+        constraints.minimum !== undefined &&
+        !result.includes(`.min(${constraints.minimum})`) &&
+        !result.includes(`.gte(${constraints.minimum})`)
+      ) {
+        suffix += `.gte(${constraints.minimum})`;
+      }
+      if (
+        constraints.maximum !== undefined &&
+        !result.includes(`.max(${constraints.maximum})`) &&
+        !result.includes(`.lte(${constraints.maximum})`)
+      ) {
+        suffix += `.lte(${constraints.maximum})`;
+      }
+      if (constraints.exclusiveMinimum !== undefined && !result.includes(`.gt(${constraints.exclusiveMinimum})`)) {
+        suffix += `.gt(${constraints.exclusiveMinimum})`;
+      }
+      if (constraints.exclusiveMaximum !== undefined && !result.includes(`.lt(${constraints.exclusiveMaximum})`)) {
+        suffix += `.lt(${constraints.exclusiveMaximum})`;
+      }
+      if (constraints.multipleOf !== undefined && !result.includes(`.multipleOf(${constraints.multipleOf})`)) {
+        suffix += `.multipleOf(${constraints.multipleOf})`;
+      }
+      if (suffix) result = result.replace('z.number()', `z.number()${suffix}`);
+    }
+    if (result.includes('z.string()')) {
+      let suffix = '';
+      if (constraints.minLength !== undefined && !result.includes(`.min(${constraints.minLength})`)) {
+        suffix += `.min(${constraints.minLength})`;
+      }
+      if (constraints.maxLength !== undefined && !result.includes(`.max(${constraints.maxLength})`)) {
+        suffix += `.max(${constraints.maxLength})`;
+      }
+      if (constraints.pattern !== undefined && !result.includes('.regex(')) {
+        suffix += `.regex(new RegExp(${JSON.stringify(constraints.pattern)}))`;
+      }
+      if (constraints.dateTime && !result.includes('adcpJsonSchemaDateTime') && !result.includes('z.iso.datetime()')) {
+        suffix += '.refine(adcpJsonSchemaDateTime, "Invalid date-time")';
+      }
+      if (constraints.uri && !result.includes('adcpJsonSchemaUri')) {
+        suffix += '.refine(adcpJsonSchemaUri, "Invalid URI")';
+      }
+      if (suffix) result = result.replace('z.string()', `z.string()${suffix}`);
+    }
+    return result;
+  };
+
+  for (const schemaFile of schemaFiles.sort()) {
+    const schema = JSON.parse(readFileSync(schemaFile, 'utf8')) as Record<string, unknown>;
+    const rawSchemaName = typeof schema.title === 'string' ? schema.title.replace(/[^A-Za-z0-9]/g, '') : '';
+    const schemaName = [rawSchemaName, rawSchemaName && rawSchemaName[0].toUpperCase() + rawSchemaName.slice(1)].find(
+      candidate => candidate && content.includes(`export const ${candidate}Schema`)
+    );
+    if (!schemaName) continue;
+    const exportStart = content.indexOf(`export const ${schemaName}Schema`);
+    if (exportStart < 0) continue;
+    const exportEndCandidate = content.indexOf('\n\nexport const ', exportStart + 1);
+    const exportEnd = exportEndCandidate < 0 ? content.length : exportEndCandidate;
+    let block = content.slice(exportStart, exportEnd);
+
+    const rootConstraints = constraintsFor(schema);
+    if (Object.keys(rootConstraints).length > 0) {
+      const rootExpression = new RegExp(`^(export const ${schemaName}Schema(?:[^=]*)= )([^;\\n]+);$`, 'm');
+      block = block.replace(rootExpression, (_line, prefix: string, expression: string) => {
+        return `${prefix}${constrainExpression(expression, rootConstraints)};`;
+      });
+    }
+
+    const occurrences = new Map<string, Map<string, CanonicalPrimitiveConstraints>>();
+    const visitSchema = (value: unknown): void => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+      const node = value as Record<string, unknown>;
+      if (node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)) {
+        for (const [propertyName, propertySchema] of Object.entries(node.properties)) {
+          if (!propertySchema || typeof propertySchema !== 'object' || Array.isArray(propertySchema)) continue;
+          const constraints = constraintsFor(propertySchema as Record<string, unknown>);
+          const signature = JSON.stringify(constraints);
+          const bySignature = occurrences.get(propertyName) ?? new Map<string, CanonicalPrimitiveConstraints>();
+          bySignature.set(signature, constraints);
+          occurrences.set(propertyName, bySignature);
+          visitSchema(propertySchema);
+        }
+      }
+      for (const [key, child] of Object.entries(node)) {
+        if (key !== 'properties') visitSchema(child);
+      }
+    };
+    visitSchema(schema);
+
+    for (const [propertyName, bySignature] of occurrences) {
+      if (bySignature.size !== 1) continue;
+      const constraints = bySignature.values().next().value as CanonicalPrimitiveConstraints;
+      if (Object.keys(constraints).length === 0) continue;
+      const escapedName = escapeRegExp(propertyName);
+      const propertyLine = new RegExp(`^(\\s*)(?:${escapedName}|${JSON.stringify(propertyName)}): ([^\\n]+)$`, 'gm');
+      block = block.replace(propertyLine, (line, indent: string, expression: string) => {
+        return `${indent}${line.slice(indent.length, line.length - expression.length)}${constrainExpression(expression, constraints)}`;
+      });
+    }
+
+    content = content.slice(0, exportStart) + block + content.slice(exportEnd);
+  }
+  return content;
+}
+
+/**
+ * Preserve the audio-VAST constraints that cannot survive the JSON Schema ->
+ * TypeScript intermediary. The source schema uses a root `not.anyOf` for the
+ * singular/plural VAST-version XOR and audio-only MediaFile requirements, while
+ * the duration bounds live on the array's item schema. Guard the authoritative
+ * shape before refining the generated validator so a protocol change cannot be
+ * silently accepted under stale hand-written assumptions.
+ */
+function postProcessCanonicalVastAudioConstraints(content: string): string {
+  const source = JSON.parse(
+    readFileSync(path.join(__dirname, '../schemas/cache/latest/formats/canonical/audio_vast.json'), 'utf8')
+  ) as Record<string, unknown>;
+  const requireRecord = (value: unknown, label: string): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`postProcessCanonicalVastAudioConstraints: canonical ${label} is missing.`);
+    }
+    return value as Record<string, unknown>;
+  };
+  const requireExact = (actual: unknown, expected: unknown, label: string): void => {
+    if (!isDeepStrictEqual(actual, expected)) {
+      throw new Error(`postProcessCanonicalVastAudioConstraints: canonical ${label} changed.`);
+    }
+  };
+
+  const properties = requireRecord(source.properties, 'properties');
+  const durationRange = requireRecord(properties.duration_ms_range, 'duration_ms_range');
+  requireExact(
+    {
+      type: durationRange.type,
+      items: durationRange.items,
+      minItems: durationRange.minItems,
+      maxItems: durationRange.maxItems,
+    },
+    {
+      type: 'array',
+      items: { type: 'integer', minimum: 0 },
+      minItems: 2,
+      maxItems: 2,
+    },
+    'duration_ms_range constraints'
+  );
+  requireExact(
+    requireRecord(source.not, 'not').anyOf,
+    [
+      { required: ['vast_version', 'vast_versions'] },
+      {
+        properties: {
+          media_file_requirements: {
+            properties: {
+              mime_types: {
+                contains: { not: { pattern: '^[Aa][Uu][Dd][Ii][Oo]/' } },
+              },
+            },
+            required: ['mime_types'],
+          },
+        },
+        required: ['media_file_requirements'],
+      },
+      {
+        properties: {
+          media_file_requirements: {
+            anyOf: [
+              { required: ['min_width'] },
+              { required: ['max_width'] },
+              { required: ['min_height'] },
+              { required: ['max_height'] },
+            ],
+          },
+        },
+        required: ['media_file_requirements'],
+      },
+    ],
+    'not.anyOf exclusions'
+  );
+
+  const schemaName = 'CanonicalFormatVASTAudioSchema';
+  const start = content.indexOf(`export const ${schemaName} = `);
+  if (start < 0) throw new Error(`postProcessCanonicalVastAudioConstraints: ${schemaName} not found.`);
+  const endCandidate = content.indexOf('\n\nexport const ', start + 1);
+  const end = endCandidate < 0 ? content.length : endCandidate;
+  let block = content.slice(start, end);
+  const unconstrainedDuration = 'duration_ms_range: z.array(z.number()).optional()';
+  const maxConstrainedDuration = 'duration_ms_range: z.array(z.number()).max(2).optional()';
+  const constrainedDuration = 'duration_ms_range: z.array(z.number().int().min(0)).length(2).optional()';
+  if (!block.includes(constrainedDuration)) {
+    const occurrences =
+      block.split(unconstrainedDuration).length - 1 + (block.split(maxConstrainedDuration).length - 1);
+    if (occurrences !== 1) {
+      throw new Error(
+        `postProcessCanonicalVastAudioConstraints: expected one unconstrained duration_ms_range, found ${occurrences}.`
+      );
+    }
+    block = block
+      .replace(unconstrainedDuration, constrainedDuration)
+      .replace(maxConstrainedDuration, constrainedDuration);
+  }
+
+  const refinementMarker = 'audio VAST declarations cannot combine vast_version and vast_versions';
+  if (!block.includes(refinementMarker)) {
+    const refinement = `.superRefine((value, ctx) => {
+    if (value.vast_version !== undefined && value.vast_versions !== undefined) {
+        ctx.addIssue({
+            code: "custom",
+            path: [],
+            message: "${refinementMarker}"
+        });
+    }
+    const requirements = value.media_file_requirements;
+    requirements?.mime_types?.forEach((mimeType, index) => {
+        if (!/^audio\\//i.test(mimeType)) {
+            ctx.addIssue({
+                code: "custom",
+                path: ["media_file_requirements", "mime_types", index],
+                message: "audio VAST media MIME types must use the audio/* family"
+            });
+        }
+    });
+    for (const dimension of ["min_width", "max_width", "min_height", "max_height"] as const) {
+        if (requirements?.[dimension] !== undefined) {
+            ctx.addIssue({
+                code: "custom",
+                path: ["media_file_requirements", dimension],
+                message: "audio VAST media requirements cannot declare visual dimensions"
+            });
+        }
+    }
+})`;
+    const refined = block.replace(/;\s*$/, `${refinement};`);
+    if (refined === block) {
+      throw new Error(`postProcessCanonicalVastAudioConstraints: unable to append ${schemaName} refinement.`);
+    }
+    block = refined;
+  }
+
+  return content.slice(0, start) + block + content.slice(end);
+}
+
+/**
+ * Preserve constraints that live inside pricing union branches or a titled
+ * nested definition. Those locations are not visible to the generic
+ * property reconciliation above, so guard the exact canonical constraints
+ * before applying the corresponding generated Zod refinements.
+ */
+function postProcessPricingOptionConstraints(content: string): string {
+  const readCanonical = (fileName: string): Record<string, unknown> =>
+    JSON.parse(
+      readFileSync(path.join(__dirname, `../schemas/cache/latest/pricing-options/${fileName}`), 'utf8')
+    ) as Record<string, unknown>;
+  const requireRecord = (value: unknown, label: string): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`postProcessPricingOptionConstraints: canonical ${label} is missing.`);
+    }
+    return value as Record<string, unknown>;
+  };
+  const requireConstraint = (
+    schema: Record<string, unknown>,
+    label: string,
+    expected: Record<string, string | number>
+  ): void => {
+    for (const [key, value] of Object.entries(expected)) {
+      if (schema[key] !== value) {
+        throw new Error(
+          `postProcessPricingOptionConstraints: canonical ${label}.${key} changed; expected ${JSON.stringify(value)}.`
+        );
+      }
+    }
+  };
+  const replaceInSchema = (schemaName: string, before: string, after: string): void => {
+    const start = content.indexOf(`export const ${schemaName}Schema = `);
+    if (start < 0) throw new Error(`postProcessPricingOptionConstraints: ${schemaName}Schema not found.`);
+    const endCandidate = content.indexOf('\n\nexport const ', start + 1);
+    const end = endCandidate < 0 ? content.length : endCandidate;
+    const block = content.slice(start, end);
+    const first = block.indexOf(before);
+    if (first < 0 || block.indexOf(before, first + before.length) >= 0) {
+      throw new Error(
+        `postProcessPricingOptionConstraints: expected exactly one ${JSON.stringify(before)} in ${schemaName}Schema.`
+      );
+    }
+    content = content.slice(0, start) + block.replace(before, after) + content.slice(end);
+  };
+
+  const cpv = readCanonical('cpv-option.json');
+  const cpvProperties = requireRecord(cpv.properties, 'CPV properties');
+  const parameters = requireRecord(cpvProperties.parameters, 'CPV parameters');
+  const parameterProperties = requireRecord(parameters.properties, 'CPV parameter properties');
+  const viewThreshold = requireRecord(parameterProperties.view_threshold, 'CPV view_threshold');
+  const thresholdBranches = viewThreshold.oneOf;
+  if (!Array.isArray(thresholdBranches) || thresholdBranches.length !== 2) {
+    throw new Error('postProcessPricingOptionConstraints: canonical CPV view_threshold branches changed.');
+  }
+  const numericThreshold = requireRecord(thresholdBranches[0], 'CPV numeric view_threshold');
+  requireConstraint(numericThreshold, 'CPV numeric view_threshold', { type: 'number', minimum: 0, maximum: 1 });
+  const durationBranch = requireRecord(thresholdBranches[1], 'CPV duration view_threshold');
+  const durationProperties = requireRecord(durationBranch.properties, 'CPV duration properties');
+  const durationSeconds = requireRecord(durationProperties.duration_seconds, 'CPV duration_seconds');
+  requireConstraint(durationSeconds, 'CPV duration_seconds', { type: 'integer', minimum: 1 });
+  replaceInSchema(
+    'CPVPricingOption',
+    'view_threshold: z.union([z.number(),',
+    'view_threshold: z.union([z.number().gte(0).lte(1),'
+  );
+  replaceInSchema('CPVPricingOption', 'duration_seconds: z.number()', 'duration_seconds: z.number().int().gte(1)');
+
+  const flatRate = readCanonical('flat-rate-option.json');
+  let doohParameters: Record<string, unknown> | undefined;
+  const findDoohParameters = (value: unknown): void => {
+    if (doohParameters || !value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach(findDoohParameters);
+      return;
+    }
+    const node = value as Record<string, unknown>;
+    if (node.title === 'DoohParameters') {
+      doohParameters = node;
+      return;
+    }
+    Object.values(node).forEach(findDoohParameters);
+  };
+  findDoohParameters(flatRate);
+  const doohProperties = requireRecord(requireRecord(doohParameters, 'DoohParameters').properties, 'DOOH properties');
+  const doohConstraints: Array<[string, Record<string, string | number>, string]> = [
+    ['sov_percentage', { type: 'number', minimum: 0, maximum: 100 }, '.gte(0).lte(100)'],
+    ['loop_duration_seconds', { type: 'integer', minimum: 1 }, '.int().gte(1)'],
+    ['min_plays_per_hour', { type: 'integer', minimum: 1 }, '.int().gte(1)'],
+    ['duration_hours', { type: 'number', minimum: 0 }, '.gte(0)'],
+    ['estimated_impressions', { type: 'integer', minimum: 0 }, '.int().gte(0)'],
+  ];
+  for (const [propertyName, expected, suffix] of doohConstraints) {
+    requireConstraint(
+      requireRecord(doohProperties[propertyName], `DOOH ${propertyName}`),
+      `DOOH ${propertyName}`,
+      expected
+    );
+    replaceInSchema('DoohParameters', `${propertyName}: z.number()`, `${propertyName}: z.number()${suffix}`);
+  }
+
+  return content;
+}
+
+/**
+ * Zod's WHATWG URL validators are not equivalent to JSON Schema draft-07's
+ * RFC 3986 `format: uri`. Normalize every URI projection to the same
+ * ajv-formats predicate used by the SDK's authoritative Ajv validation path,
+ * including one-line dereferenced schemas that property reconciliation cannot
+ * address individually.
+ */
+function postProcessJsonSchemaUriFormats(content: string): string {
+  return content
+    .replaceAll('z.url()', 'z.string().refine(adcpJsonSchemaUri, "Invalid URI")')
+    .replaceAll('.url()', '.refine(adcpJsonSchemaUri, "Invalid URI")');
 }
 
 function postProcessTrustedMatchResponseSchemas(content: string): string {
@@ -2595,6 +4375,92 @@ function postProcessMarkerUnionObjectIntersections(content: string): string {
   return result;
 }
 
+function topLevelAndOperands(expression: string): string[] | undefined {
+  let depth = 0;
+  let firstAnd = -1;
+  for (let i = 0; i < expression.length; i++) {
+    const literalEnd = skipQuotedOrRegexLiteral(expression, i);
+    if (literalEnd !== undefined) {
+      i = literalEnd - 1;
+      continue;
+    }
+    const ch = expression[i];
+    if (ch === '(' || ch === '{' || ch === '[') depth++;
+    else if (ch === ')' || ch === '}' || ch === ']') depth--;
+    else if (depth === 0 && expression.startsWith('.and(', i)) {
+      firstAnd = i;
+      break;
+    }
+  }
+  if (firstAnd < 0) return [expression.trim()];
+
+  const operands = [expression.slice(0, firstAnd).trim()];
+  let cursor = firstAnd;
+  while (cursor < expression.length) {
+    cursor = skipWhitespace(expression, cursor);
+    if (!expression.startsWith('.and(', cursor)) return undefined;
+    const argument = scanBalanced(expression, cursor + '.and'.length);
+    if (!argument) return undefined;
+    operands.push(argument.body.trim());
+    cursor = argument.end;
+  }
+  return operands;
+}
+
+/**
+ * Collapse repeated Product format/placement intersection operands introduced
+ * when json-schema-to-typescript follows the same dereferenced allOf layers
+ * through compatibility aliases. Re-validating an identical pure object or
+ * union adds no semantics, but zod-openapi expands every copy recursively.
+ */
+function postProcessRepeatedProductIntersections(content: string): string {
+  let result = content;
+
+  for (const schemaName of ['ProductFormatDeclarationSchema', 'PlacementSchema']) {
+    const target = findSchemaExportExpressions(result).find(entry => entry.name === schemaName);
+    if (!target) throw new Error(`postProcessRepeatedProductIntersections: ${schemaName} export not found.`);
+    const operands = topLevelAndOperands(target.expression);
+    if (!operands) throw new Error(`postProcessRepeatedProductIntersections: could not parse ${schemaName}.`);
+
+    const seen = new Set<string>();
+    const unique = operands.filter(operand => {
+      const exact = operand.trim();
+      if (seen.has(exact)) return false;
+      seen.add(exact);
+      return true;
+    });
+
+    if (schemaName === 'ProductFormatDeclarationSchema' && unique.length === 3 && unique.length < operands.length) {
+      const exactOperands = operands.map(operand => operand.trim());
+      const [commonA, formatUnion, commonB] = unique;
+      const expected = [commonA, formatUnion, commonB, formatUnion, commonB, formatUnion, commonB, formatUnion];
+      if (
+        exactOperands.length !== expected.length ||
+        exactOperands.some((operand, index) => operand !== expected[index]) ||
+        !commonA?.endsWith(`.merge(${commonB})`)
+      ) {
+        const classes: string[] = [];
+        const classByOperand = new Map<string, string>();
+        for (const operand of exactOperands) {
+          const label = classByOperand.get(operand) ?? String.fromCharCode(65 + classByOperand.size);
+          classByOperand.set(operand, label);
+          classes.push(label);
+        }
+        throw new Error(
+          `postProcessRepeatedProductIntersections: ProductFormatDeclaration no longer matches the verified repeated allOf projection (${classes.join('')}).`
+        );
+      }
+      unique.pop();
+    }
+
+    if (unique.length === operands.length) continue;
+    const rewritten = unique.slice(1).reduce((chain, operand) => `${chain}.and(${operand})`, unique[0]!);
+    result = result.slice(0, target.expressionStart) + rewritten + result.slice(target.expressionEnd);
+  }
+
+  return result;
+}
+
 function postProcessObjectIntersections(content: string): string {
   const schemaExpressions = extractSchemaExports(content);
   const shapeCache = new Map<string, ObjectShape | undefined>();
@@ -3096,7 +4962,9 @@ async function generateZodSchemas() {
     }
 
     // Merge both sources so cross-file type dependencies can be resolved
-    const combinedSource = `${coreContent}\n\n// ====== TOOL TYPES ======\n\n${toolsWithoutCrossImports}`;
+    const combinedSource = relaxArrayCardinalityTypes(
+      `${coreContent}\n\n// ====== TOOL TYPES ======\n\n${toolsWithoutCrossImports}`
+    );
 
     console.log('📦 Generating Zod schemas for all types...');
 
@@ -3133,10 +5001,15 @@ async function generateZodSchemas() {
     // Post-process: Fix broken imports from "undefined" (recursive types with z.lazy())
     zodSchemas = postProcessUndefinedImports(zodSchemas);
 
-    // Post-process: Convert tuple patterns to arrays to allow empty arrays
-    // ts-to-zod converts @minItems 1 to z.tuple([]).rest() which requires at least one element,
-    // but agents in the wild return empty arrays. This relaxes validation for interoperability.
-    zodSchemas = postProcessTuplesToArrays(zodSchemas);
+    // Some nested array constraints lose their JSDoc provenance in the
+    // JSON-Schema-to-TypeScript projection. Normalize the remaining exact
+    // homogeneous tuple/rest representation without touching fixed tuples.
+    zodSchemas = postProcessTupleRestArrays(zodSchemas);
+
+    // ts-to-zod does not natively support @maxItems JSDoc. Recover the
+    // retained JSON Schema provenance from the generated TS source and apply
+    // the bound to the corresponding ZodArray validators.
+    zodSchemas = postProcessArrayMaxItems(zodSchemas, combinedSource);
 
     // Post-process: Replace z.union([z.unknown(), z.undefined()]) with z.unknown().
     // ts-to-zod generates the union for Record<string, unknown> types, but z.undefined()
@@ -3152,11 +5025,16 @@ async function generateZodSchemas() {
     // .passthrough(). They also create ZodIntersection types that lose .shape access.
     // Must run after postProcessUndefinedUnions (which normalizes the record value type).
     zodSchemas = postProcessRecordIntersections(zodSchemas);
+    zodSchemas = postProcessPrimitiveIntersections(zodSchemas);
 
     // Post-process: Add .passthrough() to all z.object() schemas so unknown keys are preserved.
     // Agents may return extra/platform-specific fields not in the schema. Without passthrough,
     // Zod strips those fields, causing data loss for consumers who need them.
     zodSchemas = postProcessForPassthrough(zodSchemas);
+
+    // Preserve arbitrary JSON transformer values after ts-to-zod narrows
+    // nested `unknown` properties to open objects.
+    zodSchemas = postProcessTransformerParamJsonValues(zodSchemas);
 
     // String-only JSON Schema constraints on object|string unions must stay
     // attached to the string arm; applying them to z.union() crashes Zod.
@@ -3165,11 +5043,9 @@ async function generateZodSchemas() {
     zodSchemas = postProcessForecastRangeConstraint(zodSchemas);
     zodSchemas = postProcessPriceBreakdownConstraints(zodSchemas);
     zodSchemas = postProcessBeta4OfferAndOutcomeConstraints(zodSchemas);
+    zodSchemas = postProcessCanonicalSharedConstraints(zodSchemas);
+    zodSchemas = postProcessSignalTargetingExpressionConstraints(zodSchemas);
     zodSchemas = postProcessPreviewCreativeRequestConstraints(zodSchemas);
-
-    // TypeScript cannot retain JSON Schema `format: uri` or root oneOf
-    // exclusivity. Restore both for legacy/canonical creative identity.
-    zodSchemas = postProcessCreativeRuntimeConstraints(zodSchemas);
 
     // Placement presentation is a closed, non-executable document boundary.
     // Restore strictness, integer/cardinality rules, and canvas geometry lost
@@ -3196,16 +5072,35 @@ async function generateZodSchemas() {
     zodSchemas = postProcessCanonicalFormatMarkerIntersections(zodSchemas);
     zodSchemas = postProcessCanonicalFormatSlots(zodSchemas);
     zodSchemas = postProcessCreativeBriefRequiredDisclosures(zodSchemas);
+    zodSchemas = postProcessPostalCountrySystemSchema(zodSchemas);
     zodSchemas = postProcessPostalAreaValues(zodSchemas);
     zodSchemas = postProcessCompatibilityPurchaseCoordinatorInput(zodSchemas);
     zodSchemas = postProcessLegacyPurchaseContinuationResponse(zodSchemas);
+    const reportingStatusResponseSource = JSON.parse(
+      readFileSync(
+        path.join(__dirname, '../schemas/cache/latest/bundled/media-buy/get-reporting-status-response.json'),
+        'utf8'
+      )
+    );
+    const reportingStatusRequiredByView = reportingStatusViewRequiredFields(reportingStatusResponseSource);
+    const reportingStatusClosedStructuresBySource = reportingStatusClosedStructures(reportingStatusResponseSource);
+    const reportingFileManifestClosedStructuresBySource = reportingFileManifestClosedStructures(
+      JSON.parse(
+        readFileSync(path.join(__dirname, '../schemas/cache/latest/core/reporting-file-manifest.json'), 'utf8')
+      ),
+      sourceSchemaDocumentsById(path.join(__dirname, '../schemas/cache/latest'))
+    );
     const refineResponseSource = JSON.parse(
       readFileSync(
         path.join(__dirname, '../schemas/cache/latest/bundled/media-buy/refine-proposals-response.json'),
         'utf8'
       )
     );
-    const dereferencedRefineResponse = (await $RefParser.dereference(refineResponseSource)) as any;
+    const verifiedCacheRoot = path.join(__dirname, '../schemas/cache/latest');
+    const dereferencedRefineResponse = (await dereferenceFromVerifiedSchemaCache(
+      refineResponseSource,
+      verifiedCacheRoot
+    )) as any;
     const canonicalProposalSource = dereferencedRefineResponse?.properties?.results?.items?.properties?.proposal;
     if (!canonicalProposalSource) {
       throw new Error('Unable to locate the bundled canonical proposal used by refine_proposals.');
@@ -3281,7 +5176,13 @@ async function generateZodSchemas() {
           return `${underlying}.refine((value) => Object.keys(value).length >= ${minimum}, "Object must contain at least ${minimum} propert${minimum === 1 ? 'y' : 'ies'}")`;
         }
         if (!schema.properties && Array.isArray(schema.required) && schema.required.length > 0) {
-          const fields = schema.required.map(field => `${JSON.stringify(field)}: z.any().nonoptional()`).join(', ');
+          // Keep this presence-only guard constant-time with respect to the
+          // supplied value. Recursive validators such as `z.json()` can
+          // overflow on deeply nested untrusted payloads, while `z.unknown()`
+          // alone treats a missing key as valid on the supported Zod floor.
+          const fields = schema.required
+            .map(field => `${JSON.stringify(field)}: z.any().refine((value) => value !== undefined, "Required")`)
+            .join(', ');
           return `z.object({ ${fields} }).passthrough()`;
         }
       },
@@ -3309,6 +5210,52 @@ async function generateZodSchemas() {
     })()`;
     zodSchemas = postProcessCanonicalProposalRuntimeConstraints(zodSchemas, exactCanonicalProposal);
 
+    // Targeting state and targeting commands intentionally differ only in
+    // whether a dimension may be null. Their TypeScript projections cannot
+    // retain wire-only constraints such as minItems and string patterns, so
+    // replace both public Zod schemas from the authoritative JSON Schemas.
+    for (const [schemaName, schemaFile] of [
+      ['TargetingOverlaySchema', 'targeting.json'],
+      ['TargetingOverlayInputSchema', 'targeting-input.json'],
+    ] as const) {
+      const source = JSON.parse(readFileSync(path.join(__dirname, '../schemas/cache/latest/core', schemaFile), 'utf8'));
+      const dereferenced = (await dereferenceFromVerifiedSchemaCache(source, verifiedCacheRoot)) as any;
+      removeDiscriminatorHints(dereferenced);
+      const rootConstraints = dereferenced.allOf;
+      delete dereferenced.allOf;
+      const objectSchema = jsonSchemaToZod(dereferenced, converterOptions).replaceAll(
+        '.url()',
+        '.refine(adcpJsonSchemaUri, "Invalid URI")'
+      );
+      const constraintSchema = jsonSchemaToZod(
+        { allOf: Array.isArray(rootConstraints) ? rootConstraints : [] },
+        converterOptions
+      ).replaceAll('.url()', '.refine(adcpJsonSchemaUri, "Invalid URI")');
+      const exact = `(() => {
+        const objectSchema = ${objectSchema};
+        const exactSchema = objectSchema.superRefine((value, ctx) => {
+          const checked = ${constraintSchema}.safeParse(value);
+          if (!checked.success) {
+            for (const issue of checked.error.issues) {
+              ctx.addIssue({ code: "custom", path: issue.path, message: issue.message });
+            }
+          }
+        });
+        return Object.assign(exactSchema, {
+          pick: objectSchema.pick.bind(objectSchema),
+          omit: objectSchema.omit.bind(objectSchema),
+          extend: objectSchema.extend.bind(objectSchema),
+        });
+      })()`;
+      zodSchemas = postProcessExactSchema(zodSchemas, schemaName, exact);
+    }
+
+    // TypeScript cannot retain JSON Schema `format: uri` or root oneOf
+    // exclusivity. Restore both for legacy/canonical creative identity. This
+    // runs after replacing CanonicalProposalSchema because generated export
+    // ordering can place CreativeManifestSchema immediately after it.
+    zodSchemas = postProcessCreativeRuntimeConstraints(zodSchemas);
+
     // These promoted beta.6 canonical formats contain nested required-only
     // unions, conditionals, and `contains` constraints that TypeScript cannot
     // faithfully carry through ts-to-zod. Project their dereferenced wire
@@ -3320,7 +5267,7 @@ async function generateZodSchemas() {
       const source = JSON.parse(
         readFileSync(path.join(__dirname, '../schemas/cache/latest/formats/canonical', schemaFile), 'utf8')
       );
-      const dereferenced = (await $RefParser.dereference(source)) as any;
+      const dereferenced = (await dereferenceFromVerifiedSchemaCache(source, verifiedCacheRoot)) as any;
       removeDiscriminatorHints(dereferenced);
       // Both promoted formats extend exactly one plain object base. Flatten
       // that structural allOf before Zod projection so the public export stays
@@ -3429,7 +5376,14 @@ async function generateZodSchemas() {
                 return;
               }
               if (!referenced) {
-                const paramsSchema = CoordinatedPlacementInlineParamsRuntimeSchemas[component.format_kind];
+                const formatKind = component.format_kind;
+                if (typeof formatKind !== "string") {
+                  ctx.addIssue({ code: "custom", path: [index, "format_kind"], message: "Unsupported coordinated placement format_kind" });
+                  return;
+                }
+                const paramsSchema = CoordinatedPlacementInlineParamsRuntimeSchemas[
+                  formatKind as keyof typeof CoordinatedPlacementInlineParamsRuntimeSchemas
+                ];
                 if (!paramsSchema) {
                   ctx.addIssue({ code: "custom", path: [index, "format_kind"], message: "Unsupported coordinated placement format_kind" });
                 } else if (!paramsSchema.safeParse(component.params).success) {
@@ -3481,6 +5435,16 @@ async function generateZodSchemas() {
     // richer/conflicting intersections alone so future schema changes do not weaken checks.
     zodSchemas = postProcessObjectIntersections(zodSchemas);
 
+    // The reporting-status response composes a shared result object with a
+    // view-specific allOf arm. Recover the arm required fields from the signed
+    // bundle, then restore the closed audit-evidence boundaries that the
+    // global extension passthrough policy intentionally does not cover.
+    zodSchemas = postProcessGetReportingStatusViewRequiredFields(zodSchemas, reportingStatusRequiredByView);
+    zodSchemas = postProcessReportingEvidenceStrictness(zodSchemas);
+    zodSchemas = postProcessReportingConsumerStatusConstraints(zodSchemas);
+    zodSchemas = postProcessGetReportingStatusEvidenceStrictness(zodSchemas, reportingStatusClosedStructuresBySource);
+    zodSchemas = postProcessReportingFileManifestStrictness(zodSchemas, reportingFileManifestClosedStructuresBySource);
+
     // Preserve the image format's beta.6 motion-level refinement without
     // regressing its public ZodObject composition surface.
     zodSchemas = postProcessCanonicalImageMotionNarrowing(zodSchemas);
@@ -3507,6 +5471,18 @@ async function generateZodSchemas() {
     // Restore the schema's country-key catchall after ts-to-zod widens the
     // template-literal index signature during conversion.
     zodSchemas = postProcessPostalAreaSupportCatchall(zodSchemas);
+
+    // Reconcile canonical primitive constraints last, after structural and
+    // exact-schema rewrites that may replace earlier generated blocks.
+    zodSchemas = postProcessCanonicalPrimitiveConstraints(zodSchemas);
+    zodSchemas = postProcessCanonicalVastAudioConstraints(zodSchemas);
+    zodSchemas = postProcessPricingOptionConstraints(zodSchemas);
+    zodSchemas = postProcessJsonSchemaUriFormats(zodSchemas);
+
+    // Compatibility aliases can make jsts emit repeated format/placement
+    // intersections. Collapse them before annotation so adopter OpenAPI
+    // generators see each validation block once.
+    zodSchemas = postProcessRepeatedProductIntersections(zodSchemas);
 
     // Post-process: Add explicit z.ZodType annotations to schemas that trip TS7056.
     zodSchemas = postProcessTS7056Annotations(zodSchemas);
@@ -3560,14 +5536,29 @@ if (require.main === module) {
 }
 
 export const __test__ = {
+  postProcessForPassthrough,
+  postProcessTupleRestArrays,
+  postProcessArrayMaxItems,
+  relaxArrayCardinalityTypes,
   postProcessForNullish,
   postProcessRecordIntersections,
   postProcessMarkerUnionObjectIntersections,
+  postProcessRepeatedProductIntersections,
   postProcessCanonicalFormatSlots,
   postProcessCreativeBriefRequiredDisclosures,
+  reportingStatusViewRequiredFields,
+  reportingStatusClosedStructures,
+  reportingFileManifestClosedStructures,
+  dereferenceFromVerifiedSchemaCache,
+  postProcessGetReportingStatusViewRequiredFields,
+  postProcessReportingEvidenceStrictness,
+  postProcessReportingConsumerStatusConstraints,
+  postProcessGetReportingStatusEvidenceStrictness,
+  postProcessReportingFileManifestStrictness,
   postProcessObjectUnionIntersections,
   postProcessObjectIntersections,
   postProcessRecordSizeConstraints,
+  postProcessForecastRangeConstraint,
 };
 
 export { generateZodSchemas };

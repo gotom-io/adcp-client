@@ -45,6 +45,12 @@ export interface PgWebhookDeliveryRecoveryOptions {
   tableName?: string;
   /** Assert that the database/schema is dedicated to this deployment. */
   acknowledgeIsolatedDatabase?: boolean;
+  /**
+   * Restrict recovery leases to this trusted publisher namespace and,
+   * optionally, one tenant. Omit `tenantScope` for a publisher runtime that
+   * serves multiple trusted tenants via `emitter.forTenantScope(...)`.
+   */
+  claimScope?: Pick<WebhookDeliveryKey, 'publisherScope'> & Partial<Pick<WebhookDeliveryKey, 'tenantScope'>>;
 }
 
 export function getWebhookDeliveryMigration(options: PgWebhookDeliveryStoreOptions = {}): string {
@@ -101,6 +107,9 @@ CREATE TABLE IF NOT EXISTS ${table} (
   CONSTRAINT ${raw}_valid_state CHECK (state IN ('pending', 'settled')),
   CONSTRAINT ${raw}_valid_disposition CHECK (disposition IS NULL OR disposition IN ('delivered', 'terminal'))
 );
+
+ALTER TABLE ${table}
+  ADD COLUMN IF NOT EXISTS intent_fingerprint TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_${raw}_pending
   ON ${table}(next_attempt_at, lease_expires_at) WHERE state = 'pending';
@@ -202,6 +211,22 @@ export function pgWebhookDeliveryRecoveryBackend(
   const tableName = options.tableName ?? DEFAULT_OUTBOX_TABLE;
   const table = quoteWebhookTable(tableName);
   assertPgDeploymentNamespace('pgWebhookDeliveryRecoveryBackend', tableName, DEFAULT_OUTBOX_TABLE, options);
+  if (options.claimScope) {
+    assertDeliveryKey({
+      publisherScope: options.claimScope.publisherScope,
+      tenantScope: options.claimScope.tenantScope ?? 'claim-scope-validation',
+      deliveryId: 'claim-scope-validation',
+    });
+  }
+  const assertConfiguredScope = (key: Readonly<WebhookDeliveryKey>) => {
+    if (
+      options.claimScope &&
+      (key.publisherScope !== options.claimScope.publisherScope ||
+        (options.claimScope.tenantScope !== undefined && key.tenantScope !== options.claimScope.tenantScope))
+    ) {
+      throw new Error('Webhook recovery key is outside the configured claim scope');
+    }
+  };
 
   async function query(operation: string, text: string, values?: unknown[]) {
     try {
@@ -217,7 +242,7 @@ export function pgWebhookDeliveryRecoveryBackend(
       try {
         await db.query(
           `SELECT publisher_scope, tenant_scope, delivery_id, snapshot, snapshot_fingerprint,
-                  storage_fingerprint, state, disposition, attempt_count, next_attempt_at, lease_owner,
+                  storage_fingerprint, intent_fingerprint, state, disposition, attempt_count, next_attempt_at, lease_owner,
                   lease_claim_id, lease_version, lease_expires_at FROM ${table} LIMIT 0`
         );
       } catch (cause) {
@@ -229,6 +254,7 @@ export function pgWebhookDeliveryRecoveryBackend(
     },
     async checkpoint(key, snapshot, snapshotFingerprint, storageFingerprint, initialLease) {
       assertDeliveryKey(key);
+      assertConfiguredScope(key);
       assertLeaseControls(initialLease.ownerToken, initialLease.leaseMs);
       const leaseClaimId = randomUUID();
       const result = await query(
@@ -294,6 +320,7 @@ export function pgWebhookDeliveryRecoveryBackend(
     },
     async settle(key, disposition): Promise<void> {
       assertDeliveryKey(key);
+      assertConfiguredScope(key);
       assertWebhookDisposition(disposition);
       await query(
         'settle',
@@ -306,12 +333,16 @@ export function pgWebhookDeliveryRecoveryBackend(
     },
     async claimPending({ ownerToken, leaseMs, limit }): Promise<WebhookRecoveryRecord[]> {
       assertLeaseControls(ownerToken, leaseMs, limit);
+      const scopePredicate = options.claimScope
+        ? `AND publisher_scope = $4${options.claimScope.tenantScope === undefined ? '' : ' AND tenant_scope = $5'}`
+        : '';
       const result = await query(
         'claimPending',
         `WITH candidates AS (
            SELECT publisher_scope, tenant_scope, delivery_id
            FROM ${table}
            WHERE state = 'pending'
+             ${scopePredicate}
              AND next_attempt_at <= clock_timestamp()
              AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())
            ORDER BY next_attempt_at, created_at
@@ -334,12 +365,23 @@ export function pgWebhookDeliveryRecoveryBackend(
            FLOOR(EXTRACT(EPOCH FROM outbox.next_attempt_at) * 1000)::bigint AS next_attempt_at_ms,
            outbox.lease_owner, outbox.lease_version,
            FLOOR(EXTRACT(EPOCH FROM outbox.lease_expires_at) * 1000)::bigint AS lease_expires_at_ms`,
-        [ownerToken, leaseMs, limit]
+        [
+          ownerToken,
+          leaseMs,
+          limit,
+          ...(options.claimScope
+            ? [
+                options.claimScope.publisherScope,
+                ...(options.claimScope.tenantScope === undefined ? [] : [options.claimScope.tenantScope]),
+              ]
+            : []),
+        ]
       );
       return result.rows.map(rowToRecoveryRecord);
     },
     async renew(lease, leaseMs): Promise<number | null> {
       assertDeliveryKey(lease.key);
+      assertConfiguredScope(lease.key);
       assertLeaseControls(lease.leaseOwner, leaseMs);
       const result = await query(
         'renew',
@@ -361,6 +403,7 @@ export function pgWebhookDeliveryRecoveryBackend(
     },
     async release(lease, retryAfterMs): Promise<boolean> {
       assertDeliveryKey(lease.key);
+      assertConfiguredScope(lease.key);
       assertLeaseControls(lease.leaseOwner, 1);
       assertRetryAfterMs(retryAfterMs);
       const result = await query(
@@ -384,6 +427,7 @@ export function pgWebhookDeliveryRecoveryBackend(
     },
     async settleLease(lease, disposition): Promise<boolean> {
       assertDeliveryKey(lease.key);
+      assertConfiguredScope(lease.key);
       assertLeaseControls(lease.leaseOwner, 1);
       assertWebhookDisposition(disposition);
       const result = await query(

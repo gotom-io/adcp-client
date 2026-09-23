@@ -218,21 +218,20 @@ export interface ServeOptions {
    * deriving a URL and throw {@link UnknownHostError} for unknown hosts.
    * Evicted hosts are resolved again on their next request.
    * Setting {@link trustForwardedHost} is recommended when behind a proxy.
+   *
+   * @see {@link allowHttpHosts} for explicitly allowlisted development-only
+   * plain-HTTP hostnames.
    */
   publicUrl?: string | ((host: string) => string);
 
   /**
-   * Hostnames allowed to use a plain-http `publicUrl` in addition to the
-   * loopback set (`localhost`, `127.0.0.1`, `[::1]`). For private-network
-   * development topologies where the agent answers on a non-loopback name
-   * that TLS cannot cover — e.g. a docker-compose service alias reached by a
-   * sibling container. Traffic to these hosts is unencrypted and their name
-   * proves nothing: never list a host that is reachable beyond the trusted
-   * network segment, and never use this in production — keep the https
-   * requirement by leaving it unset. Compared case-insensitively against the
-   * URL's WHATWG-canonical hostname (IPv6 in brackets).
+   * Exact hostnames permitted to use plain HTTP in {@link publicUrl}, in
+   * addition to the built-in loopback allowance. This development-only
+   * escape hatch supports private container-network names such as
+   * docker-compose service aliases. Entries are case-insensitive and must
+   * not contain ports or wildcards. HTTPS remains required by default.
    */
-  allowInsecureHttpHosts?: string[];
+  allowHttpHosts?: string[];
 
   /**
    * Authentication middleware applied to every request. When configured,
@@ -468,17 +467,17 @@ export function serve(createAgent: (ctx: ServeContext) => AdcpServer | McpServer
   }
 
   const publicUrlOption = options?.publicUrl;
+  const allowHttpHosts = normalizeAllowHttpHosts(options?.allowHttpHosts);
   const protectedResourceOption = options?.protectedResource;
   const publicUrlIsFn = typeof publicUrlOption === 'function';
   const prmIsFn = typeof protectedResourceOption === 'function';
   const authenticationNeedsRawBody = authenticatorNeedsRawBody(options?.authenticate);
-  const insecureHttpHosts = new Set((options?.allowInsecureHttpHosts ?? []).map(h => h.toLowerCase()));
 
   // Static publicUrl — validate once at construction. Function form validates
   // lazily per host so a stale factory for one host can't prevent boot.
   let staticPublicOrigin: string | undefined;
   if (typeof publicUrlOption === 'string') {
-    staticPublicOrigin = validatePublicUrl(publicUrlOption, mountPath, insecureHttpHosts);
+    staticPublicOrigin = validatePublicUrl(publicUrlOption, mountPath, allowHttpHosts);
   }
 
   // Function-form options are pure host → value lookups. Keep their values
@@ -520,7 +519,7 @@ export function serve(createAgent: (ctx: ServeContext) => AdcpServer | McpServer
     const cached = getHostMetadata(host);
     if (cached?.publicUrl !== undefined) return cached.publicUrl;
     const publicUrl = (publicUrlOption as (h: string) => string)(canonicalHostnameForScope(host));
-    const publicOrigin = validatePublicUrl(publicUrl, mountPath, insecureHttpHosts);
+    const publicOrigin = validatePublicUrl(publicUrl, mountPath, allowHttpHosts);
     updateHostMetadata(host, { publicUrl, publicOrigin });
     return publicUrl;
   };
@@ -548,6 +547,12 @@ export function serve(createAgent: (ctx: ServeContext) => AdcpServer | McpServer
     console.warn(
       '[adcp/serve] No `authenticate` configured — this agent will accept unauthenticated requests. ' +
         'AdCP security_baseline requires authentication in production.'
+    );
+  }
+  if (allowHttpHosts.size > 0 && process.env.NODE_ENV === 'production') {
+    console.warn(
+      '[adcp/serve] `allowHttpHosts` enables plaintext HTTP for explicitly named hosts. ' +
+        'Remove this development-only option from production deployments.'
     );
   }
 
@@ -1101,7 +1106,7 @@ function trimTrailingSlashes(s: string): string {
  * call site and surfaced as a 500 so the operator sees the misconfigured
  * host instead of a silent audience-mismatch on minted tokens.
  */
-function validatePublicUrl(publicUrl: string, mountPath: string, insecureHttpHosts?: ReadonlySet<string>): string {
+function validatePublicUrl(publicUrl: string, mountPath: string, allowHttpHosts: ReadonlySet<string>): string {
   let parsed: URL;
   try {
     parsed = new URL(publicUrl);
@@ -1111,15 +1116,12 @@ function validatePublicUrl(publicUrl: string, mountPath: string, insecureHttpHos
   if (parsed.username || parsed.password) {
     throw new Error('serve(): `publicUrl` must not include username or password credentials');
   }
-  const httpAllowedHost =
-    parsed.hostname === 'localhost' ||
-    parsed.hostname === '127.0.0.1' ||
-    parsed.hostname === '[::1]' ||
-    insecureHttpHosts?.has(parsed.hostname) === true;
-  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && httpAllowedHost)) {
+  const loopbackHost =
+    parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
+  const explicitlyAllowedHttpHost = allowHttpHosts.has(parsed.hostname.toLowerCase());
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && (loopbackHost || explicitlyAllowedHttpHost))) {
     throw new Error(
-      'serve(): `publicUrl` must use https (http is allowed only for loopback development URLs ' +
-        'and `allowInsecureHttpHosts` entries)'
+      'serve(): `publicUrl` must use https (http is allowed only for loopback or hosts named in `allowHttpHosts`)'
     );
   }
   if (trimTrailingSlashes(parsed.pathname) !== trimTrailingSlashes(mountPath)) {
@@ -1132,6 +1134,42 @@ function validatePublicUrl(publicUrl: string, mountPath: string, insecureHttpHos
     throw new Error('serve(): `publicUrl` must not include query parameters or a fragment');
   }
   return parsed.origin;
+}
+
+function normalizeAllowHttpHosts(entries: string[] | undefined): ReadonlySet<string> {
+  const hosts = new Set<string>();
+  for (const entry of entries ?? []) {
+    if (
+      entry.length === 0 ||
+      entry.trim() !== entry ||
+      entry.includes('*') ||
+      entry.includes('?') ||
+      entry.includes(':')
+    ) {
+      throw new Error(
+        `serve(): invalid allowHttpHosts entry "${entry}"; use an exact hostname without whitespace, wildcards, or a port`
+      );
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(`https://${entry}/`);
+    } catch {
+      throw new Error(`serve(): invalid allowHttpHosts entry "${entry}"; expected a hostname`);
+    }
+    if (
+      parsed.hostname.length === 0 ||
+      parsed.username.length > 0 ||
+      parsed.password.length > 0 ||
+      parsed.port.length > 0 ||
+      parsed.pathname !== '/' ||
+      parsed.search.length > 0 ||
+      parsed.hash.length > 0
+    ) {
+      throw new Error(`serve(): invalid allowHttpHosts entry "${entry}"; expected a hostname without a port`);
+    }
+    hosts.add(parsed.hostname.toLowerCase());
+  }
+  return hosts;
 }
 
 /**

@@ -20,6 +20,8 @@ const { StaticJwksResolver, InMemoryReplayStore, InMemoryRevocationStore } = req
 const { getSchemaValidatorByRef } = require('../dist/lib/validation/schema-loader');
 const { toCanonicalOnlyResponse } = require('../dist/lib/v2/projection');
 const { createIdempotencyStore, memoryBackend } = require('../dist/lib/server/idempotency');
+const { createInMemoryTaskRegistry } = require('../dist/lib/server/decisioning/runtime/task-registry');
+const { ADCP_VERSION } = require('../dist/lib/version');
 
 const PRODUCTS_ONLY_BRIEF_VECTORS = JSON.parse(
   readFileSync(
@@ -181,8 +183,8 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'compact-and-legacy',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
-      capabilities: { supported_versions: ['3.0.25', '3.1.18', '3.2.0-beta.6'] },
+      adcpVersion: '3.2.0-rc.4',
+      capabilities: { supported_versions: ['3.0.25', '3.1.18', '3.2.0-rc.4'] },
       validation: { requests: 'off', responses: 'off' },
     });
 
@@ -208,7 +210,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
       method: 'tools/call',
       params: {
         name: 'list_products',
-        arguments: { adcp_version: '3.2.0-beta.6', account: { account_id: 'acc-modern' } },
+        arguments: { adcp_version: '3.2.0-rc.4', account: { account_id: 'acc-modern' } },
       },
     });
     assert.notStrictEqual(compact.isError, true, JSON.stringify(compact.structuredContent));
@@ -225,7 +227,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
       assert.notStrictEqual(legacy.isError, true, JSON.stringify(legacy.structuredContent));
     }
     assert.deepStrictEqual(calls, [
-      ['list_products', '3.2.0-beta.6', 'acc-modern'],
+      ['list_products', '3.2.0-rc.4', 'acc-modern'],
       ['get_products', '3.1.18', 'acc-3.1.18'],
       ['get_products', '3.0.25', 'acc-3.0.25'],
     ]);
@@ -272,8 +274,8 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'signed-reverse-compatibility',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
-      capabilities: { supported_versions: ['3.1.18', '3.2.0-beta.6'] },
+      adcpVersion: '3.2.0-rc.4',
+      capabilities: { supported_versions: ['3.1.18', '3.2.0-rc.4'] },
       validation: { requests: 'off', responses: 'off' },
       legacyCreativeFormatConverter: ({ formatId }) =>
         formatId.id === 'display-300x250'
@@ -327,7 +329,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'compact-only',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
+      adcpVersion: '3.2.0-rc.4',
       validation: { requests: 'off', responses: 'off' },
     });
 
@@ -342,51 +344,113 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     assert.ok(!listed.tools.some(tool => tool.name === 'get_products'));
   });
 
-  it('rejects compact proposal mutations before invoking without trusted account and principal scope', async () => {
+  it('distinguishes omitted accounts from supplied unresolved accounts in every resolution mode', async () => {
+    const auth = {
+      authInfo: {
+        token: 'redacted',
+        clientId: 'buyer-1',
+        scopes: [],
+        credential: { kind: 'api_key', key_id: 'buyer-key-1' },
+      },
+    };
+
+    for (const resolution of ['explicit', 'implicit', 'derived']) {
+      let calls = 0;
+      const base = buildPlatform();
+      const platform = buildPlatform({
+        accounts: {
+          ...base.accounts,
+          resolution,
+          resolve: async () => null,
+        },
+        mediaBuyLifecycle: {
+          requestProposals: async () => {
+            calls += 1;
+            return { outcome: 'declined', reason: 'not available' };
+          },
+          declineProposals: async () => {
+            calls += 1;
+            return { results: [] };
+          },
+        },
+      });
+      const server = createAdcpServerFromPlatform(platform, {
+        name: `scoped-compact-${resolution}`,
+        version: '1.0.0',
+        adcpVersion: '3.2.0-rc.4',
+        validation: { requests: 'off', responses: 'off' },
+      });
+
+      const omitted = await server.dispatchTestRequest(
+        {
+          method: 'tools/call',
+          params: {
+            name: 'request_proposals',
+            arguments: { idempotency_key: `proposal-scope-${resolution}-0001`, brief: 'test' },
+          },
+        },
+        auth
+      );
+      assert.strictEqual(omitted.structuredContent.adcp_error.code, 'ACCOUNT_REQUIRED', resolution);
+      assert.strictEqual(omitted.structuredContent.adcp_error.recovery, 'correctable', resolution);
+      assert.strictEqual(omitted.structuredContent.adcp_error.field, 'account', resolution);
+      if (resolution === 'implicit') {
+        assert.match(omitted.structuredContent.adcp_error.suggestion, /sync_accounts/i, resolution);
+        assert.doesNotMatch(omitted.structuredContent.adcp_error.suggestion, /account:\s*\{\s*account_id/i);
+      } else {
+        assert.match(omitted.structuredContent.adcp_error.suggestion, /list_accounts/i, resolution);
+      }
+
+      const suppliedRef =
+        resolution === 'implicit'
+          ? { brand: { domain: 'missing.example' }, operator: 'missing-operator' }
+          : { account_id: 'missing-account' };
+      const supplied = await server.dispatchTestRequest(
+        {
+          method: 'tools/call',
+          params: {
+            name: 'request_proposals',
+            arguments: {
+              idempotency_key: `proposal-supplied-${resolution}-0001`,
+              brief: 'test',
+              account: suppliedRef,
+            },
+          },
+        },
+        auth
+      );
+      assert.strictEqual(supplied.structuredContent.adcp_error.code, 'ACCOUNT_NOT_FOUND', resolution);
+      assert.strictEqual(supplied.structuredContent.adcp_error.recovery, 'terminal', resolution);
+
+      const resourceScoped = await server.dispatchTestRequest(
+        {
+          method: 'tools/call',
+          params: {
+            name: 'decline_proposals',
+            arguments: { idempotency_key: `decline-scope-${resolution}-0001`, declines: [] },
+          },
+        },
+        auth
+      );
+      assert.strictEqual(resourceScoped.structuredContent.adcp_error.code, 'ACCOUNT_REQUIRED', resolution);
+      assert.strictEqual(resourceScoped.structuredContent.adcp_error.field, 'context_id', resolution);
+      assert.match(
+        resourceScoped.structuredContent.adcp_error.suggestion,
+        resolution === 'implicit' ? /sync_accounts/i : /context_id|proposal reference/i,
+        resolution
+      );
+      assert.strictEqual(calls, 0, resolution);
+    }
+  });
+
+  it('does not treat an unauthenticated session key as compact-mutation authentication', async () => {
     let calls = 0;
     const base = buildPlatform();
     const platform = buildPlatform({
       accounts: {
         ...base.accounts,
-        resolve: async ref => (ref == null ? null : { id: ref.account_id, metadata: {} }),
+        resolve: async () => null,
       },
-      mediaBuyLifecycle: {
-        declineProposals: async () => {
-          calls += 1;
-          return { results: [] };
-        },
-      },
-    });
-    const server = createAdcpServerFromPlatform(platform, {
-      name: 'scoped-compact',
-      version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
-      validation: { requests: 'off', responses: 'off' },
-    });
-    const response = await server.dispatchTestRequest(
-      {
-        method: 'tools/call',
-        params: {
-          name: 'decline_proposals',
-          arguments: { idempotency_key: 'decline-scope-key-0001', declines: [] },
-        },
-      },
-      {
-        authInfo: {
-          token: 'redacted',
-          clientId: 'buyer-1',
-          scopes: [],
-          credential: { kind: 'api_key', key_id: 'buyer-key-1' },
-        },
-      }
-    );
-    assert.strictEqual(response.structuredContent.adcp_error.code, 'ACCOUNT_NOT_FOUND');
-    assert.strictEqual(calls, 0);
-  });
-
-  it('does not treat an unauthenticated session key as compact-mutation authentication', async () => {
-    let calls = 0;
-    const platform = buildPlatform({
       mediaBuyLifecycle: {
         declineProposals: async () => {
           calls += 1;
@@ -397,7 +461,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'anonymous-session',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
+      adcpVersion: '3.2.0-rc.4',
       resolveSessionKey: () => 'anonymous-session',
       validation: { requests: 'off', responses: 'off' },
     });
@@ -425,7 +489,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'compact-replay-auth',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
+      adcpVersion: '3.2.0-rc.4',
       idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
       resolveIdempotencyPrincipal: () => 'deliberately-shared-principal',
       resolveSessionKey: () => 'deliberately-shared-session',
@@ -474,7 +538,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'refinement-scope',
       version: '1.0.0',
-      adcpVersion: '3.2.0-beta.6',
+      adcpVersion: '3.2.0-rc.4',
       validation: { requests: 'off', responses: 'off' },
     });
     const response = await server.dispatchTestRequest(
@@ -565,6 +629,443 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     assert.ok(sawCtx.account, 'ctx.account should be populated from accounts.resolve');
     assert.strictEqual(typeof sawCtx.state.workflowSteps, 'function');
     assert.strictEqual(typeof sawCtx.resolve.creativeFormat, 'function');
+  });
+
+  it('threads authenticated request principals into native RequestContext without serializing them (#2765)', async () => {
+    const principal = {
+      token: 'incoming-secret-token',
+      clientId: 'buyer-1',
+      scopes: ['read'],
+      credential: { kind: 'api_key', key_id: 'buyer-key-1' },
+    };
+    const resolverAuth = [];
+    const handlerContexts = [];
+    const base = buildPlatform();
+    const platform = buildPlatform({
+      accounts: {
+        ...base.accounts,
+        resolve: async (_ref, ctx) => {
+          resolverAuth.push(ctx.authInfo);
+          return {
+            id: `acct-${ctx.authInfo.credential.key_id}`,
+            name: 'Scoped account',
+            status: 'active',
+            ctx_metadata: {},
+          };
+        },
+      },
+      sales: {
+        ...base.sales,
+        getProducts: async (_req, ctx) => {
+          handlerContexts.push(ctx);
+          return { products: [], cache_scope: 'account' };
+        },
+      },
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'native-auth-context',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await server.dispatchTestRequest(
+      {
+        method: 'tools/call',
+        params: { name: 'get_products', arguments: { account: { account_id: 'acct-1' } } },
+      },
+      { authInfo: principal }
+    );
+    const secondPrincipal = {
+      token: 'second-incoming-secret-token',
+      clientId: 'buyer-2',
+      scopes: ['read'],
+      credential: { kind: 'api_key', key_id: 'buyer-key-2' },
+    };
+    const secondResult = await server.dispatchTestRequest(
+      {
+        method: 'tools/call',
+        params: { name: 'get_products', arguments: { account: { account_id: 'acct-2' } } },
+      },
+      { authInfo: secondPrincipal }
+    );
+
+    assert.deepStrictEqual(resolverAuth, [principal, secondPrincipal]);
+    assert.notStrictEqual(handlerContexts[0].authInfo, principal);
+    assert.notStrictEqual(handlerContexts[1].authInfo, secondPrincipal);
+    assert.deepStrictEqual(handlerContexts[0].authInfo, principal);
+    assert.deepStrictEqual(handlerContexts[1].authInfo, secondPrincipal);
+    assert.ok(Object.isFrozen(handlerContexts[0].authInfo));
+    assert.ok(Object.isFrozen(handlerContexts[0].authInfo.credential));
+    assert.strictEqual(handlerContexts[0].account.id, 'acct-buyer-key-1');
+    assert.strictEqual(handlerContexts[1].account.id, 'acct-buyer-key-2');
+    assert.strictEqual(
+      handlerContexts[0].account.authInfo,
+      undefined,
+      'incoming principal is not persisted on account'
+    );
+    assert.strictEqual(
+      handlerContexts[1].account.authInfo,
+      undefined,
+      'incoming principal is not persisted on account'
+    );
+    assert.ok(!JSON.stringify(result).includes(principal.token), 'principal credentials never enter the wire response');
+    assert.ok(!JSON.stringify(secondResult).includes(secondPrincipal.token));
+  });
+
+  it('keeps async task ownership bound when a native handler attempts to mutate authInfo', async () => {
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            ctx.authInfo.clientId = 'caller-b';
+            return ctx.handoffToTask(async () => ({ products: [], cache_scope: 'account' }));
+          },
+        },
+      }),
+      {
+        name: 'native-auth-ownership',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+    const result = await server.dispatchTestRequest(
+      {
+        method: 'tools/call',
+        params: { name: 'get_products', arguments: { account: { account_id: 'acct-1' } } },
+      },
+      { authInfo: { token: 'secret', clientId: 'caller-a', scopes: [] } }
+    );
+    const taskId = result.structuredContent.task_id;
+    await server.awaitTaskUnsafe(taskId);
+    assert.ok(await server.getTaskState(taskId, { accountId: 'acct-1', ownerScope: 'client:caller-a' }));
+    assert.strictEqual(await server.getTaskState(taskId, { accountId: 'acct-1', ownerScope: 'client:caller-b' }), null);
+  });
+
+  it('preserves live AbortSignal cancellation in native authInfo context (#2773)', async () => {
+    const controller = new AbortController();
+    let receivedSignal;
+    let handlerStartedResolve;
+    const handlerStarted = new Promise(resolve => {
+      handlerStartedResolve = resolve;
+    });
+    let continueHandlerResolve;
+    const continueHandler = new Promise(resolve => {
+      continueHandlerResolve = resolve;
+    });
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            receivedSignal = ctx.authInfo.extra.signal;
+            handlerStartedResolve();
+            await continueHandler;
+            return { products: [], cache_scope: 'account' };
+          },
+        },
+      }),
+      {
+        name: 'native-auth-cancellation',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    const request = server.invoke({
+      toolName: 'get_products',
+      args: { account: { account_id: 'acct-1' }, buying_mode: 'wholesale' },
+      authInfo: {
+        token: 'secret',
+        clientId: 'buyer',
+        scopes: [],
+        extra: { signal: controller.signal },
+      },
+    });
+    await handlerStarted;
+
+    controller.abort(new Error('deadline'));
+    continueHandlerResolve();
+    await request;
+    assert.strictEqual(receivedSignal, controller.signal);
+    assert.strictEqual(receivedSignal.aborted, true);
+  });
+
+  it('does not eagerly invoke accessors while cloning the authInfo signal slot (#2773)', async () => {
+    const controller = new AbortController();
+    let signalReads = 0;
+    const extra = {};
+    Object.defineProperty(extra, 'signal', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        signalReads += 1;
+        return controller.signal;
+      },
+    });
+    let receivedExtra;
+    let receivedSignalDescriptor;
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            receivedExtra = ctx.authInfo.extra;
+            receivedSignalDescriptor = Object.getOwnPropertyDescriptor(receivedExtra, 'signal');
+            return { products: [], cache_scope: 'account' };
+          },
+        },
+      }),
+      {
+        name: 'native-auth-signal-accessor',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    await server.invoke({
+      toolName: 'get_products',
+      args: { account: { account_id: 'acct-1' }, buying_mode: 'wholesale' },
+      authInfo: { token: 'secret', clientId: 'buyer', scopes: [], extra },
+    });
+
+    assert.strictEqual(signalReads, 0);
+    assert.notStrictEqual(receivedExtra, extra);
+    assert.ok(Object.isFrozen(receivedExtra));
+    assert.strictEqual(receivedSignalDescriptor.get, Object.getOwnPropertyDescriptor(extra, 'signal').get);
+  });
+
+  it('preserves only extra.signal when auth credential and extra records alias in either key order (#2773)', async () => {
+    const controller = new AbortController();
+    const shared = {
+      kind: 'api_key',
+      key_id: 'caller-a',
+      signal: controller.signal,
+    };
+    const principals = [
+      {
+        token: 'secret',
+        clientId: 'caller-a',
+        scopes: [],
+        credential: shared,
+        extra: shared,
+      },
+      {
+        token: 'secret',
+        clientId: 'caller-a',
+        scopes: [],
+        extra: shared,
+        credential: shared,
+      },
+    ];
+    const receivedAuth = [];
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            receivedAuth.push(ctx.authInfo);
+            return { products: [], cache_scope: 'account' };
+          },
+        },
+      }),
+      {
+        name: 'native-auth-signal-alias',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    for (const principal of principals) {
+      await server.invoke({
+        toolName: 'get_products',
+        args: { account: { account_id: 'acct-1' }, buying_mode: 'wholesale' },
+        authInfo: principal,
+      });
+    }
+    controller.abort(new Error('deadline'));
+
+    for (const authInfo of receivedAuth) {
+      assert.strictEqual(authInfo.extra.signal, controller.signal);
+      assert.strictEqual(authInfo.extra.signal.aborted, true);
+      assert.notStrictEqual(authInfo.credential.signal, controller.signal);
+      assert.notStrictEqual(authInfo.extra, authInfo.credential);
+      assert.ok(Object.isFrozen(authInfo.extra));
+      assert.ok(Object.isFrozen(authInfo.credential));
+    }
+  });
+
+  it('preserves auth record aliases when no live signal requires a path-specific clone (#2773)', async () => {
+    const shared = { kind: 'api_key', key_id: 'caller-a' };
+    let receivedAuthInfo;
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            receivedAuthInfo = ctx.authInfo;
+            return { products: [], cache_scope: 'account' };
+          },
+        },
+      }),
+      {
+        name: 'native-auth-record-alias',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    await server.invoke({
+      toolName: 'get_products',
+      args: { account: { account_id: 'acct-1' }, buying_mode: 'wholesale' },
+      authInfo: {
+        token: 'secret',
+        clientId: 'caller-a',
+        scopes: [],
+        credential: shared,
+        extra: shared,
+      },
+    });
+
+    assert.strictEqual(receivedAuthInfo.credential, receivedAuthInfo.extra);
+    assert.notStrictEqual(receivedAuthInfo.extra, shared);
+    assert.ok(Object.isFrozen(receivedAuthInfo.extra));
+  });
+
+  it('does not let an AbortSignal prototype spoof bypass authInfo snapshotting (#2773)', async () => {
+    const principal = {
+      token: 'secret',
+      clientId: 'caller-a',
+      scopes: [],
+    };
+    Object.setPrototypeOf(principal, AbortSignal.prototype);
+    let receivedAuthInfo;
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            receivedAuthInfo = ctx.authInfo;
+            ctx.authInfo.clientId = 'caller-b';
+            return ctx.handoffToTask(async () => ({ products: [], cache_scope: 'account' }));
+          },
+        },
+      }),
+      {
+        name: 'native-auth-signal-spoof',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    const result = await server.dispatchTestRequest(
+      {
+        method: 'tools/call',
+        params: { name: 'get_products', arguments: { account: { account_id: 'acct-1' } } },
+      },
+      { authInfo: principal }
+    );
+    const taskId = result.structuredContent.task_id;
+    await server.awaitTaskUnsafe(taskId);
+
+    assert.notStrictEqual(receivedAuthInfo, principal);
+    assert.ok(Object.isFrozen(receivedAuthInfo));
+    assert.strictEqual(receivedAuthInfo.clientId, 'caller-a');
+    assert.ok(await server.getTaskState(taskId, { accountId: 'acct-1', ownerScope: 'client:caller-a' }));
+    assert.strictEqual(await server.getTaskState(taskId, { accountId: 'acct-1', ownerScope: 'client:caller-b' }), null);
+  });
+
+  it('snapshots root auth principals backed by genuine AbortSignals (#2773)', async () => {
+    const inheritedController = new AbortController();
+    const principals = [
+      Object.assign(new AbortController().signal, {
+        token: 'secret',
+        clientId: 'caller-a',
+        scopes: [],
+      }),
+      Object.setPrototypeOf(
+        {
+          token: 'secret',
+          clientId: 'caller-a',
+          scopes: [],
+        },
+        inheritedController.signal
+      ),
+    ];
+
+    for (const [index, principal] of principals.entries()) {
+      let receivedAuthInfo;
+      const base = buildPlatform();
+      const server = createAdcpServerFromPlatform(
+        buildPlatform({
+          sales: {
+            ...base.sales,
+            getProducts: async (_req, ctx) => {
+              receivedAuthInfo = ctx.authInfo;
+              ctx.authInfo.clientId = 'caller-b';
+              return ctx.handoffToTask(async () => ({ products: [], cache_scope: 'account' }));
+            },
+          },
+        }),
+        {
+          name: `native-auth-signal-root-${index}`,
+          version: '1.0.0',
+          validation: { requests: 'off', responses: 'off' },
+        }
+      );
+
+      const result = await server.dispatchTestRequest(
+        {
+          method: 'tools/call',
+          params: { name: 'get_products', arguments: { account: { account_id: 'acct-1' } } },
+        },
+        { authInfo: principal }
+      );
+      const taskId = result.structuredContent.task_id;
+      await server.awaitTaskUnsafe(taskId);
+
+      assert.notStrictEqual(receivedAuthInfo, principal);
+      assert.ok(Object.isFrozen(receivedAuthInfo));
+      assert.strictEqual(receivedAuthInfo.clientId, 'caller-a');
+      assert.ok(await server.getTaskState(taskId, { accountId: 'acct-1', ownerScope: 'client:caller-a' }));
+      assert.strictEqual(
+        await server.getTaskState(taskId, { accountId: 'acct-1', ownerScope: 'client:caller-b' }),
+        null
+      );
+    }
+  });
+
+  it('omits authInfo from unauthenticated native RequestContext calls (#2765)', async () => {
+    let handlerCtx;
+    const base = buildPlatform();
+    const server = createAdcpServerFromPlatform(
+      buildPlatform({
+        sales: {
+          ...base.sales,
+          getProducts: async (_req, ctx) => {
+            handlerCtx = ctx;
+            return { products: [], cache_scope: 'account' };
+          },
+        },
+      }),
+      {
+        name: 'native-anonymous-context',
+        version: '1.0.0',
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'get_products', arguments: { account: { account_id: 'acct-1' } } },
+    });
+    assert.strictEqual(Object.hasOwn(handlerCtx, 'authInfo'), false);
   });
 
   it('preserves dual format declarations on the AdCP 3.1 canonical product wire (#2440)', async () => {
@@ -1905,19 +2406,62 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     }
   });
 
-  it('errors cleanly when a canonical-only product cannot be represented on a 3.0 server wire', async () => {
+  it('omits a canonical-only product from a 3.0 wire without poisoning representable products', async () => {
     const platform = buildPlatform();
     const getProducts = platform.sales.getProducts;
     platform.sales.getProducts = async (...args) => {
       const response = await getProducts(...args);
       return {
         ...response,
-        products: response.products.map(product => ({
-          ...product,
-          // Inherently canonical-only: unlike the newly mapped 300x250 image,
-          // responsive asset-pool composition has no legacy named-format form.
-          format_options: [{ format_kind: 'responsive_creative', params: {} }],
-        })),
+        errors: [{ code: 'UPSTREAM_WARNING', message: 'A producer warning is preserved.' }],
+        products: [
+          {
+            ...response.products[0],
+            channels: ['display'],
+            publisher_properties: [{ publisher_domain: 'seller.example', selection_type: 'all' }],
+            pricing_options: [
+              {
+                pricing_option_id: 'p1-cpm',
+                pricing_model: 'cpm',
+                fixed_price: 5,
+                currency: 'USD',
+              },
+            ],
+            reporting_capabilities: {
+              available_reporting_frequencies: ['daily'],
+              expected_delay_minutes: 60,
+              timezone: 'UTC',
+              supports_webhooks: false,
+              available_metrics: ['impressions', 'spend'],
+              date_range_support: 'date_range',
+            },
+          },
+          {
+            product_id: 'canonical-only-responsive',
+            name: 'Canonical-only responsive product',
+            description: 'Responsive asset-pool composition has no legacy named-format form.',
+            format_options: [{ format_kind: 'responsive_creative', params: {} }],
+            channels: ['display'],
+            delivery_type: 'non_guaranteed',
+            publisher_properties: [{ publisher_domain: 'seller.example', selection_type: 'all' }],
+            pricing_options: [
+              {
+                pricing_option_id: 'canonical-only-responsive-cpm',
+                pricing_model: 'cpm',
+                fixed_price: 5,
+                currency: 'USD',
+              },
+            ],
+            reporting_capabilities: {
+              available_reporting_frequencies: ['daily'],
+              expected_delay_minutes: 60,
+              timezone: 'UTC',
+              supports_webhooks: false,
+              available_metrics: ['impressions', 'spend'],
+              date_range_support: 'date_range',
+            },
+          },
+        ],
       };
     };
 
@@ -1925,7 +2469,7 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
       name: 'legacy-wire-unrepresentable-product',
       version: '1.0.0',
       adcpVersion: '3.0.0',
-      validation: { requests: 'off', responses: 'off' },
+      validation: { requests: 'off', responses: 'strict' },
     });
 
     const result = await server.dispatchTestRequest({
@@ -1936,9 +2480,24 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
       },
     });
 
-    assert.strictEqual(result.isError, true);
-    assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
-    assert.match(result.structuredContent.adcp_error.message, /cannot be represented on the configured legacy wire/);
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.deepStrictEqual(
+      result.structuredContent.products.map(product => product.product_id),
+      ['p1']
+    );
+    assert.deepStrictEqual(result.structuredContent.products[0].format_ids, [
+      { agent_url: 'https://creative.adcontextprotocol.org/', id: 'display_image' },
+    ]);
+    assert.deepStrictEqual(result.structuredContent.errors[0], {
+      code: 'UPSTREAM_WARNING',
+      message: 'A producer warning is preserved.',
+    });
+    assert.ok(
+      result.structuredContent.errors.some(
+        error =>
+          error.code === 'CANONICAL_NOT_V1_TRANSLATABLE' && error.details?.product_id === 'canonical-only-responsive'
+      )
+    );
   });
 
   it('normalizes legacy creative refs before modern platform handlers run', async () => {
@@ -3028,6 +3587,42 @@ describe('createAdcpServerFromPlatform — v6.0 alpha', () => {
     assert.strictEqual(result.isError, true);
     assert.strictEqual(result.structuredContent.adcp_error.code, 'ACCOUNT_NOT_FOUND');
   });
+
+  it('preserves a typed auth-derived ACCOUNT_NOT_FOUND on account-optional sync discovery', async () => {
+    let calls = 0;
+    const base = buildPlatform();
+    const platform = buildPlatform({
+      accounts: {
+        ...base.accounts,
+        resolve: async ref => {
+          if (ref == null) {
+            throw new AdcpError('ACCOUNT_NOT_FOUND', { message: 'no account linkage for this principal' });
+          }
+          return null;
+        },
+      },
+      sales: {
+        ...base.sales,
+        getProducts: async () => {
+          calls += 1;
+          return { products: [], cache_scope: 'public' };
+        },
+      },
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'typed-auth-derived-error',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'get_products', arguments: { buying_mode: 'brief', brief: 'test' } },
+    });
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'ACCOUNT_NOT_FOUND');
+    assert.strictEqual(result.structuredContent.adcp_error.recovery, 'terminal');
+    assert.strictEqual(calls, 0);
+  });
 });
 
 describe('SalesPlatform — full surface dispatch', () => {
@@ -3301,6 +3896,73 @@ describe('CreativeBuilderPlatform + AudiencePlatform wiring', () => {
     assert.ok(sawReq, 'creative.buildCreative should be invoked');
   });
 
+  it('passes the BuildCreativeVariantSuccess arm through without manifest wrapping (#2706)', async () => {
+    const variantResponse = {
+      creatives: [
+        {
+          build_creative_id: 'build-1',
+          variants: [
+            {
+              build_variant_id: 'variant-1',
+              creative_manifest: {
+                format_id: { id: 'standard', agent_url: 'https://creative.example/' },
+                assets: {},
+              },
+              variant_axis_value: 'voice-1',
+              recommended: true,
+              rank: 1,
+            },
+          ],
+        },
+      ],
+      items_total: 1,
+      items_returned: 1,
+      leaves_total: 2,
+      leaves_returned: 1,
+      budget_status: 'capped',
+      errors: [{ code: 'BUDGET_CAP_REACHED', message: 'Spend cap reached', recovery: 'correctable' }],
+    };
+    const platform = {
+      ...buildCreativeOnlyPlatform({ specialisms: ['creative-generative'] }),
+      creative: { buildCreativeLegacy: async () => variantResponse },
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'variant-builder',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'strict' },
+    });
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'build_creative', arguments: {} },
+    });
+
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.deepStrictEqual(result.structuredContent.creatives, variantResponse.creatives);
+    assert.strictEqual(result.structuredContent.status, 'completed');
+    assert.strictEqual(result.structuredContent.budget_status, 'capped');
+    assert.strictEqual(result.structuredContent.errors[0].code, 'BUDGET_CAP_REACHED');
+    assert.strictEqual(result.structuredContent.creative_manifest, undefined);
+  });
+
+  it('keeps malformed creative variant groups rejected by strict response validation (#2706)', async () => {
+    const platform = {
+      ...buildCreativeOnlyPlatform({ specialisms: ['creative-generative'] }),
+      creative: { buildCreativeLegacy: async () => ({ creatives: [{}] }) },
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'invalid-variant-builder',
+      version: '1.0.0',
+      validation: { requests: 'off', responses: 'strict' },
+    });
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'build_creative', arguments: {} },
+    });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'VALIDATION_ERROR');
+  });
+
   it('preview_creative dispatches canonical capability and creative-library routes through previewCreative', async () => {
     const seen = [];
     const platform = {
@@ -3504,6 +4166,7 @@ describe('CreativeBuilderPlatform + AudiencePlatform wiring', () => {
       },
       accounts: {
         resolution: 'derived',
+        list: async () => ({ items: [] }),
         resolve: async () => ({
           id: 'singleton',
           name: 'Acme',
@@ -3554,6 +4217,7 @@ describe('CreativeBuilderPlatform + AudiencePlatform wiring', () => {
       },
       accounts: {
         resolution: 'derived',
+        list: async () => ({ items: [] }),
         resolve: async () => ({
           id: 'singleton',
           name: 'Acme',
@@ -3704,7 +4368,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     };
   }
 
-  function dispatchCreate(server) {
+  function dispatchCreate(server, overrides = {}) {
     return server.dispatchTestRequest({
       method: 'tools/call',
       params: {
@@ -3716,6 +4380,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
           start_time: '2026-05-01T00:00:00Z',
           end_time: '2026-06-01T00:00:00Z',
           account: { account_id: 'acc_1' },
+          ...overrides,
         },
       },
     });
@@ -3767,6 +4432,303 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     });
   }
 
+  it('fails closed before task creation or callback execution when push delivery is not configured (#2836)', async () => {
+    let callbackRan = false;
+    let createCalls = 0;
+    const taskRegistry = createInMemoryTaskRegistry();
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return create(args);
+    };
+    const platform = buildHitlPlatform({
+      createMediaBuy: async (_req, ctx) =>
+        ctx.handoffToTask(async () => {
+          callbackRan = true;
+          return { media_buy_id: 'must-not-run' };
+        }),
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'no-task-webhook-delivery',
+      version: '0.0.1',
+      taskRegistry,
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'no-delivery-path' },
+    });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config');
+    assert.match(result.structuredContent.adcp_error.message, /Remove push_notification_config/);
+    assert.match(result.structuredContent.adcp_error.suggestion, /configure.*task webhooks/i);
+    assert.strictEqual(createCalls, 0, 'refusal must happen before TaskRegistry.create');
+    assert.strictEqual(callbackRan, false, 'refusal must not start the background handoff');
+  });
+
+  it('rejects beta.5+ push handoffs without operation_id before task creation when request validation is off (#2836)', async () => {
+    let callbackRan = false;
+    let createCalls = 0;
+    const taskRegistry = createInMemoryTaskRegistry();
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return create(args);
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) =>
+          ctx.handoffToTask(async () => {
+            callbackRan = true;
+            return { media_buy_id: 'must-not-run' };
+          }),
+      }),
+      {
+        name: 'missing-operation-id-pre-create',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+        taskWebhookEmitter: {
+          emit: async params => ({
+            delivery_id: params.delivery_id,
+            idempotency_key: 'unused',
+            attempts: 1,
+            delivered: true,
+            errors: [],
+          }),
+        },
+      }
+    );
+
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook' },
+    });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config.operation_id');
+    assert.strictEqual(createCalls, 0, 'operation_id refusal must happen before TaskRegistry.create');
+    assert.strictEqual(callbackRan, false, 'operation_id refusal must not start the background handoff');
+  });
+
+  it('keeps the push-delivery refusal structured when the operator logger throws (#2836)', async () => {
+    let throwWarnings = false;
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) => ctx.handoffToTask(async () => ({ media_buy_id: 'must-not-run' })),
+      }),
+      {
+        name: 'throwing-refusal-logger',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        logger: {
+          debug() {},
+          info() {},
+          warn() {
+            if (throwWarnings) throw new Error('logger failure');
+          },
+          error() {},
+        },
+      }
+    );
+    throwWarnings = true;
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'throwing-logger' },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config');
+  });
+
+  it('refuses an external push handoff even when a framework emitter is configured (#2836)', async () => {
+    let producerCalled = false;
+    let createCalls = 0;
+    const taskRegistry = {
+      ...createInMemoryTaskRegistry(),
+      durability: 'durable',
+      registryId: 'external-emitter-refusal',
+    };
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return create(args);
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) =>
+          ctx.handoffToTask(
+            async () => {
+              producerCalled = true;
+            },
+            { settlement: 'external' }
+          ),
+      }),
+      {
+        name: 'external-settlement-framework-emitter',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+        taskWebhookEmitter: {
+          emit: async params => ({
+            delivery_id: params.delivery_id,
+            idempotency_key: 'unused',
+            attempts: 1,
+            delivered: true,
+            errors: [],
+          }),
+        },
+      }
+    );
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'external-emitter' },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(createCalls, 0);
+    assert.strictEqual(producerCalled, false);
+  });
+
+  it('refuses external settlement before create when the registry has no stable registryId (#2836)', async () => {
+    let producerCalled = false;
+    let createCalls = 0;
+    const taskRegistry = { ...createInMemoryTaskRegistry(), durability: 'durable', registryId: '' };
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return create(args);
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) =>
+          ctx.handoffToTask(
+            async () => {
+              producerCalled = true;
+            },
+            { settlement: 'external' }
+          ),
+      }),
+      {
+        name: 'external-settlement-no-registry-id',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+      }
+    );
+    const result = await dispatchCreate(server);
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'SERVICE_UNAVAILABLE');
+    assert.strictEqual(createCalls, 0);
+    assert.strictEqual(producerCalled, false);
+  });
+
+  it('rejects an external custom registry reference with a mismatched registryId before producer execution (#2836)', async () => {
+    let producerCalled = false;
+    let createCalls = 0;
+    const taskRegistry = { ...createInMemoryTaskRegistry(), durability: 'durable', registryId: 'expected-registry' };
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return { ...(await create(args)), registryId: 'different-registry' };
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) =>
+          ctx.handoffToTask(
+            async () => {
+              producerCalled = true;
+            },
+            { settlement: 'external' }
+          ),
+      }),
+      {
+        name: 'external-settlement-mismatched-registry-id',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+      }
+    );
+
+    const result = await dispatchCreate(server);
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'SERVICE_UNAVAILABLE');
+    assert.notStrictEqual(
+      result.structuredContent.status,
+      'submitted',
+      'a mismatched task ref must not acknowledge submitted'
+    );
+    assert.strictEqual(createCalls, 1, 'the custom create contract is checked immediately after allocation');
+    assert.strictEqual(producerCalled, false, 'a mismatched task ref must not reach the external producer');
+  });
+
+  it('keeps polling-only handoffs available without a task webhook emitter (#2836)', async () => {
+    const platform = buildHitlPlatform({
+      createMediaBuy: async (_req, ctx) => ctx.handoffToTask(async () => ({ media_buy_id: 'polling-only' })),
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'polling-only-handoff',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await dispatchCreate(server);
+    assert.notStrictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.status, 'submitted');
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
+  });
+
+  it('keeps synchronous successes with push config successful without a task webhook emitter (#2836)', async () => {
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(), {
+      name: 'sync-with-push-config',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'sync-is-not-submitted' },
+    });
+    assert.notStrictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.media_buy_id, 'mb_default');
+  });
+
+  it('fails closed through the signals dispatcher before task creation (#2836)', async () => {
+    let callbackRan = false;
+    let createCalls = 0;
+    const taskRegistry = createInMemoryTaskRegistry();
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async opts => {
+      createCalls += 1;
+      return create(opts);
+    };
+    const platform = buildHitlPlatform();
+    platform.sales = undefined;
+    platform.capabilities = { specialisms: ['signal-marketplace'], config: {} };
+    platform.signals = {
+      getSignals: async (_request, ctx) =>
+        ctx.handoffToTask(async () => {
+          callbackRan = true;
+          return { signals: [] };
+        }),
+      activateSignal: async () => ({ deployments: [] }),
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'signals-no-task-webhook-delivery',
+      version: '0.0.1',
+      taskRegistry,
+      validation: { requests: 'off', responses: 'off' },
+    });
+
+    const result = await dispatchGetSignals(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'signals-no-delivery-path' },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config');
+    assert.strictEqual(createCalls, 0);
+    assert.strictEqual(callbackRan, false);
+  });
+
   it('getProducts returning ctx.handoffToTask: submitted envelope, background completes terminal products', async () => {
     let capturedTaskId;
     const platform = buildHitlPlatform({
@@ -3800,9 +4762,9 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     assert.strictEqual(result.structuredContent.proposals, undefined);
 
     const taskId = result.structuredContent.task_id;
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
-    const finalRecord = await server.getTaskState(taskId);
+    const finalRecord = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
     assert.strictEqual(finalRecord.status, 'completed');
     assert.deepStrictEqual(finalRecord.result, {
       products: [
@@ -3850,9 +4812,9 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     assert.strictEqual(result.structuredContent.signals, undefined);
 
     const taskId = result.structuredContent.task_id;
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
-    const finalRecord = await server.getTaskState(taskId);
+    const finalRecord = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
     assert.strictEqual(finalRecord.status, 'completed');
     assert.deepStrictEqual(finalRecord.result, {
       signals: [{ signal_agent_segment_id: 'sig_async', name: 'Async signal' }],
@@ -3941,7 +4903,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     );
 
     releaseTask();
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
     const completed = await server.dispatchTestRequest({
       method: 'tools/call',
@@ -4064,7 +5026,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     );
 
     releaseTask();
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
     const completed = await server.dispatchTestRequest({
       method: 'tools/call',
@@ -4093,7 +5055,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     assertMcpWebhookPayloadValid(emits[0].payload);
   });
 
-  it('rejects async discovery when account is omitted', async () => {
+  it('returns ACCOUNT_REQUIRED before async discovery when account is omitted', async () => {
     const productsPlatform = {
       ...buildHitlPlatform({
         getProducts: async (_req, ctx) =>
@@ -4116,7 +5078,8 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     });
     const products = await dispatchGetProducts(productsServer, { account: undefined });
     assert.strictEqual(products.isError, true);
-    assert.strictEqual(products.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+    assert.strictEqual(products.structuredContent.adcp_error.code, 'ACCOUNT_REQUIRED');
+    assert.strictEqual(products.structuredContent.adcp_error.recovery, 'correctable');
     assert.strictEqual(products.structuredContent.adcp_error.field, 'account');
 
     const signalsPlatform = {
@@ -4141,7 +5104,8 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     });
     const signals = await dispatchGetSignals(signalsServer, { account: undefined });
     assert.strictEqual(signals.isError, true);
-    assert.strictEqual(signals.structuredContent.adcp_error.code, 'INVALID_REQUEST');
+    assert.strictEqual(signals.structuredContent.adcp_error.code, 'ACCOUNT_REQUIRED');
+    assert.strictEqual(signals.structuredContent.adcp_error.recovery, 'correctable');
     assert.strictEqual(signals.structuredContent.adcp_error.field, 'account');
   });
 
@@ -4251,11 +5215,251 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     );
 
     const taskId = result.structuredContent.task_id;
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
-    const finalRecord = await server.getTaskState(taskId);
+    const finalRecord = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
     assert.strictEqual(finalRecord.status, 'completed');
     assert.deepStrictEqual(finalRecord.result, { media_buy_id: 'mb_final', status: 'active' });
+  });
+
+  it('external handoff acknowledges submitted only after the durable producer commit', async () => {
+    let queuedTaskRef;
+    let markProducerStarted;
+    let releaseProducer;
+    const producerStarted = new Promise(resolve => {
+      markProducerStarted = resolve;
+    });
+    const producerCommit = new Promise(resolve => {
+      releaseProducer = resolve;
+    });
+    const platform = buildHitlPlatform({
+      createMediaBuy: async (_req, ctx) =>
+        ctx.handoffToTask(
+          async taskCtx => {
+            // Represents the application queue transaction. The complete
+            // opaque handle, rather than only taskCtx.id, crosses processes.
+            assert.strictEqual(taskCtx.reject, undefined, 'external producers cannot reject in-process');
+            assert.strictEqual('reject' in taskCtx, false, 'external context omits reject at runtime');
+            queuedTaskRef = structuredClone(taskCtx.taskRef);
+            markProducerStarted();
+            await producerCommit;
+          },
+          { settlement: 'external' }
+        ),
+    });
+    const taskRegistry = {
+      ...require('../dist/lib/server/decisioning/runtime/task-registry').createInMemoryTaskRegistry(),
+      durability: 'durable',
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'external-settlement',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry,
+    });
+
+    let responseResolved = false;
+    const submittedPromise = dispatchCreate(server).then(result => {
+      responseResolved = true;
+      return result;
+    });
+    await producerStarted;
+    assert.strictEqual(responseResolved, false, 'submitted must wait for the durable producer commit');
+    releaseProducer();
+    const submitted = await submittedPromise;
+    assert.strictEqual(submitted.structuredContent.status, 'submitted');
+
+    assert.strictEqual(queuedTaskRef.taskId, submitted.structuredContent.task_id);
+    assert.strictEqual(queuedTaskRef.accountId, 'acc_1');
+    assert.strictEqual(queuedTaskRef.ownerScope, 'account:acc_1');
+    const state = await server.getTaskState(submitted.structuredContent.task_id, queuedTaskRef);
+    assert.strictEqual(state.status, 'submitted');
+    assert.strictEqual(state.result, undefined);
+    assert.strictEqual(state.hasWebhook, undefined, 'polling-only tasks do not claim webhook delivery');
+  });
+
+  it('fails closed for framework-settled handoffs without an emitter (#2836)', async () => {
+    let callbackRan = false;
+    const taskRegistry = createInMemoryTaskRegistry();
+    let createCalls = 0;
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async opts => {
+      createCalls += 1;
+      return create(opts);
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) =>
+          ctx.handoffToTask(async () => {
+            callbackRan = true;
+            return { media_buy_id: 'must-not-run' };
+          }),
+      }),
+      {
+        name: 'framework-handoff-no-webhook-owner',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+      }
+    );
+
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'wrong-settlement' },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config');
+    assert.strictEqual(createCalls, 0);
+    assert.strictEqual(callbackRan, false);
+  });
+
+  it('refuses an external push handoff before create without an emitter (#2836)', async () => {
+    let producerCalled = false;
+    let createCalls = 0;
+    const builtIn = createInMemoryTaskRegistry();
+    const taskRegistry = {
+      ...builtIn,
+      durability: 'durable',
+      registryId: 'custom-registry-no-webhook-emitter',
+    };
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return create(args);
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform({
+        createMediaBuy: async (_req, ctx) =>
+          ctx.handoffToTask(
+            async () => {
+              producerCalled = true;
+            },
+            { settlement: 'external' }
+          ),
+      }),
+      {
+        name: 'custom-registry-no-webhook-emitter',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+      }
+    );
+
+    const result = await dispatchCreate(server, {
+      push_notification_config: {
+        url: 'https://buyer.example.com/webhook',
+        operation_id: 'missing-webhook-emitter',
+      },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config');
+    assert.strictEqual(createCalls, 0);
+    assert.strictEqual(producerCalled, false);
+  });
+
+  it('fails closed for external settlement before task creation (#2836)', async () => {
+    let producerCalled = false;
+    let createCalls = 0;
+    const taskRegistry = {
+      ...createInMemoryTaskRegistry(),
+      durability: 'durable',
+      registryId: 'external-refusal-registry',
+    };
+    const create = taskRegistry.create.bind(taskRegistry);
+    taskRegistry.create = async args => {
+      createCalls += 1;
+      return create(args);
+    };
+    const platform = buildHitlPlatform({
+      createMediaBuy: async (_req, ctx) =>
+        ctx.handoffToTask(
+          async () => {
+            producerCalled = true;
+          },
+          { settlement: 'external' }
+        ),
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'external-settlement-no-webhook-owner',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry,
+    });
+
+    const result = await dispatchCreate(server, {
+      push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'external-no-delivery-path' },
+    });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'UNSUPPORTED_FEATURE');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config');
+    assert.strictEqual(createCalls, 0);
+    assert.strictEqual(producerCalled, false);
+  });
+
+  it('polling-only external handoff producer failure rejects the initial invocation without exposing queue details', async () => {
+    const errors = [];
+    let failedTaskRef;
+    const platform = buildHitlPlatform({
+      createMediaBuy: async (_req, ctx) =>
+        ctx.handoffToTask(
+          async taskCtx => {
+            failedTaskRef = structuredClone(taskCtx.taskRef);
+            throw new Error('private queue endpoint unavailable');
+          },
+          { settlement: 'external' }
+        ),
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'external-settlement-producer-failure',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry: {
+        ...require('../dist/lib/server/decisioning/runtime/task-registry').createInMemoryTaskRegistry(),
+        durability: 'durable',
+      },
+      logger: { debug() {}, info() {}, warn() {}, error: message => errors.push(message) },
+    });
+
+    const rejected = await dispatchCreate(server);
+    assert.strictEqual(rejected.isError, true);
+    assert.strictEqual(rejected.structuredContent.adcp_error.code, 'SERVICE_UNAVAILABLE');
+    assert.strictEqual(rejected.structuredContent.task_id, undefined);
+    assert.doesNotMatch(rejected.structuredContent.adcp_error.message, /private queue endpoint/);
+    const state = await server.getTaskState(failedTaskRef.taskId, failedTaskRef);
+    assert.strictEqual(state.status, 'submitted');
+    assert.strictEqual(state.error, undefined);
+    const producerErrors = errors.filter(message =>
+      /Task remains submitted internally; no terminal state, webhook, or buyer acknowledgment was written/.test(message)
+    );
+    assert.strictEqual(producerErrors.length, 1);
+    assert.doesNotMatch(producerErrors[0], /private queue endpoint/);
+  });
+
+  it('external handoff rejects the unmodified process-local in-memory registry', async () => {
+    const { createInMemoryTaskRegistry } = require('../dist/lib/server/decisioning/runtime/task-registry');
+    const processLocalRegistry = createInMemoryTaskRegistry();
+    let producerCalled = false;
+    const platform = buildHitlPlatform({
+      createMediaBuy: async (_req, ctx) =>
+        ctx.handoffToTask(
+          async () => {
+            producerCalled = true;
+          },
+          { settlement: 'external' }
+        ),
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'external-settlement-no-registry-id',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry: processLocalRegistry,
+    });
+
+    const rejected = await dispatchCreate(server);
+    assert.strictEqual(rejected.isError, true);
+    assert.strictEqual(rejected.structuredContent.adcp_error.code, 'SERVICE_UNAVAILABLE');
+    assert.strictEqual(producerCalled, false);
   });
 
   it('canonicalizes legacy custom creatives in async terminal media-buy results', async () => {
@@ -4298,8 +5502,11 @@ describe('HITL dual-method dispatch — *Task variants', () => {
 
     const submitted = await dispatchCreate(server);
     assert.strictEqual(submitted.structuredContent.status, 'submitted');
-    await server.awaitTask(submitted.structuredContent.task_id);
-    const finalRecord = await server.getTaskState(submitted.structuredContent.task_id);
+    await server.awaitTaskUnsafe(submitted.structuredContent.task_id);
+    const finalRecord = await server.getTaskState(submitted.structuredContent.task_id, {
+      accountId: 'acc_1',
+      ownerScope: 'account:acc_1',
+    });
 
     assert.strictEqual(finalRecord.status, 'completed');
     const creative = finalRecord.result.packages[0].creatives[0];
@@ -4335,7 +5542,7 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     assert.strictEqual(submitted.structuredContent.media_buy_id, undefined);
 
     const taskId = submitted.structuredContent.task_id;
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
     const polled = await server.dispatchTestRequest({
       method: 'tools/call',
@@ -4451,8 +5658,11 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     });
     assert.strictEqual(slowResult.structuredContent.status, 'submitted');
     assert.ok(slowResult.structuredContent.task_id);
-    await server.awaitTask(slowResult.structuredContent.task_id);
-    const finalSlow = await server.getTaskState(slowResult.structuredContent.task_id);
+    await server.awaitTaskUnsafe(slowResult.structuredContent.task_id);
+    const finalSlow = await server.getTaskState(slowResult.structuredContent.task_id, {
+      accountId: 'acc_1',
+      ownerScope: 'account:acc_1',
+    });
     assert.strictEqual(finalSlow.result.media_buy_id, 'mb_hitl_slow');
   });
 
@@ -4498,9 +5708,9 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     assert.strictEqual(result.structuredContent.status, 'submitted');
     const taskId = result.structuredContent.task_id;
 
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
-    const finalRecord = await server.getTaskState(taskId);
+    const finalRecord = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
     assert.strictEqual(finalRecord.status, 'failed');
     assert.strictEqual(finalRecord.error.code, 'GOVERNANCE_DENIED');
     assert.strictEqual(finalRecord.error.recovery, 'terminal');
@@ -4523,9 +5733,9 @@ describe('HITL dual-method dispatch — *Task variants', () => {
     const result = await dispatchCreate(server);
     const taskId = result.structuredContent.task_id;
 
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
-    const finalRecord = await server.getTaskState(taskId);
+    const finalRecord = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
     assert.strictEqual(finalRecord.status, 'failed');
     assert.strictEqual(finalRecord.error.code, 'SERVICE_UNAVAILABLE');
     assert.strictEqual(finalRecord.error.recovery, 'transient');
@@ -4724,6 +5934,7 @@ describe('SalesPlatform optional methods (v1.0 gap-fill for rc.1)', () => {
     const platform = buildPlatform({
       accounts: {
         resolution: 'derived',
+        list: async () => ({ items: [] }),
         resolve: async ref => {
           resolveCalledWithRef = ref;
           return { id: 'singleton', name: 'Acme', status: 'active', metadata: {}, authInfo: { kind: 'api_key' } };
@@ -4767,6 +5978,7 @@ describe('SalesPlatform optional methods (v1.0 gap-fill for rc.1)', () => {
     const platform = buildPlatform({
       accounts: {
         resolution: 'derived',
+        list: async () => ({ items: [] }),
         resolve: async () => ({
           id: 'singleton',
           name: 'Acme',
@@ -5469,6 +6681,69 @@ describe('Custom-handler merge seam (incremental migration)', () => {
   // handlers WIN per-key; adopter handlers fill the rest. The explicit raw
   // media-buy lifecycle handlers win only for a negotiated legacy wire.
 
+  it('accepts a legacy get_signals-only handler as a truthful signal-specialism surface (#2732)', async () => {
+    const base = buildPlatform();
+    const platform = {
+      ...base,
+      sales: undefined,
+      signals: undefined,
+      capabilities: {
+        specialisms: ['signal-marketplace'],
+        supported_versions: ['3.1.18', ADCP_VERSION],
+        config: {},
+      },
+    };
+
+    assert.throws(
+      () =>
+        createAdcpServerFromPlatform(platform, {
+          name: 'missing-signals',
+          version: '0.0.1',
+          strictSpecialismValidation: true,
+        }),
+      err => err instanceof PlatformConfigError && /signal-marketplace.*signals/.test(err.message)
+    );
+
+    let receivedRequest;
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'legacy-signals',
+      version: '0.0.1',
+      adcpVersion: ADCP_VERSION,
+      capabilities: { supported_versions: ['3.1.18', ADCP_VERSION] },
+      strictSpecialismValidation: true,
+      validation: { requests: 'off', responses: 'off' },
+      signals: {
+        getSignals: async request => {
+          receivedRequest = request;
+          return { signals: [] };
+        },
+      },
+    });
+
+    const capabilities = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'get_adcp_capabilities', arguments: {} },
+    });
+    assert.notStrictEqual(capabilities.isError, true, JSON.stringify(capabilities.structuredContent));
+    assert.deepStrictEqual(capabilities.structuredContent.specialisms, ['signal-marketplace']);
+    assert.ok(capabilities.structuredContent.supported_protocols.includes('signals'));
+
+    const signals = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_signals',
+        arguments: {
+          adcp_version: '3.1.18',
+          brief: 'luxury auto intenders',
+          account: { account_id: 'acc_1' },
+        },
+      },
+    });
+    assert.notStrictEqual(signals.isError, true, JSON.stringify(signals.structuredContent));
+    assert.deepStrictEqual(signals.structuredContent.signals, []);
+    assert.strictEqual(receivedRequest.adcp_version, '3.1.18');
+  });
+
   it('dispatches getMediaBuys through opts.legacyHandlers.mediaBuy', async () => {
     const platform = buildPlatform();
     let sawArgs;
@@ -5665,6 +6940,121 @@ describe('Custom-handler merge seam (incremental migration)', () => {
     assert.strictEqual(result.structuredContent.accounts[0].brand.domain, 'acme.com');
   });
 
+  it('preserves resolved reporting delivery states for existing and new-account dry runs', async () => {
+    // The reporting delivery schema deliberately contains only secret-free
+    // desired state plus seller-resolved lifecycle fields. This adapter does
+    // not implement its ledger; it only returns the validated state that an
+    // adopter's account handler produced.
+    const reportingDeliveryState = {
+      configuration: {
+        delivery_config_id: 'daily-delivery',
+        delivery_config_version: 1,
+        offering_id: 'delivery-v1',
+        active: true,
+        feed_purpose: 'analytics',
+        report_definition_id: 'media-buy-delivery-v1',
+        reporting_profile: 'media_buy_delivery_v1',
+        scope: { all_media_buys: true },
+        coverage_requirement: 'full',
+        required_finality: 'snapshot',
+        reconciliation_mode: 'delivery_only',
+        schedule: { period_duration: 'P1D', alignment: 'utc', delivery_sla: 'PT1H' },
+      },
+      state: 'ready',
+      validated_at: '2026-09-03T00:00:00Z',
+      activated_at: '2026-09-03T00:00:00Z',
+      current_coverage: {
+        status: 'full',
+        evaluated_at: '2026-09-03T00:00:00Z',
+        media_buy_ids: [],
+        fully_covered_media_buy_ids: [],
+        partially_covered_media_buy_ids: [],
+        unsupported_media_buy_ids: [],
+        unknown_media_buy_ids: [],
+        package_ids: [],
+        covered_package_ids: [],
+        unsupported_package_ids: [],
+        unknown_package_ids: [],
+        limitations: [],
+      },
+    };
+    const platform = buildPlatform({
+      accounts: {
+        resolve: async ref => ({ id: ref?.account_id ?? 'acc_1', metadata: {}, authInfo: { kind: 'api_key' } }),
+        upsert: async (entries, ctx) => {
+          assert.strictEqual(ctx.input.dry_run, true);
+          return entries.map(entry => ({
+            brand: entry.brand ?? { domain: 'acme.example' },
+            operator: entry.operator ?? 'acme-direct',
+            account_id: entry.account?.account_id ?? 'acc_new',
+            action: entry.account ? 'unchanged' : 'created',
+            status: 'active',
+            reporting_delivery_configs: [reportingDeliveryState],
+          }));
+        },
+        list: async () => ({
+          items: [
+            {
+              id: 'acc_existing',
+              name: 'Acme',
+              status: 'active',
+              metadata: {},
+              authInfo: { kind: 'api_key' },
+              reporting_delivery_configs: [reportingDeliveryState],
+            },
+          ],
+          nextCursor: null,
+        }),
+      },
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'reporting-delivery-dry-run',
+      version: '1.0.0',
+      validation: { requests: 'strict', responses: 'strict' },
+    });
+    const cases = [
+      {
+        name: 'existing account',
+        entry: { account: { account_id: 'acc_existing' } },
+        action: 'unchanged',
+      },
+      {
+        name: 'new account',
+        entry: { brand: { domain: 'acme.example' }, operator: 'acme-direct', billing: 'agent' },
+        action: 'created',
+      },
+    ];
+    for (const [index, scenario] of cases.entries()) {
+      const result = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'sync_accounts',
+          arguments: {
+            idempotency_key: `00000000-0000-4000-8000-00000000000${index + 1}`,
+            dry_run: true,
+            accounts: [scenario.entry],
+          },
+        },
+      });
+      assert.notStrictEqual(result.isError, true, `${scenario.name}: ${JSON.stringify(result.structuredContent)}`);
+      assert.strictEqual(result.structuredContent.dry_run, true);
+      assert.strictEqual(result.structuredContent.accounts[0].action, scenario.action);
+      assert.deepStrictEqual(result.structuredContent.accounts[0].reporting_delivery_configs, [reportingDeliveryState]);
+      assert.ok(!JSON.stringify(result.structuredContent).includes('credentials'));
+    }
+
+    const listed = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: { name: 'list_accounts', arguments: {} },
+    });
+    assert.notStrictEqual(listed.isError, true, `list_accounts: ${JSON.stringify(listed.structuredContent)}`);
+    assert.ok(
+      listed.structuredContent.accounts.length > 0,
+      `list_accounts: ${JSON.stringify(listed.structuredContent)}`
+    );
+    assert.deepStrictEqual(listed.structuredContent.accounts[0].reporting_delivery_configs, [reportingDeliveryState]);
+  });
+
   it('list_accounts projects CursorPage into 3.1 pagination block (not top-level next_cursor)', async () => {
     // Regression: adcontextprotocol/adcp#5723 — the pre-fix projector emitted a
     // top-level `next_cursor` field. Both 3.0 and 3.1 `list-accounts-response`
@@ -5783,6 +7173,46 @@ describe('Custom-handler merge seam (incremental migration)', () => {
     });
     assert.notStrictEqual(result.isError, true);
     assert.ok(sawCall, 'opts.accounts.listAccounts MUST run when platform.accounts.list is undefined');
+  });
+
+  it('list_account_changes delegates to the account store with caller context', async () => {
+    let captured;
+    const platform = buildPlatform({
+      accounts: {
+        resolve: async ref => ({
+          id: ref?.account_id ?? 'acc_1',
+          metadata: {},
+          authInfo: { kind: 'api_key' },
+        }),
+        listChanges: async (request, ctx) => {
+          captured = { request, ctx };
+          return {
+            changes: [],
+            cursor: 'checkpoint-2',
+            has_more: false,
+            available_since: '2026-01-01T00:00:00Z',
+            generated_at: '2026-08-28T00:00:00Z',
+          };
+        },
+      },
+    });
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'account-change-feed',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'list_account_changes',
+        arguments: { account: { account_id: 'acc_1' }, cursor: 'checkpoint-1' },
+      },
+    });
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.strictEqual(result.structuredContent.cursor, 'checkpoint-2');
+    assert.strictEqual(captured.request.cursor, 'checkpoint-1');
+    assert.strictEqual(captured.ctx.toolName, 'list_account_changes');
+    assert.strictEqual(captured.ctx.account.id, 'acc_1');
   });
 
   it('platform-derived handler wins when both define the same key', async () => {
@@ -5950,6 +7380,7 @@ describe('SalesPlatform retail-media tools (M2)', () => {
     const platform = buildPlatform({
       accounts: {
         resolution: 'derived',
+        list: async () => ({ items: [] }),
         resolve: async () => ({
           id: 'acc_1',
           name: 'Acme',
@@ -6067,6 +7498,31 @@ describe('ContentStandardsPlatform (M1)', () => {
     });
     delete platform.contentStandards;
     assert.throws(() => validatePlatform(platform), /contentStandards/);
+  });
+});
+
+describe('sales-dooh specialism wiring (AdCP 3.1.19, adcp#6619)', () => {
+  const doohCapabilities = {
+    specialisms: ['sales-dooh'],
+    creative_agents: [],
+    channels: ['dooh'],
+    pricingModels: ['cpm'],
+    config: {},
+  };
+
+  it('validatePlatform accepts a sales-dooh claimer that implements platform.sales', () => {
+    const platform = buildPlatform({ capabilities: doohCapabilities });
+    assert.doesNotThrow(() => validatePlatform(platform));
+  });
+
+  it('validatePlatform rejects a sales-dooh claimer with neither sales nor mediaBuyLifecycle', () => {
+    const platform = buildPlatform({ capabilities: doohCapabilities });
+    delete platform.sales;
+    delete platform.mediaBuyLifecycle;
+    assert.throws(
+      () => validatePlatform(platform),
+      /sales-dooh requires platform\.sales or platform\.mediaBuyLifecycle/
+    );
   });
 });
 
@@ -6229,7 +7685,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
       },
       sales: {
         getProducts: async () => ({ products: [], cache_scope: 'account' }),
-        createMediaBuy: (_req, ctx) => ctx.handoffToTask(async () => taskFn()),
+        createMediaBuy: (_req, ctx) => ctx.handoffToTask(async taskCtx => taskFn(taskCtx)),
         updateMediaBuy: async () => ({ media_buy_id: 'mb_1' }),
         syncCreatives: async () => [],
         getMediaBuyDelivery: async () => ({ media_buys: [] }),
@@ -6268,6 +7724,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
     const platform = buildPlatform({
       accounts: {
         resolution: 'derived',
+        list: async () => ({ items: [] }),
         resolve: async () => ({
           id: 'singleton',
           name: 'X',
@@ -6336,7 +7793,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
 
     const create = events.find(e => e.kind === 'create');
     const transition = events.find(e => e.kind === 'transition');
@@ -6363,14 +7820,11 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
       const inner = require('../dist/lib/server/decisioning/runtime/task-registry').createInMemoryTaskRegistry();
       return {
         ...inner,
-        create: opts => inner.create(opts),
-        getTask: id => inner.getTask(id),
         complete: async () => {
-          throw new Error('connection refused');
+          const error = new Error('secret connection details');
+          error.name = 'secret error classification';
+          throw error;
         },
-        fail: (id, err) => inner.fail(id, err),
-        _registerBackground: (id, p) => inner._registerBackground(id, p),
-        awaitTask: id => inner.awaitTask(id),
       };
     })();
     const server = createAdcpServerFromPlatform(platform, {
@@ -6403,7 +7857,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     assert.strictEqual(transitions.length, 1);
     assert.strictEqual(transitions[0].status, 'failed');
     assert.strictEqual(transitions[0].errorCode, 'REGISTRY_WRITE_FAILED');
@@ -6412,6 +7866,47 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
       errors.find(e => e.includes('registry write failed')),
       'error logged'
     );
+    assert.ok(
+      errors.every(e => !e.includes('secret')),
+      'registry error details are not logged'
+    );
+  });
+
+  it('treats a scoped completion with no matching task as REGISTRY_WRITE_FAILED', async () => {
+    const transitions = [];
+    const errors = [];
+    const platform = buildHitlPlatform(async () => ({ media_buy_id: 'mb_42' }));
+    const inner = require('../dist/lib/server/decisioning/runtime/task-registry').createInMemoryTaskRegistry();
+    const noMatchRegistry = {
+      ...inner,
+      complete: async () => ({ outcome: 'not_found_in_scope' }),
+    };
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'obs',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry: noMatchRegistry,
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: message => errors.push(message) },
+      observability: { onTaskTransition: info => transitions.push(info) },
+    });
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'create_media_buy',
+        arguments: {
+          buyer_ref: 'b1',
+          idempotency_key: '11111111-1111-1111-1111-111111111112',
+          packages: [],
+          start_time: '2026-05-01T00:00:00Z',
+          end_time: '2026-06-01T00:00:00Z',
+          account: { account_id: 'acc_1' },
+        },
+      },
+    });
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
+
+    assert.strictEqual(transitions[0].errorCode, 'REGISTRY_WRITE_FAILED');
+    assert.ok(errors.some(message => message.includes('registry write failed')));
   });
 
   it('onTaskTransition status="failed" carries errorCode on AdcpError', async () => {
@@ -6440,7 +7935,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     assert.strictEqual(transitions.length, 1);
     assert.strictEqual(transitions[0].status, 'failed');
     assert.strictEqual(transitions[0].errorCode, 'GOVERNANCE_DENIED');
@@ -6479,7 +7974,7 @@ describe('Observability hooks (DecisioningObservabilityHooks)', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     assert.strictEqual(emits.length, 1);
     assert.strictEqual(emits[0].url, 'https://buyer.example.com/webhook');
     assert.strictEqual(emits[0].status, 'completed');
@@ -6594,7 +8089,7 @@ describe('HITL push notification webhook on terminal state', () => {
       },
       sales: {
         getProducts: async () => ({ products: [], cache_scope: 'account' }),
-        createMediaBuy: (_req, ctx) => ctx.handoffToTask(async () => taskFn()),
+        createMediaBuy: (_req, ctx) => ctx.handoffToTask(async taskCtx => taskFn(taskCtx)),
         updateMediaBuy: async () => ({ media_buy_id: 'mb_1' }),
         syncCreatives: async () => [],
         getMediaBuyDelivery: async () => ({ media_buys: [] }),
@@ -6641,7 +8136,7 @@ describe('HITL push notification webhook on terminal state', () => {
 
     assert.strictEqual(result.structuredContent.status, 'submitted');
     const taskId = result.structuredContent.task_id;
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
     assert.strictEqual(emits.length, 1, 'one webhook emitted on terminal completion');
     const emit = emits[0];
@@ -6673,11 +8168,11 @@ describe('HITL push notification webhook on terminal state', () => {
     };
 
     const platform = buildHitlPlatform(async () => ({ media_buy_id: 'mb_42', status: 'active' }));
-    for (const adcpVersion of ['3.2-beta.6']) {
+    for (const adcpVersion of ['3.2-rc.4']) {
       const server = createAdcpServerFromPlatform(platform, {
         name: 'webhook',
         version: '0.0.1',
-        adcpVersion: '3.2.0-beta.6',
+        adcpVersion: '3.2.0-rc.4',
         validation: { requests: 'off', responses: 'off' },
         taskWebhookEmitter: fakeEmitter,
       });
@@ -6743,13 +8238,69 @@ describe('HITL push notification webhook on terminal state', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
 
     assert.strictEqual(emits.length, 1);
     assert.strictEqual(emits[0].payload.status, 'failed');
     assert.deepStrictEqual(emits[0].payload.result.errors[0].code, 'GOVERNANCE_DENIED');
     assert.strictEqual(emits[0].payload.message, 'op declined');
     assert.strictEqual(emits[0].payload.token, undefined, "token omitted when buyer didn't supply one");
+  });
+
+  it('settles an in-process HITL business rejection with an artifact and no execution error', async () => {
+    const emits = [];
+    const fakeEmitter = {
+      emit: async params => {
+        emits.push(params);
+        return { delivery_id: params.delivery_id, idempotency_key: 'k', attempts: 1, delivered: true, errors: [] };
+      },
+    };
+    const platform = buildHitlPlatform(async taskCtx =>
+      taskCtx.reject(
+        {
+          media_buy_id: 'mb_declined',
+          decision: 'declined',
+          ctx_metadata: { secret: 'must-not-reach-buyer' },
+          implementation_config: { internal: true },
+          issued_ref: taskCtx.taskRef,
+        },
+        'Inventory is no longer available'
+      )
+    );
+    const server = createAdcpServerFromPlatform(platform, {
+      name: 'webhook',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskWebhookEmitter: fakeEmitter,
+    });
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'create_media_buy',
+        arguments: {
+          buyer_ref: 'b1',
+          idempotency_key: '11111111-1111-1111-1111-111111111113',
+          packages: [],
+          start_time: '2026-05-01T00:00:00Z',
+          end_time: '2026-06-01T00:00:00Z',
+          account: { account_id: 'acc_1' },
+          push_notification_config: { url: 'https://buyer.example.com/webhook', operation_id: 'op_rejected_task' },
+        },
+      },
+    });
+    const taskId = result.structuredContent.task_id;
+    await server.awaitTask(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
+    const record = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
+
+    assert.strictEqual(record.status, 'rejected');
+    assert.deepStrictEqual(record.result, { media_buy_id: 'mb_declined', decision: 'declined' });
+    assert.strictEqual(record.statusMessage, 'Inventory is no longer available');
+    assert.strictEqual(record.error, undefined);
+    assert.strictEqual(emits.length, 1);
+    assert.strictEqual(emits[0].payload.status, 'rejected');
+    assert.deepStrictEqual(emits[0].payload.result, { media_buy_id: 'mb_declined', decision: 'declined' });
+    assert.strictEqual(emits[0].payload.message, 'Inventory is no longer available');
+    assert.strictEqual(emits[0].payload.error, undefined);
   });
 
   it('does not emit webhook when push_notification_config is absent', async () => {
@@ -6781,7 +8332,7 @@ describe('HITL push notification webhook on terminal state', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
 
     assert.strictEqual(emits.length, 0, "no webhook when buyer didn't opt in");
   });
@@ -6819,7 +8370,7 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
     };
   }
 
-  async function dispatchWithPushConfig(server, pushNotificationConfig) {
+  async function dispatchWithPushConfig(server, pushNotificationConfig, { includePushConfig = true } = {}) {
     return server.dispatchTestRequest({
       method: 'tools/call',
       params: {
@@ -6831,7 +8382,7 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
           start_time: '2026-05-01T00:00:00Z',
           end_time: '2026-06-01T00:00:00Z',
           account: { account_id: 'acc_1' },
-          push_notification_config: pushNotificationConfig,
+          ...(includePushConfig && { push_notification_config: pushNotificationConfig }),
         },
       },
     });
@@ -6870,6 +8421,108 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
       }
     );
   }
+
+  it('rejects every malformed supplied push config before platform or task work when request validation is off (#2836)', async () => {
+    const malformedConfigs = [
+      ['null config', null, 'push_notification_config'],
+      ['string config', 'not-an-object', 'push_notification_config'],
+      ['number config', 42, 'push_notification_config'],
+      ['boolean config', true, 'push_notification_config'],
+      ['array config', [], 'push_notification_config'],
+      ['object without url', { operation_id: 'op_missing_url' }, 'push_notification_config.url'],
+      ['undefined url', { url: undefined, operation_id: 'op_undefined_url' }, 'push_notification_config.url'],
+      ['null url', { url: null, operation_id: 'op_null_url' }, 'push_notification_config.url'],
+      ['numeric url', { url: 42, operation_id: 'op_numeric_url' }, 'push_notification_config.url'],
+      ['array url', { url: [], operation_id: 'op_array_url' }, 'push_notification_config.url'],
+      [
+        'undefined own token',
+        { url: 'https://buyer.example.com/webhook', token: undefined, operation_id: 'op_undefined_token' },
+        'push_notification_config.token',
+      ],
+      [
+        'null own token',
+        { url: 'https://buyer.example.com/webhook', token: null, operation_id: 'op_null_token' },
+        'push_notification_config.token',
+      ],
+      [
+        'numeric own token',
+        { url: 'https://buyer.example.com/webhook', token: 42, operation_id: 'op_numeric_token' },
+        'push_notification_config.token',
+      ],
+      [
+        'array own token',
+        { url: 'https://buyer.example.com/webhook', token: [], operation_id: 'op_array_token' },
+        'push_notification_config.token',
+      ],
+    ];
+
+    for (const [label, pushNotificationConfig, field] of malformedConfigs) {
+      let handlerCalls = 0;
+      let callbackCalls = 0;
+      let createCalls = 0;
+      const taskRegistry = createInMemoryTaskRegistry();
+      const create = taskRegistry.create.bind(taskRegistry);
+      taskRegistry.create = async args => {
+        createCalls += 1;
+        return create(args);
+      };
+      const platform = buildHitlPlatform(async () => {
+        callbackCalls += 1;
+        return { media_buy_id: 'must-not-run' };
+      });
+      platform.sales.createMediaBuy = (_req, ctx) => {
+        handlerCalls += 1;
+        return ctx.handoffToTask(async () => {
+          callbackCalls += 1;
+          return { media_buy_id: 'must-not-run' };
+        });
+      };
+      const server = createAdcpServerFromPlatform(platform, {
+        name: `malformed-push-config-${label}`,
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+        taskWebhookEmitter: { emit: async () => ({ delivered: true, attempts: 1, errors: [] }) },
+      });
+
+      const result = await dispatchWithPushConfig(server, pushNotificationConfig);
+      assert.strictEqual(result.isError, true, label);
+      assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST', label);
+      assert.strictEqual(result.structuredContent.adcp_error.field, field, label);
+      assert.strictEqual(handlerCalls, 0, `${label}: platform handler must not run`);
+      assert.strictEqual(createCalls, 0, `${label}: TaskRegistry.create must not run`);
+      assert.strictEqual(callbackCalls, 0, `${label}: handoff callback must not run`);
+    }
+  });
+
+  it('keeps omitted and explicit undefined push config polling-only when request validation is off (#2836)', async () => {
+    for (const [label, pushNotificationConfig, includePushConfig] of [
+      ['omitted', undefined, false],
+      ['explicit undefined', undefined, true],
+    ]) {
+      let handlerCalls = 0;
+      let callbackCalls = 0;
+      const platform = buildHitlPlatform(async () => ({ media_buy_id: 'unused' }));
+      platform.sales.createMediaBuy = (_req, ctx) => {
+        handlerCalls += 1;
+        return ctx.handoffToTask(async () => {
+          callbackCalls += 1;
+          return { media_buy_id: 'polling-only' };
+        });
+      };
+      const server = createAdcpServerFromPlatform(platform, {
+        name: `undefined-push-config-${label}`,
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+      });
+      const result = await dispatchWithPushConfig(server, pushNotificationConfig, { includePushConfig });
+      assert.notStrictEqual(result.isError, true, label);
+      assert.strictEqual(result.structuredContent.status, 'submitted', label);
+      await server.awaitTaskUnsafe(result.structuredContent.task_id);
+      assert.strictEqual(handlerCalls, 1, label);
+      assert.strictEqual(callbackCalls, 1, label);
+    }
+  });
 
   for (const [label, url, reasonFragment] of [
     ['RFC 1918 10/8', 'https://10.0.0.1/hook', 'RFC 1918 private range 10/8'],
@@ -6918,7 +8571,7 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
     const emits = [];
     const server = makeServer({ emits });
     const result = await dispatchWithUrl(server, 'https://buyer.example.com/webhook');
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     assert.strictEqual(emits.length, 1);
     assert.strictEqual(emits[0].url, 'https://buyer.example.com/webhook');
   });
@@ -6928,29 +8581,38 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
     const emits = [];
     const server = makeServer({ emits });
     const result = await dispatchWithUrl(server, 'http://buyer.example.com/webhook');
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     assert.strictEqual(emits.length, 1);
   });
 
-  it('rejects empty token', async () => {
+  it('rejects token shorter than 16 characters', async () => {
     const emits = [];
     const server = makeServer({ emits });
     const result = await dispatchWithUrl(server, 'https://buyer.example.com/webhook', '');
     assert.strictEqual(result.isError, true);
     assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
     assert.strictEqual(result.structuredContent.adcp_error.field, 'push_notification_config.token');
-    assert.ok(result.structuredContent.adcp_error.message.includes('empty'));
+    assert.ok(result.structuredContent.adcp_error.message.includes('shorter than 16'));
     assert.strictEqual(emits.length, 0);
   });
 
-  it('rejects token over 255 chars', async () => {
+  it('accepts token between 256 and 4096 chars', async () => {
     const emits = [];
     const server = makeServer({ emits });
     const longToken = 'a'.repeat(300);
     const result = await dispatchWithUrl(server, 'https://buyer.example.com/webhook', longToken);
+    assert.notStrictEqual(result.isError, true);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
+    assert.strictEqual(emits.length, 1);
+  });
+
+  it('rejects token over 4096 chars', async () => {
+    const emits = [];
+    const server = makeServer({ emits });
+    const result = await dispatchWithUrl(server, 'https://buyer.example.com/webhook', 'a'.repeat(4097));
     assert.strictEqual(result.isError, true);
     assert.strictEqual(result.structuredContent.adcp_error.code, 'INVALID_REQUEST');
-    assert.ok(result.structuredContent.adcp_error.message.includes('longer than'));
+    assert.ok(result.structuredContent.adcp_error.message.includes('longer than 4096'));
     assert.strictEqual(emits.length, 0);
   });
 
@@ -6993,7 +8655,7 @@ describe('Push notification webhook URL/token validation (B5/B6)', () => {
     const emits = [];
     const server = makeServer({ emits });
     const result = await dispatchWithUrl(server, 'https://buyer.example.com/webhook', 'tok_abc-123:xyz.456');
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     assert.strictEqual(emits.length, 1);
     assert.strictEqual(emits[0].payload.token, 'tok_abc-123:xyz.456');
   });
@@ -7005,7 +8667,7 @@ describe('tasks_get wire tool (B9)', () => {
   // task_id (+ optional account for tenant scoping) and receive the
   // spec-flat lifecycle shape.
 
-  function buildHitlPlatform(taskFn) {
+  function buildHitlPlatform(taskFn, onRequestContext = () => {}, onResolveContext = () => {}) {
     return {
       capabilities: {
         specialisms: ['sales-non-guaranteed'],
@@ -7015,17 +8677,23 @@ describe('tasks_get wire tool (B9)', () => {
         config: {},
       },
       accounts: {
-        resolve: async ref => ({
-          id: ref?.account_id ?? 'acc_1',
-          name: 'Acme',
-          status: 'active',
-          metadata: {},
-          authInfo: { kind: 'api_key' },
-        }),
+        resolve: async (ref, context) => {
+          onResolveContext(context);
+          return {
+            id: ref?.account_id ?? 'acc_1',
+            name: 'Acme',
+            status: 'active',
+            metadata: {},
+            authInfo: { kind: 'api_key' },
+          };
+        },
       },
       sales: {
         getProducts: async () => ({ products: [], cache_scope: 'account' }),
-        createMediaBuy: (_req, ctx) => ctx.handoffToTask(async () => taskFn()),
+        createMediaBuy: (_req, ctx) => {
+          onRequestContext(ctx);
+          return ctx.handoffToTask(async taskCtx => taskFn(taskCtx));
+        },
         updateMediaBuy: async () => ({ media_buy_id: 'mb_42' }),
         syncCreatives: async () => [],
         getMediaBuyDelivery: async () => ({ media_buys: [] }),
@@ -7033,7 +8701,7 @@ describe('tasks_get wire tool (B9)', () => {
     };
   }
 
-  async function createTask(server, accountId) {
+  async function createTask(server, accountId, adcpVersion) {
     const result = await server.dispatchTestRequest({
       method: 'tools/call',
       params: {
@@ -7045,10 +8713,13 @@ describe('tasks_get wire tool (B9)', () => {
           start_time: '2026-05-01T00:00:00Z',
           end_time: '2026-06-01T00:00:00Z',
           account: { account_id: accountId },
+          ...(adcpVersion !== undefined && { adcp_version: adcpVersion }),
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    assert.notStrictEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.ok(result.structuredContent.task_id, JSON.stringify(result.structuredContent));
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     return result.structuredContent.task_id;
   }
 
@@ -7065,6 +8736,75 @@ describe('tasks_get wire tool (B9)', () => {
     const toolNames = listed.tools.map(tool => tool.name);
     assert.ok(toolNames.includes('tasks_get'), 'tasks_get should be advertised');
     assert.ok(!toolNames.includes('tasks/get'), 'slash alias should not be registered as an MCP tool');
+  });
+
+  it('retains the immutable selected version in platform and deferred task contexts', async () => {
+    const requestContexts = [];
+    const taskContexts = [];
+    const accountResolverContexts = [];
+    const sessionResolverContexts = [];
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform(
+        async taskCtx => {
+          taskContexts.push(taskCtx);
+          return { media_buy_id: `mb_${taskContexts.length}` };
+        },
+        ctx => requestContexts.push(ctx),
+        ctx => accountResolverContexts.push(ctx)
+      ),
+      {
+        name: 'versioned-handoff',
+        version: '0.0.1',
+        adcpVersion: '3.2.0-rc.4',
+        defaultAdcpVersion: '3.1.18',
+        capabilities: { supported_versions: ['3.1.18', '3.2.0-rc.4'] },
+        resolveSessionKey: async context => {
+          sessionResolverContexts.push(context);
+          return 'session-version-probe';
+        },
+        validation: { requests: 'off', responses: 'off' },
+      }
+    );
+
+    const defaultTaskId = await createTask(server, 'acc_default');
+    const modernTaskId = await createTask(server, 'acc_modern', '3.2.0-rc.4');
+    for (const [taskId, accountId, adcpVersion] of [
+      [defaultTaskId, 'acc_default', undefined],
+      [modernTaskId, 'acc_modern', '3.2.0-rc.4'],
+    ]) {
+      await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'tasks_get',
+          arguments: {
+            task_id: taskId,
+            account: { account_id: accountId },
+            ...(adcpVersion !== undefined && { adcp_version: adcpVersion }),
+          },
+        },
+      });
+    }
+
+    assert.deepStrictEqual(
+      requestContexts.map(ctx => ctx.servedAdcpVersion),
+      ['3.1', '3.2-rc.4']
+    );
+    assert.deepStrictEqual(
+      taskContexts.map(ctx => ctx.servedAdcpVersion),
+      ['3.1', '3.2-rc.4']
+    );
+    for (const context of [
+      ...requestContexts,
+      ...taskContexts,
+      ...accountResolverContexts,
+      ...sessionResolverContexts,
+    ]) {
+      assert.strictEqual(Object.getOwnPropertyDescriptor(context, 'servedAdcpVersion').writable, false);
+    }
+    assert.ok(accountResolverContexts.some(ctx => ctx.servedAdcpVersion === '3.1'));
+    assert.ok(accountResolverContexts.some(ctx => ctx.servedAdcpVersion === '3.2-rc.4'));
+    assert.ok(sessionResolverContexts.some(ctx => ctx.servedAdcpVersion === '3.1'));
+    assert.ok(sessionResolverContexts.some(ctx => ctx.servedAdcpVersion === '3.2-rc.4'));
   });
 
   it('returns spec-flat lifecycle shape for a completed task', async () => {
@@ -7089,6 +8829,109 @@ describe('tasks_get wire tool (B9)', () => {
     assert.deepStrictEqual(payload.result, { media_buy_id: 'mb_42', status: 'active' });
   });
 
+  it('keeps progress and version envelopes aligned across task polling surfaces', async () => {
+    let releaseTask;
+    let markProgressWritten;
+    const unblockTask = new Promise(resolve => {
+      releaseTask = resolve;
+    });
+    const progressWritten = new Promise(resolve => {
+      markProgressWritten = resolve;
+    });
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform(async taskCtx => {
+        try {
+          await taskCtx.update({ message: 'processing', percentage: 50, creatives_processed: 2 });
+          markProgressWritten({ ok: true });
+        } catch (error) {
+          markProgressWritten({ error });
+          throw error;
+        }
+        await unblockTask;
+        return { media_buy_id: 'mb_42', status: 'active' };
+      }),
+      { name: 'p', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+    );
+    let taskId;
+
+    try {
+      const submitted = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'create_media_buy',
+          arguments: {
+            buyer_ref: 'b1',
+            idempotency_key: '11111111-1111-1111-1111-111111111119',
+            packages: [],
+            start_time: '2026-05-01T00:00:00Z',
+            end_time: '2026-06-01T00:00:00Z',
+            account: { account_id: 'acc_owner' },
+          },
+        },
+      });
+      taskId = submitted.structuredContent.task_id;
+      const progressOutcome = await progressWritten;
+      assert.ifError(progressOutcome.error);
+
+      const args = { task_id: taskId, account: { account_id: 'acc_owner' } };
+      const legacy = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'tasks_get', arguments: args },
+      });
+      const canonical = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'get_task_status', arguments: args },
+      });
+
+      assert.deepStrictEqual(legacy.structuredContent.progress, {
+        message: 'processing',
+        percentage: 50,
+        creatives_processed: 2,
+      });
+      assert.deepStrictEqual(legacy.structuredContent.progress, canonical.structuredContent.progress);
+      assert.strictEqual(legacy.structuredContent.adcp_version, '3.2-rc.4');
+      assert.strictEqual(legacy.structuredContent.adcp_version, canonical.structuredContent.adcp_version);
+
+      const legacyPinned = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'tasks_get',
+          arguments: { ...args, adcp_version: '3.1.18', adcp_major_version: 3 },
+        },
+      });
+      const canonicalPinned = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'get_task_status',
+          arguments: { ...args, adcp_version: '3.1.18', adcp_major_version: 3 },
+        },
+      });
+      assert.strictEqual(legacyPinned.structuredContent.adcp_version, '3.1');
+      assert.strictEqual(legacyPinned.structuredContent.adcp_version, canonicalPinned.structuredContent.adcp_version);
+
+      const legacyUnsupported = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'tasks_get', arguments: { ...args, adcp_version: '99.0' } },
+      });
+      const canonicalUnsupported = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'get_task_status', arguments: { ...args, adcp_version: '99.0' } },
+      });
+      assert.strictEqual(legacyUnsupported.structuredContent.adcp_error.code, 'VERSION_UNSUPPORTED');
+      assert.strictEqual(
+        legacyUnsupported.structuredContent.adcp_error.code,
+        canonicalUnsupported.structuredContent.adcp_error.code
+      );
+      assert.strictEqual(
+        legacyUnsupported.structuredContent.adcp_version,
+        canonicalUnsupported.structuredContent.adcp_version
+      );
+    } finally {
+      releaseTask();
+      if (taskId) await server.awaitTaskUnsafe(taskId);
+    }
+  });
+
   it('serves get_task_status/list_tasks from the platform task registry while a task is submitted', async () => {
     let releaseTask;
     const unblockTask = new Promise(resolve => {
@@ -7099,7 +8942,20 @@ describe('tasks_get wire tool (B9)', () => {
         await unblockTask;
         return { media_buy_id: 'mb_42', status: 'active' };
       }),
-      { name: 'p', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+      {
+        name: 'p',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskWebhookEmitter: {
+          emit: async params => ({
+            delivery_id: params.delivery_id,
+            idempotency_key: 'k',
+            attempts: 1,
+            delivered: true,
+            errors: [],
+          }),
+        },
+      }
     );
     let taskId;
 
@@ -7139,7 +8995,7 @@ describe('tasks_get wire tool (B9)', () => {
       assert.strictEqual(status.structuredContent.status, 'submitted');
       assert.strictEqual(status.structuredContent.has_webhook, true);
       assert.strictEqual(status.structuredContent.result, undefined);
-      assert.strictEqual(status.structuredContent.adcp_version, '3.2-beta.6');
+      assert.strictEqual(status.structuredContent.adcp_version, '3.2-rc.4');
 
       const listed = await server.dispatchTestRequest({
         method: 'tools/call',
@@ -7174,7 +9030,7 @@ describe('tasks_get wire tool (B9)', () => {
       assert.strictEqual(crossTenant.structuredContent.adcp_error.code, 'REFERENCE_NOT_FOUND');
 
       releaseTask();
-      await server.awaitTask(taskId);
+      await server.awaitTaskUnsafe(taskId);
 
       const completed = await server.dispatchTestRequest({
         method: 'tools/call',
@@ -7188,7 +9044,7 @@ describe('tasks_get wire tool (B9)', () => {
       assert.deepStrictEqual(completed.structuredContent.result, { media_buy_id: 'mb_42', status: 'active' });
     } finally {
       releaseTask();
-      if (taskId) await server.awaitTask(taskId);
+      if (taskId) await server.awaitTaskUnsafe(taskId);
     }
   });
 
@@ -7235,7 +9091,7 @@ describe('tasks_get wire tool (B9)', () => {
       },
     });
     const taskId = submitted.structuredContent.task_id;
-    await server.awaitTask(taskId);
+    await server.awaitTaskUnsafe(taskId);
 
     const status = await server.dispatchTestRequest({
       method: 'tools/call',
@@ -7374,7 +9230,69 @@ describe('tasks_get wire tool (B9)', () => {
     assert.strictEqual(result.structuredContent.adcp_error.code, 'REFERENCE_NOT_FOUND');
   });
 
-  it('refuses to leak when caller omits account AND no auth context resolves one', async () => {
+  it('preserves ACCOUNT_NOT_FOUND for a supplied unresolved tasks_get account', async () => {
+    const base = buildHitlPlatform(async () => ({ media_buy_id: 'mb_42', status: 'active' }));
+    const server = createAdcpServerFromPlatform(
+      {
+        ...base,
+        accounts: {
+          ...base.accounts,
+          resolve: async () => null,
+        },
+      },
+      { name: 'p', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+    );
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'tasks_get',
+        arguments: { task_id: 'task_unknown', account: { account_id: 'missing-account' } },
+      },
+    });
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'ACCOUNT_NOT_FOUND');
+    assert.strictEqual(result.structuredContent.adcp_error.recovery, 'terminal');
+  });
+
+  it('normalizes supported auth-derived tasks_get not-found signals without weakening supplied refs', async () => {
+    const failures = [
+      () => new AccountNotFoundError(),
+      () => new AdcpError('ACCOUNT_NOT_FOUND', { message: 'no auth-derived account' }),
+    ];
+    for (const failure of failures) {
+      const base = buildHitlPlatform(async () => ({ media_buy_id: 'mb_42', status: 'active' }));
+      const server = createAdcpServerFromPlatform(
+        {
+          ...base,
+          accounts: {
+            ...base.accounts,
+            resolve: async () => {
+              throw failure();
+            },
+          },
+        },
+        { name: 'p', version: '0.0.1', validation: { requests: 'off', responses: 'off' } }
+      );
+
+      const omitted = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: { name: 'tasks_get', arguments: { task_id: 'task_unknown' } },
+      });
+      assert.strictEqual(omitted.structuredContent.adcp_error.code, 'ACCOUNT_REQUIRED');
+      assert.strictEqual(omitted.structuredContent.adcp_error.recovery, 'correctable');
+
+      const supplied = await server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: 'tasks_get',
+          arguments: { task_id: 'task_unknown', account: { account_id: 'missing-account' } },
+        },
+      });
+      assert.strictEqual(supplied.structuredContent.adcp_error.code, 'ACCOUNT_NOT_FOUND');
+      assert.strictEqual(supplied.structuredContent.adcp_error.recovery, 'terminal');
+    }
+  });
+
+  it('returns ACCOUNT_REQUIRED without leaking a task when auth-derived account resolution finds none', async () => {
     // Unauthenticated probe path: caller passes only { task_id }, no
     // `account` arg, and the resolver returns nothing for `undefined` ref
     // (i.e. there's no auth-derived account either). The handler must NOT
@@ -7419,7 +9337,10 @@ describe('tasks_get wire tool (B9)', () => {
       params: { name: 'tasks_get', arguments: { task_id: taskId } },
     });
     assert.strictEqual(result.isError, true);
-    assert.strictEqual(result.structuredContent.adcp_error.code, 'REFERENCE_NOT_FOUND');
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'ACCOUNT_REQUIRED');
+    assert.strictEqual(result.structuredContent.adcp_error.recovery, 'correctable');
+    assert.strictEqual(result.structuredContent.adcp_error.field, 'account');
+    assert.match(result.structuredContent.adcp_error.suggestion, /list_accounts|pass account/i);
   });
 
   it('returns REFERENCE_NOT_FOUND for unknown task_id', async () => {
@@ -7434,9 +9355,145 @@ describe('tasks_get wire tool (B9)', () => {
     assert.strictEqual(result.isError, true);
     assert.strictEqual(result.structuredContent.adcp_error.code, 'REFERENCE_NOT_FOUND');
   });
+
+  it('re-sanitizes legacy/custom progress and results before exposing them to buyers', async () => {
+    const inner = createInMemoryTaskRegistry();
+    const taskRegistry = {
+      ...inner,
+      getTask: async taskId => ({
+        taskId,
+        tool: 'create_media_buy',
+        accountId: 'acc_owner',
+        ownerScope: 'account:acc_owner',
+        status: taskId === 'task_legacy_result' ? 'completed' : 'working',
+        progress:
+          taskId === 'task_legacy_result'
+            ? undefined
+            : taskId === 'task_invalid_progress'
+              ? { message: 'unsafe', percentage: 101 }
+              : {
+                  message: 'processing',
+                  creatives_processed: 2,
+                  vendor: {
+                    safe: true,
+                    accessToken: 'secret-token',
+                    ctx_metadata: { private: true },
+                    task_ref: { registryId: 'private-registry', ownerScope: 'private-owner' },
+                  },
+                },
+        result:
+          taskId === 'task_legacy_result'
+            ? {
+                media_buy_id: 'mb_safe',
+                ctx_metadata: { tenant_secret: 'private' },
+                task_ref: {
+                  taskId,
+                  accountId: 'acc_owner',
+                  ownerScope: 'account:acc_owner',
+                  registryId: 'private-registry',
+                },
+                products: [
+                  {
+                    product_id: 'prod_safe',
+                    ctx_metadata: { upstream_secret: 'private' },
+                    implementation_config: { adapter_secret: 'private' },
+                  },
+                ],
+              }
+            : undefined,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:01:00.000Z',
+      }),
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform(async () => ({ media_buy_id: 'unused' })),
+      {
+        name: 'p',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+      }
+    );
+    const poll = (toolName, taskId, includeResult = false) =>
+      server.dispatchTestRequest({
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: {
+            task_id: taskId,
+            account: { account_id: 'acc_owner' },
+            ...(includeResult && { include_result: true }),
+          },
+        },
+      });
+
+    const expected = {
+      message: 'processing',
+      creatives_processed: 2,
+      vendor: { safe: true },
+    };
+    const legacy = await poll('tasks_get', 'task_legacy_progress');
+    const canonical = await poll('get_task_status', 'task_legacy_progress');
+    assert.deepStrictEqual(legacy.structuredContent.progress, expected);
+    assert.deepStrictEqual(canonical.structuredContent.progress, expected);
+
+    const legacyInvalid = await poll('tasks_get', 'task_invalid_progress');
+    const canonicalInvalid = await poll('get_task_status', 'task_invalid_progress');
+    assert.strictEqual(legacyInvalid.structuredContent.status, 'working');
+    assert.strictEqual(legacyInvalid.structuredContent.progress, undefined);
+    assert.strictEqual(canonicalInvalid.structuredContent.status, 'working');
+    assert.strictEqual(canonicalInvalid.structuredContent.progress, undefined);
+
+    const expectedResult = {
+      media_buy_id: 'mb_safe',
+      products: [{ product_id: 'prod_safe' }],
+    };
+    const legacyResult = await poll('tasks_get', 'task_legacy_result', true);
+    const canonicalResult = await poll('get_task_status', 'task_legacy_result', true);
+    assert.deepStrictEqual(legacyResult.structuredContent.result, expectedResult);
+    assert.deepStrictEqual(canonicalResult.structuredContent.result, expectedResult);
+  });
+
+  it('fails closed when a custom registry returns a record outside the requested scope', async () => {
+    const inner = createInMemoryTaskRegistry();
+    const taskRegistry = {
+      ...inner,
+      getTask: async () => ({
+        taskId: 'task_known',
+        tool: 'create_media_buy',
+        accountId: 'acc_owner',
+        ownerScope: 'account:acc_owner',
+        status: 'completed',
+        result: { media_buy_id: 'mb_private' },
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:01:00.000Z',
+      }),
+    };
+    const server = createAdcpServerFromPlatform(
+      buildHitlPlatform(async () => ({ media_buy_id: 'unused' })),
+      {
+        name: 'p',
+        version: '0.0.1',
+        validation: { requests: 'off', responses: 'off' },
+        taskRegistry,
+      }
+    );
+
+    const result = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'tasks_get',
+        arguments: { task_id: 'task_known', account: { account_id: 'acc_attacker' } },
+      },
+    });
+
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(result.structuredContent.adcp_error.code, 'REFERENCE_NOT_FOUND');
+  });
 });
 
-describe('getTaskState account-scoping (B7)', () => {
+describe('getTaskState account/principal scoping (B7)', () => {
   // Cross-tenant leak protection. getTaskState must filter by account when
   // an `expectedAccountId` is supplied — adopters wrapping it as `tasks/get`
   // pass `ctx.account.id` to scope reads.
@@ -7484,7 +9541,7 @@ describe('getTaskState account-scoping (B7)', () => {
         },
       },
     });
-    await server.awaitTask(result.structuredContent.task_id);
+    await server.awaitTaskUnsafe(result.structuredContent.task_id);
     return result.structuredContent.task_id;
   }
 
@@ -7495,7 +9552,10 @@ describe('getTaskState account-scoping (B7)', () => {
       validation: { requests: 'off', responses: 'off' },
     });
     const taskId = await createTaskFor(server, 'acc_owner');
-    const record = await server.getTaskState(taskId, 'acc_owner');
+    const record = await server.getTaskState(taskId, {
+      accountId: 'acc_owner',
+      ownerScope: 'account:acc_owner',
+    });
     assert.ok(record);
     assert.strictEqual(record.accountId, 'acc_owner');
   });
@@ -7507,18 +9567,53 @@ describe('getTaskState account-scoping (B7)', () => {
       validation: { requests: 'off', responses: 'off' },
     });
     const taskId = await createTaskFor(server, 'acc_owner');
-    const record = await server.getTaskState(taskId, 'acc_other');
+    const record = await server.getTaskState(taskId, {
+      accountId: 'acc_other',
+      ownerScope: 'account:acc_other',
+    });
     assert.strictEqual(record, null, 'cross-tenant probe must not leak the task');
   });
 
-  it('unscoped read still works (ops/test contexts)', async () => {
+  it('fails closed when a custom registry returns a mismatched record', async () => {
+    const inner = createInMemoryTaskRegistry();
+    const taskRegistry = {
+      ...inner,
+      getTask: async () => ({
+        taskId: 'task_known',
+        tool: 'create_media_buy',
+        accountId: 'acc_owner',
+        ownerScope: 'session:owner',
+        status: 'completed',
+        result: { media_buy_id: 'mb_private' },
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:01:00.000Z',
+      }),
+    };
+    const server = createAdcpServerFromPlatform(buildHitlPlatform(), {
+      name: 't',
+      version: '0.0.1',
+      validation: { requests: 'off', responses: 'off' },
+      taskRegistry,
+    });
+
+    const record = await server.getTaskState('task_known', {
+      accountId: 'acc_attacker',
+      ownerScope: 'session:attacker',
+    });
+    assert.strictEqual(record, null);
+  });
+
+  it('requires explicit account and owner scope for application reads', async () => {
     const server = createAdcpServerFromPlatform(buildHitlPlatform(), {
       name: 't',
       version: '0.0.1',
       validation: { requests: 'off', responses: 'off' },
     });
     const taskId = await createTaskFor(server, 'acc_owner');
-    const record = await server.getTaskState(taskId);
+    const record = await server.getTaskState(taskId, {
+      accountId: 'acc_owner',
+      ownerScope: 'account:acc_owner',
+    });
     assert.ok(record);
     assert.strictEqual(record.accountId, 'acc_owner');
   });
@@ -7896,7 +9991,7 @@ describe('createAdcpServerFromPlatform — default resolveIdempotencyPrincipal',
       {
         name: 'principal-compat',
         version: '0.0.1',
-        adcpVersion: '3.2.0-beta.6',
+        adcpVersion: '3.2.0-rc.4',
         idempotency,
         validation: { requests: 'off', responses: 'off' },
       }

@@ -222,9 +222,9 @@ describe('MockSeller worked example — unified hybrid shape', () => {
       assert.ok(result.structuredContent.task_id.startsWith('task_'));
       const taskId = result.structuredContent.task_id;
 
-      await server.awaitTask(taskId);
+      await server.awaitTaskUnsafe(taskId);
 
-      const final = await server.getTaskState(taskId);
+      const final = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
       assert.strictEqual(final.status, 'completed');
       assert.strictEqual(final.result.status, 'active');
     });
@@ -239,7 +239,7 @@ describe('MockSeller worked example — unified hybrid shape', () => {
       assert.deepStrictEqual(result.structuredContent.ext, ext);
       assert.strictEqual(result.structuredContent.media_buy_id, undefined);
 
-      await server.awaitTask(result.structuredContent.task_id);
+      await server.awaitTaskUnsafe(result.structuredContent.task_id);
     });
 
     it('omits ext from the submitted envelope when the adopter passed none', async () => {
@@ -250,7 +250,7 @@ describe('MockSeller worked example — unified hybrid shape', () => {
       assert.strictEqual(result.structuredContent.status, 'submitted');
       assert.ok(!('ext' in result.structuredContent));
 
-      await server.awaitTask(result.structuredContent.task_id);
+      await server.awaitTaskUnsafe(result.structuredContent.task_id);
     });
 
     it('background AdcpError records terminal failed with structured fields', async () => {
@@ -265,9 +265,9 @@ describe('MockSeller worked example — unified hybrid shape', () => {
       assert.strictEqual(result.structuredContent.status, 'submitted');
       const taskId = result.structuredContent.task_id;
 
-      await server.awaitTask(taskId);
+      await server.awaitTaskUnsafe(taskId);
 
-      const final = await server.getTaskState(taskId);
+      const final = await server.getTaskState(taskId, { accountId: 'acc_1', ownerScope: 'account:acc_1' });
       assert.strictEqual(final.status, 'failed');
       assert.strictEqual(final.error.code, 'INVALID_REQUEST');
       assert.strictEqual(final.error.recovery, 'correctable');

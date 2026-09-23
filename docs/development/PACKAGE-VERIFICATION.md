@@ -1,14 +1,19 @@
 # Package artifact verification
 
 The SDK ships a tree-shakeable dual ESM + CJS build with ~30 subpath exports.
-Three mechanical guards keep the publish artifact honest so packaging regressions
+Four mechanical guards keep the publish artifact honest so packaging regressions
 fail CI instead of reaching consumers.
 
-**How they run in CI** (all three live in `.github/workflows/ci.yml`):
+**How they run in CI** (all four live in `.github/workflows/ci.yml`):
 
 - `check:package-size` is a fast, offline `npm pack --dry-run` audit, so it runs
   after every `library-build`. It caps packed bytes, unpacked bytes, file count,
   and the generated declaration sizes, and requires the exact schema façade.
+- `check:publish-protocol-artifacts` inspects the actual npm pack inventory,
+  export map, and advertised compatibility list. It permits maintained stable
+  bundles plus the exact `ADCP_VERSION` prerelease and rejects every superseded
+  beta/RC schema, compliance bundle, or versioned type subpath. It also runs
+  from `prepublishOnly` after schema sync and build.
 - `check:package` is cheap and offline, so it runs on **every PR** as a step in
   the `library-build` job.
 - `verify:package` does a live registry install, so it runs in the
@@ -44,11 +49,35 @@ Requires a prior `npm run build:lib` (it inspects `dist/`).
 
 `scripts/check-package-size.mjs` asks npm for the exact dry-run pack manifest
 and fails closed if its size metadata is missing. It enforces budgets for
-compressed bytes, installed bytes, and entry count, plus separate limits for
-the canonical generated schema declaration and its ESM façade. Because it runs
+compressed bytes, installed bytes, file count, total compact bundled-schema
+bytes, and the canonical generated schema declaration plus its ESM façade. It
+also rejects source maps in the publish artifact. Because it runs
 unconditionally after `build:lib`, growth from any packaged source, generated
 schema, or copied cache is covered even when the live package smoke is skipped.
 The full `verify:package` smoke imports and runs the same checker.
+
+Historical documentation is intentionally outside this policy. SDK release
+notes may mention beta versions; only executable protocol artifacts and public
+compatibility claims are restricted.
+
+### Compact offline schema bundles
+
+The protocol cache contains both canonical schemas with `$ref` links and a
+mostly dereferenced `bundled/` copy of every tool schema. Publishing those
+upstream bundles verbatim duplicates shared definitions hundreds of times.
+`scripts/copy-schemas-to-dist.ts` instead compacts each protocol-authored
+bundled document, storing repeated schema fragments once under private local
+`$defs`. Local builds retain those compact JSON files for direct inspection.
+The published package stores them together in one Brotli archive per wire
+version; the schema loader expands the private refs before returning a schema,
+so IDs, retained refs, AJV diagnostics, and logical
+`bundled/<domain>/<tool>.json` paths remain unchanged for runtime validation
+and conformance consumers. There is no network fetch and no supported-version
+reduction.
+
+Runtime JavaScript and declaration source maps are intentionally not shipped.
+The public repository and declarations remain the debugging source, while the
+maps added thousands of files and several compressed MiB to every install.
 
 ### Why the build emits `.d.mts`
 
@@ -99,10 +128,11 @@ the tarball plus its **required** peers pinned to their **range floors** and
 (outside the workspace, so npm resolution is honest and not monorepo-deduped),
 then loads the main, enums, server, testing, and schemas entry points through
 both a real ESM `import` and a real CJS `require`, asserting each loads and
-exposes a known runtime symbol. It also type-checks the exact generated schema
-surface from `.mts` and `.cts` consumers. `server` is included so the
-`@a2a-js/sdk` peer gets real ESM/CJS load coverage through a dedicated
-entrypoint. Optional peers
+exposes a known runtime symbol. It also exercises runtime validation,
+conformance loading, and server error-arm discovery from the installed Brotli
+archives, then type-checks the exact generated schema surface from `.mts` and
+`.cts` consumers. `server` is included so the `@a2a-js/sdk` peer gets real
+ESM/CJS load coverage through a dedicated entrypoint. Optional peers
 (`peerDependenciesMeta`) are **not** installed — no tested subpath loads them,
 so pinning them would add only install weight and registry-flake surface. The
 floor/load smoke uses `npm install` (never workspace pnpm/catalog), and both
@@ -125,8 +155,11 @@ listed for completeness but the smoke does not install them.)
 | `@modelcontextprotocol/sdk` | `^1.24.0` | `src/lib/server/{serve,tasks,postgres-task-store}.ts` import `@modelcontextprotocol/sdk/experimental/tasks/*` | `experimental/tasks/stores/in-memory.js` first ships in **1.24.0** (absent in 1.23.1). The main entry eagerly loads `server/tasks`, so any consumer importing `@adcp/sdk` on `< 1.24.0` hits `ERR_MODULE_NOT_FOUND`. Corrected from an earlier `^1.17.5`. |
 | `zod` | `^4.1.5` | Bare `import … from 'zod'` only (no `zod/v4` subpaths); top-level v4 API | v4 top-level surface; loads at the supported peer floor while development tracks the current compatible 4.x release. |
 | `@opentelemetry/api` | `^1.0.0` (optional) | Metrics/tracing | Stable 1.x API. Not installed by the smoke. |
-| `pg` | `^8.0.0` (optional) | `postgres-task-store` | Stable 8.x `Pool`/`Client` API. Not installed by the smoke. |
 | `redis` | `^4.6.0 \|\| ^5.0.0 \|\| ^6.0.0` (optional) | Redis-backed stores | All three supported major lines use the async client APIs consumed by the SDK. Not installed by the smoke. |
 
 When a floor changes, update both `package.json#peerDependencies` and this
 table, then rerun `verify:package` to confirm the new floor loads.
+
+`pg` is a regular runtime dependency. The `doctor --dir` inspector must resolve
+its PostgreSQL driver from the trusted CLI installation, never execute a driver
+from the inspected project.

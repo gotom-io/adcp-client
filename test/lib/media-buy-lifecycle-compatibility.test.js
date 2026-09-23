@@ -11,6 +11,7 @@ const { createIdempotencyStore, memoryBackend } = require('../../dist/lib/server
 
 async function withDualSurfaceSeller(serverAdcpVersion, buyerAdcpVersion, run, options = {}) {
   const calls = [];
+  const legacyRequests = [];
   let mediaBuy = {
     media_buy_id: 'hidden-legacy-media-buy-1',
     status: 'active',
@@ -22,7 +23,7 @@ async function withDualSurfaceSeller(serverAdcpVersion, buyerAdcpVersion, run, o
     end_time: '2027-02-01T00:00:00Z',
     confirmed_at: '2027-01-01T00:00:00Z',
   };
-  const supportedVersions = ['3.0.25', '3.1.18', '3.2.0-beta.6'].filter(version => {
+  const supportedVersions = ['3.0.25', '3.1.18', '3.2.0-rc.4'].filter(version => {
     if (serverAdcpVersion.startsWith('3.0.')) return version.startsWith('3.0.');
     if (serverAdcpVersion.startsWith('3.1.')) return !version.startsWith('3.2.');
     return true;
@@ -31,6 +32,7 @@ async function withDualSurfaceSeller(serverAdcpVersion, buyerAdcpVersion, run, o
     name: 'dual-surface-seller',
     version: '1.0.0',
     adcpVersion: serverAdcpVersion,
+    ...(options.defaultAdcpVersion && { defaultAdcpVersion: options.defaultAdcpVersion }),
     idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
     resolveSessionKey: () => 'dual-surface-seller',
     ...(options.mcpToolProfile && { mcpToolProfile: options.mcpToolProfile }),
@@ -49,6 +51,7 @@ async function withDualSurfaceSeller(serverAdcpVersion, buyerAdcpVersion, run, o
       requestProposals: async () =>
         adcpError('TERMS_REJECTED', { message: 'fixture rejection', recovery: 'correctable' }),
       getProducts: async params => {
+        legacyRequests.push(structuredClone(params));
         calls.push(['get_products', params.adcp_version, params.adcp_major_version]);
         if (params.buying_mode === 'brief' || params.buying_mode === 'refine') {
           const refinedProposalId = params.refine?.find(item => item.scope === 'proposal')?.proposal_id;
@@ -75,7 +78,7 @@ async function withDualSurfaceSeller(serverAdcpVersion, buyerAdcpVersion, run, o
             cache_scope: 'account',
           };
         }
-        return { products: [], cache_scope: 'public' };
+        return { products: options.legacyProducts ?? [], cache_scope: 'public' };
       },
       createMediaBuy: async params => {
         calls.push(['create_media_buy', params.adcp_version, params.adcp_major_version, structuredClone(params)]);
@@ -124,18 +127,63 @@ async function withDualSurfaceSeller(serverAdcpVersion, buyerAdcpVersion, run, o
   const buyer = AgentClient.fromMCPClient(mcpClient, {
     adcpVersion: buyerAdcpVersion,
     validation: { requests: 'strict', responses: 'off' },
+    ...(options.legacyFormatConverter && { legacyFormatConverter: options.legacyFormatConverter }),
   });
   try {
-    await run({ buyer, mcpClient, calls, getMediaBuy: () => mediaBuy });
+    await run({ buyer, mcpClient, calls, legacyRequests, getMediaBuy: () => mediaBuy });
   } finally {
     await Promise.allSettled([mcpClient.close(), server.close()]);
   }
 }
 
+test('dual-surface seller defaults unversioned MCP callers to 3.1 while explicit 3.2 remains reachable', async () => {
+  await withDualSurfaceSeller(
+    '3.2.0-rc.4',
+    '3.2.0-rc.4',
+    async ({ mcpClient, calls }) => {
+      const sdkTools = await AgentClient.fromMCPClient(mcpClient, {
+        adcpVersion: '3.2.0-rc.4',
+        validation: { requests: 'strict', responses: 'off' },
+      }).getAgentInfo();
+      assert.ok(sdkTools.tools.some(tool => tool.name === 'list_products'));
+      assert.ok(!sdkTools.tools.some(tool => tool.name === 'get_products'));
+
+      const defaultTools = await mcpClient.listTools();
+      assert.strictEqual(defaultTools._meta.adcp_version, '3.1.18');
+      assert.ok(defaultTools.tools.some(tool => tool.name === 'get_products'));
+      assert.ok(!defaultTools.tools.some(tool => tool.name === 'list_products'));
+
+      const explicitTools = await mcpClient.listTools({ _meta: { adcp_version: '3.2.0-rc.4' } });
+      assert.strictEqual(explicitTools._meta.adcp_version, '3.2.0-rc.4');
+      assert.ok(explicitTools.tools.some(tool => tool.name === 'list_products'));
+      assert.ok(!explicitTools.tools.some(tool => tool.name === 'get_products'));
+
+      const established = await mcpClient.callTool({
+        name: 'get_products',
+        arguments: { buying_mode: 'wholesale' },
+      });
+      assert.notStrictEqual(established.isError, true, JSON.stringify(established.structuredContent));
+      assert.strictEqual(established.structuredContent.adcp_version, '3.1');
+
+      const compact = await mcpClient.callTool({
+        name: 'list_products',
+        arguments: { adcp_version: '3.2-rc.4', max_results: 10 },
+      });
+      assert.notStrictEqual(compact.isError, true, JSON.stringify(compact.structuredContent));
+      assert.strictEqual(compact.structuredContent.adcp_version, '3.2-rc.4');
+      assert.deepStrictEqual(
+        calls.map(([tool]) => tool),
+        ['get_products', 'list_products']
+      );
+    },
+    { defaultAdcpVersion: '3.1.18' }
+  );
+});
+
 test('forced established diagnostics use actual MCP tool discovery on an all-tools 3.2 seller', async () => {
   await withDualSurfaceSeller(
-    '3.2.0-beta.6',
-    '3.2.0-beta.6',
+    '3.2.0-rc.4',
+    '3.2.0-rc.4',
     async ({ buyer, calls }) => {
       const lifecycle = await buyer.negotiateMediaBuyLifecycle({
         preferredLifecycle: 'established',
@@ -276,7 +324,7 @@ test('forced established diagnostics use actual MCP tool discovery on an all-too
 });
 
 test('SDK buyer uses the compact lifecycle against a 3.2 seller profile', async () => {
-  await withDualSurfaceSeller('3.2.0-beta.6', '3.2.0-beta.6', async ({ buyer, mcpClient, calls }) => {
+  await withDualSurfaceSeller('3.2.0-rc.4', '3.2.0-rc.4', async ({ buyer, mcpClient, calls }) => {
     const listed = await mcpClient.listTools();
     assert.ok(listed.tools.some(tool => tool.name === 'list_products'));
     assert.ok(!listed.tools.some(tool => tool.name === 'get_products'));
@@ -284,15 +332,15 @@ test('SDK buyer uses the compact lifecycle against a 3.2 seller profile', async 
     const result = await buyer.listProducts({ max_results: 10 });
     assert.strictEqual(result.success, true, JSON.stringify(result));
     assert.strictEqual(result.data.feed_version, 'feed-modern');
-    assert.deepStrictEqual(calls, [['list_products', '3.2-beta.6', 3]]);
+    assert.deepStrictEqual(calls, [['list_products', '3.2-rc.4', 3]]);
 
     const lifecycle = await buyer.negotiateMediaBuyLifecycle();
     const compatible = await lifecycle.listProducts({ max_results: 5 });
-    assert.strictEqual(lifecycle.negotiated_version, '3.2-beta.6');
+    assert.strictEqual(lifecycle.negotiated_version, '3.2-rc.4');
     assert.strictEqual(compatible.compatibility.lifecycle, 'compact');
     assert.deepStrictEqual(compatible.compatibility.tools_used, ['list_products']);
     assert.strictEqual(compatible.data.feed_version, 'feed-modern');
-    assert.deepStrictEqual(calls.at(-1), ['list_products', '3.2-beta.6', 3]);
+    assert.deepStrictEqual(calls.at(-1), ['list_products', '3.2-rc.4', 3]);
 
     const rejected = await mcpClient.callTool({
       name: 'request_proposals',
@@ -317,7 +365,7 @@ test('SDK buyer uses the compact lifecycle against a 3.2 seller profile', async 
 
 for (const adcpVersion of ['3.1.18', '3.0.25']) {
   test(`SDK buyer pinned to ${adcpVersion} can call a 3.2 seller's hidden legacy facade`, async () => {
-    await withDualSurfaceSeller('3.2.0-beta.6', adcpVersion, async ({ buyer, mcpClient, calls }) => {
+    await withDualSurfaceSeller('3.2.0-rc.4', adcpVersion, async ({ buyer, mcpClient, calls, legacyRequests }) => {
       const listed = await mcpClient.listTools();
       assert.ok(!listed.tools.some(tool => tool.name === 'get_products'));
 
@@ -327,17 +375,34 @@ for (const adcpVersion of ['3.1.18', '3.0.25']) {
       assert.deepStrictEqual(calls, [expectedWireClaim]);
 
       const lifecycle = await buyer.negotiateMediaBuyLifecycle();
-      const compatible = await lifecycle.listProducts({ max_results: 5 });
+      const compatible = await lifecycle.listProducts({
+        idempotency_key: `legacy-list-${adcpVersion}`,
+        account: { account_id: 'account-1' },
+        brand: { domain: 'example.com' },
+        criteria: { offer_filters: { countries: ['US'] } },
+        cursor: 'legacy-cursor-1',
+        max_results: 5,
+      });
       assert.strictEqual(lifecycle.negotiated_version, adcpVersion === '3.1.18' ? '3.1' : '3.0');
       assert.strictEqual(compatible.compatibility.lifecycle, 'established');
       assert.strictEqual(compatible.compatibility.compatibility, 'lossless_projection');
       assert.deepStrictEqual(compatible.compatibility.tools_used, ['get_products']);
       assert.deepStrictEqual(calls.at(-1), expectedWireClaim);
+      assert.deepStrictEqual(legacyRequests.at(-1), {
+        buying_mode: 'wholesale',
+        idempotency_key: `legacy-list-${adcpVersion}`,
+        account: { account_id: 'account-1' },
+        brand: { domain: 'example.com' },
+        filters: { countries: ['US'] },
+        pagination: { cursor: 'legacy-cursor-1', max_results: 5 },
+        ...(adcpVersion === '3.1.18' && { adcp_version: '3.1' }),
+        adcp_major_version: 3,
+      });
     });
   });
 
   test(`SDK buyer pinned to ${adcpVersion} preserves the full hidden legacy lifecycle on a normal 3.2 profile`, async () => {
-    await withDualSurfaceSeller('3.2.0-beta.6', adcpVersion, async ({ buyer, mcpClient, calls }) => {
+    await withDualSurfaceSeller('3.2.0-rc.4', adcpVersion, async ({ buyer, mcpClient, calls }) => {
       const listedTools = await mcpClient.listTools();
       for (const hidden of ['get_products', 'create_media_buy', 'update_media_buy']) {
         assert.ok(!listedTools.tools.some(tool => tool.name === hidden), `${hidden} must stay hidden from tools/list`);
@@ -538,5 +603,151 @@ for (const adcpVersion of ['3.1.18', '3.0.25']) {
       assert.deepStrictEqual(compatible.compatibility.tools_used, ['get_products']);
       assert.deepStrictEqual(calls.at(-1), expectedWireClaim);
     });
+  });
+}
+
+for (const lane of [
+  {
+    name: '3.1 served release',
+    negotiatedVersion: '3.1.18',
+    capabilities: {
+      version: 'v3',
+      servedVersion: '3.1.18',
+      supportedVersions: ['3.1.18'],
+      idempotency: { replayTtlSeconds: 3600 },
+      mediaBuyLifecycleTools: ['get_products'],
+      discoveredTools: ['get_products'],
+    },
+  },
+  {
+    name: 'metadata-free 3.0',
+    negotiatedVersion: '3.0',
+    capabilities: {
+      version: 'v3',
+      idempotency: { replayTtlSeconds: 3600 },
+      mediaBuyLifecycleTools: ['get_products'],
+      discoveredTools: ['get_products'],
+    },
+  },
+]) {
+  test(`3.2-pinned buyer projects ${lane.name} claims to a hidden legacy handler`, async () => {
+    await withDualSurfaceSeller(
+      '3.2.0-rc.4',
+      '3.2.0-rc.4',
+      async ({ buyer, mcpClient, calls, legacyRequests }) => {
+        const compactTools = await mcpClient.listTools({ _meta: { adcp_version: '3.2-rc.4' } });
+        assert.ok(!compactTools.tools.some(tool => tool.name === 'get_products'));
+
+        buyer.getCapabilities = async () => lane.capabilities;
+        const lifecycle = await buyer.negotiateMediaBuyLifecycle({
+          principalScope: 'hidden-boundary-buyer',
+          legacyPurchaseSellerSessionScope: 'hidden-boundary-seller-session',
+          allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic'],
+        });
+        const result = await lifecycle.listProducts({
+          idempotency_key: `hidden-${lane.negotiatedVersion}-list-0001`,
+          account: { account_id: 'account-hidden-boundary' },
+          criteria: { offer_filters: { countries: ['US'] } },
+          cursor: 'hidden-boundary-cursor',
+          max_results: 7,
+        });
+
+        assert.equal(lifecycle.negotiated_version, lane.negotiatedVersion);
+        assert.equal(result.success, true, JSON.stringify(result));
+        assert.deepStrictEqual(calls.at(-1), [
+          'get_products',
+          lane.negotiatedVersion.startsWith('3.1') ? '3.1' : undefined,
+          3,
+        ]);
+        assert.deepStrictEqual(legacyRequests.at(-1), {
+          buying_mode: 'wholesale',
+          adcp_major_version: 3,
+          ...(lane.negotiatedVersion.startsWith('3.1') && { adcp_version: '3.1' }),
+          idempotency_key: `hidden-${lane.negotiatedVersion}-list-0001`,
+          account: { account_id: 'account-hidden-boundary' },
+          filters: { countries: ['US'] },
+          pagination: { cursor: 'hidden-boundary-cursor', max_results: 7 },
+        });
+
+        const continuation = result.data.purchase_continuation;
+        assert.ok(continuation, JSON.stringify(result));
+        assert.equal(continuation.kind, 'legacy_create');
+        const legacyCreateIdempotencyKey = lane.negotiatedVersion.startsWith('3.1')
+          ? '6ec62a3e-9859-4b29-943f-53f10c988c2f'
+          : 'fc689f57-d34d-43b7-a7b9-8aa38f69af59';
+        const purchased = await lifecycle.continueLegacyPurchase({
+          idempotency_key: lane.negotiatedVersion.startsWith('3.1')
+            ? 'ccf730a8-a043-4b51-a7a3-e1cb77a908b9'
+            : '38a18528-b290-4a18-bf5d-58f05d481c14',
+          continuation_token: continuation.continuation_token,
+          account: { account_id: 'account-hidden-boundary' },
+          selected_product_ids: ['hidden-product-1'],
+          accepted_losses: continuation.losses,
+          legacy_create_request: {
+            idempotency_key: legacyCreateIdempotencyKey,
+            account: { account_id: 'account-hidden-boundary' },
+            brand: { domain: 'example.com' },
+            packages: [{ product_id: 'hidden-product-1', pricing_option_id: 'hidden-price-1', budget: 100 }],
+            start_time: '2027-01-01T00:00:00Z',
+            end_time: '2027-02-01T00:00:00Z',
+          },
+        });
+        assert.equal(purchased.success, true, JSON.stringify(purchased));
+        const createCall = calls.findLast(([tool]) => tool === 'create_media_buy');
+        assert.deepStrictEqual(createCall.slice(0, 3), [
+          'create_media_buy',
+          lane.negotiatedVersion.startsWith('3.1') ? '3.1' : undefined,
+          3,
+        ]);
+        assert.deepStrictEqual(createCall[3], {
+          adcp_major_version: 3,
+          ...(lane.negotiatedVersion.startsWith('3.1') && { adcp_version: '3.1' }),
+          idempotency_key: legacyCreateIdempotencyKey,
+          account: { account_id: 'account-hidden-boundary' },
+          brand: { domain: 'example.com' },
+          packages: [{ product_id: 'hidden-product-1', pricing_option_id: 'hidden-price-1', budget: 100 }],
+          start_time: '2027-01-01T00:00:00Z',
+          end_time: '2027-02-01T00:00:00Z',
+        });
+      },
+      {
+        legacyProducts: [
+          {
+            product_id: 'hidden-product-1',
+            name: 'Hidden legacy product',
+            description: 'Purchasable through the legacy facade',
+            publisher_properties: [{ publisher_domain: 'example.com', selection_type: 'all' }],
+            format_ids: [{ agent_url: 'https://formats.example/catalog', id: 'hidden-display' }],
+            delivery_type: 'non_guaranteed',
+            pricing_options: [
+              {
+                pricing_option_id: 'hidden-price-1',
+                pricing_model: 'cpm',
+                currency: 'USD',
+                fixed_price: 10,
+              },
+            ],
+            reporting_capabilities: {
+              available_reporting_frequencies: ['daily'],
+              expected_delay_minutes: 60,
+              timezone: 'UTC',
+              supports_webhooks: false,
+              available_metrics: ['impressions'],
+              date_range_support: 'date_range',
+            },
+          },
+        ],
+        legacyFormatConverter: () => ({
+          format_option_id: 'hidden-format-option',
+          format_kind: 'custom',
+          format_shape: 'display',
+          format_schema: {
+            uri: 'https://formats.example/schemas/hidden-display.json',
+            digest: `sha256:${'a'.repeat(64)}`,
+          },
+          params: {},
+        }),
+      }
+    );
   });
 }

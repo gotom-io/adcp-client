@@ -233,6 +233,139 @@ describe('storyboard run --webhook-receiver', () => {
     assert.strictEqual(result.status, 0, `stderr: ${result.stderr}`);
   });
 
+  test('--webhook-receiver-host survives positional parsing', () => {
+    const result = runCli([
+      'storyboard',
+      'run',
+      'test-mcp',
+      '--file',
+      scenarioPath,
+      '--webhook-receiver',
+      'proxy',
+      '--webhook-receiver-host',
+      '0.0.0.0',
+      '--webhook-receiver-public-url',
+      'http://tests:9999',
+      '--allow-http',
+      '--dry-run',
+    ]);
+    assert.strictEqual(result.status, 0, `stderr: ${result.stderr}`);
+  });
+
+  test('HTTP proxy public URL requires --allow-http', () => {
+    const result = runCli([
+      'storyboard',
+      'run',
+      'test-mcp',
+      '--file',
+      scenarioPath,
+      '--webhook-receiver',
+      'proxy',
+      '--webhook-receiver-public-url',
+      'http://tests:9999',
+      '--dry-run',
+    ]);
+    assert.strictEqual(result.status, 2);
+    assert.match(result.stderr, /requires --allow-http/);
+  });
+
+  test('invalid proxy public URL forms fail during dry-run validation', () => {
+    for (const [url, pattern] of [
+      ['file:///etc/passwd', /must use http or https/],
+      ['https://user:password@example.com', /must not include userinfo/],
+      ['https://example.com/hooks?tenant=1', /query string or fragment/],
+    ]) {
+      const result = runCli([
+        'storyboard',
+        'run',
+        'test-mcp',
+        '--file',
+        scenarioPath,
+        '--webhook-receiver',
+        'proxy',
+        '--webhook-receiver-public-url',
+        url,
+        '--dry-run',
+      ]);
+      assert.strictEqual(result.status, 2, `${url}: ${result.stderr}`);
+      assert.match(result.stderr, pattern);
+    }
+  });
+
+  test('TLS certificate and key flags must be paired', () => {
+    const result = runCli([
+      'storyboard',
+      'run',
+      'test-mcp',
+      '--file',
+      scenarioPath,
+      '--webhook-receiver',
+      '--webhook-receiver-tls-cert',
+      scenarioPath,
+      '--dry-run',
+    ]);
+    assert.strictEqual(result.status, 2);
+    assert.match(result.stderr, /tls-cert and --webhook-receiver-tls-key must be provided together/);
+  });
+
+  test('direct TLS rejects an HTTP public URL during dry-run', () => {
+    const result = runCli([
+      'storyboard',
+      'run',
+      'test-mcp',
+      '--file',
+      scenarioPath,
+      '--webhook-receiver',
+      'proxy',
+      '--webhook-receiver-public-url',
+      'http://tests:9999',
+      '--allow-http',
+      '--webhook-receiver-tls-cert',
+      scenarioPath,
+      '--webhook-receiver-tls-key',
+      scenarioPath,
+      '--dry-run',
+    ]);
+    assert.strictEqual(result.status, 2);
+    assert.match(result.stderr, /direct webhook receiver TLS requires an https:\/\//);
+  });
+
+  test('TLS material must come from regular files', () => {
+    const result = runCli([
+      'storyboard',
+      'run',
+      'test-mcp',
+      '--file',
+      scenarioPath,
+      '--webhook-receiver',
+      '--webhook-receiver-tls-cert',
+      tmpDir,
+      '--webhook-receiver-tls-key',
+      tmpDir,
+      '--dry-run',
+    ]);
+    assert.strictEqual(result.status, 2);
+    assert.match(result.stderr, /must be a regular file/);
+  });
+
+  test('TLS files are read eagerly with an actionable error', () => {
+    const result = runCli([
+      'storyboard',
+      'run',
+      'test-mcp',
+      '--file',
+      scenarioPath,
+      '--webhook-receiver',
+      '--webhook-receiver-tls-cert',
+      path.join(tmpDir, 'missing-cert.pem'),
+      '--webhook-receiver-tls-key',
+      path.join(tmpDir, 'missing-key.pem'),
+      '--dry-run',
+    ]);
+    assert.strictEqual(result.status, 2);
+    assert.match(result.stderr, /unable to read webhook receiver TLS files/);
+  });
+
   test('--webhook-receiver followed by a storyboard ID does not consume the ID as mode', () => {
     // Footgun check: `--webhook-receiver` takes an OPTIONAL value. An operator
     // writing `... --webhook-receiver webhook-emission` (expecting webhook-emission
@@ -361,14 +494,17 @@ describe('storyboard run --webhook-receiver-auto-tunnel', () => {
   test('ADCP_WEBHOOK_TUNNEL override substitutes {port} and captures marker URL', () => {
     // End-to-end of the override path: the stub prints the URL behind the
     // `ADCP_TUNNEL_URL=` marker and stays alive. The CLI must capture that URL,
-    // proceed to runStoryboard, fail at network dispatch (test-mcp isn't real
-    // here), and kill the tunnel on exit. The `runCli` timeout is the
-    // regression guard — if capture succeeds but the run hangs, the test fails
-    // loudly instead of stalling CI.
-    const result = runCli(['storyboard', 'run', 'test-mcp', '--file', scenarioPath, '--webhook-receiver-auto-tunnel'], {
-      ADCP_WEBHOOK_TUNNEL: `${stubTunnelPath} {port}`,
-      ADCP_WEBHOOK_TUNNEL_TIMEOUT_MS: '5000',
-    });
+    // proceed to runStoryboard, fail at network dispatch, and kill the tunnel
+    // on exit. Use a refused loopback endpoint: test-mcp is a live public service
+    // whose network timing must not determine this local tunnel lifecycle test.
+    // The runCli timeout catches a hang after capture instead of stalling CI.
+    const result = runCli(
+      ['storyboard', 'run', 'http://127.0.0.1:1/mcp', '--file', scenarioPath, '--webhook-receiver-auto-tunnel'],
+      {
+        ADCP_WEBHOOK_TUNNEL: `${stubTunnelPath} {port}`,
+        ADCP_WEBHOOK_TUNNEL_TIMEOUT_MS: '5000',
+      }
+    );
     assert.notStrictEqual(result.signal, 'SIGKILL', 'CLI hung past timeout — regression');
     assert.match(result.stderr, /Auto-tunnel \(.+\): https:\/\/stub-\d+\.tunnel\.test → http:\/\/localhost:\d+/);
   });
@@ -378,11 +514,15 @@ describe('storyboard run --webhook-receiver-auto-tunnel', () => {
     // forwarding URL, the scanner must not latch onto that bystander. The stub
     // prints the noise URL first, then the marker; success proves the scanner
     // kept reading past the noise instead of wiring the wrong destination.
-    const result = runCli(['storyboard', 'run', 'test-mcp', '--file', scenarioPath, '--webhook-receiver-auto-tunnel'], {
-      ADCP_WEBHOOK_TUNNEL: `${stubTunnelPath} {port}`,
-      FAKE_TUNNEL_NOISE_URL: 'https://docs.example.com/getting-started',
-      ADCP_WEBHOOK_TUNNEL_TIMEOUT_MS: '5000',
-    });
+    const result = runCli(
+      ['storyboard', 'run', 'http://127.0.0.1:1/mcp', '--file', scenarioPath, '--webhook-receiver-auto-tunnel'],
+      {
+        ADCP_WEBHOOK_TUNNEL: `${stubTunnelPath} {port}`,
+        FAKE_TUNNEL_NOISE_URL: 'https://docs.example.com/getting-started',
+        ADCP_WEBHOOK_TUNNEL_TIMEOUT_MS: '5000',
+      }
+    );
+    assert.notStrictEqual(result.signal, 'SIGKILL', 'CLI hung past timeout after marker capture');
     assert.match(result.stderr, /Auto-tunnel \(.+\): https:\/\/stub-\d+\.tunnel\.test/);
     assert.doesNotMatch(result.stderr, /Auto-tunnel \(.+\): https:\/\/docs\.example\.com/);
   });

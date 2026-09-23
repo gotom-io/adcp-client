@@ -23,7 +23,12 @@ import type {
   UpdateMediaBuyRequest,
   UpdateMediaBuyResponse,
 } from '../../types/tools.generated';
-import { projectV1ProductToV2, resolveCanonicalFormatKind } from './v1-to-v2';
+import {
+  canonicalDeclarationFromBareId,
+  migratedFormatOptionId,
+  projectV1ProductToV2,
+  resolveCanonicalFormatKind,
+} from './v1-to-v2';
 import type { LegacyFormatConverter } from './v1-to-v2';
 import { CanonicalFormatLegacyResolutionError, resolveCanonicalFormatLegacyRefs } from './v2-to-v1';
 import type { CanonicalFormatLegacyResolver } from './v2-to-v1';
@@ -95,12 +100,13 @@ export type CanonicalPlacement = Omit<CanonicalCreativeResponse<Placement>, 'for
 export type CanonicalProduct = Omit<
   CanonicalCreativeResponse<Product>,
   'format_ids' | 'format_options' | 'placements'
-> & {
-  product_id: string;
-  format_ids?: never;
-  format_options: NonEmptyCanonicalFormatDeclarations;
-  placements?: CanonicalPlacement[];
-};
+> &
+  import('../../supply-path/products').ProductSupplyPathAnnotation & {
+    product_id: string;
+    format_ids?: never;
+    format_options: NonEmptyCanonicalFormatDeclarations;
+    placements?: CanonicalPlacement[];
+  };
 type CanonicalGetProductsField = Exclude<NonNullable<GetProductsRequest['fields']>[number], 'format_ids'>;
 /** Primary product discovery request cannot ask the SDK to expose legacy format IDs. */
 export type CanonicalGetProductsRequest = Omit<GetProductsRequest, 'fields'> & {
@@ -265,6 +271,7 @@ export function stripLegacyCreativeIdentity<T>(value: T): CanonicalCreativeRespo
     'video_hosted',
     'video_vast',
     'audio_hosted',
+    'audio_vast',
     'audio_daast',
     'sponsored_placement',
     'native_in_feed',
@@ -645,6 +652,7 @@ const CANONICAL_FORMAT_KINDS = new Set<CanonicalFormatKind>([
   'video_hosted',
   'video_vast',
   'audio_hosted',
+  'audio_vast',
   'audio_daast',
   'sponsored_placement',
   'native_in_feed',
@@ -867,6 +875,96 @@ function refMatchesParams(ref: V1FormatId, paramsValue: unknown): boolean {
   return true;
 }
 
+interface CreativeFormatParameterConstraints {
+  width?: number;
+  height?: number;
+  durationMs?: number;
+}
+
+function creativeFormatParameterConstraints(
+  creative: Record<string, unknown>
+): CreativeFormatParameterConstraints | undefined {
+  const params = record(creative.format_parameters);
+  if (!params) return undefined;
+  const width = typeof params.width === 'number' ? params.width : undefined;
+  const height = typeof params.height === 'number' ? params.height : undefined;
+  const durationMs =
+    typeof params.duration_ms === 'number'
+      ? params.duration_ms
+      : typeof params.duration_ms_exact === 'number'
+        ? params.duration_ms_exact
+        : undefined;
+  if (width === undefined && height === undefined && durationMs === undefined) return undefined;
+  return { width, height, durationMs };
+}
+
+function refContradictsConstraints(ref: V1FormatId, constraints: CreativeFormatParameterConstraints): boolean {
+  if (constraints.width !== undefined && typeof ref.width === 'number' && ref.width !== constraints.width) return true;
+  if (constraints.height !== undefined && typeof ref.height === 'number' && ref.height !== constraints.height) {
+    return true;
+  }
+  if (
+    constraints.durationMs !== undefined &&
+    typeof ref.duration_ms === 'number' &&
+    ref.duration_ms !== constraints.durationMs
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function refPinsConstraints(ref: V1FormatId, constraints: CreativeFormatParameterConstraints): boolean {
+  if (constraints.width !== undefined && typeof ref.width !== 'number') return false;
+  if (constraints.height !== undefined && typeof ref.height !== 'number') return false;
+  if (constraints.durationMs !== undefined && typeof ref.duration_ms !== 'number') return false;
+  return true;
+}
+
+function legacyIdPinsDimensions(ref: V1FormatId): boolean | undefined {
+  const declaration = canonicalDeclarationFromBareId(ref.id, { agentUrl: ref.agent_url });
+  if (!declaration) return undefined;
+  const params = record(declaration.params) ?? {};
+  return (
+    typeof params.width === 'number' ||
+    typeof params.height === 'number' ||
+    typeof params.duration_ms_exact === 'number' ||
+    Array.isArray(params.sizes)
+  );
+}
+
+function refConstraintKey(ref: V1FormatId): string {
+  return [agentIdentity(ref.agent_url), ref.width ?? '', ref.height ?? '', ref.duration_ms ?? ''].join('|');
+}
+
+/**
+ * Most-constrained-wins for a canonical creative facing several legacy refs of
+ * its kind. Drop refs that contradict the creative's own `format_parameters`,
+ * prefer refs that pin them, and among refs imposing identical constraints (a
+ * seller listing `display_html` at 300x250 next to `display_300x250_html`)
+ * prefer the legacy id whose own declaration pins that size over a generic
+ * parametrized id. Refs that still differ in their constraints stay ambiguous
+ * and the caller keeps failing closed.
+ */
+function preferMostConstrainedLegacyCandidates(
+  candidates: LegacyCandidate[],
+  creative: Record<string, unknown>
+): LegacyCandidate[] {
+  if (candidates.length <= 1) return candidates;
+  let remaining = candidates;
+  const constraints = creativeFormatParameterConstraints(creative);
+  if (constraints) {
+    const compatible = remaining.filter(candidate => !refContradictsConstraints(candidate.ref, constraints));
+    if (compatible.length > 0) remaining = compatible;
+    const pinned = remaining.filter(candidate => refPinsConstraints(candidate.ref, constraints));
+    if (pinned.length > 0) remaining = pinned;
+  }
+  if (remaining.length <= 1) return remaining;
+  const constraintKeys = new Set(remaining.map(candidate => refConstraintKey(candidate.ref)));
+  if (constraintKeys.size !== 1) return remaining;
+  const specific = remaining.filter(candidate => legacyIdPinsDimensions(candidate.ref) === true);
+  return specific.length > 0 && specific.length < remaining.length ? specific : remaining;
+}
+
 function selectLegacyRef(
   creative: Record<string, unknown>,
   container: CreativeFormatSelectorContainer,
@@ -885,8 +983,13 @@ function selectLegacyRef(
     if (selectedOptionRefs.length > 0 && !selectedOptionRefs.some(ref => sameOptionReference(ref, creativeOptionRef))) {
       return undefined;
     }
-    candidates = candidates.filter(
-      candidate => candidate.formatOptionRef && sameOptionReference(candidate.formatOptionRef, creativeOptionRef)
+    // A legacy-only container carries bare legacy refs whose synthetic option
+    // ids were minted from the same tuple at discovery time, so a pin can still
+    // be matched exactly by re-deriving that id.
+    candidates = candidates.filter(candidate =>
+      candidate.formatOptionRef
+        ? sameOptionReference(candidate.formatOptionRef, creativeOptionRef)
+        : migratedFormatOptionId(candidate.ref) === creativeOptionRef.format_option_id
     );
   } else if (selectedOptionRefs.length > 0) {
     candidates = candidates.filter(
@@ -912,6 +1015,7 @@ function selectLegacyRef(
   let matching = candidates.filter(candidate => candidate.formatKind === creative.format_kind);
   const constrained = matching.filter(candidate => refMatchesParams(candidate.ref, candidate.selectorParams));
   if (constrained.length > 0) matching = constrained;
+  matching = preferMostConstrainedLegacyCandidates(matching, creative);
   return matching.length === 1 ? matching[0]!.ref : undefined;
 }
 
@@ -1252,6 +1356,7 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
     let candidates = allCandidates.filter(candidate => candidate.formatKind === creativeRecord.format_kind);
     const constrained = candidates.filter(candidate => refMatchesParams(candidate.ref, selectorContainer.params));
     if (constrained.length > 0) candidates = constrained;
+    candidates = preferMostConstrainedLegacyCandidates(candidates, creativeRecord);
     let resolved: V1FormatId[] | undefined;
     try {
       if (
@@ -1282,6 +1387,10 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
       );
     }
     if (resolved) return projectCreative(creativeRecord, resolved[0]!) as unknown as LegacyProjectedCreative<T>;
+    const pinned = optionReference(creativeRecord.format_option_ref) !== undefined;
+    if (candidates.length === 1 && !pinned) {
+      return projectCreative(creativeRecord, candidates[0]!.ref) as unknown as LegacyProjectedCreative<T>;
+    }
     if (candidates.length > 1) {
       throw new CreativeFormatProjectionError(
         operation,
@@ -1289,7 +1398,9 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
         `the seller advertised ${candidates.length} legacy refs for canonical kind ${creativeRecord.format_kind}`
       );
     }
-    const reason = 'the selected seller product did not provide one unambiguous legacy format reference';
+    const reason = pinned
+      ? 'the creative is pinned to a format option that names none of the selected seller product legacy format references'
+      : 'the selected seller product did not provide one unambiguous legacy format reference';
     throw new CreativeFormatProjectionError(operation, creativeId, reason);
   }
   return creative as unknown as LegacyProjectedCreative<T>;
