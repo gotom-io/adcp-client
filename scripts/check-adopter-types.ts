@@ -13,7 +13,7 @@
  * diagnostic against the scaffold.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,19 +44,56 @@ const ADOPTER_TSCONFIG = {
   include: ['adopter.ts'],
 };
 
+const DECLARATION_TSCONFIG = {
+  compilerOptions: {
+    target: 'ES2022',
+    module: 'ESNext',
+    moduleResolution: 'bundler',
+    strict: true,
+    skipLibCheck: false,
+    declaration: true,
+    emitDeclarationOnly: true,
+    outDir: 'declarations',
+    types: ['node'],
+    ignoreDeprecations: '6.0',
+  },
+  include: ['adopter-declaration.ts'],
+};
+
+const DECLARATION_SOURCE = `
+import { ProductSchema, GetProductsRequestSchema } from '@adcp/sdk/schemas';
+import { z } from 'zod';
+
+export const SavedProductSchema = ProductSchema.safeExtend({
+  local_id: z.string().optional(),
+});
+
+export const LocalGetProductsSchema = GetProductsRequestSchema.extend({
+  ext: z.object({ local: z.record(z.string(), z.unknown()) }).optional(),
+});
+
+export const LocalGetProductsWithoutOptionalExtension: z.output<typeof LocalGetProductsSchema> = {
+  buying_mode: 'brief',
+};
+`;
+
 const ADOPTER_SOURCE = `
 // Mirrors the repro from issue #1236 and locks the server-side handler
 // payload typing surface that adopters consume from a packed SDK tarball.
 import type {
   AdcpServer,
+  Account,
+  AccountStore,
   ActivateSignalPayload,
   LegacyBuildCreativePayload,
   LegacyBuildCreativeMultiPayload,
+  LegacyBuildCreativeVariantPayload,
   CheckGovernancePayload,
   CreativeApprovedPayload,
   CreatePropertyListPayload,
   CreateMediaBuyPayload,
   CreateMediaBuyHandlerResult,
+  DecisioningAdcpServer,
   GetMediaBuyDeliveryPayload,
   GetMediaBuysPayload,
   GetAccountFinancialsHandlerResult,
@@ -65,6 +102,7 @@ import type {
   GetProductsPayload,
   LegacyGetRightsPayload,
   ListAccountsHandlerResult,
+  ListAccountChangesHandlerResult,
   ListAccountsPayload,
   LegacyListCreativeFormatsPayload,
   LegacyListContentStandardsPayload,
@@ -78,10 +116,13 @@ import type {
   SIGetOfferingPayload,
   SyncAudiencesPayload,
   SyncAccountsHandlerResult,
+  SyncAccountsResultRow,
   SyncCreativesPayload,
   SyncCreativesHandlerResult,
   SyncEventSourcesPayload,
   SyncGovernanceHandlerResult,
+  TaskHandoffProgress,
+  TaskRegistry,
   LegacyUpdateRightsPayload,
   UpdateMediaBuyPayload,
 } from '@adcp/sdk/server';
@@ -96,6 +137,7 @@ import { createSingleAgentClient, extractAdcpErrorFromMcp, extractAdcpErrorFromT
 import type {
   CreateMediaBuyPayload as TypesCreateMediaBuyPayload,
   CreateMediaBuySuccess,
+  BuildCreativeVariantSuccess,
   CanonicalFormatAgentPlacementAISurfaceSponsoredPlacement,
   CanonicalFormatBase,
   CanonicalFormatDAASTAudio,
@@ -120,6 +162,7 @@ import type {
   DisclosurePosition,
   FormatSchemaReferenceResult,
   CreateMediaBuyPayload as RootCreateMediaBuyPayload,
+  DelegatedOperatorAuthorizationContext,
   GetProductsPayload as RootGetProductsPayload,
   LegacyProduct,
   LegacyGetProductsResponse,
@@ -130,8 +173,10 @@ import type {
   GetProductsRequest,
   SLAWindow,
   SlaWindow,
+  TaskOptions,
   UpdateMediaBuyPayload as RootUpdateMediaBuyPayload,
   LegacyGetProductsRequest,
+  WebhookRegistration,
 } from '@adcp/sdk';
 import { z } from 'zod';
 import type {
@@ -141,6 +186,7 @@ import type {
   CommercialTerms,
   ExplicitPackagesWithFixedAllocation,
   ListCreativesResponse,
+  NotificationConfig,
   Placement,
   PostalCountrySystem,
   PublisherPropertySelector,
@@ -176,6 +222,71 @@ import type {
 import { createCanonicalReferenceResolver as createSubpathCanonicalReferenceResolver } from '@adcp/sdk/canonical-references';
 import { customToolFor, customToolForSchema, TOOL_INPUT_SCHEMAS, TOOL_INPUT_SHAPES, TOOL_REQUEST_SCHEMAS } from '@adcp/sdk/schemas';
 import * as publicSchemas from '@adcp/sdk/schemas';
+
+const _delegatedOperatorAuthorization: DelegatedOperatorAuthorizationContext = {
+  brand: 'brand_a',
+  scope: 'media_buying',
+  country: 'GB',
+};
+const _delegatedTaskOptions: TaskOptions = {
+  delegatedOperatorAuthorization: _delegatedOperatorAuthorization,
+};
+const _tupleAwareWebhookRegistration: WebhookRegistration = {
+  agentId: 'seller',
+  agentUrl: 'https://seller.example/mcp',
+  protocol: 'mcp',
+  operationId: 'operation',
+  taskType: 'get_products',
+  callbackUrl: 'https://buyer.example/webhook',
+  method: 'POST',
+  mode: 'rfc9421',
+  authorizationContextVersion: 1,
+  delegatedOperatorAuthorization: _delegatedOperatorAuthorization,
+  createdAt: 1,
+  expiresAt: 2,
+};
+void _delegatedTaskOptions;
+void _tupleAwareWebhookRegistration;
+
+const _accountChangeStore: AccountStore = {
+  async resolve() {
+    return null;
+  },
+  async listChanges(): Promise<ListAccountChangesHandlerResult> {
+    return {
+      changes: [],
+      cursor: 'checkpoint',
+      has_more: false,
+      available_since: '2026-01-01T00:00:00Z',
+      generated_at: '2026-08-28T00:00:00Z',
+    };
+  },
+};
+void _accountChangeStore;
+
+// Issue #2831: decisioning Account surfaces must accept the current generated
+// 3.2 notification contract, including reporting lifecycle subscriptions.
+const _reportingStatusNotification: NotificationConfig = {
+  subscriber_id: 'reporting-status',
+  url: 'https://buyer.example/webhooks/adcp/reporting',
+  event_types: ['reporting.status_changed'],
+};
+const _accountWithReportingStatusNotification: Account = {
+  id: 'acct_1',
+  name: 'Acme',
+  status: 'active',
+  ctx_metadata: {},
+  notification_configs: [_reportingStatusNotification],
+};
+const _syncRowWithReportingStatusNotification: SyncAccountsResultRow = {
+  brand: { domain: 'acme.example' },
+  operator: 'acme-direct',
+  action: 'updated',
+  status: 'active',
+  notification_configs: [_reportingStatusNotification],
+};
+void _accountWithReportingStatusNotification;
+void _syncRowWithReportingStatusNotification;
 
 // Public schema declarations must retain their object helpers and complete
 // parse outputs after packing, not just while compiling inside the repository.
@@ -390,6 +501,34 @@ void extractAdcpErrorFromMcp;
 void extractAdcpErrorFromTransport;
 void createAdcpServerFromPlatform;
 
+// Scoped task-registry migration: production reads require explicit authority;
+// the old unscoped lookup is intentionally absent from packed declarations.
+declare const _decisioningServer: DecisioningAdcpServer;
+void _decisioningServer.getTaskState('task_1', { accountId: 'acct_1', ownerScope: 'account:acct_1' });
+// @ts-expect-error unsafe task lookup is not a public production API
+void _decisioningServer.getTaskStateUnsafe('task_1');
+void _decisioningServer.awaitTaskUnsafe('task_1');
+const _taskRegistry: TaskRegistry = {
+  scopeVersion: 1,
+  async create() {
+    return { taskId: 'task_1', accountId: 'acct_1', ownerScope: 'account:acct_1' };
+  },
+  async getTask() {
+    return null;
+  },
+  async complete() {},
+  async fail() {},
+  async updateProgress() {},
+  _registerBackground() {},
+  async awaitTask() {},
+  async _awaitTaskUnsafe() {},
+};
+// @ts-expect-error unsafe task lookup is not part of the public registry contract
+void _taskRegistry._getTaskUnsafe('task_1');
+void _taskRegistry._awaitTaskUnsafe('task_1');
+const _extendedProgress: TaskHandoffProgress = { message: 'working', creatives_processed: 3 };
+void _extendedProgress;
+
 const _createMediaBuyPayload: CreateMediaBuyPayload = {
   media_buy_id: 'mb_1',
   confirmed_at: '2026-01-01T00:00:00Z',
@@ -462,6 +601,7 @@ const _payloadResults: [
   Result<GetMediaBuyDeliveryPayload, Error>,
   Result<LegacyBuildCreativePayload, Error>,
   Result<LegacyBuildCreativeMultiPayload, Error>,
+  Result<LegacyBuildCreativeVariantPayload, Error>,
   Result<SyncAudiencesPayload, Error>,
   Result<ActivateSignalPayload, Error>,
   Result<GetBrandIdentityPayload, Error>,
@@ -485,6 +625,7 @@ const _payloadResults: [
   }),
   ok({ creative_manifest: creativeManifest }),
   ok({ creative_manifests: [] }),
+  ok({ creatives: [] } satisfies BuildCreativeVariantSuccess),
   ok({ audiences: [] }),
   ok({ deployments: [] }),
   ok({ brand_id: 'brand_1', house: { domain: 'acme.com', name: 'Acme' }, names: [{ en: 'Acme' }] }),
@@ -871,7 +1012,9 @@ function main(): void {
     JSON.stringify({ name: 'adopter-types-check', version: '0.0.0', private: true })
   );
   writeFileSync(join(adopterDir, 'tsconfig.json'), JSON.stringify(ADOPTER_TSCONFIG, null, 2));
+  writeFileSync(join(adopterDir, 'tsconfig.declaration.json'), JSON.stringify(DECLARATION_TSCONFIG, null, 2));
   writeFileSync(join(adopterDir, 'adopter.ts'), ADOPTER_SOURCE);
+  writeFileSync(join(adopterDir, 'adopter-declaration.ts'), DECLARATION_SOURCE);
 
   // @types/express, @opentelemetry/api, and redis cover transitive type
   // references from the server bundle — adopters who import
@@ -918,6 +1061,17 @@ function main(): void {
   try {
     run('npx', ['--no-install', 'tsc', '--noEmit'], adopterDir, tscEnv);
     console.log('[adopter-types] PASS — published .d.ts files type-check cleanly for an adopter.');
+
+    console.log('[adopter-types] emitting declarations for composed public schemas...');
+    run('npx', ['--no-install', 'tsc', '-p', 'tsconfig.declaration.json'], adopterDir, tscEnv);
+    const declaration = readFileSync(join(adopterDir, 'declarations', 'adopter-declaration.d.ts'), 'utf8');
+    if (/dist\/lib\/types\/[^'"\s]*generated/.test(declaration)) {
+      throw new Error('Composed public schema declaration references SDK-private generated modules.');
+    }
+    if (!declaration.includes('SavedProductSchema') || !declaration.includes('LocalGetProductsSchema')) {
+      throw new Error('Composed public schema declarations were not emitted.');
+    }
+    console.log('[adopter-types] PASS — composed schema declarations are portable.');
   } catch {
     console.error('[adopter-types] FAIL — published .d.ts files do not type-check on a clean adopter project.');
     console.error(`  Scaffold preserved at: ${adopterDir}`);

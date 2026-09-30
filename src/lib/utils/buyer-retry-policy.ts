@@ -109,6 +109,17 @@ export interface RetryContext {
  * Override hook for adopters with vertical-specific policy needs.
  * Receives the error + context; returns a `RetryDecision` or `null` to fall
  * through to the default policy.
+ *
+ * The `error` argument is the full `AdcpStructuredError`, so an override
+ * registered under a coarse outer `code` (e.g. `INVALID_REQUEST`) can still
+ * key on `error.buyer_reason?.code` for a more specific action — useful when
+ * the seller emits a producer-internal top-level code but populates
+ * `buyer_reason` with a standard buyer-actionable classification like
+ * `BUDGET_TOO_LOW` or `CREATIVE_REJECTED`. Note that the overrides map is
+ * keyed by outer `error.code` only — an override that inspects
+ * `error.buyer_reason.code` MUST be registered under every outer code that
+ * might carry that buyer-actionable reason (or under the wildcard patterns
+ * an adopter's platform emits).
  */
 export type RetryDecisionOverride = (error: AdcpStructuredError, ctx: RetryContext) => RetryDecision | null;
 
@@ -160,9 +171,10 @@ const EXPLICIT_CODE_POLICY: Partial<Record<ErrorCode, CodePolicy>> = {
   GOVERNANCE_UNAVAILABLE: { action: 'escalate', escalateReason: 'governance_unreachable' },
   CAMPAIGN_SUSPENDED: { action: 'escalate', escalateReason: 'governance_unreachable' },
 
-  // Resource-not-found — re-discover and retry. attemptCap: 3 so a buyer with
+  // Account selection / resource-not-found — re-discover and retry. attemptCap: 3 so a buyer with
   // a stale cache can list, mutate, list-again-on-second-staleness, and still
   // succeed before escalation.
+  ACCOUNT_REQUIRED: { action: 'mutate-and-retry', attemptCap: 3, reason: 'redirect', baseDelayMs: 250 },
   ACCOUNT_NOT_FOUND: { action: 'mutate-and-retry', attemptCap: 3, reason: 'redirect', baseDelayMs: 250 },
   MEDIA_BUY_NOT_FOUND: { action: 'mutate-and-retry', attemptCap: 3, reason: 'redirect', baseDelayMs: 250 },
   PACKAGE_NOT_FOUND: { action: 'mutate-and-retry', attemptCap: 3, reason: 'redirect', baseDelayMs: 250 },

@@ -21,6 +21,14 @@ describe('Inline-union value arrays (inline-enums.generated)', () => {
     assert.ok(inlineEnums.AudioAssetRequirements_FormatsValues, 'AudioAssetRequirements_FormatsValues exported');
   });
 
+  it('preserves change-term kind exports when their validators are intersections', async () => {
+    if (!inlineEnums) inlineEnums = await import('../../dist/lib/types/inline-enums.generated.js');
+    assert.deepEqual([...inlineEnums.BudgetChangeConstraints_KindValues], ['budget']);
+    assert.deepEqual([...inlineEnums.FlightChangeConstraints_KindValues], ['flight']);
+    assert.deepEqual([...inlineEnums.PackageCountConstraints_KindValues], ['package_count']);
+    assert.deepEqual([...inlineEnums.EffectiveTimingConstraints_KindValues], ['effective_timing']);
+  });
+
   it('user-flagged values match the AdCP spec (image-asset-requirements.json formats enum)', async () => {
     if (!inlineEnums) inlineEnums = await import('../../dist/lib/types/inline-enums.generated.js');
     // Pinned to the spec's `properties.formats.items.enum` in
@@ -36,6 +44,16 @@ describe('Inline-union value arrays (inline-enums.generated)', () => {
   it('user-flagged values match the AdCP spec (video-asset-requirements.json containers enum)', async () => {
     if (!inlineEnums) inlineEnums = await import('../../dist/lib/types/inline-enums.generated.js');
     assert.deepEqual([...inlineEnums.VideoAssetRequirements_ContainersValues], ['mp4', 'webm', 'mov', 'avi', 'mkv']);
+  });
+
+  it('flattens nested string unions without dropping canonical get_products fields', async () => {
+    if (!inlineEnums) inlineEnums = await import('../../dist/lib/types/inline-enums.generated.js');
+    const fields = inlineEnums.GetProductsRequest_FieldsValues;
+
+    assert.ok(fields.includes('measurement_terms'));
+    assert.ok(fields.includes('list_applications'));
+    assert.ok(fields.includes('format_ids'));
+    assert.equal(new Set(fields).size, fields.length);
   });
 
   it('values are non-empty const arrays of strings (every export)', async () => {

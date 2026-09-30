@@ -136,10 +136,10 @@ describe('Request Builder', () => {
       assert.strictEqual(result.packages[0].pricing_option_id, 'opt-1');
     });
 
-    test('includes default pricing_option_id when no products discovered', () => {
+    test('falls back to compliance fixture ids when no products are discovered', () => {
       const result = buildRequest(step('create_media_buy'), {}, DEFAULT_OPTIONS);
-      assert.strictEqual(result.packages[0].pricing_option_id, 'default');
-      assert.ok(result.packages[0].product_id, 'should have product_id');
+      assert.strictEqual(result.packages[0].pricing_option_id, 'test-pricing');
+      assert.strictEqual(result.packages[0].product_id, 'test-product');
       assert.ok(result.packages[0].budget > 0, 'should have positive budget');
     });
 
@@ -394,6 +394,18 @@ describe('Request Builder', () => {
         'sentinel pricing_option_id → discovery'
       );
       assert.strictEqual(result.packages[0].budget, 5000, 'non-sentinel fixture fields pass through');
+    });
+
+    test('preserves pricing sentinel for fixture binding when seeded products are not in runner context', () => {
+      const s = step('create_media_buy', {
+        sample_request: {
+          start_time: FUTURE_START,
+          packages: [{ product_id: 'test-product', budget: 5000, pricing_option_id: 'test-pricing' }],
+        },
+      });
+      const result = buildRequest(s, {}, DEFAULT_OPTIONS);
+      assert.strictEqual(result.packages[0].product_id, 'test-product');
+      assert.strictEqual(result.packages[0].pricing_option_id, 'test-pricing');
     });
 
     test('preserves top-level sample_request fields the enricher does not normalise (#1604)', () => {
@@ -1074,6 +1086,31 @@ describe('Request Builder', () => {
       );
       assert.deepStrictEqual(result.context, { correlation_id: 'signal_owned--activate_on_agent' });
       assert.deepStrictEqual(result.ext, { test_platform: { test_run: true } });
+    });
+  });
+
+  describe('check_governance', () => {
+    test('preserves an authored delivery request without injecting intent-only fields (#2705)', () => {
+      const fixture = {
+        phase: 'delivery',
+        caller: 'https://buyer-agent.example/',
+        governance_context: 'signed-context',
+        planned_delivery: { impressions: 1000 },
+        delivery_metrics: { impressions: 750 },
+      };
+      const result = buildRequest(step('check_governance', { sample_request: fixture }), {}, DEFAULT_OPTIONS);
+
+      assert.deepStrictEqual(result, fixture);
+      assert.strictEqual(result.plan_id, undefined);
+      assert.strictEqual(result.tool, undefined);
+      assert.strictEqual(result.payload, undefined);
+    });
+
+    test('keeps the intent fallback for an un-authored request', () => {
+      const result = buildRequest(step('check_governance'), {}, DEFAULT_OPTIONS);
+      assert.strictEqual(result.plan_id, 'unknown');
+      assert.strictEqual(result.tool, 'get_products');
+      assert.ok(result.payload);
     });
   });
 

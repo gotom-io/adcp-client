@@ -1355,9 +1355,48 @@ const mediaBuyStore = createMediaBuyStore({ store: stateStore });
 // instance persists across requests — a fresh registry per request would
 // lose every submitted task between create_media_buy and the buyer's
 // first tasks_get poll. SWAP `createInMemoryTaskRegistry()` for
-// `createPostgresTaskRegistry({ pool })` in production; in-memory
+// `createPostgresTaskRegistry({ pool, namespace: tenantId })` in production; in-memory
 // in-flight tasks are lost on process restart.
 const taskRegistry = createInMemoryTaskRegistry();
+
+// TEST-ONLY: The storyboard runner supplies a local webhook receiver for the
+// guaranteed-sales async scenario. Deliver its terminal task notification for
+// real. Production uses the SDK `webhooks` configuration with signing, durable
+// delivery binding, and recovery instead.
+const storyboardTaskWebhookEmitter =
+  process.env['NODE_ENV'] === 'development'
+    ? {
+        unsigned: true,
+        emit: async ({
+          url,
+          payload,
+          delivery_id,
+        }: {
+          url: string;
+          payload: Record<string, unknown>;
+          delivery_id: string;
+        }) => {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+            // This emitter exists only for the local compliance storyboard.
+            // Never follow a buyer-controlled redirect, and bound a stalled
+            // receiver so the development process can cleanly terminate.
+            redirect: 'error',
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!response.ok) throw new Error(`Storyboard webhook receiver returned HTTP ${response.status}`);
+          return {
+            delivery_id,
+            idempotency_key: `storyboard-${delivery_id}`,
+            attempts: 1,
+            delivered: true,
+            errors: [],
+          };
+        },
+      }
+    : undefined;
 
 serve(
   ({ taskStore }) =>
@@ -1366,6 +1405,7 @@ serve(
       version: '1.0.0',
       taskStore,
       taskRegistry,
+      ...(storyboardTaskWebhookEmitter !== undefined && { taskWebhookEmitter: storyboardTaskWebhookEmitter }),
       idempotency: idempotencyStore,
       mediaBuyStore,
       canonicalFormatLegacyResolver: context => {

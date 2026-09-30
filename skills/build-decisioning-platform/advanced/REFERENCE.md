@@ -27,7 +27,12 @@ The framework owns wire mapping, account resolution, idempotency, signing, async
 Minimal copy-paste-runnable example. Single tenant, one product, sync `create_media_buy`. Substitute your real lookups inside the bodies.
 
 ```ts
-import { AdcpError, createAdcpServerFromPlatform, type SalesPlatform, type AccountStore } from '@adcp/sdk/server';
+import {
+  AdcpError,
+  createAdcpServerFromPlatform,
+  createDerivedAccountStore,
+  type SalesPlatform,
+} from '@adcp/sdk/server';
 
 // Don't annotate `platform: DecisioningPlatform` — let TS infer the
 // `specialisms: ['sales-non-guaranteed']` literal so RequiredPlatformsFor
@@ -41,18 +46,18 @@ const platform = {
     config: {},
   },
 
-  // Single-tenant: one synthetic account; framework still routes everything
-  // through resolve(). See § "accounts.resolve() is mandatory".
-  accounts: {
-    resolution: 'derived',
-    resolve: async () => ({
+  // One account per credential; framework still routes everything through
+  // resolve(). The factory verifies buyer-supplied account_ids and publishes
+  // the one-row list_accounts that 'derived' requires. See
+  // § "accounts.resolve() is mandatory".
+  accounts: createDerivedAccountStore({
+    toAccount: () => ({
       id: 'tenant_singleton',
       name: 'My Ad Network',
       status: 'active',
-      metadata: {},
-      authInfo: { kind: 'api_key' },
+      ctx_metadata: {},
     }),
-  } satisfies AccountStore,
+  }),
 
   sales: {
     getProducts: async (req, ctx) => ({
@@ -175,7 +180,7 @@ createMediaBuy: async (req, ctx) => {
 
 **Same primitive across all specialisms** — sales (`product` / `media_buy` / `package`), creative-builder (refine workflow: stash on `build_creative`, read on `refine_creative`), audiences, signals, brand-rights.
 
-See [`docs/proposals/decisioning-platform-v6-1-ctx-metadata.md`](../../docs/proposals/decisioning-platform-v6-1-ctx-metadata.md) for the full design.
+See [`decisioning-platform-v6-1-ctx-metadata.md`](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/proposals/decisioning-platform-v6-1-ctx-metadata.md) for the full design.
 
 ## Two async patterns
 
@@ -267,7 +272,7 @@ sales: SalesPlatform<MyMeta> = {
 **The buyer gets terminal state two ways:**
 
 1. **Webhook push** — buyer included `push_notification_config: { url, token }` in the original request. Framework signs (RFC 9421) + delivers to that URL with the spec's `mcp-webhook-payload.json` envelope on terminal state. URL is validated server-side: rejects RFC 1918, loopback, link-local, CGNAT, IPv6 unique-local, alternate IPv4 forms, and IPv4-mapped IPv6 before delivery (SSRF guard). Bad URLs FAIL FAST with `INVALID_REQUEST` at the request boundary — buyers see their config error immediately, not as silent webhook drops.
-2. **Polling** — framework auto-registers a `tasks_get` custom tool. Buyers call it with `{ task_id, account }` and receive the spec-flat lifecycle shape (`task_id`, `task_type`, `status`, `created_at`, `updated_at`, `completed_at` on terminal, `result` on completed, top-level `error: { code, message, details? }` on failed). Tenant-scoped — passes `account` through `accounts.resolve(ref, ctx)` and refuses cross-tenant probes with `REFERENCE_NOT_FOUND`. You don't write this tool; it's wired in by the framework. Programmatic access for ops / cron code is via `server.getTaskState(taskId, accountId)`.
+2. **Polling** — framework auto-registers a `tasks_get` custom tool. Buyers call it with `{ task_id, account }` and receive the spec-flat lifecycle shape (`task_id`, `task_type`, `status`, `created_at`, `updated_at`, `completed_at` on terminal, `result` on completed, top-level `error: { code, message, details? }` on failed). Tenant-scoped — passes `account` through `accounts.resolve(ref, ctx)` and refuses cross-tenant probes with `REFERENCE_NOT_FOUND`. You don't write this tool; it's wired in by the framework. Scoped application code uses `server.getTaskState(taskId, { accountId, ownerScope })`; persist the issued `ScopedTaskRef` when work must cross a process boundary.
 
 **Sync-only tools that need long-running completion** use `publishStatusChange(...)` for lifecycle updates instead of HITL. The per-tool wire response schemas don't include `Submitted` arms for `update_media_buy`, `build_creative`, `sync_catalogs`, or `get_products` (a spec inconsistency tracked as [adcp#3392](https://github.com/adcontextprotocol/adcp/issues/3392) — the Submitted schemas exist but aren't rolled into each tool's response `oneOf`). Until the spec consolidates, long-running work on those tools publishes status changes (`media_buy` → `active` → `completed`) on the event bus and buyers subscribe. When adcp#3392 lands, the SDK will widen the unified shape to `update_media_buy`, `build_creative`, and `sync_catalogs` — but NOT to `get_products` (see "Proposal generation" below).
 
@@ -412,13 +417,15 @@ Coercion rules (per-entry):
 
 `accounts.resolve(ref, ctx?)` is the single tenant boundary. Three resolution modes:
 
-| `resolution`           | When to pick                                                                                                                                                         | What `resolve` receives                                          |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `'explicit'` (default) | Multi-tenant; buyer passes `account_id` on every request (Snap, Meta, GAM via Network/Company id).                                                                   | `ref = { account_id }` (or `{ brand, operator }`) on every call. |
-| `'implicit'`           | Buyer pre-syncs accounts via `sync_accounts`; subsequent calls resolved by `ctx.authInfo` lookup against pre-synced linkage (LinkedIn, some retail-media operators). | `ref` may be undefined; use `ctx.authInfo.clientId` to look up.  |
-| `'derived'`            | Single-tenant; one logical advertiser per agent process. Auth principal alone identifies the tenant.                                                                 | `ref` typically undefined; return the singleton regardless.      |
+| `resolution`           | When to pick                                                                                                                                                                                             | What `resolve` receives                                                                                                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `'explicit'` (default) | Multi-tenant; buyer passes `account_id` on every request (Snap, Meta, GAM via Network/Company id).                                                                                                       | `ref = { account_id }` (or `{ brand, operator }`) on every call.                                                                                                                                 |
+| `'implicit'`           | Buyer pre-syncs accounts via `sync_accounts`; subsequent calls resolved by `ctx.authInfo` lookup against pre-synced linkage (LinkedIn, some retail-media operators).                                     | `ref` may be undefined; use `ctx.authInfo.clientId` to look up.                                                                                                                                  |
+| `'derived'`            | Account-id namespace discovered through `list_accounts` — an upstream platform owns the roster (Meta / Snap / AudioStack), or your credential is bound to a single account. `accounts.list` is required. | `ref = { account_id }` after discovery, or undefined on ref-less tools. Verify the id against what the caller's credential can reach; the framework refuses `{ brand, operator }` for this mode. |
 
-**If you have one tenant, declare `resolution: 'derived'`.** The default is `'explicit'`. A single-tenant agent that omits `resolution` falls into `'explicit'` mode where tools whose buyer omits the `account` field (`provide_performance_feedback`, `list_creative_formats`, `report_usage`, `tasks_get` without explicit account) silently fail with `ACCOUNT_NOT_FOUND` because the framework expects the buyer to pass an account on those tools too.
+**If one credential reaches one account, declare `resolution: 'derived'`.** The default is `'explicit'`. An agent that omits `resolution` falls into `'explicit'` mode where tools whose buyer omits the `account` field (`provide_performance_feedback`, `list_creative_formats`, `report_usage`, `tasks_get` without explicit account) cannot derive a tenant unless the resolver handles `ref === undefined`. Account-required operations emit `ACCOUNT_REQUIRED`; account-optional tools may run without `ctx.account`. In `'derived'` mode the framework auto-selects the one account the credential reaches.
+
+**`'derived'` changed in SDK 14 (adcp-client#1647 / upstream adcp#5062).** It used to mean "single-tenant; `account_id` is meaningless on the wire" and the framework refused inline `account_id`. Corrected: `'derived'` is an upstream-managed account-id namespace — buyers discover ids with `list_accounts` and send `{ account_id }`; the `{ brand, operator }` arm is refused; `accounts.list` is mandatory (`createAdcpServerFromPlatform` throws `PlatformConfigError` without it); and `accounts.resolve` must verify a buyer-supplied id against the caller's reachable set. Use `createDerivedAccountStore`, which does the verification and wires `list` for you.
 
 ```ts
 // Multi-tenant
@@ -429,7 +436,7 @@ accounts: {
     if (ref?.brand) return await this.db.findByBrand(ref.brand.domain, ref.operator);
     // ref undefined: tool without `account` field on wire — auth-derived path.
     if (ctx?.authInfo?.clientId) return await this.db.findByClient(ctx.authInfo.clientId);
-    return null; // → ACCOUNT_NOT_FOUND
+    return null; // account-required operation → ACCOUNT_REQUIRED
   },
 } satisfies AccountStore;
 ```
@@ -446,26 +453,42 @@ The framework calls `accounts.resolve(undefined, { authInfo, toolName })` for ev
 - `tasks_get` when called without `account` (single-tenant case)
 - `get_account_financials` (account is implicit from auth)
 
-If your `'explicit'`-mode resolver only handles `ref?.account_id` and falls through on `undefined`, those tools get `ctx.account === undefined` and the framework returns `ACCOUNT_NOT_FOUND`. The fix is the `if (ctx?.authInfo?.clientId)` branch in the example above. Your tenants are reachable from the OAuth client / API-key principal — that's how multi-tenant SaaS auth works — so this is a code-path you already have at the auth layer; just thread it into `resolve()`.
+If your `'explicit'`-mode resolver only handles `ref?.account_id` and falls through on `undefined`, those tools get `ctx.account === undefined`; account-required tools return `ACCOUNT_REQUIRED`. The fix is the `if (ctx?.authInfo?.clientId)` branch in the example above. Your tenants are reachable from the OAuth client / API-key principal — that's how multi-tenant SaaS auth works — so this is a code-path you already have at the auth layer; just thread it into `resolve()`.
 
 Throwing `AccountNotFoundError` only from `resolve()` — never from specialism methods — gets the spec's fixed `ACCOUNT_NOT_FOUND` envelope. Generic throws from inside `resolve()` map to `SERVICE_UNAVAILABLE`.
 
 ### `accounts.resolve()` is mandatory — even for "no tenant" agents
 
-The framework calls `accounts.resolve()` on every request before dispatching to a specialism method. Single-tenant agents that historically skipped account resolution (no per-buyer scoping; the agent serves one logical advertiser) MUST still implement `resolve()` — declare `resolution: 'derived'` and return a single synthetic `Account` regardless of the input ref:
+The framework calls `accounts.resolve()` on every request before dispatching to a specialism method. Agents that historically skipped account resolution (no per-buyer scoping; one logical advertiser per credential) MUST still implement `resolve()`. Declare `resolution: 'derived'` and let the Shape D factory build the store — it verifies buyer-supplied ids, auto-selects the singleton on ref-less tools, and publishes the one-row `list_accounts` the mode requires:
+
+```ts
+import { createDerivedAccountStore } from '@adcp/sdk/server';
+
+accounts: AccountStore<MyMeta> = createDerivedAccountStore<MyMeta>({
+  toAccount: () => ({
+    id: 'singleton', // the id buyers read from list_accounts and send back
+    name: 'My Agent',
+    status: 'active',
+    ctx_metadata: {
+      /* whatever your handlers want to read off ctx.account.ctx_metadata */
+    },
+  }),
+});
+```
+
+Hand-rolling it is fine too, but then you own both obligations — `list` and the id check:
 
 ```ts
 accounts: AccountStore<MyMeta> = {
-  resolution: 'derived', // single-tenant; auth principal alone identifies the tenant
-  resolve: async () => ({
-    id: 'singleton',
-    name: 'My Agent',
-    status: 'active',
-    metadata: {
-      /* whatever your handlers want to read off ctx.account.ctx_metadata */
-    },
-    authInfo: { kind: 'api_key' },
-  }),
+  resolution: 'derived',
+  resolve: async (ref, _ctx) => {
+    const account = { id: 'singleton', name: 'My Agent', status: 'active' as const, ctx_metadata: {} };
+    const id = refAccountId(ref);
+    // Fail closed: a buyer-supplied id that isn't ours resolves to
+    // ACCOUNT_NOT_FOUND, never to "the account we happen to have".
+    return id !== undefined && id !== account.id ? null : account;
+  },
+  list: async () => ({ items: [{ id: 'singleton', name: 'My Agent', status: 'active', ctx_metadata: {} }] }),
 };
 ```
 
@@ -528,31 +551,44 @@ Same pattern for stdio + http transports — `authenticate` runs at the transpor
 
 The framework's default in-memory `TaskRegistry` is gated by `NODE_ENV` — refuses to construct outside `{test, development}` unless `ADCP_DECISIONING_ALLOW_INMEMORY_TASKS=1` is explicitly set. Every HITL-eligible production deployment needs a durable task registry so task state survives process restarts and load-balancer failover.
 
-Ship `createPostgresTaskRegistry({ pool, tableName? })`:
+Ship `createPostgresTaskRegistry({ pool, namespace, storageId, tableName? })`.
+`storageId` is a stable, non-secret identifier unique to the physical
+database/schema and environment; strict out-of-process worker settlement fails
+closed without it:
 
 ```ts
 import { Pool } from 'pg';
 import {
   createAdcpServerFromPlatform,
   createPostgresTaskRegistry,
-  getDecisioningTaskRegistryMigration,
+  getDecisioningTaskRegistryBootstrap,
+  getDecisioningTaskRegistryScopeV1Upgrade,
+  completeScopedTask,
+  failScopedTask,
 } from '@adcp/sdk/server';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// Once at boot — idempotent CREATE TABLE IF NOT EXISTS, safe to re-run
-await pool.query(getDecisioningTaskRegistryMigration());
+const taskRegistryNamespace = 'tenant:my-agent';
+// New/empty database bootstrap only. For a populated legacy table, drain
+// traffic and run every phase returned by
+// getDecisioningTaskRegistryScopeV1Upgrade({ namespace }) as documented.
+await pool.query(getDecisioningTaskRegistryBootstrap({ namespace: taskRegistryNamespace }));
 
 const server = createAdcpServerFromPlatform(platform, {
   name: 'My Ad Network',
   version: '1.0.0',
-  taskRegistry: createPostgresTaskRegistry({ pool }),
+  taskRegistry: createPostgresTaskRegistry({
+    pool,
+    namespace: taskRegistryNamespace,
+    storageId: 'prod-eu1:primary-db',
+  }),
 });
 ```
 
-Cross-instance reads work — process A allocates the task, process B reads the lifecycle for `tasks_get`. Terminal-state idempotency is enforced via SQL `WHERE status = 'submitted'` so concurrent webhook deliveries can't race to overwrite each other. Background-completion tracking (`_registerBackground`) is process-local — promises don't serialize, so production HITL flows that span process boundaries drive completion via webhook → an explicit `complete()` / `fail()` from the receiving process.
+Cross-instance reads work — process A allocates the task, process B reads the lifecycle for `tasks_get`. Terminal-state idempotency is enforced atomically so concurrent settlements cannot overwrite each other. Background-completion tracking (`_registerBackground`) is process-local — promises do not serialize. Return `ctx.handoffToTask(producer, { settlement: 'external' })` only for polling: omit `push_notification_config`, persist the complete `taskCtx.taskRef` before the producer returns, then use `completeScopedTask()` / `failScopedTask()`. The framework withholds `submitted` until that durable write succeeds; acknowledge only `applied` or an `already_terminal` result with the intended status, and retry or dead-letter a scoped miss. `createPostgresTaskSettlementCoordinator()` with `completeScopedPushTask()` / `failScopedPushTask()` is a lower-level application-managed push-settlement path for an integration that already creates and owns both the task and protected push registration outside this framework handoff path. It does not make an external handoff push-capable; registry-only helpers still reject those application-managed push tasks.
 
-Custom backend? Implement the `TaskRegistry` interface (8 methods) for Redis / DynamoDB / Spanner / etc. — the framework awaits each call so all 4 mutators (`create`, `complete`, `fail`, `getTask`) can be storage-backed.
+Custom backend? Implement the scoped `TaskRegistry` interface for Redis / DynamoDB / Spanner / etc. The framework awaits every storage method; apply both `accountId` and `ownerScope` on every read and write, then set `scopeVersion: 1`. Keep the explicitly named unsafe methods limited to trusted administrative and test paths.
 
 **Adopter `*Task` return size cap.** Postgres-backed registries cap `result` / `error` JSONB rows at 4MB. Returns over the cap surface via `onTaskTransition` with `errorCode: 'REGISTRY_WRITE_FAILED'` and skip webhook delivery (registry state is inconsistent, so the framework refuses to push). Offload large payloads to blob storage and return references in the result body instead. The cap protects the DB write path only — adopter code that serializes `result` for logs/metrics MUST impose its own bound.
 
@@ -990,15 +1026,14 @@ Hooks are throw-safe — adopter callback exceptions are caught and logged via t
 
 ## Reference
 
-- Worked example: [`examples/decisioning-platform-mock-seller.ts`](../../examples/decisioning-platform-mock-seller.ts)
-- Integration tests: [`test/server-decisioning-mock-seller.test.js`](../../test/server-decisioning-mock-seller.test.js)
-- Design doc: [`docs/proposals/decisioning-platform-v1.md`](../../docs/proposals/decisioning-platform-v1.md)
-- MCP+A2A serving: [`docs/proposals/mcp-a2a-unified-serving.md`](../../docs/proposals/mcp-a2a-unified-serving.md)
+- Worked example: [`examples/decisioning-platform-mock-seller.ts`](../../../examples/decisioning-platform-mock-seller.ts)
+- Integration tests: [`server-decisioning-mock-seller.test.js`](https://github.com/adcontextprotocol/adcp-client/blob/main/test/server-decisioning-mock-seller.test.js)
+- Design doc: [`decisioning-platform-v1.md`](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/proposals/decisioning-platform-v1.md)
+- MCP+A2A serving: [`mcp-a2a-unified-serving.md`](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/proposals/mcp-a2a-unified-serving.md)
 - Migration sketches: `docs/proposals/decisioning-platform-{training-agent,gam,scope3,prebid}-migration.md`
 
 ## What's not in v6.0 alpha
 
-- Public `./server` export — `./server/decisioning` is preview-only; subject to change before v6.0 GA
 - Native MCP `tasks/get` method dispatch (we ship `tasks_get` snake-case as a tool today; native method dispatch via the MCP SDK's `registerToolTask` lands in v6.1, supporting both surfaces)
 - `ctx.runAsync` `maxAutoAwaitMs` cap with AbortSignal cancellation
 - `getCapabilitiesFor(account)` per-tenant runtime

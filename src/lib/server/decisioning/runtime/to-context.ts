@@ -30,14 +30,112 @@
 import type { HandlerContext } from '../../create-adcp-server';
 import type { Account } from '../account';
 import type { RequestContext, CtxMetadataAccessor } from '../context';
-import type { TaskRegistry } from './task-registry';
+import { sanitizeTaskProgressForStorage, type ScopedTaskRef, type TaskRegistry } from './task-registry';
 import {
   _createTaskHandoff,
+  throwTaskHandoffRejection,
+  type ExternalTaskHandoffContext,
+  type ExternalTaskHandoffOptions,
   type TaskHandoffContext,
   type TaskHandoff,
   type TaskHandoffOptions,
 } from '../async-outcome';
 import type { CtxMetadataStore, ResourceKind, CtxMetadataRef } from '../../ctx-metadata';
+
+const abortSignalAbortedGetter =
+  typeof AbortSignal === 'undefined'
+    ? undefined
+    : Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
+
+function isNativeAbortSignal(value: object): value is AbortSignal {
+  if (abortSignalAbortedGetter === undefined) return false;
+  try {
+    abortSignalAbortedGetter.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type AuthValuePosition = 'root' | 'extra' | 'abort-signal' | 'other';
+type SeenAuthValues = WeakMap<object, Map<AuthValuePosition, unknown>>;
+
+function nestedAuthValuePosition(position: AuthValuePosition, key: PropertyKey): AuthValuePosition {
+  if (position === 'root' && key === 'extra') return 'extra';
+  if (position === 'extra' && key === 'signal') return 'abort-signal';
+  return 'other';
+}
+
+function authValueCachePosition(object: object, position: AuthValuePosition, root: object): AuthValuePosition {
+  if (position === 'root' || object === root) return 'root';
+  if (position !== 'extra') return 'other';
+  const signalDescriptor = Object.getOwnPropertyDescriptor(object, 'signal');
+  return signalDescriptor &&
+    'value' in signalDescriptor &&
+    signalDescriptor.value !== null &&
+    (typeof signalDescriptor.value === 'object' || typeof signalDescriptor.value === 'function') &&
+    isNativeAbortSignal(signalDescriptor.value)
+    ? 'extra'
+    : 'other';
+}
+
+function rememberAuthValueClone(
+  seen: SeenAuthValues,
+  object: object,
+  position: AuthValuePosition,
+  clone: unknown
+): void {
+  const clonesByPosition = seen.get(object) ?? new Map<AuthValuePosition, unknown>();
+  clonesByPosition.set(position, clone);
+  seen.set(object, clonesByPosition);
+}
+
+function cloneAndFreezeAuthValue<T>(
+  value: T,
+  seen: SeenAuthValues = new WeakMap(),
+  position: AuthValuePosition = 'root',
+  rootObject?: object
+): T {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return value;
+  // AbortSignal is a live, request-local capability rather than a data
+  // record. Cloning its prototype and own properties creates an object that
+  // fails the native brand check and is disconnected from future aborts.
+  // Preserve the verified host signal by reference so provider work observes
+  // cancellation after dispatch has begun.
+  const object = value as unknown as object;
+  const root = rootObject ?? object;
+  if (position === 'abort-signal' && object !== root && isNativeAbortSignal(object)) return value;
+  const cachePosition = authValueCachePosition(object, position, root);
+  const clonesByPosition = seen.get(object);
+  if (clonesByPosition?.has(cachePosition)) return clonesByPosition.get(cachePosition) as T;
+  if (value instanceof Date) return Object.freeze(new Date(value.getTime())) as T;
+  if (value instanceof Map) {
+    const clone = new Map();
+    rememberAuthValueClone(seen, object, cachePosition, clone);
+    for (const [key, entry] of value)
+      clone.set(cloneAndFreezeAuthValue(key, seen, 'other', root), cloneAndFreezeAuthValue(entry, seen, 'other', root));
+    return Object.freeze(clone) as T;
+  }
+  if (value instanceof Set) {
+    const clone = new Set();
+    rememberAuthValueClone(seen, object, cachePosition, clone);
+    for (const entry of value) clone.add(cloneAndFreezeAuthValue(entry, seen, 'other', root));
+    return Object.freeze(clone) as T;
+  }
+  const clone = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  rememberAuthValueClone(seen, object, cachePosition, clone);
+  for (const key of Reflect.ownKeys(object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor) continue;
+    if ('value' in descriptor) {
+      descriptor.value = cloneAndFreezeAuthValue(descriptor.value, seen, nestedAuthValuePosition(position, key), root);
+      descriptor.writable = false;
+    }
+    descriptor.configurable = false;
+    Object.defineProperty(clone, key, descriptor);
+  }
+  return Object.freeze(clone) as T;
+}
 
 /**
  * Build an account-scoped CtxMetadataAccessor for a single request.
@@ -85,6 +183,32 @@ function buildCtxMetadataAccessor(store: CtxMetadataStore, accountId: string): C
   };
 }
 
+function createContextTaskHandoff(
+  fn: (taskCtx: ExternalTaskHandoffContext) => Promise<void>,
+  options: ExternalTaskHandoffOptions
+): TaskHandoff<never>;
+function createContextTaskHandoff<TResult>(
+  fn: (taskCtx: TaskHandoffContext) => Promise<TResult>,
+  options?: TaskHandoffOptions
+): TaskHandoff<TResult>;
+function createContextTaskHandoff(
+  fn: (taskCtx: TaskHandoffContext) => Promise<unknown>,
+  options?: TaskHandoffOptions | ExternalTaskHandoffOptions
+): TaskHandoff<unknown> {
+  if (options?.task_id !== undefined) {
+    if (typeof options.task_id !== 'string' || options.task_id.length === 0) {
+      throw new Error('handoffToTask options.task_id must be a non-empty string');
+    }
+    if (options.task_id.length > 128) {
+      throw new Error('handoffToTask options.task_id must be ≤ 128 characters');
+    }
+  }
+  if (options != null && 'settlement' in options && options.settlement !== 'external') {
+    throw new Error("handoffToTask options.settlement must be 'external'");
+  }
+  return _createTaskHandoff(fn, options);
+}
+
 export function buildRequestContext<TCtxMeta = Record<string, unknown>>(
   handlerCtx: HandlerContext<Account<TCtxMeta>>,
   ctxMetadataStore?: CtxMetadataStore,
@@ -96,14 +220,15 @@ export function buildRequestContext<TCtxMeta = Record<string, unknown>>(
   // no-account tools, or buyers calling without auth). Adopter handlers
   // for those tools are responsible for either deriving the account
   // themselves (e.g., via `media_buy_id` ownership) or throwing
-  // `AdcpError('ACCOUNT_NOT_FOUND')` if account is required.
+  // `AdcpError('ACCOUNT_REQUIRED')` if account is required.
   //
   // The `RequestContext.account` type is non-optional for ergonomic typing
   // — adopters writing handlers for the 90% case (tools with `account` on
   // the wire) shouldn't have to optional-chain everywhere. Adopters of
   // no-account tools either:
-  //   1. Declare `resolution: 'derived'` and return a singleton from
-  //      `accounts.resolve(undefined)` — `ctx.account` is always set
+  //   1. Declare `resolution: 'derived'` and resolve the credential's
+  //      single reachable account from `accounts.resolve(undefined)` —
+  //      `ctx.account` is set whenever that credential reaches exactly one
   //   2. Implement only `'explicit'` and never claim no-account
   //      specialisms — the tool is unreachable
   //   3. Read `ctx.account` defensively (`as Account | undefined` cast)
@@ -127,8 +252,9 @@ export function buildRequestContext<TCtxMeta = Record<string, unknown>>(
       ? buildCtxMetadataAccessor(ctxMetadataStore, account.id)
       : undefined;
 
-  return {
+  const context: RequestContext<Account<TCtxMeta>> = {
     account,
+    ...(handlerCtx.authInfo != null && { authInfo: cloneAndFreezeAuthValue(handlerCtx.authInfo) }),
     ...(handlerCtx.agent != null && { agent: handlerCtx.agent }),
     ...(handlerCtx.callerMutationScope != null && {
       callerMutationScope: Object.freeze({ ...handlerCtx.callerMutationScope }),
@@ -149,21 +275,17 @@ export function buildRequestContext<TCtxMeta = Record<string, unknown>>(
       creativeFormat: stubResolver('creativeFormat'),
     },
     ctxMetadata,
-    handoffToTask<TResult>(
-      fn: (taskCtx: TaskHandoffContext) => Promise<TResult>,
-      options?: TaskHandoffOptions
-    ): TaskHandoff<TResult> {
-      if (options?.task_id !== undefined) {
-        if (typeof options.task_id !== 'string' || options.task_id.length === 0) {
-          throw new Error('handoffToTask options.task_id must be a non-empty string');
-        }
-        if (options.task_id.length > 128) {
-          throw new Error('handoffToTask options.task_id must be ≤ 128 characters');
-        }
-      }
-      return _createTaskHandoff(fn, options);
-    },
+    handoffToTask: createContextTaskHandoff,
   };
+  if (handlerCtx.servedAdcpVersion !== undefined) {
+    Object.defineProperty(context, 'servedAdcpVersion', {
+      value: handlerCtx.servedAdcpVersion,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return context;
 }
 
 /**
@@ -184,12 +306,22 @@ export function buildRequestContext<TCtxMeta = Record<string, unknown>>(
  * `heartbeat()` remains a no-op stub (v6.1); it is a liveness / TTL-reset
  * signal for operator infrastructure, not buyer-facing.
  */
-export function buildHandoffContext(taskRegistry: TaskRegistry, taskId: string): TaskHandoffContext {
-  return {
+export function buildExternalHandoffContext(
+  taskRegistry: TaskRegistry,
+  taskRef: ScopedTaskRef,
+  servedAdcpVersion?: string
+): ExternalTaskHandoffContext {
+  const { taskId } = taskRef;
+  const context: ExternalTaskHandoffContext = {
     id: taskId,
+    taskRef,
     update: async progress => {
+      const sanitized = sanitizeTaskProgressForStorage(progress);
       try {
-        await taskRegistry.updateProgress(taskId, progress);
+        const outcome = await taskRegistry.updateProgress(taskId, taskRef, sanitized);
+        if (outcome?.outcome === 'not_found_in_scope') {
+          throw new Error(`Task registry progress write matched no task in the supplied scope: ${taskId}`);
+        }
       } catch {
         // Swallow — a transient registry write failure must not abort the
         // adopter's background handoff function. The buyer-facing impact is
@@ -200,4 +332,24 @@ export function buildHandoffContext(taskRegistry: TaskRegistry, taskId: string):
       await Promise.resolve();
     },
   };
+  if (servedAdcpVersion !== undefined) {
+    Object.defineProperty(context, 'servedAdcpVersion', {
+      value: servedAdcpVersion,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return context;
+}
+
+/** @internal Construct the framework-settled context, including reject(). */
+export function buildHandoffContext(
+  taskRegistry: TaskRegistry,
+  taskRef: ScopedTaskRef,
+  servedAdcpVersion?: string
+): TaskHandoffContext {
+  return Object.assign(buildExternalHandoffContext(taskRegistry, taskRef, servedAdcpVersion), {
+    reject: <TResult = never>(result: TResult, reason?: string): never => throwTaskHandoffRejection(result, reason),
+  });
 }

@@ -13,6 +13,7 @@ import {
   type ADCPMultiAgentClient,
   type AdcpTaskName,
   type CanonicalCreateMediaBuyRequest,
+  type CanonicalCreateMediaBuyInput,
   type CanonicalCreativeResponse,
   type CanonicalFormatKind,
   type CanonicalFormatAssetSlot,
@@ -54,7 +55,11 @@ import {
   type AdcpServerConfig as V5AdcpServerConfig,
   type MediaBuyHandlers as V5MediaBuyHandlers,
 } from '../lib/server/legacy/v5';
-import type { ListTransformersRequest, SyncPlansRequest } from '../lib/types/tools.generated';
+import type {
+  ListTransformersRequest,
+  SyncPlansRequest,
+  SyncReportingStatusRequest,
+} from '../lib/types/tools.generated';
 import type { FormatReferenceStructuredObject } from '../lib/types/core.generated';
 
 declare const client: CreativeAgentClient;
@@ -74,6 +79,7 @@ declare const buildRequest: MutatingRequestInput<LegacyBuildCreativeRequest>;
 declare const standardTaskName: AdcpTaskName;
 declare const standardTaskParams: TaskRequestFor<typeof standardTaskName>;
 declare const syncPlansRequest: SyncPlansRequest;
+declare const syncReportingStatusRequest: MutatingRequestInput<SyncReportingStatusRequest>;
 declare const listTransformersRequest: ListTransformersRequest;
 declare const product: CanonicalProduct;
 declare const rootProduct: RootProduct;
@@ -235,6 +241,45 @@ agent.createMediaBuy(canonicalCreate);
 single.createMediaBuy(canonicalCreate);
 single.createMediaBuy(canonicalCreate, undefined, { canonicalFormatLegacyResolver });
 agent.executeTask('create_media_buy', canonicalCreate);
+
+const createWithReportingPreferences = {
+  ...canonicalCreate,
+  reporting_webhook: {
+    url: undefined,
+    reporting_frequency: 'daily',
+    requested_metrics: ['impressions', 'spend'],
+  },
+} satisfies MutatingRequestInput<CanonicalCreateMediaBuyInput>;
+agent.createMediaBuy(createWithReportingPreferences);
+single.createMediaBuy(createWithReportingPreferences);
+collection.createMediaBuy(createWithReportingPreferences);
+agent.executeTask('create_media_buy', createWithReportingPreferences);
+
+const reportingAuthenticationOnly: NonNullable<CanonicalCreateMediaBuyInput['reporting_webhook']> = {
+  authentication: {
+    schemes: ['HMAC-SHA256'],
+    credentials: 'caller-supplied-secret-at-least-32-characters',
+  },
+};
+const reportingMetricsOnly: NonNullable<CanonicalCreateMediaBuyInput['reporting_webhook']> = {
+  requested_metrics: ['impressions', 'spend'],
+};
+void reportingAuthenticationOnly;
+void reportingMetricsOnly;
+
+const reportingPreferencesWithPartialAuthentication: NonNullable<CanonicalCreateMediaBuyInput['reporting_webhook']> = {
+  reporting_frequency: 'daily',
+  // @ts-expect-error Authentication is an atomic block; credentials cannot come from another source.
+  authentication: { schemes: ['HMAC-SHA256'] },
+};
+void reportingPreferencesWithPartialAuthentication;
+
+// @ts-expect-error A caller-provided URL must bring its own complete authentication block.
+const reportingPreferencesWithUntrustedUrl: NonNullable<CanonicalCreateMediaBuyInput['reporting_webhook']> = {
+  reporting_frequency: 'daily',
+  url: 'https://untrusted.example/reporting',
+};
+void reportingPreferencesWithUntrustedUrl;
 agent.executeCustomTask<{ ok: true }>('vendor_extension', {});
 single.executeCustomTask<{ ok: true }>('vendor_extension', {});
 // @ts-expect-error Extension task names must use executeCustomTask().
@@ -247,6 +292,11 @@ single.executeTask('sync_plans', syncPlansRequest).then(result => {
     // @ts-expect-error Typed standard-task responses are not `any`.
     const impossible: string = result.data.not_a_real_sync_plans_field;
     void impossible;
+  }
+});
+single.executeTask('sync_reporting_status', syncReportingStatusRequest).then(result => {
+  if (result.success && result.status === 'completed') {
+    void result.data.results;
   }
 });
 // @ts-expect-error Every protected primary task has its exact request type.

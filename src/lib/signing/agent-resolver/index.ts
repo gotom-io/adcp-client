@@ -21,6 +21,8 @@ export { ResolvedAgentJwksResolver } from './resolved-agent-jwks';
 export type {
   AgentResolution,
   AgentProtocol,
+  AuthorizedOperatorScope,
+  DelegatedOperatorAuthorizationContext,
   FetchCapabilitiesFn,
   ResolveAgentOptions,
   TraceStep,

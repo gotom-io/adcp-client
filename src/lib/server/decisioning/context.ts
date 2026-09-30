@@ -22,14 +22,20 @@
  * @public
  */
 
-import type { Account } from './account';
+import type { Account, ResolvedAuthInfo } from './account';
 import type {
   Format,
   FormatReferenceStructuredObject,
   PropertyList,
   CollectionList,
 } from '../../types/tools.generated';
-import type { TaskHandoff, TaskHandoffContext, TaskHandoffOptions } from './async-outcome';
+import type {
+  ExternalTaskHandoffContext,
+  ExternalTaskHandoffOptions,
+  TaskHandoff,
+  TaskHandoffContext,
+  TaskHandoffOptions,
+} from './async-outcome';
 import type { CtxMetadataRef, ResourceKind } from '../ctx-metadata';
 import type { BuyerAgent } from './buyer-agent';
 import type { Recipe } from './proposal';
@@ -44,6 +50,27 @@ import type { ProposalRefinementScope } from '../../negotiation/seller';
 export interface RequestContext<TAccount = Account> {
   /** Resolved account for this request. */
   account: TAccount;
+
+  /** Immutable AdCP release selected by the SDK for this request. */
+  readonly servedAdcpVersion?: string;
+
+  /**
+   * Verified incoming request principal, when the transport authenticated
+   * the caller. This is the same request-local value supplied to
+   * `accounts.resolve()`; it is distinct from `ctx.account.authInfo`, which
+   * models an adopter-managed upstream/platform credential.
+   *
+   * The framework omits this key entirely for unauthenticated calls. Treat
+   * tokens and credential material as ephemeral: never copy this value into
+   * `ctx_metadata`, account objects, task results, logs, or durable HITL
+   * state. Background workers must re-resolve credentials; if durable work
+   * only needs identity, snapshot a stable non-secret principal identifier.
+   * A native `AbortSignal` stored as a data property at
+   * `authInfo.extra.signal` retains its identity so later host cancellation
+   * remains observable. Other auth values retain the framework's existing
+   * clone-and-freeze behavior.
+   */
+  authInfo?: Readonly<ResolvedAuthInfo>;
 
   /** Framework-derived caller namespace for authenticated mutations. */
   callerMutationScope?: Readonly<CallerMutationScope>;
@@ -198,9 +225,12 @@ export interface RequestContext<TAccount = Account> {
    * Hand off the call to a background task. Returns a `TaskHandoff<T>`
    * marker — return that from your method to signal the framework should
    * project the spec-defined `Submitted` envelope to the buyer and run
-   * `fn` asynchronously. `fn` receives a `TaskHandoffContext` with the
+   * `fn` asynchronously. Framework-settled callbacks receive a
+   * `TaskHandoffContext` with the
    * framework-issued `id` plus `update`/`heartbeat` affordances; its
-   * return value becomes the task's terminal artifact.
+   * return value becomes the task's terminal artifact. To end a business
+   * decision as `rejected` rather than a structured execution failure, write
+   * `return taskCtx.reject(result, reason)`.
    *
    * Use this for hybrid sellers — the same tool serves both fast
    * (programmatic remnant, instant `media_buy_id`) and slow (guaranteed
@@ -228,7 +258,20 @@ export interface RequestContext<TAccount = Account> {
    * to echo it verbatim (e.g. `force_create_media_buy_arm`). The framework uses
    * the supplied id instead of minting a fresh one; `taskCtx.id` reflects it.
    * Constraints: non-empty, ≤ 128 characters. Throws if violated.
+   *
+   * For crash-safe queue workers, pass `{ settlement: 'external' }`. The
+   * callback receives an `ExternalTaskHandoffContext`: it must durably enqueue
+   * `taskCtx.taskRef` and return only after that write commits. It deliberately
+   * has no `reject()` method; a trusted worker must settle it through a scoped
+   * settlement helper. If the producer callback
+   * throws, the initial invocation fails and the task remains internally
+   * submitted, so the framework cannot acknowledge unrecoverable work or
+   * create a terminal task without its required durable delivery record.
    */
+  handoffToTask(
+    fn: (taskCtx: ExternalTaskHandoffContext) => Promise<void>,
+    options: ExternalTaskHandoffOptions
+  ): TaskHandoff<never>;
   handoffToTask<TResult>(
     fn: (taskCtx: TaskHandoffContext) => Promise<TResult>,
     options?: TaskHandoffOptions

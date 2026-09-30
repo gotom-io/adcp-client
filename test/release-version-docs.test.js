@@ -4,19 +4,35 @@ const { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync,
 const { tmpdir } = require('node:os');
 const { test } = require('node:test');
 const path = require('node:path');
+const YAML = require('yaml');
 
 const ROOT = path.resolve(__dirname, '..');
+
+test('release job serializes package-global npm mutations across branches', () => {
+  const workflow = readFileSync(path.join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
+  const parsed = YAML.parse(workflow);
+
+  assert.equal(parsed.concurrency, undefined, 'the interop prerequisite must not hold the npm mutation lock');
+  assert.deepEqual(parsed.jobs.release.concurrency, {
+    group: 'npm-release-dist-tags',
+    'cancel-in-progress': false,
+  });
+});
 
 test('Changesets release versioning regenerates agent docs after the package version changes', () => {
   const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const commands = pkg.scripts.version.split(/\s*&&\s*/);
   const bumpIndex = commands.indexOf('changeset version');
+  const lockfileIndex = commands.indexOf('npm install --package-lock-only --ignore-scripts');
   const syncIndex = commands.indexOf('npm run sync-version');
   const docsIndex = commands.indexOf('npm run generate-agent-docs');
+  const worksheetIndex = commands.indexOf('npm run generate-release-worksheet');
 
   assert.notEqual(bumpIndex, -1, 'release versioning must invoke Changesets');
+  assert.ok(lockfileIndex > bumpIndex && lockfileIndex < syncIndex, 'lockfile resolution must follow the version bump');
   assert.ok(syncIndex > bumpIndex, 'runtime version metadata must update after the package version bump');
   assert.ok(docsIndex > syncIndex, 'agent docs must regenerate from the updated runtime version metadata');
+  assert.ok(worksheetIndex > docsIndex, 'the release worksheet must regenerate after agent docs');
 
   const workflow = readFileSync(path.join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
   assert.match(workflow, /^\s+version:\s*['"]?npm run version['"]?\s*$/m);
@@ -41,9 +57,9 @@ test('the release version workflow leaves generated agent docs current', { timeo
     run('git', ['worktree', 'add', '--detach', worktree, 'HEAD'], ROOT);
     worktreeCreated = true;
 
-    // Use the release script under test while keeping this test isolated from the
-    // caller's checkout. Generated inputs and dependencies are intentionally
-    // shared read-only; `npm install --package-lock-only` does not alter them.
+    // Keep this test isolated from the caller's checkout. The release script's
+    // lockfile install may contact the registry and is unrelated to these docs.
+    // Its presence and order are checked above; run the other steps here.
     copyFileSync(path.join(ROOT, 'package.json'), path.join(worktree, 'package.json'));
     copyFileSync(path.join(ROOT, 'ADCP_VERSION'), path.join(worktree, 'ADCP_VERSION'));
     writeFileSync(
@@ -57,7 +73,10 @@ test('the release version workflow leaves generated agent docs current', { timeo
     symlinkSync(path.join(ROOT, 'compliance', 'cache'), path.join(worktree, 'compliance', 'cache'), 'dir');
 
     const originalVersion = JSON.parse(readFileSync(path.join(worktree, 'package.json'), 'utf8')).version;
-    run('npm', ['run', 'version']);
+    run(path.join(worktree, 'node_modules', '.bin', 'changeset'), ['version']);
+    run('npm', ['run', 'sync-version']);
+    run('npm', ['run', 'generate-agent-docs']);
+    run('npm', ['run', 'generate-release-worksheet']);
     const releasedVersion = JSON.parse(readFileSync(path.join(worktree, 'package.json'), 'utf8')).version;
 
     assert.notEqual(releasedVersion, originalVersion, 'Changesets must produce a release version');
@@ -72,7 +91,7 @@ test('the release version workflow leaves generated agent docs current', { timeo
 
     // Changesets stages the release-PR output before CI checks it. Staging the
     // generated docs makes ci:docs-check report only regeneration drift.
-    run('git', ['add', 'docs/llms.txt', 'docs/TYPE-SUMMARY.md']);
+    run('git', ['add', 'docs/llms.txt', 'docs/TYPE-SUMMARY.md', 'docs/migration-14.x-rc-worksheet.md']);
     run('npm', ['run', 'ci:docs-check']);
   } finally {
     if (worktreeCreated) {

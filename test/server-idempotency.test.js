@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { createAdcpServer: _createAdcpServer } = require('../dist/lib/server/create-adcp-server');
 const { createIdempotencyStore, memoryBackend } = require('../dist/lib/server/idempotency');
 const { adcpError } = require('../dist/lib/server/errors');
+const { ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY } = require('../dist/lib/server/structured-content-fallback');
 
 // Idempotency tests use sparse handler fixtures; opt out of the strict
 // response-validation default so we stay focused on replay/claim behavior.
@@ -448,6 +449,95 @@ describe('createAdcpServer with idempotency', () => {
     assert.equal(invalid.adcp_error?.field, 'idempotency_key');
   });
 
+  it('replays keyed get_creative_features evaluations while preserving keyless compatibility', async () => {
+    const idempotency = createIdempotencyStore({
+      backend: memoryBackend({ sweepIntervalMs: 0 }),
+      ttlSeconds: 86400,
+    });
+    let calls = 0;
+    const server = createAdcpServer({
+      name: 'T',
+      version: '1.0.0',
+      idempotency,
+      resolveSessionKey: () => 'tenant',
+      governance: {
+        getCreativeFeatures: async () => ({ results: [], execution: ++calls }),
+      },
+    });
+    const creative_manifest = {
+      format_id: { agent_url: 'https://creative.example', id: 'format-1' },
+      assets: {},
+    };
+    const keyed = { creative_manifest, idempotency_key: 'creative_features_eval_0001' };
+
+    const first = await callTool(server, 'get_creative_features', keyed);
+    const replay = await callTool(server, 'get_creative_features', keyed);
+    const conflict = await callTool(server, 'get_creative_features', {
+      ...keyed,
+      creative_manifest: { ...creative_manifest, format_id: { ...creative_manifest.format_id, id: 'format-2' } },
+    });
+    const keyless = await callTool(server, 'get_creative_features', { creative_manifest });
+
+    assert.equal(first.execution, 1);
+    assert.equal(replay.execution, 1);
+    assert.equal(replay.replayed, true);
+    assert.equal(conflict.adcp_error?.code, 'IDEMPOTENCY_CONFLICT');
+    assert.equal(keyless.execution, 2);
+    assert.equal(calls, 2);
+  });
+
+  it('durably replays COMMITTED_RESOURCE_PURGED without redispatch', async () => {
+    const idempotency = createIdempotencyStore({
+      backend: memoryBackend({ sweepIntervalMs: 0 }),
+      ttlSeconds: 86400,
+    });
+    let calls = 0;
+    const server = createAdcpServer({
+      name: 'T',
+      version: '1.0.0',
+      idempotency,
+      resolveSessionKey: () => 'tenant',
+      governance: {
+        getCreativeFeatures: async () => {
+          calls++;
+          return adcpError('COMMITTED_RESOURCE_PURGED', { message: 'The committed evaluation was purged.' });
+        },
+      },
+    });
+    const request = {
+      creative_manifest: {
+        format_id: { agent_url: 'https://creative.example', id: 'format-1' },
+        assets: {},
+      },
+      idempotency_key: 'creative_features_purged_01',
+    };
+
+    const first = await callTool(server, 'get_creative_features', request);
+    const replay = await callTool(server, 'get_creative_features', request);
+
+    assert.equal(first.adcp_error?.code, 'COMMITTED_RESOURCE_PURGED');
+    assert.equal(first.replayed, undefined);
+    assert.equal(replay.adcp_error?.code, 'COMMITTED_RESOURCE_PURGED');
+    assert.equal(replay.replayed, true);
+    assert.equal(calls, 1);
+  });
+
+  it('requires a 24-hour replay TTL when get_creative_features is registered', () => {
+    assert.throws(
+      () =>
+        createAdcpServer({
+          name: 'T',
+          version: '1.0.0',
+          idempotency: createIdempotencyStore({
+            backend: memoryBackend({ sweepIntervalMs: 0 }),
+            ttlSeconds: 3600,
+          }),
+          governance: { getCreativeFeatures: async () => ({ results: [] }) },
+        }),
+      /get_creative_features requires idempotency\.ttlSeconds >= 86400/
+    );
+  });
+
   it('applies idempotency to the state-changing get_products proposal-finalize variant', async () => {
     const idempotency = createIdempotencyStore({
       backend: memoryBackend({ sweepIntervalMs: 0 }),
@@ -485,7 +575,7 @@ describe('createAdcpServer with idempotency', () => {
       push_notification_config: {
         url: 'https://buyer.example/callback',
         operation_id: 'op_finalize_proposal_2',
-        token: 'receipt-token',
+        token: 'receipt-token-1234',
         authentication: { schemes: ['HMAC-SHA256'], credentials: 'secret-v1' },
       },
     };
@@ -604,9 +694,9 @@ describe('createAdcpServer with idempotency', () => {
     assert.equal(first.adcp_error?.code, 'SERVICE_UNAVAILABLE');
     assert.match(first.adcp_error?.message, /Reconcile.*natural key/i);
 
-    // Exact retry replays the ambiguity fence and never repeats the mutation.
+    // Exact retry observes the durable unresolved claim and never repeats the mutation.
     const second = await callTool(server, 'create_media_buy', { ...basePayload, idempotency_key: key });
-    assert.equal(second.adcp_error?.code, 'SERVICE_UNAVAILABLE');
+    assert.equal(second.adcp_error?.code, 'IDEMPOTENCY_IN_FLIGHT');
     assert.equal(calls, 1);
   });
 
@@ -661,7 +751,7 @@ describe('createAdcpServer with idempotency', () => {
 
     assert.equal(first.adcp_error?.code, 'SERVICE_UNAVAILABLE');
     assert.match(first.adcp_error?.message, /Reconcile.*natural key/i);
-    assert.equal(retry.adcp_error?.code, 'SERVICE_UNAVAILABLE');
+    assert.equal(retry.adcp_error?.code, 'IDEMPOTENCY_IN_FLIGHT');
     assert.equal(calls, 1);
   });
 
@@ -694,7 +784,7 @@ describe('createAdcpServer with idempotency', () => {
     const retry = await callTool(server, 'create_media_buy', request);
 
     assert.equal(first.adcp_error?.code, 'SERVICE_UNAVAILABLE');
-    assert.equal(retry.adcp_error?.code, 'SERVICE_UNAVAILABLE');
+    assert.equal(retry.adcp_error?.code, 'IDEMPOTENCY_IN_FLIGHT');
     assert.match(first.adcp_error?.message, /Reconcile.*natural key/i);
     assert.equal(calls, 1);
   });
@@ -754,8 +844,7 @@ describe('createAdcpServer with idempotency', () => {
     const retry = await callTool(server, 'create_media_buy', request);
 
     assert.equal(first.adcp_error?.code, 'SERVICE_UNAVAILABLE');
-    assert.equal(retry.adcp_error?.code, 'SERVICE_UNAVAILABLE');
-    assert.match(retry.adcp_error?.message, /Reconcile.*natural key/i);
+    assert.equal(retry.adcp_error?.code, 'IDEMPOTENCY_IN_FLIGHT');
     assert.equal(calls, 1, 'exact retry must replay the ambiguity marker instead of re-running the mutation');
   });
 
@@ -790,6 +879,51 @@ describe('createAdcpServer with idempotency', () => {
     assert.equal(replay.replayed, true);
     assert.equal(enhancements, 1, 'response enhancer must only run for the original execution');
     assert.equal(calls, 1);
+  });
+
+  it('caches the canonical response before applying a per-client text fallback', async () => {
+    let calls = 0;
+    const server = createAdcpServer({
+      name: 'T',
+      version: '1.0.0',
+      adcpVersion: '3.1.18',
+      idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
+      resolveSessionKey: () => 'tenant',
+      structuredContentTextFallback: ({ clientInfo }) => clientInfo?.name !== 'capable-host',
+      mediaBuy: {
+        createMediaBuy: async () => {
+          calls += 1;
+          return { media_buy_id: 'mb_canonical_cache', packages: [] };
+        },
+      },
+    });
+    const args = { ...basePayload, idempotency_key: 'fallback_cache_abcdefgh' };
+
+    const first = await server.invoke({
+      toolName: 'create_media_buy',
+      args,
+      responseContext: {
+        transport: 'mcp',
+        clientInfo: { name: 'text-only-host', version: '1.0.0' },
+      },
+    });
+    const replay = await server.invoke({
+      toolName: 'create_media_buy',
+      args,
+      responseContext: {
+        transport: 'mcp',
+        clientInfo: { name: 'capable-host', version: '1.0.0' },
+      },
+    });
+
+    assert.equal(calls, 1, 'second client should replay rather than re-execute');
+    assert.equal(first.content.at(-1)._meta?.[ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY], true);
+    assert.equal(
+      replay.content.some(block => block._meta?.[ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY] === true),
+      false,
+      'the first client decoration must not be stored in the canonical replay entry'
+    );
+    assert.equal(replay.structuredContent.replayed, true);
   });
 
   it('fails closed when the idempotency backend cannot publish a completed response', async () => {
@@ -987,13 +1121,12 @@ describe('createAdcpServer with idempotency', () => {
     assert.equal(calls.length, 1);
   });
 
-  it('strict-mode mutation VALIDATION_ERROR remains fenced beyond the transient-error window', async t => {
+  it('strict-mode mutation VALIDATION_ERROR leaves an unresolved fence beyond the logical TTL', async t => {
     // Regression guard for issue #758: a drifted handler under strict
     // response validation used to release the idempotency claim and return
     // VALIDATION_ERROR — letting a retrying buyer re-execute the handler
-    // indefinitely. Mutations now retain the validation failure for the
-    // full replay TTL so expiration of the old 10-second transient window
-    // cannot permit another side effect.
+    // indefinitely. Mutations now preserve an unresolved claim until an
+    // operator reconciles the outcome, even beyond the configured TTL.
     t.mock.timers.enable({ apis: ['Date'], now: 2_000_000_000_000 });
     const idempotency = createIdempotencyStore({
       backend: memoryBackend({ sweepIntervalMs: 0 }),
@@ -1022,17 +1155,17 @@ describe('createAdcpServer with idempotency', () => {
     assert.equal(calls, 1);
 
     const second = await callTool(server, 'create_media_buy', req);
-    assert.equal(second.adcp_error?.code, 'VALIDATION_ERROR', 'retry must replay the cached error');
+    assert.equal(second.adcp_error?.code, 'IDEMPOTENCY_IN_FLIGHT', 'retry must observe the unresolved claim');
     assert.equal(calls, 1, 'handler must not re-execute on immediate retry');
 
-    t.mock.timers.tick(11_000);
-    const afterTransientWindow = await callTool(server, 'create_media_buy', req);
+    t.mock.timers.tick(3_700_000);
+    const afterLogicalTtl = await callTool(server, 'create_media_buy', req);
     assert.equal(
-      afterTransientWindow.adcp_error?.code,
-      'VALIDATION_ERROR',
-      'mutation fence must outlive the former transient-error TTL'
+      afterLogicalTtl.adcp_error?.code,
+      'IDEMPOTENCY_IN_FLIGHT',
+      'unresolved mutation fence must outlive the configured logical TTL'
     );
-    assert.equal(calls, 1, 'handler must not re-execute after the former transient-error window');
+    assert.equal(calls, 1, 'handler must not re-execute after the logical TTL');
   });
 
   it('strict-mode transient-error cache does not mask IDEMPOTENCY_CONFLICT on different payload', async () => {
@@ -1096,8 +1229,8 @@ describe('createAdcpServer with idempotency', () => {
     // producing the drifted response, a parallel call B with the same
     // key + payload must hit the IN_FLIGHT claim (IDEMPOTENCY_IN_FLIGHT)
     // rather than re-entering the handler. Once A completes and writes
-    // the transient-error entry, a subsequent retry hits the cached
-    // VALIDATION_ERROR — not the handler.
+    // an unresolved claim, a subsequent retry remains in-flight rather than
+    // replaying a framework-generated error as a terminal outcome.
     const idempotency = createIdempotencyStore({
       backend: memoryBackend({ sweepIntervalMs: 0 }),
     });
@@ -1137,7 +1270,7 @@ describe('createAdcpServer with idempotency', () => {
     assert.equal(calls, 1);
 
     const c = await callTool(server, 'create_media_buy', req);
-    assert.equal(c.adcp_error?.code, 'VALIDATION_ERROR', 'post-completion retry replays cached error');
+    assert.equal(c.adcp_error?.code, 'IDEMPOTENCY_IN_FLIGHT', 'post-completion retry remains fenced');
     assert.equal(calls, 1, 'handler still not re-executed after the in-flight window closes');
   });
 

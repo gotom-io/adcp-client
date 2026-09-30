@@ -5,7 +5,7 @@
  * Follows canonical A2A response format per AdCP specification.
  */
 
-import { z } from 'zod';
+import type { z } from 'zod';
 import { getBestUnionErrors } from './union-errors';
 
 /**
@@ -32,9 +32,9 @@ import type {
   GetSignalsResponse,
   ActivateSignalResponse,
 } from '../types/tools.generated';
-import { prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS } from './response-schemas';
 import { injectLegacyEnvelopeStatus, normalizeLegacyMediaBuyStatusForReturn } from './envelope-status-compat';
 import { getLatestA2ADataPartFromResponse } from './a2a-artifacts';
+import { getCachedResponseSchemas, type ResponseSchemasModule } from './response-schema-cache';
 
 /**
  * Typed error thrown when the response unwrapper's Zod schema rejects an
@@ -117,7 +117,7 @@ const SUCCESS_PAYLOAD_FIELD_GROUPS_BY_TOOL: Readonly<Record<string, readonly (re
   sync_catalogs: [['catalogs']],
   sync_creatives: [['creatives']],
   list_creatives: [['query_summary', 'pagination', 'creatives']],
-  build_creative: [['creative_manifest'], ['creative_manifests']],
+  build_creative: [['creative_manifest'], ['creative_manifests'], ['creatives']],
   preview_creative: [['response_type', 'previews']],
   get_creative_delivery: [['currency', 'reporting_period', 'creatives']],
   validate_input: [['results']],
@@ -338,6 +338,7 @@ export function unwrapProtocolResponse(
 
   // Validate success responses against tool schema if tool name provided
   if (toolName) {
+    const { prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS } = loadResponseSchemas();
     const schema = TOOL_RESPONSE_SCHEMAS[toolName];
     if (schema) {
       // Strip _message before validation — it's a text summary added by the unwrapper,
@@ -367,6 +368,7 @@ export function unwrapProtocolResponse(
             } else {
               validated = restoreLegacyMediaBuyStatusForReturn(validated, stripped, dataToValidate, toolName);
             }
+            validated = restoreCompatibilityVersionForReturn(validated, stripped, dataToValidate);
             if (!('adcp_version' in stripped)) {
               const { adcp_version: _v, ...rest } = validated as unknown as Record<string, unknown>;
               validated = rest as unknown as typeof validated;
@@ -405,6 +407,7 @@ export function unwrapProtocolResponse(
       } else {
         validated = restoreLegacyMediaBuyStatusForReturn(validated, stripped, dataToValidate, toolName);
       }
+      validated = restoreCompatibilityVersionForReturn(validated, stripped, dataToValidate);
       if (!('adcp_version' in stripped)) {
         const { adcp_version: _v, ...rest } = validated as unknown as Record<string, unknown>;
         validated = rest as unknown as typeof validated;
@@ -416,6 +419,21 @@ export function unwrapProtocolResponse(
 
   // Return unwrapped response (no validation) — already tagged above.
   return unwrapped as AdCPResponse;
+}
+
+function restoreCompatibilityVersionForReturn<T extends AdCPResponse & { _message?: string }>(
+  validated: T,
+  original: Record<string, unknown>,
+  compat: Record<string, unknown>
+): T {
+  if (
+    typeof original.adcp_version === 'string' &&
+    typeof compat.adcp_version === 'string' &&
+    original.adcp_version !== compat.adcp_version
+  ) {
+    return { ...validated, adcp_version: original.adcp_version } as T;
+  }
+  return validated;
 }
 
 function restoreLegacyMediaBuyStatusForReturn<T extends AdCPResponse & { _message?: string }>(
@@ -449,6 +467,7 @@ function restoreLegacyMediaBuyStatusForReturn<T extends AdCPResponse & { _messag
  * Returns the filtered response, or null if filtering can't help.
  */
 function filterInvalidProducts(schema: z.ZodType, data: Record<string, unknown>): Record<string, unknown> | null {
+  const { z } = require('zod') as typeof import('zod');
   const products = data.products;
   if (!Array.isArray(products)) return null;
 
@@ -805,6 +824,7 @@ export function isAdcpSuccess(response: any, taskName: string, responseAdcpVersi
   }
 
   // Try to validate with Zod schema if available
+  const { prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS } = loadResponseSchemas();
   const schema = TOOL_RESPONSE_SCHEMAS[taskName];
   if (schema) {
     const { _message: _, ...stripped } = (response ?? {}) as Record<string, unknown>;
@@ -821,4 +841,12 @@ export function isAdcpSuccess(response: any, taskName: string, responseAdcpVersi
 
   // Unknown task - can't validate, assume success if no errors
   return true;
+}
+
+let responseSchemasModule: ResponseSchemasModule | undefined;
+
+function loadResponseSchemas(): ResponseSchemasModule {
+  responseSchemasModule ??=
+    getCachedResponseSchemas() ?? (require('./response-schemas') as typeof import('./response-schemas'));
+  return responseSchemasModule;
 }

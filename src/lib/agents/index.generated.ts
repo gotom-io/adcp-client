@@ -33,6 +33,12 @@ import type {
   GetMediaBuysResponse,
   GetMediaBuyDeliveryRequest,
   GetMediaBuyDeliveryResponse,
+  GetReportingStatusRequest,
+  GetReportingStatusResponse,
+  SyncReportingStatusRequest,
+  SyncReportingStatusResponse,
+  SyncReportingReceiptsRequest,
+  SyncReportingReceiptsResponse,
   ProvidePerformanceFeedbackRequest,
   ProvidePerformanceFeedbackResponse,
   SyncEventSourcesRequest,
@@ -123,6 +129,12 @@ import type {
   ListTasksResponse,
   SyncAgentNotificationConfigsRequest,
   SyncAgentNotificationConfigsResponse,
+  SyncPrincipalRequest,
+  SyncPrincipalResponse,
+  GetPrincipalRequest,
+  GetPrincipalResponse,
+  ListAccountChangesRequest,
+  ListAccountChangesResponse,
   ListAccountsRequest,
   ListAccountsResponse,
   SyncAccountsRequest,
@@ -290,6 +302,27 @@ export class Agent {
    */
   async getMediaBuyDelivery(params: GetMediaBuyDeliveryRequest): Promise<GetMediaBuyDeliveryResponse> {
     return this.callTool<GetMediaBuyDeliveryResponse>('get_media_buy_delivery', params);
+  }
+
+  /**
+   * Official AdCP get_reporting_status tool schema
+   */
+  async getReportingStatus(params: GetReportingStatusRequest): Promise<GetReportingStatusResponse> {
+    return this.callTool<GetReportingStatusResponse>('get_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_status tool schema
+   */
+  async syncReportingStatus(params: MutatingRequestInput<SyncReportingStatusRequest>): Promise<SyncReportingStatusResponse> {
+    return this.callTool<SyncReportingStatusResponse>('sync_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_receipts tool schema
+   */
+  async syncReportingReceipts(params: MutatingRequestInput<SyncReportingReceiptsRequest>): Promise<SyncReportingReceiptsResponse> {
+    return this.callTool<SyncReportingReceiptsResponse>('sync_reporting_receipts', params);
   }
 
   /**
@@ -608,6 +641,27 @@ export class Agent {
   }
 
   /**
+   * Official AdCP sync_principal tool schema
+   */
+  async syncPrincipal(params: MutatingRequestInput<SyncPrincipalRequest>): Promise<SyncPrincipalResponse> {
+    return this.callTool<SyncPrincipalResponse>('sync_principal', params);
+  }
+
+  /**
+   * Official AdCP get_principal tool schema
+   */
+  async getPrincipal(params: GetPrincipalRequest): Promise<GetPrincipalResponse> {
+    return this.callTool<GetPrincipalResponse>('get_principal', params);
+  }
+
+  /**
+   * Official AdCP list_account_changes tool schema
+   */
+  async listAccountChanges(params: ListAccountChangesRequest): Promise<ListAccountChangesResponse> {
+    return this.callTool<ListAccountChangesResponse>('list_account_changes', params);
+  }
+
+  /**
    * Official AdCP list_accounts tool schema
    */
   async listAccounts(params: ListAccountsRequest): Promise<ListAccountsResponse> {
@@ -741,6 +795,27 @@ export class AgentCollection {
    */
   async getMediaBuyDelivery(params: GetMediaBuyDeliveryRequest): Promise<GetMediaBuyDeliveryResponse[]> {
     return this.callToolOnAll<GetMediaBuyDeliveryResponse>('get_media_buy_delivery', params);
+  }
+
+  /**
+   * Official AdCP get_reporting_status tool schema (across multiple agents)
+   */
+  async getReportingStatus(params: GetReportingStatusRequest): Promise<GetReportingStatusResponse[]> {
+    return this.callToolOnAll<GetReportingStatusResponse>('get_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_status tool schema (across multiple agents)
+   */
+  async syncReportingStatus(params: MutatingRequestInput<SyncReportingStatusRequest>): Promise<SyncReportingStatusResponse[]> {
+    return this.callToolOnAll<SyncReportingStatusResponse>('sync_reporting_status', params);
+  }
+
+  /**
+   * Official AdCP sync_reporting_receipts tool schema (across multiple agents)
+   */
+  async syncReportingReceipts(params: MutatingRequestInput<SyncReportingReceiptsRequest>): Promise<SyncReportingReceiptsResponse[]> {
+    return this.callToolOnAll<SyncReportingReceiptsResponse>('sync_reporting_receipts', params);
   }
 
   /**
@@ -1007,6 +1082,27 @@ export class AgentCollection {
    */
   async syncAgentNotificationConfigs(params: MutatingRequestInput<SyncAgentNotificationConfigsRequest>): Promise<SyncAgentNotificationConfigsResponse[]> {
     return this.callToolOnAll<SyncAgentNotificationConfigsResponse>('sync_agent_notification_configs', params);
+  }
+
+  /**
+   * Official AdCP sync_principal tool schema (across multiple agents)
+   */
+  async syncPrincipal(params: MutatingRequestInput<SyncPrincipalRequest>): Promise<SyncPrincipalResponse[]> {
+    return this.callToolOnAll<SyncPrincipalResponse>('sync_principal', params);
+  }
+
+  /**
+   * Official AdCP get_principal tool schema (across multiple agents)
+   */
+  async getPrincipal(params: GetPrincipalRequest): Promise<GetPrincipalResponse[]> {
+    return this.callToolOnAll<GetPrincipalResponse>('get_principal', params);
+  }
+
+  /**
+   * Official AdCP list_account_changes tool schema (across multiple agents)
+   */
+  async listAccountChanges(params: ListAccountChangesRequest): Promise<ListAccountChangesResponse[]> {
+    return this.callToolOnAll<ListAccountChangesResponse>('list_account_changes', params);
   }
 
   /**

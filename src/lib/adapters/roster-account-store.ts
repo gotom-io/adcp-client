@@ -19,11 +19,12 @@
  *   in-memory map); the SDK provides the AccountStore plumbing. Most
  *   SSPs, broadcasters, and retail-media networks where AE/CSM provisions
  *   the account in an internal admin tool before the buyer ever calls.
- * - **No account concept — auth principal IS the tenant** → `createDerivedAccountStore`
- *   (Shape D, `resolution: 'derived'`). Single-tenant agents
- *   (audiostack, flashtalking, single-namespace retail-media) where there
- *   is no `account_id` on the wire and every call authenticates with the
- *   per-request bearer.
+ * - **An upstream platform owns the roster and you front it** →
+ *   `createDerivedAccountStore` (Shape D, `resolution: 'derived'`). Agents
+ *   proxying Meta / Snap / AudioStack / flashtalking, where the upstream
+ *   assigns the ids, the buyer discovers them through `list_accounts`, and
+ *   every call authenticates with the per-request credential that scopes the
+ *   reachable roster.
  *
  * Design notes:
  * - Lookup is a point function, not a roster getter. An adopter with
@@ -59,6 +60,10 @@ export interface RosterAccountStoreOptions<TRosterEntry, TCtxMeta = Record<strin
    * Called once per `resolve()` with an `account_id`-shaped reference. Wire
    * shape `{ brand, operator }` and missing refs do NOT call `lookup`; see
    * the resolve behavior below.
+   * Scope the lookup to the authenticated principal in `ctx`. The wire
+   * `account_id` is buyer supplied, including on `list_creative_formats`
+   * since AdCP rc.7, and the helper cannot infer your roster's authorization
+   * relation from the id alone.
    *
    * Throw to signal a transient upstream failure (DB outage, network blip).
    * The framework projects to `SERVICE_UNAVAILABLE`. Returning `undefined`

@@ -23,7 +23,7 @@ if (process.argv.includes('--allow-http')) {
 }
 
 const { AdCPClient, detectProtocol, usesDeprecatedAssetsField } = require('../dist/lib/index.js');
-const { readFileSync, statSync } = require('fs');
+const { readFileSync, statSync, openSync, fstatSync, readSync, closeSync, constants: fsConstants } = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const net = require('net');
@@ -48,10 +48,21 @@ const {
   writeSummaryFile,
   printSoftFailBlock,
   defaultComplianceTimeoutSeconds,
+  escapeTerminalControlChars,
+  formatStepSkipLines,
+  formatStepVerdictLines,
+  isCoverageUnavailableStep,
+  unverifiedSigningCoverage,
+  parseRequestSigningFlags,
 } = require('./adcp-storyboard-summary.js');
+
 const { scheduleVersionCheck } = require('./adcp-version-check.js');
-const { formatStoryboardResultsAsJUnit } = require('../dist/lib/testing/storyboard/junit.js');
-const { LIBRARY_VERSION } = require('../dist/lib/version.js');
+const {
+  formatStoryboardResultsAsJUnit,
+  routedStoryboardResultGroup,
+} = require('../dist/lib/testing/storyboard/junit.js');
+const { ADCP_VERSION, LIBRARY_VERSION } = require('../dist/lib/version.js');
+const { isAdcpVersionSupported } = require('../dist/lib/utils/adcp-version-config.js');
 const { appendBuiltInVersionUnsupportedHint } = require('./adcp-version-unsupported-hint.js');
 const { sandboxRunOptions } = require('./adcp-storyboard-sandbox.js');
 const {
@@ -1130,6 +1141,13 @@ function parseAgentOptions(args) {
     !args[webhookReceiverPortIdx + 1].startsWith('--')
       ? args[webhookReceiverPortIdx + 1]
       : null;
+  const webhookReceiverHostIdx = args.indexOf('--webhook-receiver-host');
+  const webhookReceiverHostValue =
+    webhookReceiverHostIdx !== -1 &&
+    webhookReceiverHostIdx + 1 < args.length &&
+    !args[webhookReceiverHostIdx + 1].startsWith('--')
+      ? args[webhookReceiverHostIdx + 1]
+      : null;
   const webhookReceiverPublicUrlIdx = args.indexOf('--webhook-receiver-public-url');
   const webhookReceiverPublicUrlValue =
     webhookReceiverPublicUrlIdx !== -1 &&
@@ -1137,12 +1155,32 @@ function parseAgentOptions(args) {
     !args[webhookReceiverPublicUrlIdx + 1].startsWith('--')
       ? args[webhookReceiverPublicUrlIdx + 1]
       : null;
+  const webhookReceiverTlsCertIdx = args.indexOf('--webhook-receiver-tls-cert');
+  const webhookReceiverTlsCertValue =
+    webhookReceiverTlsCertIdx !== -1 &&
+    webhookReceiverTlsCertIdx + 1 < args.length &&
+    !args[webhookReceiverTlsCertIdx + 1].startsWith('--')
+      ? args[webhookReceiverTlsCertIdx + 1]
+      : null;
+  const webhookReceiverTlsKeyIdx = args.indexOf('--webhook-receiver-tls-key');
+  const webhookReceiverTlsKeyValue =
+    webhookReceiverTlsKeyIdx !== -1 &&
+    webhookReceiverTlsKeyIdx + 1 < args.length &&
+    !args[webhookReceiverTlsKeyIdx + 1].startsWith('--')
+      ? args[webhookReceiverTlsKeyIdx + 1]
+      : null;
 
   const invariantsIdx = args.indexOf('--invariants');
   const invariantsValue =
     invariantsIdx !== -1 && invariantsIdx + 1 < args.length && !args[invariantsIdx + 1].startsWith('--')
       ? args[invariantsIdx + 1]
       : null;
+
+  // Request-signing vector knobs are captured here solely so their values are
+  // excluded from `positionalArgs`. The authoritative parse (validation +
+  // error exits) lives in `extractRequestSigningOptions(args)`.
+  const signingTransportValue = readFlagValue(args, '--signing-transport');
+  const signingSkipVectorsValue = readFlagValue(args, '--signing-skip-vectors');
 
   const localAgentIdx = args.indexOf('--local-agent');
   const localAgentValue =
@@ -1212,8 +1250,13 @@ function parseAgentOptions(args) {
     multiInstanceStrategyValue,
     webhookReceiverModeValue,
     webhookReceiverPortValue,
+    webhookReceiverHostValue,
     webhookReceiverPublicUrlValue,
+    webhookReceiverTlsCertValue,
+    webhookReceiverTlsKeyValue,
     invariantsValue,
+    signingTransportValue,
+    signingSkipVectorsValue,
     localAgentValue,
     formatValue,
     summaryOutputValue,
@@ -1922,6 +1965,8 @@ USAGE:
   adcp <command> [args]
 
 COMMANDS:
+  init seller [options]       Scaffold a compact AdCP 3.2 seller
+  doctor [options]            Check project secrets, SDK drift, and migrations
   storyboard <subcommand>     Test agent flows (run, list, show, step)
   specialism <subcommand>     Inspect a compliance specialism (list, show)
   grade <subject> <url>       Conformance graders (e.g. request-signing)
@@ -2111,11 +2156,19 @@ WEBHOOK OPTIONS:
                                   the webhook-emission and idempotency bundles
                                   to produce grades instead of skips.
   --webhook-receiver-port PORT    Force a bind port (default: auto-assign).
+  --webhook-receiver-host HOST    Bind address for the local listener (default:
+                                  127.0.0.1). Use 0.0.0.0 or :: with proxy mode
+                                  for container-to-container callbacks.
   --webhook-receiver-public-url URL
-                                  Public HTTPS base URL for proxy mode. Implies
+                                  Public HTTPS base URL for proxy mode. HTTP is
+                                  accepted only with --allow-http. Implies
                                   --webhook-receiver proxy when used alone.
                                   Incompatible with --multi-instance-strategy
                                   multi-pass (receiver URL is per-pass).
+  --webhook-receiver-tls-cert FILE
+  --webhook-receiver-tls-key FILE Serve HTTPS directly with this certificate
+                                  and private key. Both flags are required.
+                                  Omit when a tunnel or ingress terminates TLS.
   --webhook-receiver-auto-tunnel  Autodetect a tunnel binary on PATH (ngrok or
                                   cloudflared; override with $ADCP_WEBHOOK_TUNNEL),
                                   spawn it against the receiver, and plug its
@@ -2128,6 +2181,42 @@ WEBHOOK OPTIONS:
                                   \`sh -c\` wrapper — cleanup signals the
                                   direct child only).
                                   HTTP-on-the-wire — spec-compliant.
+
+REQUEST-SIGNING VECTOR OPTIONS (signed_requests storyboard):
+  --signing-transport raw|mcp|a2a How the RFC 9421 conformance vectors are
+                                  framed on the wire. NOT the same as
+                                  --transport/--protocol, which selects how the
+                                  storyboard itself talks to the agent. Default:
+                                  inferred from the resolved protocol — an MCP
+                                  run wraps each vector in a tools/call envelope
+                                  (mcp); an A2A run signs the exact request the
+                                  official A2A client emits after Agent Card
+                                  discovery. Pass raw for agents that
+                                  expose AdCP tools as per-operation HTTP
+                                  endpoints. Mirrors
+                                  \`adcp grade request-signing --transport\`.
+  --signing-skip-vectors IDS      Comma-separated vector ids to skip (graded
+                                  operator_skip), e.g.
+                                  025-jwk-alg-crv-mismatch. Unknown ids are
+                                  rejected — a typo would otherwise skip
+                                  nothing, silently.
+  --signing-skip-rate-abuse       Skip the rate-abuse vector, which floods
+                                  cap+1 requests at the agent. Boolean: pass
+                                  the bare flag (=false is rejected, not read
+                                  as "off").
+
+  A run whose signing vectors were never dispatched exits 3 even though its
+  steps are skip-shaped: nothing about the verifier was graded. --soft-fail
+  reports it and exits 0.
+
+PARALLEL DISPATCH OPTIONS:
+  --parallel-dispatch             Enable process-local concurrent dispatches
+                                  for storyboards that require the
+                                  parallel_dispatch_runner contract. This
+                                  exercises event-loop concurrency, which is
+                                  sufficient for rule 9 / first-insert-wins.
+                                  Distributed mode is not implemented and
+                                  grades not_applicable.
 
 OPTIONS:
   --context JSON      Pass context from previous step (step only)
@@ -2718,6 +2807,42 @@ async function resolveFileComplianceRunOptions(args, opts) {
   return { adcpVersion, complianceDir, schemaRoot };
 }
 
+// Only render runner-authored capability dependency details here. Other skip
+// details can contain raw seller diagnostics and retain their existing surface.
+function printCapabilityPrerequisiteSkip(step) {
+  if (!step.skipped || step.skip_reason !== 'capability_prerequisite_unavailable' || !step.skip?.detail || step.error)
+    return;
+  console.log(`   Skipped: ${escapeTerminalControlChars(step.skip.detail)}`);
+}
+
+// `printCapabilityPrerequisiteSkip` already phrases this one.
+const SKIP_REASONS_PRINTED_ELSEWHERE = new Set(['capability_prerequisite_unavailable']);
+
+/**
+ * Print why a step was skipped, naming runner-owned coverage gaps as gaps
+ * and echoing the remedy the runner supplied. Without this a skipped-only
+ * run prints a green-looking `0 passed` line and nothing else.
+ */
+// Remedy strings already printed in this invocation. A whole-storyboard
+// coverage gap repeats one ~550-character remedy per vector; on a routed run
+// that is ~38 identical copies, which buries the rest of the report.
+const PRINTED_SKIP_REMEDIES = new Set();
+
+function printStepSkipDetail(step) {
+  const lines = formatStepSkipLines(step, { handledReasons: SKIP_REASONS_PRINTED_ELSEWHERE });
+  for (const [index, line] of lines.entries()) {
+    // Line 0 is the reason; any line after it is the detail/remedy.
+    if (index > 0 && line.length > 200) {
+      if (PRINTED_SKIP_REMEDIES.has(line)) {
+        console.log('   (same remedy as above)');
+        continue;
+      }
+      PRINTED_SKIP_REMEDIES.add(line);
+    }
+    console.log(line);
+  }
+}
+
 async function handleStoryboardRun(args) {
   let opts = parseAgentOptions(args);
   let {
@@ -2795,7 +2920,7 @@ async function handleStoryboardRun(args) {
       'Usage: adcp storyboard run <agent> [storyboard_id|--file path] [options]\n' +
         '  Local agent: adcp storyboard run --local-agent <module> [storyboard_id|bundle_id]\n' +
         '  Multi-instance: adcp storyboard run --url <url1> --url <url2> <storyboard_id|bundle_id>\n' +
-        '  Multi-agent:   adcp storyboard run --agents-map ./agents.yaml <storyboard_id|bundle_id>'
+        '  Multi-agent:   adcp storyboard run --agents-map ./agents.yaml [storyboard_id|bundle_id]'
     );
     process.exit(2);
   }
@@ -2804,6 +2929,12 @@ async function handleStoryboardRun(args) {
     console.error('ERROR: Cannot combine a storyboard ID with --file. Use one or the other.');
     process.exit(2);
   }
+
+  // Usage gate before any network work: a mistyped signing flag should exit 2
+  // without protocol autodetection, and certainly without the inline OAuth
+  // browser flow below. The authoritative parse runs again downstream, on the
+  // path that actually consumes the options.
+  extractRequestSigningOptions(args);
 
   // Inline OAuth: if --oauth is set and the agent is a saved alias that
   // doesn't have valid tokens, run the browser flow now so the downstream
@@ -2858,6 +2989,8 @@ async function handleStoryboardRun(args) {
   // conflicts surface in dry-run too.
   const webhookAutoTunnel = args.includes('--webhook-receiver-auto-tunnel');
   const webhookReceiverBase = extractWebhookReceiverOptions(args);
+  const parallelDispatchOpts = extractParallelDispatchOptions(args);
+  const requestSigningOpts = extractRequestSigningOptions(args);
   validateAutoTunnelArgs(args, webhookReceiverBase);
 
   // Load invariants before the dry-run gate so `--dry-run --invariants` fails
@@ -2919,10 +3052,12 @@ async function handleStoryboardRun(args) {
       resolvedOauthClientCredentials,
     }),
     ...(webhookReceiverOpts ?? {}),
+    ...mergeStoryboardContracts(webhookReceiverOpts, parallelDispatchOpts),
     ...(fileComplianceOptions.complianceDir && { complianceDir: fileComplianceOptions.complianceDir }),
     ...(fileComplianceOptions.adcpVersion && { adcpVersion: fileComplianceOptions.adcpVersion }),
     ...(fileComplianceOptions.schemaRoot && { schemaRoot: fileComplianceOptions.schemaRoot }),
     ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
+    ...(opts.allowHttp && { allow_http: true }),
     ...sandboxRunOptions(opts),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
     ...(opts.mediaBuyLifecycleCompatibility && {
@@ -2930,6 +3065,7 @@ async function handleStoryboardRun(args) {
     }),
     ...(mergedRunHeaders && { headers: mergedRunHeaders }),
     ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+    ...(requestSigningOpts ?? {}),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -2973,6 +3109,7 @@ async function handleStoryboardRun(args) {
         not_applicable: ' [not applicable]',
         no_phases: ' [no phases]',
         prerequisite_failed: ' [prerequisite failed]',
+        capability_prerequisite_unavailable: ' [capability prerequisite unavailable]',
         unsatisfied_contract: ' [contract out of scope]',
       };
       for (const step of phase.steps) {
@@ -2980,8 +3117,10 @@ async function handleStoryboardRun(args) {
         const skipLabel = SKIP_LABELS[step.skip_reason] ?? '';
         console.log(`\n${icon} ${step.title}${skipLabel} (${step.duration_ms}ms)`);
         console.log(`   Task: ${step.task}`);
+        printCapabilityPrerequisiteSkip(step);
+        printStepSkipDetail(step);
         if (step.error) {
-          console.log(`   Error: ${step.error}`);
+          console.log(`   Error: ${escapeTerminalControlChars(step.error)}`);
         }
         for (const v of step.validations) {
           const vIcon = v.passed ? '✅' : '❌';
@@ -3031,8 +3170,8 @@ async function handleStoryboardRun(args) {
  * transport and land in attribution output.
  */
 /**
- * Parse `--webhook-receiver [mode]`, `--webhook-receiver-port <port>`, and
- * `--webhook-receiver-public-url <url>`. Returns a `{ webhook_receiver, contracts }`
+ * Parse `--webhook-receiver [mode]` and its host, port, public-URL, and TLS
+ * flags. Returns a `{ webhook_receiver, contracts }`
  * pair suitable for spreading into `runStoryboard` / `comply` options, or
  * `null` if no webhook-receiver flag is set.
  *
@@ -3046,8 +3185,13 @@ function extractWebhookReceiverOptions(args) {
   const idx = args.indexOf('--webhook-receiver');
   const publicUrlIdx = args.indexOf('--webhook-receiver-public-url');
   const portIdx = args.indexOf('--webhook-receiver-port');
+  const hostIdx = args.indexOf('--webhook-receiver-host');
+  const tlsCertIdx = args.indexOf('--webhook-receiver-tls-cert');
+  const tlsKeyIdx = args.indexOf('--webhook-receiver-tls-key');
 
-  if (idx === -1 && publicUrlIdx === -1 && portIdx === -1) return null;
+  if (idx === -1 && publicUrlIdx === -1 && portIdx === -1 && hostIdx === -1 && tlsCertIdx === -1 && tlsKeyIdx === -1) {
+    return null;
+  }
 
   let mode = 'loopback_mock';
   if (idx !== -1) {
@@ -3071,6 +3215,29 @@ function extractWebhookReceiverOptions(args) {
       process.exit(2);
     }
     publicUrl = val;
+    let parsedPublicUrl;
+    try {
+      parsedPublicUrl = new URL(publicUrl);
+    } catch {
+      console.error(`ERROR: --webhook-receiver-public-url is not a valid URL: "${publicUrl}"`);
+      process.exit(2);
+    }
+    if (parsedPublicUrl.protocol !== 'http:' && parsedPublicUrl.protocol !== 'https:') {
+      console.error(`ERROR: --webhook-receiver-public-url must use http or https, got ${parsedPublicUrl.protocol}`);
+      process.exit(2);
+    }
+    if (parsedPublicUrl.username || parsedPublicUrl.password) {
+      console.error('ERROR: --webhook-receiver-public-url must not include userinfo');
+      process.exit(2);
+    }
+    if (parsedPublicUrl.search || parsedPublicUrl.hash) {
+      console.error('ERROR: --webhook-receiver-public-url must not include a query string or fragment');
+      process.exit(2);
+    }
+    if (parsedPublicUrl.protocol === 'http:' && !args.includes('--allow-http')) {
+      console.error('ERROR: an http:// webhook receiver public URL requires --allow-http (local development only)');
+      process.exit(2);
+    }
     // --webhook-receiver-public-url without --webhook-receiver implies proxy mode.
     // With explicit `--webhook-receiver loopback`, the combination is a user
     // error — loopback mode ignores public_url.
@@ -3105,14 +3272,160 @@ function extractWebhookReceiverOptions(args) {
     port = parsed;
   }
 
+  let host;
+  if (hostIdx !== -1) {
+    host = args[hostIdx + 1];
+    if (host === undefined || host.startsWith('--')) {
+      console.error('ERROR: --webhook-receiver-host requires a hostname or bind address');
+      process.exit(2);
+    }
+    if (host.length === 0 || /[\s/\\\r\n\x00]/.test(host)) {
+      console.error(`ERROR: --webhook-receiver-host is not a valid bind address: "${host}"`);
+      process.exit(2);
+    }
+  }
+
+  const tlsCertPath = tlsCertIdx === -1 ? undefined : args[tlsCertIdx + 1];
+  const tlsKeyPath = tlsKeyIdx === -1 ? undefined : args[tlsKeyIdx + 1];
+  if (tlsCertPath === undefined && tlsCertIdx !== -1) {
+    console.error('ERROR: --webhook-receiver-tls-cert requires a file path');
+    process.exit(2);
+  }
+  if (tlsKeyPath === undefined && tlsKeyIdx !== -1) {
+    console.error('ERROR: --webhook-receiver-tls-key requires a file path');
+    process.exit(2);
+  }
+  if (tlsCertPath?.startsWith('--')) {
+    console.error('ERROR: --webhook-receiver-tls-cert requires a file path');
+    process.exit(2);
+  }
+  if (tlsKeyPath?.startsWith('--')) {
+    console.error('ERROR: --webhook-receiver-tls-key requires a file path');
+    process.exit(2);
+  }
+  if ((tlsCertPath === undefined) !== (tlsKeyPath === undefined)) {
+    console.error('ERROR: --webhook-receiver-tls-cert and --webhook-receiver-tls-key must be provided together');
+    process.exit(2);
+  }
+  let tls;
+  if (tlsCertPath !== undefined && tlsKeyPath !== undefined) {
+    try {
+      tls = {
+        cert: readBoundedRegularFile(path.resolve(tlsCertPath), 'TLS certificate'),
+        key: readBoundedRegularFile(path.resolve(tlsKeyPath), 'TLS private key'),
+      };
+    } catch (err) {
+      console.error(`ERROR: unable to read webhook receiver TLS files: ${err.message}`);
+      process.exit(2);
+    }
+  }
+  if (tls && publicUrl && new URL(publicUrl).protocol !== 'https:') {
+    console.error('ERROR: direct webhook receiver TLS requires an https:// public URL');
+    process.exit(2);
+  }
+
   return {
     webhook_receiver: {
       mode,
+      ...(host !== undefined && { host }),
       ...(port !== undefined && { port }),
       ...(publicUrl !== undefined && { public_url: publicUrl }),
+      ...(tls !== undefined && { tls }),
     },
     contracts: ['webhook_receiver_runner'],
   };
+}
+
+/**
+ * Parse the opt-in `--parallel-dispatch` flag. The runner already implements
+ * the process-local fan-out contract, but only advertises it when an operator
+ * explicitly requests concurrent grading. This preserves the existing
+ * not_applicable skip for callers that omit the flag.
+ */
+function extractParallelDispatchOptions(args) {
+  return args.includes('--parallel-dispatch') ? { contracts: ['parallel_dispatch_runner'] } : null;
+}
+
+/**
+ * CLI wrapper over `parseRequestSigningFlags`: turn a rejected flag into a
+ * usage message and exit 2 rather than silently falling back — a mistyped
+ * transport would otherwise surface as 38 unexplained vector failures.
+ */
+function extractRequestSigningOptions(args) {
+  const parsed = parseRequestSigningFlags(
+    flag => readFlagValue(args, flag),
+    flag => args.includes(flag) || args.some(a => a.startsWith(`${flag}=`)),
+    {
+      readInlineValue: flag => {
+        const eqArg = args.find(a => a.startsWith(`${flag}=`));
+        return eqArg ? eqArg.slice(flag.length + 1) : null;
+      },
+      knownVectorIds: args.some(a => a === '--signing-skip-vectors' || a.startsWith('--signing-skip-vectors='))
+        ? knownSigningVectorIds(args)
+        : null,
+    }
+  );
+  if (!parsed.ok) {
+    console.error(`ERROR: ${parsed.error}`);
+    process.exit(2);
+  }
+  return parsed.options;
+}
+
+/**
+ * Vector ids from the compliance cache this run will actually grade against,
+ * for validating `--signing-skip-vectors`.
+ *
+ * Returns `null` when the cache can't be read: a missing cache is the run's
+ * problem to report where it matters (the runner says so with a remedy), not
+ * a reason to refuse an otherwise valid flag.
+ */
+function knownSigningVectorIds(args) {
+  try {
+    const { loadRequestSigningVectors } = require('../dist/lib/testing/storyboard/request-signing/index.js');
+    const { complianceVersion, complianceDir } = parseComplianceSelection(args);
+    const loaded = loadRequestSigningVectors({
+      ...(complianceVersion && { version: complianceVersion }),
+      ...(complianceDir && { complianceDir }),
+    });
+    return [...loaded.positive, ...loaded.negative].map(v => v.id);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Combine independently requested storyboard-runner contracts. Both webhook
+ * receiver and parallel dispatch are opt-ins, so a run that requests both
+ * must advertise both rather than allowing the later object spread to replace
+ * the earlier contracts array.
+ */
+function mergeStoryboardContracts(...optionSets) {
+  const contracts = [...new Set(optionSets.flatMap(optionSet => optionSet?.contracts ?? []))];
+  return contracts.length > 0 ? { contracts } : {};
+}
+
+const MAX_WEBHOOK_TLS_FILE_BYTES = 1_048_576;
+
+function readBoundedRegularFile(filePath, label) {
+  const fd = openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`${label} must be a regular file`);
+    if (stat.size > MAX_WEBHOOK_TLS_FILE_BYTES) {
+      throw new Error(`${label} exceeds the 1 MiB size limit`);
+    }
+    const buffer = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = readSync(fd, buffer, offset, buffer.length - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+    return offset === buffer.length ? buffer : buffer.subarray(0, offset);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -3466,6 +3779,11 @@ function validateAutoTunnelArgs(args, base) {
     console.error('       Pick one — auto-tunnel mints a URL for you, public-url supplies your own.');
     process.exit(2);
   }
+  if (base?.webhook_receiver.tls) {
+    console.error('ERROR: --webhook-receiver-auto-tunnel cannot be combined with direct TLS certificate flags.');
+    console.error('       The tunnel terminates HTTPS and forwards plain HTTP to the local receiver.');
+    process.exit(2);
+  }
   // Auto-tunnel implies proxy mode and mints the URL itself. A coexisting
   // `--webhook-receiver [mode]` flag is always wrong: `loopback` contradicts
   // the minted URL, `proxy` without public-url is caught earlier in
@@ -3488,7 +3806,12 @@ async function resolveWebhookReceiverOptions(args, { jsonOutput } = {}) {
   const { publicUrl } = await spawnAutoTunnel({ port, timeoutMs, jsonOutput });
 
   return {
-    webhook_receiver: { mode: 'proxy_url', port, public_url: publicUrl },
+    webhook_receiver: {
+      mode: 'proxy_url',
+      ...(base?.webhook_receiver.host !== undefined && { host: base.webhook_receiver.host }),
+      port,
+      public_url: publicUrl,
+    },
     contracts: ['webhook_receiver_runner'],
   };
 }
@@ -3755,6 +4078,8 @@ async function handleLocalAgentStoryboardRun(modulePath, args, opts) {
   }
 
   const storyboardsSpec = storyboardId ? [storyboardId] : 'all';
+  const parallelDispatchOpts = extractParallelDispatchOptions(args);
+  const requestSigningOpts = extractRequestSigningOptions(args);
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
   let result;
   try {
@@ -3772,6 +4097,8 @@ async function handleLocalAgentStoryboardRun(modulePath, args, opts) {
           mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
         }),
         ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+        ...mergeStoryboardContracts(parallelDispatchOpts),
+        ...(requestSigningOpts ?? {}),
       },
       onStoryboardComplete:
         jsonOutput || format === 'junit'
@@ -3982,6 +4309,8 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
   // up front — not after bundle resolution, connection setup, or dispatch.
   const webhookAutoTunnel = args.includes('--webhook-receiver-auto-tunnel');
   const webhookReceiverBase = extractWebhookReceiverOptions(args);
+  const parallelDispatchOpts = extractParallelDispatchOptions(args);
+  const requestSigningOpts = extractRequestSigningOptions(args);
   validateAutoTunnelArgs(args, webhookReceiverBase);
   if ((webhookReceiverBase || webhookAutoTunnel) && strategy === 'multi-pass') {
     // The runner throws on this combination (each pass binds a fresh receiver
@@ -4197,6 +4526,7 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
     ...(opts.allowHttp && { allow_http: true }),
     multi_instance_strategy: strategy,
     ...(webhookReceiverOpts ?? {}),
+    ...mergeStoryboardContracts(webhookReceiverOpts, parallelDispatchOpts),
     ...(runComplianceDir && { complianceDir: runComplianceDir }),
     ...(runAdcpVersion && { adcpVersion: runAdcpVersion }),
     ...(runSchemaRoot && { schemaRoot: runSchemaRoot }),
@@ -4207,6 +4537,7 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
       mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
     }),
     ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+    ...(requestSigningOpts ?? {}),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -4252,8 +4583,10 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
           const instTag = step.agent_index ? `[#${step.agent_index}] ` : '';
           console.log(`\n${icon} ${instTag}${step.title}${skipLabel} (${step.duration_ms}ms)`);
           console.log(`   Task: ${step.task}`);
+          printCapabilityPrerequisiteSkip(step);
+          printStepSkipDetail(step);
           if (step.error) {
-            console.log(`   Error: ${step.error}`);
+            console.log(`   Error: ${escapeTerminalControlChars(step.error)}`);
           }
           for (const v of step.validations) {
             const vIcon = v.passed ? '✅' : '❌';
@@ -4308,9 +4641,8 @@ async function handleMultiInstanceStoryboardRun(args, opts, urls) {
  * `get_adcp_capabilities`; tools without a unique claimant fall through to
  * `--default-agent`, or fail-fast with `unroutable_task`.
  *
- * Capability-driven full assessment is intentionally not supported here —
- * the assessment dispatches via `comply()` which expects a single agent.
- * Storyboard ID, bundle ID, or `--file` is required.
+ * With no storyboard or file, every tenant is discovered first and the
+ * topology runs the union of capability-applicable storyboards.
  */
 async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
   const { authToken, authScheme, protocolFlag, jsonOutput, dryRun, positionalArgs, file: filePath, format } = opts;
@@ -4318,6 +4650,8 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
 
   const webhookAutoTunnel = args.includes('--webhook-receiver-auto-tunnel');
   const webhookReceiverBase = extractWebhookReceiverOptions(args);
+  const parallelDispatchOpts = extractParallelDispatchOptions(args);
+  const requestSigningOpts = extractRequestSigningOptions(args);
   validateAutoTunnelArgs(args, webhookReceiverBase);
 
   // Strip per-flag values that may have leaked into positionals via parseAgentOptions.
@@ -4337,15 +4671,9 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
   }
 
   const storyboardId = firstPositional;
+  const capabilityDriven = !filePath && !storyboardId;
   if (filePath && storyboardId) {
     console.error('ERROR: Cannot combine a storyboard ID with --file. Use one or the other.');
-    process.exit(2);
-  }
-  if (!filePath && !storyboardId) {
-    console.error(
-      'ERROR: Multi-agent routing requires a storyboard ID, bundle ID, or --file. ' +
-        'Capability-driven full assessment is not yet routing-aware.'
-    );
     process.exit(2);
   }
 
@@ -4360,7 +4688,7 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
       console.error(`Failed to load storyboard from ${filePath}: ${err.message}`);
       process.exit(2);
     }
-  } else {
+  } else if (storyboardId) {
     const bundle = findBundleById(storyboardId, resolveOptions);
     if (bundle) {
       const bundleStoryboards = loadBundleStoryboards(bundle);
@@ -4416,6 +4744,49 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
 
   await loadInvariantModules(args);
 
+  let routedSelection;
+  let routedSelectionSummary;
+  let routingProfiles;
+  if (capabilityDriven) {
+    const { discoverAgentRouting } = await import('../dist/lib/testing/storyboard/agent-routing.js');
+    const { resolveRoutedAssessment } = await import('../dist/lib/testing/compliance/comply.js');
+    const discoveryOptions = {
+      protocol,
+      ...buildResolvedAuthOption({ resolvedAuth: authToken, resolvedAuthScheme: authScheme || 'bearer' }),
+      ...(opts.allowHttp && { allow_http: true }),
+      agents: routing.agents,
+      ...(routing.default_agent ? { default_agent: routing.default_agent } : {}),
+      ...(runComplianceDir && { complianceDir: runComplianceDir }),
+      ...(runAdcpVersion && { adcpVersion: runAdcpVersion }),
+      ...(runSchemaRoot && { schemaRoot: runSchemaRoot }),
+      ...sandboxRunOptions(opts),
+      ...(requestSigningOpts ?? {}),
+    };
+    const restoreDiscoveryLogs = jsonOutput ? captureStdoutLogs() : null;
+    try {
+      if (!jsonOutput) console.error('Discovering routed agent capabilities...');
+      const routingContext = await discoverAgentRouting(discoveryOptions);
+      routingProfiles = routingContext.profiles;
+      routedSelection = resolveRoutedAssessment(routingProfiles, resolveOptions);
+      routedSelectionSummary = {
+        agents: routedSelection.agents,
+        not_applicable: routedSelection.not_applicable,
+        missing_tools: routedSelection.missing_tools,
+        storyboard_ids: routedSelection.storyboards.map(storyboard => storyboard.id),
+      };
+      storyboards.push(...routedSelection.storyboards);
+    } catch (err) {
+      console.error(`ERROR: Failed to resolve routed assessment: ${err.message}`);
+      process.exit(1);
+    } finally {
+      if (restoreDiscoveryLogs) restoreDiscoveryLogs();
+    }
+    if (storyboards.length === 0) {
+      console.error('ERROR: Routed capability discovery selected no runnable storyboards.');
+      process.exit(1);
+    }
+  }
+
   const totalSteps = storyboards.reduce(
     (sum, sb) => sum + sb.phases.reduce((phaseSum, p) => phaseSum + p.steps.length, 0),
     0
@@ -4445,6 +4816,10 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
         default_agent: routing.default_agent,
         protocol,
         preview: true,
+        ...(capabilityDriven && {
+          assessment_mode: 'capability-driven',
+          selection: routedSelectionSummary,
+        }),
         storyboards: storyboards.map(sb => ({
           storyboard_id: sb.id,
           storyboard_title: sb.title,
@@ -4467,6 +4842,10 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
       }
       console.log(`\n${totalSteps} step(s) would be routed at run time. Use without --dry-run to execute.`);
     }
+    if (capabilityDriven) {
+      const { closeConnections } = await import('../dist/lib/protocols/index.js');
+      await closeConnections(protocol);
+    }
     return;
   }
 
@@ -4481,6 +4860,7 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
     agents: routing.agents,
     ...(routing.default_agent ? { default_agent: routing.default_agent } : {}),
     ...(webhookReceiverOpts ?? {}),
+    ...mergeStoryboardContracts(webhookReceiverOpts, parallelDispatchOpts),
     ...(runComplianceDir && { complianceDir: runComplianceDir }),
     ...(runAdcpVersion && { adcpVersion: runAdcpVersion }),
     ...(runSchemaRoot && { schemaRoot: runSchemaRoot }),
@@ -4491,6 +4871,8 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
       mediaBuyLifecycleCompatibility: opts.mediaBuyLifecycleCompatibility,
     }),
     ...(opts.loadedTestKit !== undefined && { test_kit: opts.loadedTestKit }),
+    ...(requestSigningOpts ?? {}),
+    ...(routingProfiles && { _routingProfiles: routingProfiles }),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -4508,7 +4890,12 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
   }
 
   if (format === 'junit') {
-    process.stdout.write(formatStoryboardResultsAsJUnit(results));
+    const suiteGroups = capabilityDriven
+      ? Object.fromEntries(results.map(result => [result.storyboard_id, routedStoryboardResultGroup(result)]))
+      : undefined;
+    process.stdout.write(
+      formatStoryboardResultsAsJUnit(results, suiteGroups ? { suite_groups: suiteGroups } : undefined)
+    );
     if (opts.softFail && hadFailure) {
       printSoftFailBlock(
         results.filter(r => !r.overall_passed).map(r => r.storyboard_id),
@@ -4519,13 +4906,25 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
   }
 
   if (jsonOutput) {
+    const reports = {};
+    if (capabilityDriven) {
+      for (const result of results) {
+        const group = routedStoryboardResultGroup(result);
+        (reports[group] ??= []).push(result);
+      }
+    }
     await writeJsonOutput(
-      results.length === 1
+      !capabilityDriven && results.length === 1
         ? results[0]
         : {
             agents: routing.agents,
             default_agent: routing.default_agent,
-            storyboards: results,
+            ...(capabilityDriven && {
+              assessment_mode: 'capability-driven',
+              selection: routedSelectionSummary,
+              reports,
+            }),
+            ...(!capabilityDriven && { storyboards: results }),
             overall_passed: !hadFailure,
           }
     );
@@ -4544,6 +4943,7 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
       not_applicable: ' [not applicable]',
       no_phases: ' [no phases]',
       prerequisite_failed: ' [prerequisite failed]',
+      capability_prerequisite_unavailable: ' [capability prerequisite unavailable]',
       unsatisfied_contract: ' [contract out of scope]',
     };
     for (const result of results) {
@@ -4559,12 +4959,15 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
           // routing decisions are visible in the human-readable output.
           let agentTag = '';
           if (step.agent_url && result.agent_map) {
-            const key = Object.entries(result.agent_map).find(([, url]) => url === step.agent_url)?.[0];
+            const entries = Object.entries(result.agent_map);
+            const key = entries[step.agent_index - 1]?.[0] ?? entries.find(([, url]) => url === step.agent_url)?.[0];
             if (key) agentTag = `[${key}] `;
           }
           console.log(`\n${icon} ${agentTag}${step.title}${skipLabel} (${step.duration_ms}ms)`);
           console.log(`   Task: ${step.task}`);
-          if (step.error) console.log(`   Error: ${step.error}`);
+          printCapabilityPrerequisiteSkip(step);
+          printStepSkipDetail(step);
+          if (step.error) console.log(`   Error: ${escapeTerminalControlChars(step.error)}`);
           for (const v of step.validations) {
             const vIcon = v.passed ? '✅' : '❌';
             console.log(`   ${vIcon} ${v.description}`);
@@ -4606,6 +5009,22 @@ async function handleAgentsRoutedStoryboardRun(args, opts, routing) {
 }
 
 // Shared implementation: run all matching storyboards against an agent
+// One remedy per way a run can end with no graded vector. Keeping them
+// distinct matters: an unreachable agent and an over-broad
+// `--signing-skip-vectors` need opposite actions from the operator.
+const SIGNING_COVERAGE_REMEDIES = {
+  probe_errored: 'the probes could not complete — fix the transport or auth failure reported above, then re-run',
+  transport_unverified:
+    'this runner has no request-signing dispatch for the run protocol — grade the MCP or REST binding, ' +
+    'or set --signing-transport when that binding answers at the same URL',
+  scope_excluded:
+    "every vector was excluded by this run's own selection — drop the --signing-skip-vectors entries you did " +
+    'not mean to exclude',
+  self_check_only:
+    'only the in-library SDK self-check ran, and it never contacts your agent — widen the selection so a wire ' +
+    'vector is graded',
+};
+
 async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
   const opts = parsedOpts || parseAgentOptions(rawArgs);
 
@@ -4686,7 +5105,12 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     resolvedOauthClientCredentials: oauthClientCredentials,
   });
 
+  // Validate the signing flags before `resolveWebhookReceiverOptions`, which
+  // may spawn a tunnel child process: a bad flag value should exit 2 without
+  // standing infrastructure up first.
+  const requestSigningOpts = extractRequestSigningOptions(rawArgs);
   const webhookReceiverOpts = await resolveWebhookReceiverOptions(rawArgs, { jsonOutput: opts.jsonOutput });
+  const parallelDispatchOpts = extractParallelDispatchOptions(rawArgs);
 
   await loadInvariantModules(rawArgs);
 
@@ -4700,6 +5124,7 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     ...(authOption && { auth: authOption }),
     ...(opts.allowHttp && { allow_http: true }),
     ...(webhookReceiverOpts ?? {}),
+    ...mergeStoryboardContracts(webhookReceiverOpts, parallelDispatchOpts),
     ...sandboxRunOptions(opts),
     ...(opts.assertsSeededState && { assertsSeededState: true }),
     ...(opts.mediaBuyLifecycleCompatibility && {
@@ -4713,6 +5138,7 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     ...(opts.schemaRoot && { schemaRoot: opts.schemaRoot }),
     ...(!opts.strictResponseSchemaValidation && { strictResponseSchemaValidation: false }),
     ...(opts.hostedStableLineAlias && { hostedStableLineAlias: opts.hostedStableLineAlias }),
+    ...(requestSigningOpts ?? {}),
   };
 
   if (!opts.jsonOutput) {
@@ -4816,14 +5242,34 @@ async function runFullAssessment(agentArg, rawArgs, parsedOpts) {
     // exercised its tracks and they passed" is a CI failure. `partial`
     // is preserved as exit 0 because some tracks were silent (wired but
     // unexercised) — that's a reportable observation, not a hard failure.
+    //
+    // One narrow exception (adcp-client#2954): a run whose request-signing
+    // vectors were never dispatched verified nothing about the verifier, and
+    // its steps are skip-shaped, so every count above reads clean. That is
+    // the case #2956 exists to make visible in CI, so it exits nonzero — on
+    // its own signal, without touching how any other `partial` run exits.
+    const unverifiedSigning = unverifiedSigningCoverage(result);
     const isFailingExit =
       result.overall_status === 'failing' ||
       result.overall_status === 'unreachable' ||
-      result.overall_status === 'auth_required';
+      result.overall_status === 'auth_required' ||
+      unverifiedSigning.length > 0;
 
+    if (unverifiedSigning.length > 0 && !opts.jsonOutput) {
+      for (const gap of unverifiedSigning) {
+        console.error(
+          `\n❌ ${escapeTerminalControlChars(gap.storyboard_id)}: no request-signing vector reached the agent. ` +
+            `${SIGNING_COVERAGE_REMEDIES[gap.coverage] ?? 'no vector was graded'}.`
+        );
+      }
+      if (!opts.softFail) {
+        console.error('   Pass --soft-fail to report this without failing the job.');
+      }
+    }
     if (opts.softFail && isFailingExit) {
       const failedNames = result.failures?.map(f => f.storyboard_id).filter((v, i, a) => a.indexOf(v) === i) ?? [];
-      printSoftFailBlock(failedNames, opts.jsonOutput);
+      const unverifiedNames = unverifiedSigning.map(gap => gap.storyboard_id);
+      printSoftFailBlock([...new Set([...failedNames, ...unverifiedNames])], opts.jsonOutput);
     }
     process.exit(opts.softFail ? 0 : isFailingExit ? 3 : 0);
   } catch (error) {
@@ -4904,6 +5350,10 @@ async function handleStoryboardStepCmd(args) {
     process.exit(2);
   }
 
+  // Same usage gate as `storyboard run`: fail a bad signing flag before the
+  // OAuth browser flow and agent resolution.
+  extractRequestSigningOptions(args);
+
   await maybeRunInlineOAuth(agentArg, args, { jsonOutput });
 
   const {
@@ -4954,6 +5404,7 @@ async function handleStoryboardStepCmd(args) {
       resolvedOauthClient,
       resolvedOauthClientCredentials,
     }),
+    ...(extractRequestSigningOptions(args) ?? {}),
   };
 
   const restoreLogs = jsonOutput ? captureStdoutLogs() : null;
@@ -4967,10 +5418,12 @@ async function handleStoryboardStepCmd(args) {
   if (jsonOutput) {
     await writeJsonOutput(result);
   } else {
-    const icon = result.passed ? '✅' : '❌';
     console.log(`\n── Step: ${result.title} ──────────────────────────────`);
     console.log(`Task: ${result.task}`);
-    console.log(`\n${icon} ${result.passed ? 'Passed' : 'Failed'} (${result.duration_ms}ms)`);
+    console.log('');
+    for (const line of formatStepVerdictLines(result, { durationMs: result.duration_ms })) {
+      console.log(line);
+    }
 
     if (result.error) {
       console.log(`Error: ${result.error}`);
@@ -5005,7 +5458,19 @@ async function handleStoryboardStepCmd(args) {
     }
   }
 
-  process.exit(result.passed ? 0 : 3);
+  // A skipped step is `passed: true` — skip is not failure. That is right for
+  // a step the agent opted out of, and wrong for one the runner could not
+  // grade: `adcp storyboard step … && echo ok` would print ok for a vector
+  // nothing verified. Exit 3 on that gap, matching what the verdict lines
+  // above already say (adcp-client#2954) — and honour `--soft-fail` here as
+  // every other exit site in this file does, because the help text and the
+  // guide both offer it as the opt-out for exactly this.
+  const stepFailed = !result.passed || isCoverageUnavailableStep(result);
+  if (stepFailed && opts.softFail) {
+    printSoftFailBlock([`${storyboardId}/${stepId}`], jsonOutput);
+    process.exit(0);
+  }
+  process.exit(stepFailed ? 3 : 0);
 }
 
 async function handleCheckNetworkCommand(args) {
@@ -5302,7 +5767,7 @@ function renderDiagnosisReport(report) {
     const label = STEP_LABELS[step.name] || step.name;
     const prefix = `  • ${label}`;
     if (step.error) {
-      console.log(`${prefix}  ↳ skipped: ${step.error}`);
+      console.log(`${prefix}  ↳ skipped: ${escapeTerminalControlChars(step.error)}`);
       continue;
     }
     if (step.http) {
@@ -5397,6 +5862,33 @@ async function main() {
   if (args[0] === 'registry') {
     const code = await handleRegistryCommand(args.slice(1));
     process.exitCode = code;
+    return;
+  }
+
+  if (args[0] === 'init') {
+    const { handleInitCommand } = require('./adcp-project.js');
+    await handleInitCommand(
+      args.slice(1).filter(arg => arg !== '--allow-v2' && arg !== '--allow-http'),
+      { libraryVersion: LIBRARY_VERSION }
+    );
+    return;
+  }
+
+  if (args[0] === 'doctor') {
+    const { handleDoctorCommand } = require('./adcp-project.js');
+    await handleDoctorCommand(
+      args.slice(1).filter(arg => arg !== '--allow-v2' && arg !== '--allow-http'),
+      {
+        libraryVersion: LIBRARY_VERSION,
+        adcpVersion: ADCP_VERSION,
+        AdCPClient,
+        detectProtocol,
+        isAdcpVersionSupported,
+        resolveAgent(name) {
+          return BUILT_IN_AGENTS[name] ?? getAgent(name) ?? { url: name };
+        },
+      }
+    );
     return;
   }
 

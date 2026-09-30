@@ -7,12 +7,20 @@
 export {
   comply,
   collectObservations,
+  buildComplianceBundleResults,
   computeOverallStatus,
   formatComplianceResults,
   formatComplianceResultsJSON,
   rotateStoryboardsForOffset,
 } from './comply';
-export type { ComplyOptions } from './comply';
+export type {
+  ComplyOptions,
+  ComplianceBundleAssessmentOptions,
+  ComplyRouteStoryboardContext,
+  ComplyStoryboardRoute,
+  ComplyStoryboardRouting,
+  ComplyStoryboardSkip,
+} from './comply';
 
 export {
   buildComplianceSummary,
@@ -37,6 +45,8 @@ export type {
   TrackStatus,
   OverallStatus,
   ComplianceFailure,
+  ComplianceBundleResult,
+  ComplianceBundleStatus,
   ComplianceResult,
   ComplianceSummary,
   AdvisoryObservation,

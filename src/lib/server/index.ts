@@ -52,6 +52,7 @@ export type {
   AcquireRightsRejectedPayload as LegacyAcquireRightsRejectedPayload,
   BuildCreativeMultiPayload as LegacyBuildCreativeMultiPayload,
   BuildCreativePayload as LegacyBuildCreativePayload,
+  BuildCreativeVariantPayload as LegacyBuildCreativeVariantPayload,
   CalibrateContentPayload as LegacyCalibrateContentPayload,
   CheckGovernancePayload,
   CreateCollectionListPayload,
@@ -165,12 +166,25 @@ export {
 } from './responses';
 export type { McpToolResponse } from './responses';
 
+export { ADCP_MIRRORED_STRUCTURED_CONTENT_META_KEY } from './structured-content-fallback';
+export type {
+  StructuredContentFallbackTransport,
+  StructuredContentTextFallback,
+  StructuredContentTextFallbackContext,
+} from './structured-content-fallback';
+
 export { validActionsForStatus } from './media-buy-helpers';
 export type { ValidAction, CancelMediaBuyInput } from './media-buy-helpers';
 export { assertUpdateMediaBuyAllowed } from './media-buy-actions';
 export type { AssertUpdateMediaBuyAllowedOptions } from './media-buy-actions';
 
 export { createMediaBuyStore, DEFAULT_MEDIA_BUY_STORE_COLLECTION } from './media-buy-store';
+// Request-only Targeting Input projection (AdCP 3.2, DR-0020). Re-exported on
+// the server subpath because sellers are the side that has to resolve a clear
+// command into strict effective targeting before persisting or echoing it.
+export { applyTargetingInput, hasTargetingClears, resolveTargetingInput } from '../media-buy/targeting-input';
+export type { ResolvedTargetingInput, TargetingInputFor } from '../media-buy/targeting-input';
+export type { CreateTargetingInput, UpdateTargetingInput } from '../types';
 export type {
   MediaBuyStore,
   CreateMediaBuyStoreOptions,
@@ -360,6 +374,7 @@ export type {
   AdcpTestRequest,
   AdcpTestToolsCallRequest,
   AdcpTestResponse,
+  AdcpInvokeOptions,
 } from './adcp-server';
 // Handler-bag types describe the raw v5 server surface. Primary-barrel names
 // are explicit Legacy aliases; the legacy/v5 subpath retains the originals.
@@ -370,7 +385,10 @@ export type {
   AdcpServerToolName,
   AdcpCapabilitiesConfig,
   AdcpCapabilitiesOverrides,
+  AdcpToolVersionRange,
   AdcpCustomToolConfig as LegacyAdcpCustomToolConfig,
+  AdcpCustomToolHandler as LegacyAdcpCustomToolHandler,
+  AdcpCustomToolHandlerExtra as LegacyAdcpCustomToolHandlerExtra,
   McpAppUiMeta,
   McpAppMeta,
   AdcpLogger,
@@ -459,6 +477,7 @@ export type {
   LegacyHttpSecurityScheme,
   LegacySecurityScheme,
 } from './a2a-adapter';
+export type { A2ALegacyCompatOptions } from '../protocols/a2a';
 
 export { createWebhookEmitter, memoryWebhookDeliveryStore, memoryWebhookKeyStore } from './webhook-emitter';
 export {
@@ -471,8 +490,12 @@ export {
   WEBHOOK_DELIVERY_MIGRATION,
   WEBHOOK_DELIVERY_RECOVERY_MIGRATION,
   createWebhookDeliveryRecovery,
+  createPostgresWebhookRuntime,
+  toWebhookRecoveryDisposition,
   pollWebhookDeliveryRecovery,
   memoryWebhookDeliveryRecoveryBackend,
+  WebhookAuthenticationProtectionError,
+  WebhookAuthenticationResolutionError,
   WebhookDeliveryTerminalError,
   isWebhookDeliveryTerminalError,
 } from './webhook-delivery';
@@ -485,6 +508,8 @@ export type {
   WebhookAuthenticationAdapter,
   WebhookAuthenticationContext,
   StoredWebhookDeliverySnapshot,
+  PreparedWebhookDeliverySnapshot,
+  PrepareWebhookDeliveryOptions,
   WebhookRecoveryRecord,
   WebhookRecoveryLease,
   WebhookRecoveryCheckpointResult,
@@ -493,6 +518,10 @@ export type {
   DurableWebhookDeliveryRecovery,
   CreateWebhookDeliveryRecoveryOptions,
   PollWebhookDeliveryRecoveryOptions,
+  CreatePostgresWebhookRuntimeOptions,
+  PostgresWebhookRecoveryPollOptions,
+  PostgresWebhookRuntime,
+  WebhookRecoveryDisposition,
 } from './webhook-delivery';
 export type {
   WebhookEmitter,
@@ -515,8 +544,95 @@ export type {
   WebhookIdempotencyKeyStore,
   WebhookRetryOptions,
   WebhookAuthentication,
+  WebhookAttemptAuthorizer,
+  WebhookAttemptAuthorizationDecision,
+  WebhookAttemptSuppressionReason,
 } from './webhook-emitter';
 export type { SigningProvider } from '../signing/provider';
+
+export {
+  ACCOUNT_NOTIFICATION_TYPES,
+  CALLER_NOTIFICATION_TYPES,
+  NOTIFICATION_SUBSCRIPTION_MIGRATION,
+  NotificationSubscriptionValidationError,
+  createPersistentNotificationRuntime,
+  createPersistentNotificationProtocolHandlers,
+  createPostgresPersistentNotificationRuntime,
+  getNotificationSubscriptionMigration,
+  memoryNotificationSubscriptionStore,
+  notificationSuppressionDisposition,
+  pgNotificationSubscriptionStore,
+  projectNotificationSubscriptionReadback,
+  validatePersistentNotificationDestination,
+} from './notification-subscriptions';
+export type {
+  CreatePostgresPersistentNotificationRuntimeOptions,
+  NotificationAuthenticationMode,
+  NotificationCredentialBindingAdapter,
+  NotificationDeliveryAuthorizationInput,
+  NotificationDeliveryAttemptCheckpoint,
+  NotificationDeliveryAttemptCheckpointInput,
+  NotificationDeliveryAuthorizer,
+  NotificationDestinationValidator,
+  NotificationEvent,
+  NotificationEventAnchor,
+  NotificationFanoutDelivery,
+  NotificationFanoutResult,
+  NotificationProofAdapter,
+  NotificationPreparationResult,
+  PreparedNotificationReplacement,
+  NotificationRecipientRef,
+  NotificationReplacementResult,
+  NotificationSubscriptionConfigInput,
+  NotificationSubscriptionMatch,
+  NotificationSubscriptionScope,
+  NotificationSubscriptionSet,
+  NotificationSubscriptionStore,
+  NotificationSubscriptionStoreReplaceResult,
+  NotificationSuppressionDisposition,
+  NotificationSubscriptionView,
+  PersistentNotificationRuntime,
+  PersistentNotificationRuntimeOptions,
+  PostgresNotificationSubscriptionStoreOptions,
+  PostgresPersistentNotificationRuntime,
+  StoredNotificationAuthentication,
+  StoredNotificationSubscription,
+} from './notification-subscriptions';
+
+export {
+  createPrincipalLifecycle,
+  createPrincipalStateStore,
+  principalNotificationSubscriptionStore,
+  DEFAULT_PRINCIPAL_STORE_COLLECTION,
+} from './principal';
+export type {
+  CreatePrincipalLifecycleOptions,
+  CreatePrincipalStateStoreOptions,
+  PendingPrincipalNotification,
+  PrepareReportingDestination,
+  PrincipalAppliedResult,
+  PrincipalConfiguration,
+  PrincipalConfigurationInput,
+  PrincipalDeclarationSupport,
+  PrincipalDeclarations,
+  PrincipalDeclarationsState,
+  PrincipalDestinationTransition,
+  PrincipalKind,
+  PrincipalLifecycleRuntime,
+  PrincipalNotificationRecoveryResult,
+  PrincipalPendingNotificationPage,
+  PrincipalReportingDestination,
+  PrincipalReportingDestinationInput,
+  PrincipalStateStore,
+  PrincipalStoreReplaceResult,
+  PrincipalStoreScope,
+  ReportingDestinationPreparation,
+  ResolvedReportingDestination,
+  ResolvedPrincipalScope,
+  StoredPrincipalRecord,
+  StoredReportingDestinationGeneration,
+  VersionedPrincipalRecord,
+} from './principal';
 
 export { createPinAndBindFetch, WEBHOOK_SSRF_POLICY, LOOPBACK_OK_WEBHOOK_SSRF_POLICY } from './pin-and-bind-fetch';
 export type { PinAndBindFetchOptions, DnsLookupAll } from './pin-and-bind-fetch';
@@ -713,7 +829,13 @@ export {
 
 export { createRosterAccountStore, type RosterAccountStoreOptions } from '../adapters/roster-account-store';
 
-export { createDerivedAccountStore, type DerivedAccountStoreOptions } from '../adapters/derived-account-store';
+export {
+  createDerivedAccountStore,
+  type DerivedAccountStoreOptions,
+  type DerivedAccountStoreBaseOptions,
+  type DerivedSingletonAccountStoreOptions,
+  type DerivedRosterAccountStoreOptions,
+} from '../adapters/derived-account-store';
 
 // ---------------------------------------------------------------------------
 // Socket Mode — outbound WebSocket bridge for adopter dev environments
@@ -727,3 +849,9 @@ export {
 
 export { createAdcpServerFromPlatform } from './decisioning/runtime/from-platform';
 export { createInMemoryTaskRegistry } from './decisioning/runtime/task-registry';
+export { mediaBuyActionResolver } from './media-buy-action-resolver';
+export type {
+  SellerActionDecision,
+  SellerActionResolutionOptions,
+  SellerActionResolution,
+} from './media-buy-action-resolver';

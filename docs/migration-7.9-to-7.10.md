@@ -352,7 +352,11 @@ resolver enforces `DEFAULT_MAX_KEYWORDS` before compiling custom
 format schemas; the validation budget remains the caller's per-manifest
 runtime concern.
 
-## 5. AdCP 3.1.0-beta.5 opt-in
+## 5. Historical AdCP 3.1 beta opt-in
+
+> This section describes the 7.10-era preview. Current SDK releases no longer
+> ship the retired 3.1 beta cache or type subpath; use the primary 3.2 types and
+> a maintained stable compatibility pin instead.
 
 Pin to the beta to validate against its schemas (wholesale feed surfaces,
 `format_option_refs` on PackageRequest, etc.):
@@ -365,10 +369,8 @@ const client = new AdCPClient({
 });
 ```
 
-The SDK's primary pin stays at the GA `ADCP_VERSION` — this is a
-side-bundle, not a default move. Schemas live at
-`schemas/cache/3.1.0-beta.5/`; refresh with `npm run sync-schemas:3.1-beta`
-+ `npm run generate-types:3.1-beta`.
+At the time, this was a side-bundle rather than a default pin move. Its sync
+and generation commands were removed when the primary pin advanced beyond it.
 
 ## 6. What v1-only adopters should do
 
@@ -385,7 +387,7 @@ optional new path.
 ## 7. What to expect at 8.0
 
 The 8.0 design doc
-([`docs/development/v3.1-sdk-design.md`](./development/v3.1-sdk-design.md))
+([`docs/development/v3.1-sdk-design.md`](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/development/v3.1-sdk-design.md))
 narrows the public Product type to V2-only — `format_ids[]` comes off
 the public surface and lives only on legacy adapters. 8.0 also adds
 **per-agent version negotiation** so the SDK can auto-detect a seller's

@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * Idempotent guard for the schema cache. Tests load schemas from
- * `schemas/cache/{current,3.1.18,3.0.25,v2.5}/` (gitignored, populated by
+ * `schemas/cache/{current,3.1.24,3.0.25,v2.5}/` (gitignored, populated by
  * `npm run sync-schemas:all`). Fresh clones, branch switches that wipe
  * the cache, and `git clean -fdx` all leave a dev environment that
  * silently fails ~9 test suites with "AdCP schema data for version 'v2.5'
@@ -9,10 +9,10 @@
  * but local dev hits a paper cut.
  *
  * This script runs as a `pretest` hook. It checks whether both caches
- * exist and runs `sync-schemas:all` only when something is missing. The
- * check is ~10ms when caches are present (filesystem stat); the sync
- * fetches a tarball and takes ~5s, but only the first time after a
- * cache wipe.
+ * exist and whether the primary cache matches any tracked PR-bundle
+ * provenance, then syncs only stale or missing caches. The fast path is
+ * filesystem reads; the sync fetches a tarball and takes ~5s, but only after
+ * a cache wipe or provenance change.
  *
  * No CI-time cost: CI's explicit `sync-schemas:all` populates both
  * caches before tests run, so this guard is a no-op there.
@@ -20,12 +20,13 @@
 import { existsSync, lstatSync, readFileSync, rmSync, symlinkSync } from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { cacheMatchesCodegenProvenance } from './sync-schemas';
 
 const REPO_ROOT = path.join(__dirname, '..');
 const CACHE_ROOT = path.join(REPO_ROOT, 'schemas/cache');
 const COMPLIANCE_CACHE_ROOT = path.join(REPO_ROOT, 'compliance/cache');
 const STABLE_3_0_SCHEMA_VERSION = '3.0.25';
-const STABLE_3_1_SCHEMA_VERSION = '3.1.18';
+const STABLE_3_1_SCHEMA_VERSION = '3.1.24';
 
 function currentAdcpVersion(): string {
   return readFileSync(path.join(REPO_ROOT, 'ADCP_VERSION'), 'utf8').trim();
@@ -33,7 +34,13 @@ function currentAdcpVersion(): string {
 
 function hasCurrentV3Cache(): boolean {
   const current = currentAdcpVersion();
-  return existsSync(path.join(CACHE_ROOT, current));
+  return (
+    existsSync(path.join(CACHE_ROOT, current)) &&
+    cacheMatchesCodegenProvenance(
+      path.join(REPO_ROOT, 'schemas/codegen-provenance.json'),
+      path.join(CACHE_ROOT, current, '_provenance.json')
+    )
+  );
 }
 
 function hasStableV30Cache(): boolean {
@@ -100,7 +107,7 @@ if (!stableV30Ok || !stableV30ComplianceOk) scripts.push(`sync-schemas -- ${STAB
 if (!stableV31Ok || !stableV31ComplianceOk) scripts.push(`sync-schemas -- ${STABLE_3_1_SCHEMA_VERSION}`);
 if (!v25Ok) scripts.push('sync-schemas:v2.5');
 
-console.log(`[schemas:ensure] Missing schema cache; running: ${scripts.join(', ')}`);
+console.log(`[schemas:ensure] Missing or provenance-stale schema cache; running: ${scripts.join(', ')}`);
 
 for (const script of scripts) {
   const [name, ...args] = script.split(' ');

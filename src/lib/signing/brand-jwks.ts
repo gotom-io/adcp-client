@@ -23,7 +23,7 @@
  * JWKS still doesn't have the kid and the brand.json cooldown has elapsed) to
  * brand.json itself, in case the sender rotated `jwks_uri`.
  */
-import { ssrfSafeFetch } from '../net';
+import { ssrfSafeFetch, type SsrfDnsLookup } from '../net';
 import type { JwksResolver } from './jwks';
 import { HttpsJwksResolver, type HttpsJwksResolverOptions } from './jwks-https';
 import type { AdcpJsonWebKey } from './types';
@@ -57,13 +57,19 @@ export type BrandJsonResolverErrorCode =
  */
 export class BrandJsonResolverError extends Error {
   readonly code: BrandJsonResolverErrorCode;
-  /** HTTP status behind a `fetch_failed`, so callers can tell 404 from 5xx without parsing the message. */
+  override readonly cause?: unknown;
+  /** HTTP status for `fetch_failed` responses, when a response was received. */
   readonly httpStatus?: number;
-  constructor(code: BrandJsonResolverErrorCode, message: string, meta?: { httpStatus?: number }) {
+  constructor(
+    code: BrandJsonResolverErrorCode,
+    message: string,
+    details: { httpStatus?: number; cause?: unknown } = {}
+  ) {
     super(message);
     this.name = 'BrandJsonResolverError';
     this.code = code;
-    if (meta?.httpStatus !== undefined) this.httpStatus = meta.httpStatus;
+    this.httpStatus = details.httpStatus;
+    this.cause = details.cause;
   }
 }
 
@@ -109,11 +115,16 @@ export interface BrandJsonJwksResolverOptions {
    */
   allowPrivateIp?: boolean;
   /**
-   * Forwarded to the inner {@link HttpsJwksResolver} constructor.
-   * `allowPrivateIp` and `now` are set from the outer options and should not
-   * be passed here.
+   * DNS resolver used for both brand.json and JWKS fetches. Every returned
+   * address remains subject to SSRF classification and connection pinning.
    */
-  jwksOptions?: Omit<HttpsJwksResolverOptions, 'allowPrivateIp' | 'now'>;
+  lookup?: SsrfDnsLookup;
+  /**
+   * Forwarded to the inner {@link HttpsJwksResolver} constructor.
+   * `allowPrivateIp`, `lookup`, and `now` are set from the outer options and
+   * should not be passed here.
+   */
+  jwksOptions?: Omit<HttpsJwksResolverOptions, 'allowPrivateIp' | 'lookup' | 'now'>;
   /** Clock override for deterministic tests. Returns epoch seconds. */
   now?: () => number;
 }
@@ -158,7 +169,8 @@ export class BrandJsonJwksResolver implements JwksResolver {
   private readonly maxAge: number;
   private readonly maxRedirects: number;
   private readonly allowPrivateIp: boolean;
-  private readonly jwksOptions: Omit<HttpsJwksResolverOptions, 'allowPrivateIp' | 'now'>;
+  private readonly lookup: SsrfDnsLookup | undefined;
+  private readonly jwksOptions: Omit<HttpsJwksResolverOptions, 'allowPrivateIp' | 'lookup' | 'now'>;
   private readonly now: () => number;
   private snapshot: BrandSnapshot | undefined;
   private inner: HttpsJwksResolver | undefined;
@@ -175,6 +187,7 @@ export class BrandJsonJwksResolver implements JwksResolver {
     this.maxAge = options.maxAgeSeconds ?? DEFAULT_MAX_AGE_SECONDS;
     this.maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
     this.allowPrivateIp = options.allowPrivateIp ?? false;
+    this.lookup = options.lookup;
     this.jwksOptions = options.jwksOptions ?? {};
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }
@@ -241,6 +254,7 @@ export class BrandJsonJwksResolver implements JwksResolver {
       currentEtag: this.snapshot?.etag,
       maxRedirects: this.maxRedirects,
       allowPrivateIp: this.allowPrivateIp,
+      lookup: this.lookup,
     });
 
     // 304 on the entry URL: extend the lifetime, keep the inner resolver.
@@ -260,6 +274,7 @@ export class BrandJsonJwksResolver implements JwksResolver {
       this.inner = new HttpsJwksResolver(agent.jwksUri, {
         ...this.jwksOptions,
         allowPrivateIp: this.allowPrivateIp,
+        lookup: this.lookup,
         now: this.now,
       });
     }
@@ -281,6 +296,27 @@ export interface FetchedBrandJson {
   cacheControl?: string;
 }
 
+export interface FetchBrandJsonOptions {
+  /** Entry-point URL. HTTPS and public addresses are required by default. */
+  startUrl: string;
+  /** ETag sent only to the entry URL for cache revalidation. */
+  currentEtag?: string;
+  /** Maximum JSON-level `authoritative_location` / `house` hops. Default 3, hard maximum 10. */
+  maxRedirects?: number;
+  /** Permit HTTP and private addresses for controlled development environments. */
+  allowPrivateIp?: boolean;
+  /** DNS resolver forwarded to every SSRF-safe fetch in the redirect chain. */
+  lookup?: SsrfDnsLookup;
+  /** Whole-request deadline per hop. Default and hard maximum 10 seconds. */
+  timeoutMs?: number;
+  /** Response-body cap per hop. Default and hard maximum 256 KiB. */
+  maxBodyBytes?: number;
+}
+
+const MAX_BRAND_JSON_TIMEOUT_MS = 10_000;
+const MAX_BRAND_JSON_BODY_BYTES = 262_144;
+const MAX_BRAND_JSON_REDIRECTS = 10;
+
 /**
  * Fetch brand.json from `startUrl`, following `authoritative_location` and
  * `house` string redirect variants up to `maxRedirects` hops. Each hop goes
@@ -290,20 +326,30 @@ export interface FetchedBrandJson {
  * `{"house": "evil.com\\@victim.com"}` or `{"authoritative_location":
  * "http://169.254.169.254/..."}` is rejected at parse time rather than
  * relying on `ssrfSafeFetch` to catch every pathological shape.
+ *
+ * This low-level function is intentionally stateless. Callers MUST add
+ * response caching and a minimum refresh cooldown rather than invoking it on
+ * every authorization request. Prefer `BrandJsonJwksResolver` when resolving
+ * signing keys; it provides both safeguards.
  */
-export async function fetchBrandJson(args: {
-  startUrl: string;
-  currentEtag?: string;
-  maxRedirects: number;
-  allowPrivateIp: boolean;
-  /** Override the transport defaults (10 s / 64 KiB) — brand.json portfolios can exceed 64 KiB. */
-  timeoutMs?: number;
-  maxBodyBytes?: number;
-}): Promise<FetchedBrandJson> {
+export async function fetchBrandJson(args: FetchBrandJsonOptions): Promise<FetchedBrandJson> {
+  const maxRedirects = boundedIntegerOption('maxRedirects', args.maxRedirects ?? DEFAULT_MAX_REDIRECTS, {
+    min: 0,
+    max: MAX_BRAND_JSON_REDIRECTS,
+  });
+  const timeoutMs = boundedIntegerOption('timeoutMs', args.timeoutMs ?? MAX_BRAND_JSON_TIMEOUT_MS, {
+    min: 1,
+    max: MAX_BRAND_JSON_TIMEOUT_MS,
+  });
+  const maxBodyBytes = boundedIntegerOption('maxBodyBytes', args.maxBodyBytes ?? MAX_BRAND_JSON_BODY_BYTES, {
+    min: 1,
+    max: MAX_BRAND_JSON_BODY_BYTES,
+  });
+  const allowPrivateIp = args.allowPrivateIp === true;
   const seen = new Set<string>();
-  let url = canonicalizeUrl(args.startUrl, args.allowPrivateIp);
+  let url = canonicalizeUrl(args.startUrl, allowPrivateIp);
 
-  for (let hop = 0; hop <= args.maxRedirects; hop++) {
+  for (let hop = 0; hop <= maxRedirects; hop++) {
     if (seen.has(url)) {
       throw new BrandJsonResolverError('redirect_loop', `brand.json redirect loop detected`);
     }
@@ -317,13 +363,19 @@ export async function fetchBrandJson(args: {
     // a lie about the redirect target.
     if (hop === 0 && args.currentEtag) headers['if-none-match'] = args.currentEtag;
 
-    const res = await ssrfSafeFetch(url, {
-      method: 'GET',
-      headers,
-      allowPrivateIp: args.allowPrivateIp,
-      timeoutMs: args.timeoutMs,
-      maxBodyBytes: args.maxBodyBytes,
-    });
+    let res: Awaited<ReturnType<typeof ssrfSafeFetch>>;
+    try {
+      res = await ssrfSafeFetch(url, {
+        method: 'GET',
+        headers,
+        allowPrivateIp,
+        lookup: args.lookup,
+        timeoutMs,
+        maxBodyBytes,
+      });
+    } catch (cause) {
+      throw new BrandJsonResolverError('fetch_failed', 'Unable to fetch brand.json', { cause });
+    }
 
     if (hop === 0 && res.status === 304) {
       return {
@@ -356,10 +408,10 @@ export async function fetchBrandJson(args: {
     const house = typeof obj.house === 'string' ? obj.house : undefined;
 
     if (authoritative !== undefined) {
-      if (hop === args.maxRedirects) {
+      if (hop === maxRedirects) {
         throw new BrandJsonResolverError('redirect_depth_exceeded', `brand.json redirect depth exceeded`);
       }
-      url = canonicalizeUrl(authoritative, args.allowPrivateIp);
+      url = canonicalizeUrl(authoritative, allowPrivateIp);
       continue;
     }
     if (house !== undefined) {
@@ -370,10 +422,10 @@ export async function fetchBrandJson(args: {
       if (!BARE_HOSTNAME.test(house)) {
         throw new BrandJsonResolverError('invalid_house', `brand.json "house" is not a bare hostname`);
       }
-      if (hop === args.maxRedirects) {
+      if (hop === maxRedirects) {
         throw new BrandJsonResolverError('redirect_depth_exceeded', `brand.json redirect depth exceeded`);
       }
-      url = canonicalizeUrl(`https://${house}/.well-known/brand.json`, args.allowPrivateIp);
+      url = canonicalizeUrl(`https://${house}/.well-known/brand.json`, allowPrivateIp);
       continue;
     }
 
@@ -395,6 +447,13 @@ export async function fetchBrandJson(args: {
   }
 
   throw new BrandJsonResolverError('redirect_depth_exceeded', `brand.json redirect depth exceeded`);
+}
+
+function boundedIntegerOption(name: string, value: number, bounds: { min: number; max: number }): number {
+  if (!Number.isInteger(value) || value < bounds.min || value > bounds.max) {
+    throw new TypeError(`fetchBrandJson: ${name} must be an integer between ${bounds.min} and ${bounds.max}`);
+  }
+  return value;
 }
 
 /**

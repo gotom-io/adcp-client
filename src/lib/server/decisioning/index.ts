@@ -17,11 +17,16 @@
 // to the wire `adcp_error` envelope.
 //
 // HITL is expressed in the type system via the dual-method shape on each
-// spec-HITL tool (`xxx` for sync, `xxxTask` for HITL). No adopter-facing
-// task primitives — the framework owns task lifecycle and dispatches the
-// `*Task` method in the background.
+// spec-HITL tool (`xxx` for sync, `xxxTask` for HITL). The framework owns
+// task lifecycle and dispatches the `*Task` method in the background.
 export { type AdcpStructuredError, type ErrorCode, AdcpError } from './async-outcome';
-export type { TaskHandoffOptions } from './async-outcome';
+export type {
+  ExternalTaskHandoffOptions,
+  ExternalTaskHandoffContext,
+  TaskHandoffOptions,
+  TaskHandoffProgress,
+  TaskHandoffContext,
+} from './async-outcome';
 export { withResponseSummary } from './response-summary';
 export type { ResponseWithSummary } from './response-summary';
 export type { ServerPayload } from '../../types/server-payload';
@@ -89,10 +94,13 @@ export { normalizePostalAreaSupport, normalizeTargetingCapabilities } from './ca
 // Account model
 export type {
   Account,
+  AccountResolutionMode,
+  CanonicalAccountResolutionMode,
   AuthPrincipal,
   AccountStore,
   AccountFilter,
   ListAccountsPayload,
+  ListAccountChangesPayload,
   SyncAccountsPayload,
   SyncAccountsSuccessPayload,
   SyncAccountsRow,
@@ -104,6 +112,7 @@ export type {
   GetAccountFinancialsPayload,
   GetAccountFinancialsSuccessPayload,
   ListAccountsHandlerResult,
+  ListAccountChangesHandlerResult,
   SyncAccountsHandlerResult,
   SyncGovernanceHandlerResult,
   ReportUsageHandlerResult,
@@ -114,7 +123,13 @@ export type {
   ResolvedAuthInfo,
 } from './account';
 
-export { AccountNotFoundError, refAccountId } from './account';
+export {
+  AccountNotFoundError,
+  isAccountResolutionMode,
+  normalizeAccountResolution,
+  refAccountId,
+  refHasNaturalKey,
+} from './account';
 
 // Multi-tenant AccountStore builder. Bakes in the two-path resolution
 // (operator-routed + auth-derived) and the per-entry tenant-isolation gate
@@ -161,6 +176,7 @@ export type {
 
 // Top-level platform + compile-time capability enforcement
 export type { DecisioningPlatform, RequiredPlatformsFor, RequiredCapabilitiesFor } from './platform';
+export type { ReliableReportingPlatform } from './specialisms/reporting';
 
 // Method-level composition (closes #1314) — wrap individual platform methods
 // with `before` / `after` hooks for short-circuit + enrichment patterns.
@@ -179,6 +195,7 @@ export type {
   LegacyBuildCreativeReturn,
   LegacyBuildCreativePayload,
   LegacyBuildCreativeMultiPayload,
+  BuildCreativeVariantPayload,
   PreviewCreativePayload,
   LegacyPreviewCreativePayload,
   LegacyListCreativeFormatsPayload,
@@ -195,6 +212,7 @@ export type {
   LegacyBuildCreativeReturn as CreativeAdServerLegacyBuildCreativeReturn,
   LegacyBuildCreativePayload as CreativeAdServerLegacyBuildCreativePayload,
   LegacyBuildCreativeMultiPayload as CreativeAdServerLegacyBuildCreativeMultiPayload,
+  BuildCreativeVariantPayload as CreativeAdServerBuildCreativeVariantPayload,
   PreviewCreativePayload as CreativeAdServerPreviewCreativePayload,
   LegacyPreviewCreativePayload as CreativeAdServerLegacyPreviewCreativePayload,
   LegacyListCreativeFormatsPayload as CreativeAdServerLegacyListCreativeFormatsPayload,
@@ -347,6 +365,7 @@ export {
   getHydratedLegacyFormatIds,
   getAllAdcpMigrations,
   type CreateAdcpServerFromPlatformOptions,
+  type AccountOf,
   type LegacyDecisioningHandlerGroups,
   type RequiredOptsFor,
   type DecisioningAdcpServer,
@@ -354,17 +373,67 @@ export {
 } from './runtime/from-platform';
 export { PlatformConfigError, validatePlatform } from './runtime/validate-platform';
 export {
+  completeScopedTask,
   createInMemoryTaskRegistry,
+  failScopedTask,
+  rejectScopedTask,
+  updateScopedTaskProgress,
+  type ScopedTaskRef,
+  type TaskMutationOutcome,
   type TaskRegistry,
+  type TaskRegistryMutationResult,
+  type TaskRegistryScope,
   type TaskRecord,
   type TaskStatus,
 } from './runtime/task-registry';
 export {
   createPostgresTaskRegistry,
+  getDecisioningTaskRegistryBootstrap,
   getDecisioningTaskRegistryMigration,
+  getDecisioningTaskRegistryScopeV1Upgrade,
+  getDecisioningTaskRegistryStatusWidenV61Migration,
   type CreatePostgresTaskRegistryOptions,
+  type DecisioningTaskRegistryScopeV1Upgrade,
+  type DecisioningTaskRegistryScopeV1UpgradeOptions,
+  type DecisioningTaskRegistryStatusWidenV61MigrationOptions,
   type PgQueryable,
+  type PgTransactionClient,
+  type PgTransactionalPool,
 } from './runtime/postgres-task-registry';
+export {
+  completeScopedPushTask,
+  createPostgresTaskSettlementCoordinator,
+  failScopedPushTask,
+  rejectScopedPushTask,
+  TaskPushSettlementConfigurationError,
+  type PostgresTaskSettlementCoordinator,
+  type PostgresTaskSettlementCoordinatorOptions,
+  type TaskPushDeliveryState,
+  type TaskPushSettlementConfig,
+  type TaskPushSettlementOutcome,
+} from './runtime/postgres-task-settlement';
+export {
+  canonicalizeTaskSettlementIntent,
+  createPostgresTaskSettlementIntentQueue,
+  getTaskSettlementIntentMigration,
+  TASK_SETTLEMENT_INTENT_IDEMPOTENCY_HORIZON_MS,
+  TaskSettlementIntentConflictError,
+  type CreatePostgresTaskSettlementIntentQueueOptions,
+  type DurableTaskSettlementRef,
+  type PostgresTaskSettlementIntentQueue,
+  type PruneTaskSettlementIntentAcknowledgementsOptions,
+  type RecoverTaskSettlementIntentsOptions,
+  type TaskSettlementIntent,
+  type TaskSettlementIntentCheckpoint,
+  type TaskSettlementIntentRecoveryContext,
+  type TaskSettlementIntentRecoveryErrorContext,
+  type TaskSettlementIntentRecoveryMetrics,
+  type TaskSettlementIntentWriteOptions,
+} from './runtime/postgres-task-settlement-intents';
+export {
+  applyTaskSettlementIntent,
+  type ApplyTaskSettlementIntentOptions,
+} from './runtime/apply-task-settlement-intent';
 
 // Multi-tenant deployment helper — wraps createAdcpServerFromPlatform with
 // per-tenant config, health states (healthy/unverified/disabled), and JWKS
@@ -462,11 +531,17 @@ export type {
   ProposalRecord,
   ProposalStore,
   InMemoryProposalStoreOptions,
+  ProposalPgQueryable,
+  PostgresProposalStoreOptions,
+  ProposalStoreMigrationOptions,
   MockProposalManagerOptions,
 } from './proposal';
 export {
   validateProposalCapabilities,
   InMemoryProposalStore,
+  PostgresProposalStore,
+  createPostgresProposalStore,
+  getProposalStoreMigration,
   MockProposalManager,
   enforceProposalExpiry,
   validateCapabilityOverlap,

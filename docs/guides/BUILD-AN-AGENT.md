@@ -29,6 +29,13 @@ before runtime. The `definePlatform` / `defineSalesCorePlatform` /
 sibling helpers let you write inline platform literals without
 `req: unknown` casts.
 
+Standing caller- and account-level notification subscribers need durable
+control-plane state in addition to the webhook delivery outbox. Use
+`createPostgresPersistentNotificationRuntime()`; it owns declarative
+replacement, proof generations, and per-attempt authorization while composing
+with the existing delivery kernel. See
+[Persistent notification subscriptions](./PERSISTENT-NOTIFICATION-RUNTIME.md).
+
 For multi-specialism production agents (sales + creative + governance +
 brand-rights), the `examples/hello_*` family is the copy-paste
 starting point for each specialism.
@@ -172,9 +179,37 @@ serve(() => createAdcpServerFromPlatform(platform, { name: 'My Publisher', versi
 - **Compile-time specialism enforcement** via `RequiredPlatformsFor<S>` — claim `'sales-non-guaranteed'` and the typechecker requires `SalesCorePlatform & SalesIngestionPlatform` on `sales` (`SalesPlatform` was split in 6.7 with all methods individually optional; per-specialism enforcement moves up to the type-level).
 - **Auto-generates `get_adcp_capabilities`** from registered platform methods — no manual capability declaration.
 - **Auto-applies response builders** — return raw data, the framework wraps them in MCP `CallToolResult` with `structuredContent`.
-- **Resolves accounts** — `accounts.resolve(ref, ctx)` runs before your platform method, the resolved account lands at `ctx.account`. Returns `ACCOUNT_NOT_FOUND` envelope if resolution returns null. `accounts.resolution: 'implicit'` enforces inline-`{account_id}` refusal at the framework boundary (post-6.7 — pre-6.7 the docstring was aspirational).
+- **Resolves accounts** — `accounts.resolve(ref, ctx)` runs before your platform method, and the resolved account lands at `ctx.account`. A buyer-supplied unknown, unauthorized, or mismatched ref returns terminal `ACCOUNT_NOT_FOUND`; an account-required operation with no supplied or auth-derived selection returns correctable `ACCOUNT_REQUIRED`. `accounts.resolution: 'implicit'` enforces inline-`{account_id}` refusal at the framework boundary (post-6.7 — pre-6.7 the docstring was aspirational).
 - **Idempotency, signing, async tasks, status normalization, lifecycle state** are framework-owned. Synchronous terminal responses do not emit completion webhooks by default; the inline result is authoritative. Adopters write the business decisions.
 - **Catches handler errors** — unhandled exceptions return `SERVICE_UNAVAILABLE` instead of crashing. Throw a typed error class (see § "Returning errors from handlers") to surface a structured envelope.
+
+When one tool cannot truthfully project across the server's entire release
+window, narrow that tool with `toolVersions`. The framework applies the same
+inclusive range to MCP discovery (legacy and modern), A2A skills, direct
+dispatch, validation/projection, and capability discovery:
+
+```typescript
+const platform = definePlatform({
+  capabilities: {
+    specialisms: ['sales-non-guaranteed', 'signal-marketplace'] as const,
+    supported_versions: ['3.0.25', '3.1.18'],
+    // ...
+  },
+  // ...
+});
+
+createAdcpServerFromPlatform(platform, {
+  name: 'My Publisher',
+  version: '1.0.0',
+  toolVersions: {
+    get_signals: { min: '3.1' },
+  },
+});
+```
+
+This keeps compatible media-buy tools available to 3.0 buyers while hiding
+and rejecting only `get_signals` at 3.0. Unknown tool names, invalid releases,
+empty ranges, and `min > max` fail during server construction.
 
 ### Customizing human-readable MCP response text
 
@@ -265,6 +300,19 @@ app.use(express.json());
 a2a.mount(app);
 app.listen(3000);
 ```
+
+The adapter enables the official A2A SDK's v0.3 compatibility layer by
+default, preserving existing sellers and buyers. For a native A2A 1.0-only
+server, pass `legacyCompat: { enabled: false }` to `createA2AAdapter`. This
+removes the v0.3 interface from the agent card and disables the SDK's legacy
+JSON-RPC and card handlers; it does not introduce a separate protocol
+implementation.
+
+Compliance storyboards are stricter than ordinary adopter calls: A2A runs use
+native 1.0 mode unconditionally, including per-agent routes in a multi-agent
+run. An agent that publishes only the v0.3 compatibility interface can remain
+reachable by normal SDK clients but will fail A2A compliance grading until it
+publishes its native 1.0 card and JSON-RPC interface.
 
 `tokenStore.lookup` represents your real credential verifier or identity provider. Returning a fixed principal for any
 non-empty bearer is an authentication bypass, not a safe example simplification.
@@ -384,7 +432,7 @@ mediaBuy: {
 
 ### Account Resolution
 
-`AccountStore.resolve(ref, ctx)` runs before every platform method. The resolved account lands at `ctx.account`. If `resolve` returns `null`, the framework responds with `ACCOUNT_NOT_FOUND` and your method never runs.
+`AccountStore.resolve(ref, ctx)` runs before every platform method. The resolved account lands at `ctx.account`. If a supplied ref resolves to `null`, the framework responds with terminal `ACCOUNT_NOT_FOUND`. If no ref was supplied and auth-derived resolution cannot select an account, account-required operations respond with correctable `ACCOUNT_REQUIRED`; account-optional operations may still run without `ctx.account`.
 
 ```typescript
 import { definePlatform, refAccountId, AccountNotFoundError } from '@adcp/sdk/server';
@@ -392,9 +440,11 @@ import { definePlatform, refAccountId, AccountNotFoundError } from '@adcp/sdk/se
 const platform = definePlatform({
   capabilities: { specialisms: ['sales-non-guaranteed'] as const, /* ... */ },
   accounts: {
-    // 'explicit' (default), 'implicit' (sync_accounts-first), or 'derived' (single-tenant).
-    // 'implicit' adopters: framework refuses inline {account_id} references with INVALID_REQUEST
-    // *before* reaching your resolver (post-6.7).
+    // 'explicit' (default), 'implicit' (sync_accounts-first), or 'derived'
+    // (upstream-managed account-id namespace, discovered via list_accounts).
+    // The framework enforces each mode's durable reference shape *before*
+    // reaching your resolver: 'implicit' refuses inline {account_id};
+    // 'derived' refuses the {brand, operator} natural key.
     resolution: 'explicit',
     resolve: async (ref, ctx) => {
       const id = refAccountId(ref);
@@ -403,7 +453,7 @@ const platform = definePlatform({
       if (ctx?.authInfo?.credential?.client_id) {
         return db.findByClient(ctx.authInfo.credential.client_id);
       }
-      return null; // → ACCOUNT_NOT_FOUND
+      return null; // account-required operation → ACCOUNT_REQUIRED
     },
   },
   sales: defineSalesCorePlatform({
@@ -420,8 +470,8 @@ const platform = definePlatform({
 Three resolution modes:
 
 - **`'explicit'`** (default) — buyer passes `{account_id}` inline on every request. Snap, Meta, GAM-style sellers. The framework calls `resolve(ref, ctx)` with the inline ref.
-- **`'implicit'`** — buyer must call `sync_accounts` first; subsequent requests resolve from the auth-principal linkage your `upsert` populated. LinkedIn-shaped sellers. The framework refuses inline `{account_id}` references with `INVALID_REQUEST` (post-6.7 — pre-6.7 the docstring claimed this but nothing checked it). Use [`InMemoryImplicitAccountStore`](../../src/lib/adapters/implicit-account-store.ts) for the reference shape.
-- **`'derived'`** — single-tenant agents where the auth principal alone identifies the tenant. Self-hosted broadcasters, retail-media operators in proxy mode. `resolve(undefined, ctx)` returns the singleton.
+- **`'implicit'`** — buyer must call `sync_accounts` first; subsequent requests resolve from the auth-principal linkage your `upsert` populated. LinkedIn-shaped sellers. The framework refuses inline `{account_id}` references with `INVALID_REQUEST` (post-6.7 — pre-6.7 the docstring claimed this but nothing checked it). Use [`InMemoryImplicitAccountStore`](https://github.com/adcontextprotocol/adcp-client/blob/main/src/lib/adapters/implicit-account-store.ts) for the reference shape.
+- **`'derived'`** — an upstream-managed account-id namespace: you front a platform that owns the roster (Meta / Snap ad accounts, AudioStack workspaces, a retail-media proxy), or the credential is bound to a single account. Buyers discover ids via `list_accounts` and pass `{account_id}`; the framework refuses the `{brand, operator}` arm, `accounts.list` is required, and `resolve` must verify the buyer-supplied id against what the caller's credential can reach. Use [`createDerivedAccountStore`](https://github.com/adcontextprotocol/adcp-client/blob/main/src/lib/adapters/derived-account-store.ts), which does both. `resolve(undefined, ctx)` auto-selects when exactly one account is reachable. **Changed in SDK 14** — see the [migration guide](../migration-13-to-14.md#derived-account-resolution-is-now-an-upstream-managed-account-id-namespace).
 
 **Stateless BYOK provider adapters.** For single-account API-key or
 bearer-token BYOK, the provider credential can be the AdCP request credential
@@ -432,8 +482,9 @@ derives the account from request auth, and uses the same request-local token
 for upstream provider calls. No SDK-managed OAuth flow, refresh-token store,
 provider-token store, or callback route is required when the caller owns the
 provider credential lifecycle. If the provider credential can see multiple
-upstream accounts, use an explicit account roster pattern such as
-`createOAuthPassthroughResolver` instead of `'derived'`. Handlers with a
+upstream accounts, stay in `'derived'` and supply `listAccounts` so buyers
+can discover and name one, or use `createOAuthPassthroughResolver` under
+`'explicit'` when you own the id namespace. Handlers with a
 resolved account should read the active token from
 `ctx.account.authInfo?.token`; refresh hooks update `account.authInfo`.
 Handlers without a resolved account can read the request token from
@@ -538,6 +589,45 @@ key before issuing a new intent. Optional idempotency on non-mutating handlers
 may still release its claim after a thrown error because no mutation was
 admitted.
 
+### Durable proposal lifecycle state
+
+Production sellers using the proposal manager should keep proposal recipes
+and consumption fences in PostgreSQL alongside the durable task registry and
+task-settlement coordinator:
+
+```ts
+import {
+  createPostgresProposalStore,
+  getProposalStoreMigration,
+  serve,
+} from '@adcp/sdk/server';
+
+// Run this migration once from deployment tooling, not in every server replica.
+await pool.query(getProposalStoreMigration({ tableName: 'seller_adcp_proposals' }));
+pool.on('error', err => logger.error({ err }, 'PostgreSQL pool error'));
+const proposalStore = createPostgresProposalStore({
+  db: pool,
+  namespace: 'seller-prod',
+  tableName: 'seller_adcp_proposals',
+});
+serve(() => createAdcpServerFromPlatform(platform, {
+  name: 'Seller', version: '1.0.0', proposalStore,
+}), {
+  readinessCheck: () => proposalStore.probe(),
+});
+```
+
+The store scopes every read and CAS transition by deployment namespace and
+account, persists exact JSON-safe proposal/recipe documents, and atomically
+enforces `draft → committed → consuming → consumed`. Run bounded
+`proposalStore.cleanupExpired()` from an operations worker; expiry uses the
+database clock. Never place credentials in proposal recipes or payloads—the
+store rejects credential-shaped fields and oversized documents.
+`expectedAccountId` is required by durable store mutations; the framework
+supplies it automatically. The process-local store retains unscoped
+`commit`/`discard` only as a deprecated source-compatibility path for preview
+adopters, and refuses ambiguous duplicate IDs across accounts.
+
 ### Schema-Driven Validation (opt-in)
 
 `createAdcpServerFromPlatform` can validate every inbound request and handler response against the bundled AdCP JSON schemas for the SDK's declared version. Catches field-name drift (e.g. a handler emits `targeting_overlay` where the spec expects `targeting`) before the response leaves your agent.
@@ -631,9 +721,32 @@ createAdcpServerFromPlatform(platform, {
 });
 ```
 
+**Push-enabled HITL task handoffs fail closed.** When a handler returns
+`ctx.handoffToTask(...)` for a request with a validated
+`push_notification_config.url`, the server must have a terminal task-webhook
+delivery owner. Configure `webhooks` for framework delivery, or omit
+`push_notification_config` and let the buyer poll. A server without either
+returns structured `UNSUPPORTED_FEATURE` before creating a task or starting the
+handoff callback. The platform handler has already run to return its marker, so
+keep irreversible effects in the handoff callback; framework-managed proposal
+reservations are unwound. Buyers changing the request must use a new
+`idempotency_key`. Synchronous responses are unaffected.
+
+This applies to `handoffToTask(..., { settlement: 'external' })` too: external
+producers have no SDK terminal-delivery path, so they must omit
+`push_notification_config` and use polling. A framework emitter does not make
+an externally settled task deliverable.
+
 **Production key storage.** For outbound request or webhook signing, prefer a KMS-backed `SigningProvider` over in-process JWKs. See [SIGNING-GUIDE.md § Production Key Storage](./SIGNING-GUIDE.md#step-35-production-key-storage--kms--hsm--vault) for the full walkthrough including a reference GCP KMS adapter. Production webhook servers must provide a shared durable `deliveryStore` plus `deliveryRecovery`, a durable outbox that checkpoints the exact destination, payload/timestamp, authentication reference, and retry policy before delivery and recovers unsettled snapshots after restart. The SDK supplies PostgreSQL and Redis delivery stores, recovery backends, migrations, and a bounded recovery polling API; applications supply the KMS/secret adapter and operational scheduler. Tenant namespaces are derived from trusted resolved request context.
 
 See [SIGNING-GUIDE.md](./SIGNING-GUIDE.md) for the full walkthrough: key generation, JWKS publication, brand.json, conformance testing, and KMS-backed production deployment.
+
+When a human approval or provider callback commits before the application can
+settle its SDK task, use the PostgreSQL settlement-intent queue to close that
+earlier crash window. See [Durable task settlement](./DURABLE-TASK-SETTLEMENT.md)
+for the domain transaction → task/webhook transaction → webhook recovery
+sequence, copyable polling and push settlement handlers, and scoped dead-letter
+operations.
 
 ### Portable MCP Apps for custom tools
 
@@ -643,10 +756,7 @@ MCP connections and every modern per-request server reconstruction; the same
 configuration therefore works in compliant Claude, ChatGPT, and future hosts.
 
 ```typescript
-import {
-  createAdcpServerFromPlatform,
-  MCP_APP_RESOURCE_MIME_TYPE,
-} from '@adcp/sdk/server';
+import { createAdcpServerFromPlatform } from '@adcp/sdk/server';
 
 const server = createAdcpServerFromPlatform(platform, {
   name: 'My Publisher',
@@ -655,7 +765,6 @@ const server = createAdcpServerFromPlatform(platform, {
     {
       name: 'creative_upload',
       uri: 'ui://creative/upload',
-      mimeType: MCP_APP_RESOURCE_MIME_TYPE,
       _meta: {
         ui: {
           csp: {
@@ -694,6 +803,12 @@ MCP App resources always use a `ui://` URI and
 reject other shapes. The resource `_meta.ui` object carries CSP domains,
 permissions, a dedicated host domain, and border preference, and is emitted
 consistently by both `resources/list` and `resources/read`.
+
+Registration delegates to the official MCP Apps v2 server helpers. New code
+should use `_meta.ui.resourceUri`; the helpers also mirror the deprecated
+`_meta['ui/resourceUri']` key for older hosts and accept that key from legacy
+configurations during migration. The resource MIME type defaults to the MCP
+Apps value, so it normally does not need to be specified.
 
 `ui.visibility` is host routing metadata, not an authorization boundary.
 App-only handlers must still authenticate and authorize every request, and
@@ -978,6 +1093,6 @@ See [`examples/error-compliant-server.ts`](../../examples/error-compliant-server
 
 ## Related
 
-- [`registerAdcpTaskTool()`](../../src/lib/server/tasks.ts) — for async tools that need background processing
+- [`registerAdcpTaskTool()`](https://github.com/adcontextprotocol/adcp-client/blob/main/src/lib/server/tasks.ts) — for async tools that need background processing
 - [`examples/error-compliant-server.ts`](../../examples/error-compliant-server.ts) — media buy agent with multiple tools and error handling
 - [AdCP specification](https://adcontextprotocol.org) — full protocol reference

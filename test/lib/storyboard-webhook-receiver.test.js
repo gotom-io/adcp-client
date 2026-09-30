@@ -14,6 +14,12 @@
 const { describe, test, afterEach } = require('node:test');
 const assert = require('node:assert');
 const http = require('http');
+const https = require('node:https');
+const net = require('node:net');
+const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const { createWebhookReceiver } = require('../../dist/lib/testing/storyboard/webhook-receiver.js');
@@ -35,7 +41,118 @@ async function post(url, body, headers) {
   });
 }
 
+function postWithTestTls(url, body) {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      {
+        method: 'POST',
+        rejectUnauthorized: false,
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+      },
+      res => {
+        res.resume();
+        res.once('end', () => resolve(res));
+      }
+    );
+    req.once('error', reject);
+    req.end(payload);
+  });
+}
+
+async function getFreePort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+
 describe('createWebhookReceiver', () => {
+  test('echoes proof-of-control challenges on the registered callback URL (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const challenge = 'proof-control-token-0000000000000001';
+      const callbackUrl = `${receiver.base_url}/step/register/op-1`;
+      const challengeBody = {
+        type: 'webhook.challenge',
+        challenge,
+        account_id: 'acct_123',
+        subscriber_id: 'buyer-primary',
+        seller_agent_url: 'https://seller.example/adcp',
+        delivery_auth: { mode: 'rfc9421' },
+        event_types: ['creative.status_changed'],
+      };
+      const response = await post(callbackUrl, challengeBody, {
+        signature: 'sig1=:c2lnbmF0dXJl:',
+        'signature-input': 'sig1=("@method" "@target-uri");keyid="seller-key"',
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(await response.json(), { challenge });
+      assert.strictEqual(receiver.all().length, 0, 'challenge probes are not webhook deliveries');
+      assert.strictEqual(receiver.challenges().length, 1, 'challenge metadata is retained for grading');
+      assert.deepStrictEqual(receiver.challenges()[0].body, challengeBody);
+      assert.ok(receiver.challenges()[0].headers['signature-input']);
+
+      const malformed = await post(callbackUrl, { ...challengeBody, challenge: 'too-short' });
+      assert.strictEqual(malformed.status, 400);
+      const missingRequired = await post(callbackUrl, { type: 'webhook.challenge', challenge });
+      assert.strictEqual(missingRequired.status, 400);
+      const obsoleteRoute = await post(`${receiver.base_url}/challenge`, challengeBody);
+      assert.strictEqual(obsoleteRoute.status, 404);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('accepts the agent-level proof-of-control challenge arm', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const challenge = 'agent-proof-control-token-000000000001';
+      const body = {
+        type: 'webhook.challenge',
+        scope: 'agent',
+        challenge,
+        subscriber_id: 'registry-cache',
+        seller_agent_url: 'https://seller.example/adcp',
+        delivery_auth: { mode: 'rfc9421' },
+        event_types: ['capabilities.changed'],
+      };
+      const response = await post(`${receiver.base_url}/step/register_agent/op-2`, body);
+
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(await response.json(), { challenge });
+      assert.deepStrictEqual(receiver.challenges()[0].body, body);
+      assert.strictEqual(receiver.all().length, 0);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('rejects oversized challenge envelopes before retaining them', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const response = await post(`${receiver.base_url}/step/register/op-large`, {
+        type: 'webhook.challenge',
+        challenge: 'proof-control-token-0000000000000001',
+        account_id: 'x'.repeat(17_000),
+        subscriber_id: 'buyer-primary',
+        seller_agent_url: 'https://seller.example/adcp',
+        delivery_auth: { mode: 'rfc9421' },
+        event_types: ['creative.status_changed'],
+      });
+
+      assert.strictEqual(response.status, 413);
+      assert.strictEqual(receiver.challenges().length, 0);
+    } finally {
+      await receiver.close();
+    }
+  });
+
   test('per-step URL routing captures step_id + operation_id from path', async () => {
     const receiver = await createWebhookReceiver();
     try {
@@ -158,6 +275,15 @@ describe('createWebhookReceiver', () => {
     assert.deepStrictEqual(result, []);
   });
 
+  test('close resolves a pending first-match waiter immediately (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    const pending = receiver.wait({ step_id: 'nobody' }, 60_000);
+
+    await receiver.close();
+    const result = await Promise.race([pending, delay(250).then(() => 'still-pending')]);
+    assert.deepStrictEqual(result, { timed_out: true });
+  });
+
   test('close preserves matches already captured by a pending wait_all', async () => {
     const receiver = await createWebhookReceiver();
     const pending = receiver.wait_all({ step_id: 'captured_before_close' }, 60_000);
@@ -220,7 +346,7 @@ describe('createWebhookReceiver', () => {
     const rec = await createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://tunnel.example' });
     try {
       assert.strictEqual(rec.mode, 'proxy_url');
-      assert.strictEqual(rec.base_url, 'https://tunnel.example');
+      assert.match(rec.base_url, /^https:\/\/tunnel\.example\/_adcp_receiver\/[0-9a-f-]+$/);
     } finally {
       await rec.close();
     }
@@ -236,11 +362,117 @@ describe('createWebhookReceiver', () => {
       () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://example.com\r\nX-Evil: 1' }),
       /CR\/LF/
     );
+    await assert.rejects(
+      () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'https://example.com?redirect=1' }),
+      /query string or fragment/
+    );
+  });
+
+  test('requires an explicit local-development opt-in for an HTTP proxy URL', async () => {
+    await assert.rejects(
+      () => createWebhookReceiver({ mode: 'proxy_url', public_url: 'http://tests:9999' }),
+      /must use https/
+    );
+    const receiver = await createWebhookReceiver({
+      mode: 'proxy_url',
+      public_url: 'http://tests:9999',
+      allowHttp: true,
+    });
+    await receiver.close();
   });
 
   test('rejects 0.0.0.0 in loopback_mock mode', async () => {
     await assert.rejects(() => createWebhookReceiver({ host: '0.0.0.0' }), /not permitted/);
+    await assert.rejects(() => createWebhookReceiver({ host: '0:0:0:0:0:0:0:0' }), /not permitted/);
   });
+
+  test('binds on all interfaces in proxy mode and protects the route with an unguessable prefix', async () => {
+    const port = await getFreePort();
+    const receiver = await createWebhookReceiver({
+      mode: 'proxy_url',
+      host: '0.0.0.0',
+      port,
+      public_url: `http://tests:${port}/hooks`,
+      allowHttp: true,
+    });
+    try {
+      const routePrefix = new URL(receiver.base_url).pathname;
+      const accepted = await post(`http://127.0.0.1:${port}${routePrefix}/step/container/op-1`, {
+        idempotency_key: 'evt_x1234567890abcdef',
+      });
+      assert.strictEqual(accepted.status, 204);
+      assert.strictEqual(receiver.all().length, 1);
+      assert.strictEqual(receiver.all()[0].path, '/step/container/op-1');
+
+      const unscoped = await post(`http://127.0.0.1:${port}/step/container/op-2`, {
+        idempotency_key: 'evt_x1234567890abcdef',
+      });
+      assert.strictEqual(unscoped.status, 404);
+      assert.strictEqual(receiver.all().length, 1);
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('requires an HTTPS public URL when direct TLS is configured', async () => {
+    await assert.rejects(
+      () =>
+        createWebhookReceiver({
+          mode: 'proxy_url',
+          public_url: 'http://tests:9999',
+          allowHttp: true,
+          tls: { cert: 'invalid', key: 'invalid' },
+        }),
+      /must use https when local TLS is configured/
+    );
+  });
+
+  test(
+    'serves and captures webhooks over direct TLS',
+    { skip: spawnSync('openssl', ['version'], { stdio: 'ignore' }).status !== 0 },
+    async () => {
+      const certDir = mkdtempSync(path.join(tmpdir(), 'adcp-webhook-tls-'));
+      const certPath = path.join(certDir, 'cert.pem');
+      const keyPath = path.join(certDir, 'key.pem');
+      let receiver;
+      try {
+        const generated = spawnSync(
+          'openssl',
+          [
+            'req',
+            '-x509',
+            '-newkey',
+            'rsa:2048',
+            '-nodes',
+            '-keyout',
+            keyPath,
+            '-out',
+            certPath,
+            '-days',
+            '1',
+            '-subj',
+            '/CN=127.0.0.1',
+            '-addext',
+            'subjectAltName=IP:127.0.0.1',
+          ],
+          { stdio: 'ignore' }
+        );
+        assert.strictEqual(generated.status, 0, 'failed to generate test TLS certificate');
+        receiver = await createWebhookReceiver({
+          tls: { cert: readFileSync(certPath), key: readFileSync(keyPath) },
+        });
+        assert.match(receiver.base_url, /^https:\/\//);
+        const response = await postWithTestTls(`${receiver.base_url}/step/tls/op-1`, {
+          idempotency_key: 'evt_x1234567890abcdef',
+        });
+        assert.strictEqual(response.statusCode, 204);
+        assert.strictEqual(receiver.all().length, 1);
+      } finally {
+        if (receiver) await receiver.close();
+        rmSync(certDir, { recursive: true, force: true });
+      }
+    }
+  );
 
   test('redacts sensitive headers in captured webhooks', async () => {
     const receiver = await createWebhookReceiver();
@@ -1129,6 +1361,120 @@ describe('runStoryboard: expect_no_webhook step task', () => {
     const esmAssertions = await import('../../dist/lib/testing/storyboard/webhook-assertions.mjs');
     assert.strictEqual(webhookAssertions.WEBHOOK_ASSERTION_TASKS.has('expect_no_webhook'), true);
     assert.strictEqual(esmAssertions.WEBHOOK_ASSERTION_TASKS.has('expect_no_webhook'), true);
+  });
+});
+
+describe('executeWebhookAssertionStep prerequisites', () => {
+  test('fails immediately when an earlier account notification setup failed (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const setup = {
+        id: 'register_notifications',
+        title: 'Register notifications',
+        task: 'sync_accounts',
+        sample_request: {
+          accounts: [
+            {
+              notification_configs: [
+                {
+                  subscriber_id: 'buyer-primary',
+                  url: 'https://receiver.example/',
+                  event_types: ['creative.status_changed'],
+                },
+              ],
+            },
+          ],
+        },
+      };
+      const assertion = {
+        id: 'assert_notification',
+        title: 'Assert notification',
+        task: 'expect_webhook',
+        filter: { subscriber_id: 'buyer-primary' },
+        timeout_seconds: 60,
+      };
+      const runState = {
+        contributions: new Set(),
+        priorStepResults: new Map([
+          ['register_notifications', { step_id: 'register_notifications', passed: false, skipped: false }],
+        ]),
+        priorProbes: new Map(),
+        agentUrl: '',
+        webhookReceiver: { ...receiver, wait: async () => ({ timed_out: true }) },
+        runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+      };
+      const started = Date.now();
+      const result = await executeWebhookAssertionStep(
+        assertion,
+        'assertions',
+        {},
+        [
+          { step: setup, phaseId: 'setup', globalIndex: 0 },
+          { step: assertion, phaseId: 'assertions', globalIndex: 1 },
+        ],
+        {},
+        runState
+      );
+
+      assert.strictEqual(result.skipped, true);
+      assert.strictEqual(result.skip.reason, 'prerequisite_failed');
+      assert.match(result.skip.detail, /register_notifications/);
+      assert.ok(Date.now() - started < 250, 'must not enter the webhook timeout');
+    } finally {
+      await receiver.close();
+    }
+  });
+
+  test('requires every supplied discriminator to match a failed notification setup (#2701)', async () => {
+    const receiver = await createWebhookReceiver();
+    try {
+      const setup = {
+        id: 'register_other_notifications',
+        title: 'Register other notifications',
+        task: 'sync_accounts',
+        sample_request: {
+          accounts: [
+            {
+              notification_configs: [{ subscriber_id: 'other', event_types: ['creative.status_changed'] }],
+            },
+          ],
+        },
+      };
+      const assertion = {
+        id: 'assert_notification',
+        title: 'Assert notification',
+        task: 'expect_no_webhook',
+        triggered_by: 'trigger',
+        filter: { subscriber_id: 'buyer-primary', notification_type: 'creative.status_changed' },
+        timeout_seconds: 0,
+      };
+      const runState = {
+        contributions: new Set(),
+        priorStepResults: new Map([
+          ['register_other_notifications', { step_id: 'register_other_notifications', passed: false, skipped: false }],
+          ['trigger', { step_id: 'trigger', passed: true, skipped: false }],
+        ]),
+        priorProbes: new Map(),
+        agentUrl: '',
+        webhookReceiver: { ...receiver, wait: async () => ({ timed_out: true }) },
+        runnerVars: createRunnerVariables({ webhookBase: receiver.base_url }),
+      };
+      const result = await executeWebhookAssertionStep(
+        assertion,
+        'assertions',
+        {},
+        [
+          { step: setup, phaseId: 'setup', globalIndex: 0 },
+          { step: assertion, phaseId: 'assertions', globalIndex: 1 },
+        ],
+        {},
+        runState
+      );
+
+      assert.notStrictEqual(result.skip?.reason, 'prerequisite_failed');
+    } finally {
+      await receiver.close();
+    }
   });
 });
 

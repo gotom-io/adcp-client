@@ -9,6 +9,9 @@ import { z } from 'zod';
 import * as schemas from '../types/schemas.generated';
 import { SyncCreativesResponseStrictSchema } from '../validation/sync-creatives';
 import { isPre31AdcpVersion } from './adcp-version-config';
+import { GetReportingStatusResponseCurrentSchema } from './reporting-status-response';
+import { toReleasePrecisionVersion } from '../version';
+import { cacheResponseSchemas } from './response-schema-cache';
 
 function declaresLegacy30xPayload(response: Record<string, unknown>): boolean {
   const adcpVersion = response.adcp_version;
@@ -25,11 +28,18 @@ export function prepareResponseForSchemaValidation(
   data: unknown,
   responseAdcpVersion?: string
 ): unknown {
-  if (toolName !== 'get_products') return data;
-  if (!isPre31AdcpVersion(responseAdcpVersion)) return data;
   if (data == null || typeof data !== 'object' || Array.isArray(data)) return data;
 
   const response = data as Record<string, unknown>;
+  // Legacy 3.0 sellers commonly echoed the SDK/bundle's full semver. Current
+  // envelopes correctly require release precision, so normalize only this
+  // established compatibility path for validation. The unwrapper restores
+  // the seller-authored value before returning it to the caller.
+  if (typeof response.adcp_version === 'string' && /^3\.0\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(response.adcp_version)) {
+    return { ...response, adcp_version: toReleasePrecisionVersion(response.adcp_version) };
+  }
+  if (toolName !== 'get_products') return data;
+  if (!isPre31AdcpVersion(responseAdcpVersion)) return data;
   if (response.adcp_version !== undefined || response.adcp_major_version !== undefined) return data;
   return { ...response, adcp_version: '3.0' };
 }
@@ -61,6 +71,12 @@ export const TOOL_RESPONSE_SCHEMAS: Partial<Record<string, z.ZodType>> = {
   update_media_buy: schemas.UpdateMediaBuyResponseSchema,
   get_media_buys: schemas.GetMediaBuysResponseSchema,
   get_media_buy_delivery: schemas.GetMediaBuyDeliveryResponseSchema,
+  // The generated Zod schema preserves source-required view fields and closed
+  // reporting evidence boundaries. Keep this current-version guard adjacent to
+  // it for the remaining cross-field reporting invariants.
+  get_reporting_status: schemas.GetReportingStatusResponseSchema.and(GetReportingStatusResponseCurrentSchema),
+  sync_reporting_status: schemas.SyncReportingStatusResponseSchema,
+  sync_reporting_receipts: schemas.SyncReportingReceiptsResponseSchema,
   provide_performance_feedback: schemas.ProvidePerformanceFeedbackResponseSchema,
 
   // Creative
@@ -85,6 +101,7 @@ export const TOOL_RESPONSE_SCHEMAS: Partial<Record<string, z.ZodType>> = {
   identity_match: schemas.IdentityMatchResponseRouterPublisherSchema,
 
   // Account & audience
+  list_account_changes: schemas.ListAccountChangesResponseSchema,
   sync_accounts: schemas.SyncAccountsResponseSchema,
   list_accounts: schemas.ListAccountsResponseSchema,
   sync_governance: schemas.SyncGovernanceResponseSchema,
@@ -140,6 +157,10 @@ export const TOOL_RESPONSE_SCHEMAS: Partial<Record<string, z.ZodType>> = {
   list_tasks: schemas.ListTasksResponseSchema,
   sync_agent_notification_configs: schemas.SyncAgentNotificationConfigsResponseSchema,
 
+  // Principal configuration
+  get_principal: schemas.GetPrincipalResponseSchema,
+  sync_principal: schemas.SyncPrincipalResponseSchema,
+
   // Test controller
   comply_test_controller: schemas.ComplyTestControllerResponseSchema,
 
@@ -164,3 +185,5 @@ export const TOOL_RESPONSE_SCHEMAS: Partial<Record<string, z.ZodType>> = {
   verify_brand_claims: schemas.VerifyBrandClaimsResponseBulkSchema,
   search_brands: schemas.SearchBrandsResponseSchema,
 };
+
+cacheResponseSchemas({ prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS });

@@ -35,6 +35,7 @@ export const TOOL_PROTOCOL_MAP: Readonly<Record<string, AdcpProtocol>> = {
 
   // governance
   check_governance: 'governance',
+  get_creative_features: 'governance',
   sync_plans: 'governance',
   report_plan_outcome: 'governance',
   get_plan_audit_logs: 'governance',
@@ -65,7 +66,6 @@ export const TOOL_PROTOCOL_MAP: Readonly<Record<string, AdcpProtocol>> = {
   get_creative_delivery: 'creative',
   list_creative_formats: 'creative',
   list_creatives: 'creative',
-  sync_creatives: 'creative',
 
   // brand
   get_brand_identity: 'brand',
@@ -84,8 +84,14 @@ export const TOOL_PROTOCOL_MAP: Readonly<Record<string, AdcpProtocol>> = {
   accept_proposal: 'media-buy',
   control_media_buy: 'media-buy',
   sync_agent_notification_configs: 'media-buy',
+  sync_principal: 'media-buy',
+  get_principal: 'media-buy',
   create_media_buy: 'media-buy',
   update_media_buy: 'media-buy',
+  // The task-type schemas through AdCP 3.2 classify this dual-domain tool as
+  // media-buy. Keep lifecycle routing compatible even when a creative agent
+  // also implements the operation.
+  sync_creatives: 'media-buy',
   media_buy_delivery: 'media-buy',
   get_media_buy_delivery: 'media-buy',
   sync_event_sources: 'media-buy',
@@ -93,10 +99,14 @@ export const TOOL_PROTOCOL_MAP: Readonly<Record<string, AdcpProtocol>> = {
   sync_catalogs: 'media-buy',
   log_event: 'media-buy',
   sync_accounts: 'media-buy',
+  list_account_changes: 'media-buy',
   list_accounts: 'media-buy',
   get_account_financials: 'media-buy',
   report_usage: 'media-buy',
   provide_performance_feedback: 'media-buy',
+  get_reporting_status: 'media-buy',
+  sync_reporting_status: 'media-buy',
+  sync_reporting_receipts: 'media-buy',
   get_media_buys: 'media-buy',
 };
 

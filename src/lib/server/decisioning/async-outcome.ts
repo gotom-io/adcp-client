@@ -16,6 +16,7 @@
  */
 
 import { getErrorRecovery, STANDARD_ERROR_CODES, type StandardErrorCode } from '../../types/error-codes';
+import type { ScopedTaskRef } from './runtime/task-registry';
 
 /**
  * Error code vocabulary the SDK recognizes. Uses the same runtime table as
@@ -82,6 +83,17 @@ export interface AdcpStructuredError {
    */
   retry_after?: number;
   details?: Record<string, unknown>;
+  /**
+   * Buyer-actionable classification of the failure. Use when the enclosing
+   * `code`/`message` is too coarse or carries producer-internal context that
+   * must not cross the buyer trust boundary. `code` reuses the standard
+   * error vocabulary; `message` MUST be buyer-safe (no vendor identifiers,
+   * ad-server type names, internal object names, internal IDs, or stack
+   * traces). When present, `recovery` classifies the buyer-actionable
+   * reason. See `core/error.json`'s `buyer_reason` field for the normative
+   * contract.
+   */
+  buyer_reason?: { code: string; message: string };
 }
 
 /**
@@ -113,6 +125,7 @@ export class AdcpError extends Error {
   readonly suggestion?: string;
   readonly retry_after?: number;
   readonly details?: Record<string, unknown>;
+  readonly buyer_reason?: { code: string; message: string };
 
   constructor(
     code: ErrorCode | (string & {}),
@@ -129,6 +142,15 @@ export class AdcpError extends Error {
       suggestion?: string;
       retry_after?: number;
       details?: Record<string, unknown>;
+      /**
+       * Buyer-actionable classification. When the enclosing `code`/`message`
+       * is too coarse or carries producer-internal context, populate this
+       * with a buyer-safe (`code`, `message`) pair drawn from the standard
+       * error vocabulary. Per spec, `message` MUST NOT contain vendor
+       * identifiers, ad-server type names, internal object names, internal
+       * IDs, or stack traces.
+       */
+      buyer_reason?: { code: string; message: string };
     }
   ) {
     super(options.message);
@@ -143,6 +165,7 @@ export class AdcpError extends Error {
     if (options.suggestion !== undefined) this.suggestion = options.suggestion;
     if (options.retry_after !== undefined) this.retry_after = options.retry_after;
     if (options.details !== undefined) this.details = options.details;
+    if (options.buyer_reason !== undefined) this.buyer_reason = options.buyer_reason;
   }
 
   /** Coerce to the structured envelope shape the framework projects to the wire. */
@@ -155,6 +178,7 @@ export class AdcpError extends Error {
       ...(this.suggestion !== undefined && { suggestion: this.suggestion }),
       ...(this.retry_after !== undefined && { retry_after: this.retry_after }),
       ...(this.details !== undefined && { details: this.details }),
+      ...(this.buyer_reason !== undefined && { buyer_reason: this.buyer_reason }),
     };
   }
 
@@ -200,16 +224,30 @@ export interface TaskHandoffOptions {
   /**
    * Vendor-namespaced extension object echoed on the submitted envelope
    * (`{ status: 'submitted', task_id, ext }`). The spec's submitted branch
-   * declares `ext`; keys MUST be namespaced under a vendor key (`ext.gotom`),
+   * declares `ext`; keys MUST be namespaced under a vendor key (`ext.acme`),
    * never a spec field such as `media_buy_id` — those belong on the terminal
    * artifact. Not persisted; a registry decorator may re-attach it on reads.
    */
   ext?: Record<string, unknown>;
 }
 
+/**
+ * Options for a handoff whose terminal result is owned by a durable worker.
+ * The callback must only persist the complete task handle and work item; the
+ * framework waits for that commit before acknowledging submitted, then leaves
+ * the task submitted for the worker to settle.
+ *
+ * @public
+ */
+export interface ExternalTaskHandoffOptions extends TaskHandoffOptions {
+  readonly settlement: 'external';
+}
+
+type AnyTaskHandoffOptions = TaskHandoffOptions | ExternalTaskHandoffOptions;
+
 type TaskHandoffEntry = {
   fn: (taskCtx: TaskHandoffContext) => Promise<unknown>;
-  options?: TaskHandoffOptions;
+  options?: AnyTaskHandoffOptions;
 };
 
 /**
@@ -265,6 +303,39 @@ export interface TaskHandoff<TResult> {
  */
 export interface TaskHandoffContext {
   readonly id: string;
+  /** Immutable AdCP release selected for the request that created this task. */
+  readonly servedAdcpVersion?: string;
+  /**
+   * Trusted serializable handle for durable out-of-process settlement.
+   * Persist the complete value; never project it onto the buyer wire.
+   */
+  readonly taskRef: ScopedTaskRef;
+  update(progress: TaskHandoffProgress): Promise<void>;
+  heartbeat(): Promise<void>;
+  /**
+   * Terminate this handoff as a business rejection. This throws an internal
+   * control-flow signal, so write `return taskCtx.reject(result, reason)`.
+   * Unlike throwing `AdcpError`, this records a `rejected` task with the
+   * supplied terminal artifact and no structured execution error.
+   */
+  reject<TResult = never>(result: TResult, reason?: string): never;
+}
+
+/**
+ * Context supplied to an external-settlement producer. The producer owns only
+ * durable work enqueueing; a separate trusted worker settles the task through
+ * a scoped helper. Business rejection is intentionally unavailable here: a
+ * producer has neither the crash-safe push route nor the coordinator needed
+ * to atomically record a terminal rejection and its outbox checkpoint.
+ *
+ * @public
+ */
+export interface ExternalTaskHandoffContext {
+  readonly id: string;
+  /** Immutable AdCP release selected for the request that created this task. */
+  readonly servedAdcpVersion?: string;
+  /** Trusted serializable handle for the durable worker settlement record. */
+  readonly taskRef: ScopedTaskRef;
   update(progress: TaskHandoffProgress): Promise<void>;
   heartbeat(): Promise<void>;
 }
@@ -275,6 +346,33 @@ export interface TaskHandoffProgress {
   step_number?: number;
   total_steps?: number;
   current_step?: string;
+  /** Tool/vendor-specific progress fields permitted by the wire schema. */
+  [key: string]: unknown;
+}
+
+/** @internal Framework-only signal used by `TaskHandoffContext.reject()`. */
+export class TaskHandoffRejection extends Error {
+  readonly name = 'TaskHandoffRejection' as const;
+
+  constructor(
+    readonly result: unknown,
+    readonly reason?: string
+  ) {
+    super('Task handoff rejected');
+  }
+}
+
+/** @internal */
+export function throwTaskHandoffRejection<TResult = never>(result: TResult, reason?: string): never {
+  if (reason !== undefined && typeof reason !== 'string') {
+    throw new TypeError('Task rejection reason must be a string');
+  }
+  throw new TaskHandoffRejection(result, reason);
+}
+
+/** @internal */
+export function isTaskHandoffRejection(value: unknown): value is TaskHandoffRejection {
+  return value instanceof TaskHandoffRejection;
 }
 
 /**
@@ -290,7 +388,7 @@ export interface TaskHandoffProgress {
  */
 export function _createTaskHandoff<TResult>(
   fn: (taskCtx: TaskHandoffContext) => Promise<TResult>,
-  options?: TaskHandoffOptions
+  options?: AnyTaskHandoffOptions
 ): TaskHandoff<TResult> {
   // Frozen object so adopters can't mutate the brand field. Even if
   // they did, the dispatch seam keys on identity (WeakMap), not on
@@ -332,8 +430,8 @@ export function isTaskHandoff<TResult>(value: unknown): value is TaskHandoff<TRe
  */
 export function _extractHandoffEntry<TResult>(
   handoff: TaskHandoff<TResult>
-): { fn: (taskCtx: TaskHandoffContext) => Promise<TResult>; options?: TaskHandoffOptions } | undefined {
+): { fn: (taskCtx: TaskHandoffContext) => Promise<TResult>; options?: AnyTaskHandoffOptions } | undefined {
   const entry = taskHandoffEntries.get(handoff as unknown as object);
   if (!entry) return undefined;
-  return entry as { fn: (taskCtx: TaskHandoffContext) => Promise<TResult>; options?: TaskHandoffOptions };
+  return entry as { fn: (taskCtx: TaskHandoffContext) => Promise<TResult>; options?: AnyTaskHandoffOptions };
 }

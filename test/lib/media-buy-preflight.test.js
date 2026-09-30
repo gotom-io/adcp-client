@@ -25,6 +25,8 @@ const {
   getRollupParent,
   preflightUpdateMediaBuy,
   recoveryForModeMismatch,
+  ACTIONS_BY_FIELD,
+  STRUCTURED_ONLY_MEDIA_BUY_ACTIONS,
   __resetValidActionsWarningForTests,
 } = require('../../dist/lib/media-buy');
 const { ValidationError } = require('../../dist/lib/errors');
@@ -120,6 +122,39 @@ describe('getAvailableActions compat shim', () => {
     assert.strictEqual(hit.entry.action, 'update_budget');
   });
 
+  test('findAvailableAction retains runtime compatibility with pre-GA requires_proposal entries', () => {
+    const buy = buyWith([{ action: 'extend_flight', mode: 'requires_proposal' }]);
+    const hit = findAvailableAction(buy, 'extend_flight', { silent: true });
+    assert.ok(hit);
+    assert.strictEqual(hit.entry.mode, 'requires_proposal');
+    assert.strictEqual(canExtendFlight(buy), false);
+
+    const result = preflightUpdateMediaBuy(buy, { end_time: '2026-07-01T00:00:00Z' });
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.denials[0].reason, 'mode_mismatch');
+    assert.strictEqual(result.denials[0].recovery.kind, 'createProposal');
+
+    const strict = preflightUpdateMediaBuy(
+      buyWith([{ action: 'extend_flight', mode: 'requires_proposal', change_term_id: 'term-1' }], {
+        accepted_proposal: {
+          commercial_terms: {
+            change_terms: [
+              {
+                term_id: 'term-1',
+                action: 'extend_flight',
+                service_mode: 'self_serve',
+              },
+            ],
+          },
+        },
+      }),
+      { end_time: '2026-07-01T00:00:00Z' }
+    );
+    assert.strictEqual(strict.ok, false);
+    assert.strictEqual(strict.denials[0].reason, 'mode_mismatch');
+    assert.strictEqual(strict.denials[0].recovery.kind, 'createProposal');
+  });
+
   test('getRollupParent maps fine-grained to legacy coarse', () => {
     assert.strictEqual(getRollupParent('increase_budget'), 'update_budget');
     assert.strictEqual(getRollupParent('extend_flight'), 'update_dates');
@@ -189,7 +224,7 @@ describe('decomposeUpdateMediaBuy', () => {
 
   test('returns empty plan for unknown/no-op patches', () => {
     const plan = decomposeUpdateMediaBuy(buy, {
-      packages: [{ package_id: 'pkg_1', paused: false }],
+      packages: [{ package_id: 'pkg_1' }],
     });
     assert.deepStrictEqual(plan, {
       mutations: [],
@@ -367,6 +402,34 @@ describe('preflightUpdateMediaBuy', () => {
     assert.ok(Array.isArray(result.currently_available_actions));
   });
 
+  test('strict assessment preserves condition_unresolved for a negotiated action omitted from the live projection', () => {
+    const buy = buyWith([{ action: 'pause', mode: 'self_serve', change_term_id: 'pause-term' }], {
+      status: 'active',
+      total_budget: 10_000,
+      accepted_proposal: {
+        commercial_terms: {
+          change_terms: [
+            {
+              term_id: 'increase-term',
+              action: 'increase_budget',
+              service_mode: 'seller_managed',
+              allowed_statuses: ['active'],
+              conditions: ['account_in_good_standing'],
+            },
+          ],
+        },
+      },
+    });
+
+    const result = preflightUpdateMediaBuy(buy, {
+      total_budget: { amount: 11_000, currency: 'USD' },
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.denials[0].action, 'increase_budget');
+    assert.strictEqual(result.denials[0].reason, 'condition_unresolved');
+  });
+
   test('multi-action request reports every blocked action', () => {
     // Buy advertises only `increase_budget`. Request touches end_time
     // (extend_flight) AND a second packages[].budget bump that maps to
@@ -404,15 +467,11 @@ describe('preflightUpdateMediaBuy', () => {
     assert.throws(() => preflightUpdateMediaBuy(buy, {}), ValidationError);
   });
 
-  test('request touching only pkg.paused throws (not a real action)', () => {
-    // pkg.paused has no entry in the action mapping - the spec keys pause
-    // at the buy level only. Resolver should ignore it; preflight should
-    // refuse to dispatch a no-op rather than misclassify it as `pause`.
+  test('package pause/resume requires its own lifecycle right', () => {
     const buy = buyWith([{ action: 'pause', mode: 'self_serve' }]);
-    assert.throws(
-      () => preflightUpdateMediaBuy(buy, { packages: [{ package_id: 'pkg_1', paused: false }] }),
-      ValidationError
-    );
+    const result = preflightUpdateMediaBuy(buy, { packages: [{ package_id: 'pkg_1', paused: false }] });
+    assert.equal(result.ok, false);
+    assert.equal(result.denials[0].action, 'resume');
   });
 
   test('requiresAsyncFlow false when every mode is self_serve', () => {
@@ -430,6 +489,17 @@ describe('recoveryForModeMismatch', () => {
     assert.match(r.message, /create_proposal/);
   });
 
+  test('legacy requires_proposal rollup preserves child-action recovery', () => {
+    const current = buyWith([{ action: 'update_dates', mode: 'requires_proposal' }]);
+    const result = preflightUpdateMediaBuy(current, { end_time: '2026-07-01T00:00:00Z' });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.denials[0].action, 'extend_flight');
+    assert.strictEqual(result.denials[0].reason, 'mode_mismatch');
+    assert.strictEqual(result.denials[0].recovery.kind, 'createProposal');
+    assert.match(result.denials[0].recovery.message, /extend_flight/);
+  });
+
   test('requires_approval returns waitForApproval hint', () => {
     const r = recoveryForModeMismatch('cancel', [{ action: 'cancel', mode: 'requires_approval' }]);
     assert.strictEqual(r.kind, 'waitForApproval');
@@ -445,5 +515,79 @@ describe('recoveryForModeMismatch', () => {
   test('returns undefined when attempted action not in available list', () => {
     const r = recoveryForModeMismatch('pause', [{ action: 'cancel', mode: 'requires_approval' }]);
     assert.strictEqual(r, undefined);
+  });
+});
+
+// AdCP 3.2 (adcontextprotocol/adcp#7449): the MediaBuy-level `frequency_cap`
+// request field maps to the structured-only action
+// `update_media_buy_frequency_cap`, whose binding the generator reads from
+// core/media-buy-available-action-id.json. On schema pins that predate that
+// file the field has no binding and must be ignored like any unrecognized key.
+describe('MediaBuy-level frequency_cap (structured-only action, #2887)', () => {
+  const FREQUENCY_CAP_ACTION = 'update_media_buy_frequency_cap';
+  const pinHasBinding = Array.isArray(ACTIONS_BY_FIELD.frequency_cap);
+  const skipWithout = pinHasBinding ? false : 'pinned schema cache predates core/media-buy-available-action-id.json';
+  const skipWith = pinHasBinding ? 'pinned schema cache ships core/media-buy-available-action-id.json' : false;
+
+  test('binding presence matches the structured-only action list', () => {
+    assert.strictEqual(STRUCTURED_ONLY_MEDIA_BUY_ACTIONS.includes(FREQUENCY_CAP_ACTION), pinHasBinding);
+  });
+
+  test('setting the shared cap decomposes to update_media_buy_frequency_cap', { skip: skipWithout }, () => {
+    const buy = buyWith([{ action: FREQUENCY_CAP_ACTION, mode: 'self_serve' }]);
+    const cap = { max_impressions: 5, per: 'user', duration: { unit: 'day', value: 1 } };
+    const decomposed = decomposeUpdateMediaBuy(buy, { frequency_cap: cap });
+    assert.deepStrictEqual(decomposed.mutations, [
+      { action: FREQUENCY_CAP_ACTION, field: 'frequency_cap', path: 'frequency_cap', scope: 'buy', to: cap },
+    ]);
+    assert.deepStrictEqual(
+      decomposed.actions.map(a => a.action),
+      [FREQUENCY_CAP_ACTION]
+    );
+  });
+
+  test('clearing the shared cap (null) still maps to the same action', { skip: skipWithout }, () => {
+    const buy = buyWith([{ action: FREQUENCY_CAP_ACTION, mode: 'self_serve' }]);
+    const result = getActionForMutation(buy, { frequency_cap: null });
+    assert.deepStrictEqual(
+      result.map(a => a.action),
+      [FREQUENCY_CAP_ACTION]
+    );
+  });
+
+  test('preflight passes when available_actions[] advertises the action', { skip: skipWithout }, () => {
+    const buy = buyWith([{ action: FREQUENCY_CAP_ACTION, mode: 'requires_approval' }]);
+    const result = preflightUpdateMediaBuy(buy, { frequency_cap: { max_impressions: 3, per: 'user' } });
+    assert.strictEqual(result.ok, true);
+    assert.deepStrictEqual(result.modes, ['requires_approval']);
+    assert.strictEqual(result.requiresAsyncFlow, true);
+  });
+
+  test('preflight denies when only the package-level cap action is advertised', { skip: skipWithout }, () => {
+    const buy = buyWith([{ action: 'update_frequency_caps', mode: 'self_serve' }]);
+    const result = preflightUpdateMediaBuy(buy, { frequency_cap: { max_impressions: 3, per: 'user' } });
+    assert.strictEqual(result.ok, false);
+    assert.deepStrictEqual(
+      result.denials.map(d => d.action),
+      [FREQUENCY_CAP_ACTION]
+    );
+  });
+
+  test('shared cap and package cap resolve to two distinct actions', { skip: skipWithout }, () => {
+    const buy = buyWith([
+      { action: FREQUENCY_CAP_ACTION, mode: 'self_serve' },
+      { action: 'update_frequency_caps', mode: 'self_serve' },
+    ]);
+    const result = getActionForMutation(buy, {
+      frequency_cap: { max_impressions: 3, per: 'user' },
+      packages: [{ package_id: 'pkg_1', targeting_overlay: { frequency_cap: { count: 3 } } }],
+    });
+    assert.deepStrictEqual(result.map(a => a.action).sort(), [FREQUENCY_CAP_ACTION, 'update_frequency_caps'].sort());
+  });
+
+  test('without a binding the field is ignored and a cap-only request is a no-op', { skip: skipWith }, () => {
+    const buy = buyWith([{ action: 'update_frequency_caps', mode: 'self_serve' }]);
+    assert.deepStrictEqual(getActionForMutation(buy, { frequency_cap: { max_impressions: 3, per: 'user' } }), []);
+    assert.throws(() => preflightUpdateMediaBuy(buy, { frequency_cap: null }), ValidationError);
   });
 });

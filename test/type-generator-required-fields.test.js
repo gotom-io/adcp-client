@@ -9,6 +9,50 @@ const ts = require('typescript');
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CORE_SCHEMA_DIR = path.join(REPO_ROOT, 'schemas/cache/latest/core');
 const CORE_TYPES_PATH = path.join(REPO_ROOT, 'src/lib/types/core.generated.ts');
+const TOOL_TYPES_PATH = path.join(REPO_ROOT, 'src/lib/types/tools.generated.ts');
+
+test('CommittedMediaBuy keeps rc.6 name metadata in aggregate TS and Zod output', () => {
+  const coreTypes = fs.readFileSync(CORE_TYPES_PATH, 'utf8');
+  const toolsTypes = fs.readFileSync(TOOL_TYPES_PATH, 'utf8');
+  const declaration = coreTypes.match(/export interface CommittedMediaBuy \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(declaration, 'CommittedMediaBuy declaration is generated');
+  assert.match(declaration, /@minLength 1[\s\S]*media_buy_id: string;/);
+  assert.match(declaration, /@minLength 1[\s\S]*@maxLength 255[\s\S]*@pattern \\S[\s\S]*name\?: string;/);
+  assert.match(declaration, /@minimum 1[\s\S]*revision: number;/);
+  assert.match(declaration, /@format date-time[\s\S]*confirmed_at\?: string \| null;/);
+  assert.match(toolsTypes, /import type \{[\s\S]*?\bCommittedMediaBuy,/);
+  assert.match(toolsTypes, /export type \{[^\n]*\bCommittedMediaBuy,/);
+
+  const changeTerms = coreTypes.match(/export type BudgetChangeConstraints = \{[\s\S]*?\n\);/)?.[0];
+  assert.ok(changeTerms, 'authoritative change-term constraints are generated');
+  assert.match(changeTerms, /kind: 'budget';/);
+  assert.match(changeTerms, /max_delta_percent\?: number;/);
+  assert.match(changeTerms, /\| \{ max_delta_amount: Money \}/);
+  assert.match(changeTerms, /\| \{ max_delta_percent: number \}/);
+
+  const {
+    CommittedMediaBuySchema,
+    MediaBuyChangeTermConstraintsSchema,
+  } = require('../dist/lib/types/schemas.generated.js');
+  assert.equal(CommittedMediaBuySchema.shape.media_buy_id.safeParse('').success, false);
+  assert.equal(CommittedMediaBuySchema.shape.name.safeParse('Campaign display name').success, true);
+  assert.equal(CommittedMediaBuySchema.shape.name.safeParse('   ').success, false);
+  assert.equal(CommittedMediaBuySchema.shape.name.safeParse('x'.repeat(256)).success, false);
+  assert.equal(CommittedMediaBuySchema.shape.revision.safeParse(0).success, false);
+  assert.equal(CommittedMediaBuySchema.shape.confirmed_at.safeParse('not-a-date').success, false);
+
+  for (const kind of ['budget', 'flight', 'package_count', 'effective_timing']) {
+    assert.equal(MediaBuyChangeTermConstraintsSchema.safeParse({ kind }).success, false, `${kind} requires a bound`);
+  }
+  for (const value of [
+    { kind: 'budget', max_delta_percent: 0 },
+    { kind: 'flight', earliest_result: '2026-09-24T00:00:00Z' },
+    { kind: 'package_count', max_additions: 0 },
+    { kind: 'effective_timing', earliest_effective_at: '2026-09-24T00:00:00Z' },
+  ]) {
+    assert.equal(MediaBuyChangeTermConstraintsSchema.safeParse(value).success, true);
+  }
+});
 
 function runGeneratorHarness(source) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adcp-required-fields-'));
@@ -18,6 +62,7 @@ function runGeneratorHarness(source) {
     script,
     source
       .replaceAll('__GENERATOR__', JSON.stringify(path.join(REPO_ROOT, 'scripts/generate-types.ts')))
+      .replaceAll('__ZOD_GENERATOR__', JSON.stringify(path.join(REPO_ROOT, 'scripts/generate-zod-from-ts.ts')))
       .replaceAll('__REPO_ROOT__', JSON.stringify(REPO_ROOT))
       .replaceAll('__OUTPUT__', JSON.stringify(output))
   );
@@ -29,6 +74,62 @@ function runGeneratorHarness(source) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test('canonical primitive reconciliation follows titled nested schemas into their generated blocks', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { postProcessCanonicalPrimitiveConstraints } from __ZOD_GENERATOR__;
+
+const input = \`export const CommitmentSubmittedSchema = z.object({
+    status: z.literal("submitted"),
+    task_id: z.string(),
+    message: z.string().optional()
+}).passthrough();
+
+export const ProductPurchaseImpressionsSchema = z.number();
+
+export const CommittedMediaBuySchema = z.object({
+    status: z.literal("completed"),
+    media_buy_id: z.string(),
+    name: z.string().optional(),
+    revision: z.number(),
+    confirmed_at: z.string().optional().nullable()
+}).passthrough();
+
+export const MediaBuyCommitmentResponseSchema = z.union([
+    CommittedMediaBuySchema,
+    CommitmentSubmittedSchema
+]);
+
+export const GetProductsRequestSchema = z.object({
+    adcp_version: z.string().optional(),
+    adcp_major_version: z.number().optional()
+}).passthrough();
+
+export const GetProductsResponseSchema = z.object({
+    timestamp: z.string().optional(),
+    governance_context: z.string().optional(),
+    adcp_version: z.string().optional(),
+    adcp_major_version: z.number().optional()
+}).passthrough();\`;
+const once = postProcessCanonicalPrimitiveConstraints(input);
+const twice = postProcessCanonicalPrimitiveConstraints(once);
+writeFileSync(__OUTPUT__, JSON.stringify({ once, twice }));
+`);
+
+  assert.equal(result.twice, result.once, 'canonical constraint reconciliation is idempotent');
+  assert.match(result.once, /task_id: z\.string\(\)\.min\(1\)/);
+  assert.match(result.once, /message: z\.string\(\)\.max\(2000\)\.optional\(\)/);
+  assert.match(result.once, /ProductPurchaseImpressionsSchema = z\.number\(\)\.gte\(0\)/);
+  assert.match(result.once, /media_buy_id: z\.string\(\)\.min\(1\)/);
+  assert.match(result.once, /name: z\.string\(\)\.min\(1\)\.max\(255\)\.regex\(new RegExp\("\\\\S"\)\)\.optional\(\)/);
+  assert.match(result.once, /revision: z\.number\(\)\.int\(\)\.gte\(1\)/);
+  assert.match(result.once, /confirmed_at: z\.string\(\)\.refine\(adcpJsonSchemaDateTime/);
+  assert.match(result.once, /adcp_version: z\.string\(\)\.regex\(new RegExp/);
+  assert.match(result.once, /adcp_major_version: z\.number\(\)\.int\(\)\.gte\(1\)\.lte\(99\)/);
+  assert.match(result.once, /timestamp: z\.string\(\)\.refine\(adcpJsonSchemaDateTime/);
+  assert.match(result.once, /governance_context: z\.string\(\)\.min\(1\)\.max\(4096\)\.regex\(new RegExp/);
+});
 
 test('issue #2674 array fields match their relaxed public Zod types', () => {
   const result = runGeneratorHarness(`
@@ -74,6 +175,74 @@ writeFileSync(__OUTPUT__, JSON.stringify({ output: relaxZodCompatibilityArrayTyp
   assert.match(result.output, /named_format_id: string;/);
 });
 
+test('TransformerParam defaults and enumerable option values retain arbitrary JSON types (#2704)', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { postProcessTransformerParamJsonValues } from __ZOD_GENERATOR__;
+
+const input = \`export const TransformerParamSchema = z.object({
+    options: z.array(z.object({ value: JsonValueSchema })).optional(),
+    default: JsonValueSchema.optional(),
+});
+export const NextSchema = z.object({ value: z.object({}).passthrough() });\`;
+writeFileSync(__OUTPUT__, JSON.stringify({ output: postProcessTransformerParamJsonValues(input) }));
+`);
+
+  assert.match(result.output, /value: z\.json\(\)/);
+  assert.match(result.output, /default: z\.json\(\)\.optional\(\)/);
+  assert.match(result.output, /NextSchema = z\.object\(\{ value: z\.object/);
+});
+
+test('TransformerParam public types use recursive JSON values in aggregate tool output (#2704)', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { normalizeTransformerParamJsonValueTypes } from __GENERATOR__;
+
+const input = \`export type TransformerParam = {} & {
+  options?: { value: {}; label?: string }[];
+  default?: {};
+}
+export interface NextType { value: {}; }\`;
+writeFileSync(__OUTPUT__, JSON.stringify({ output: normalizeTransformerParamJsonValueTypes(input) }));
+`);
+
+  assert.match(result.output, /export type JsonValue = string \| number \| boolean \| null/);
+  assert.match(result.output, /value: JsonValue/);
+  assert.match(result.output, /default\?: JsonValue/);
+  assert.match(result.output, /NextType \{ value: \{\}/);
+});
+
+test('generated TransformerParamSchema accepts scalar, array, object, and null JSON values (#2704)', () => {
+  const { TransformerParamSchema } = require('../dist/lib/types/schemas.generated.js');
+  const values = ['voice-1', 1.25, true, null, ['a', 2], { provider: 'example' }];
+
+  for (const value of values) {
+    assert.strictEqual(
+      TransformerParamSchema.safeParse({
+        field: 'voice',
+        type: 'string',
+        value_source: 'enumerable',
+        default: value,
+        options: [{ value }],
+      }).success,
+      true,
+      `expected ${JSON.stringify(value)} to remain valid JSON`
+    );
+  }
+
+  for (const value of [undefined, () => true, 1n, Symbol('not-json'), Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.strictEqual(
+      TransformerParamSchema.safeParse({
+        field: 'voice',
+        type: 'string',
+        value_source: 'enumerable',
+        options: [{ value }],
+      }).success,
+      false
+    );
+  }
+});
+
 test('PostalCountrySystem propagates unconditional requirements into every anyOf branch', () => {
   const result = runGeneratorHarness(`
 import { writeFileSync } from 'node:fs';
@@ -101,6 +270,52 @@ writeFileSync(__OUTPUT__, JSON.stringify({
     ['country', 'system'],
   ]);
   assert.equal(result.originalBranchesRemainUntouched, true);
+});
+
+test('codegen ignores annotation-only x-* allOf members without collapsing the structural type', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { enforceStrictSchema } from __GENERATOR__;
+
+const transformed = enforceStrictSchema({
+  type: 'object',
+  properties: {
+    creative_id: { type: 'string' },
+    action: { type: 'string' },
+  },
+  required: ['creative_id', 'action'],
+  allOf: [{
+    'x-adcp-validation': {
+      verifier_constraints: { revision_echo: { must_equal_request: true } },
+    },
+  }],
+});
+writeFileSync(__OUTPUT__, JSON.stringify(transformed));
+`);
+
+  assert.deepEqual(Object.keys(result.properties), ['creative_id', 'action']);
+  assert.deepEqual(result.required, ['creative_id', 'action']);
+  assert.equal(result.allOf, undefined);
+});
+
+test('codegen keeps lexical anyOf constraints from creating impossible string intersections', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { enforceStrictSchema } from __GENERATOR__;
+
+const transformed = enforceStrictSchema({
+  type: 'string',
+  anyOf: [
+    { format: 'uri-template' },
+    { format: 'uri', pattern: '^https?://' },
+    { pattern: '^https?://[^\\\\s]+$' },
+  ],
+});
+writeFileSync(__OUTPUT__, JSON.stringify(transformed));
+`);
+
+  assert.equal(result.type, 'string');
+  assert.equal(result.anyOf, undefined);
 });
 
 test('PostalArea preserves the native branch fields and non-empty values type', () => {
@@ -366,6 +581,79 @@ writeFileSync(__OUTPUT__, JSON.stringify({
   assert.ok(result.continuationProperties.includes('product_ids'));
 });
 
+test('decline_proposals result branches retain shared fields beside an open unable arm', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds, enforceStrictSchema } from __GENERATOR__;
+
+const source = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/media-buy/decline-proposals-response.json'), 'utf8')
+);
+const transformed = enforceStrictSchema(applyCodegenSchemaWorkarounds(source, 'DeclineProposalsResponse'));
+const branches = transformed.oneOf.map((response: any) => response.properties.results.items.oneOf);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  branches: branches.map((arms: any[]) => arms.map((arm: any) => ({
+    outcome: arm.properties.outcome.const,
+    required: arm.required,
+    properties: Object.keys(arm.properties),
+  }))),
+}));
+`);
+
+  assert.equal(result.branches.length, 2, 'completed and submitted envelopes should both retain result arms');
+  for (const arms of result.branches) {
+    const declined = arms.find(arm => arm.outcome === 'declined');
+    const unable = arms.find(arm => arm.outcome === 'unable');
+    assert.ok(declined.required.includes('proposal_id'));
+    assert.ok(declined.required.includes('outcome'));
+    assert.ok(declined.properties.includes('proposal_id'));
+    assert.ok(!declined.properties.includes('reason'));
+    assert.ok(unable.required.includes('proposal_id'));
+    assert.ok(unable.required.includes('outcome'));
+    assert.ok(unable.required.includes('reason'));
+    assert.ok(unable.properties.includes('proposal_id'));
+    assert.ok(unable.properties.includes('reason'));
+  }
+});
+
+test('mutual-exclusion rewrite leaves branches with unsupported validators intact', () => {
+  const result = runGeneratorHarness(`
+import { writeFileSync } from 'node:fs';
+import { enforceStrictSchema } from __GENERATOR__;
+
+const source = {
+  type: 'object',
+  properties: {
+    outcome: { type: 'string' },
+    proposal_id: { type: 'string' },
+    reason: { type: 'string' },
+  },
+  required: ['proposal_id', 'outcome'],
+  oneOf: [
+    {
+      properties: { outcome: { const: 'declined' } },
+      required: ['outcome'],
+      not: { required: ['reason'] },
+    },
+    {
+      properties: { outcome: { const: 'unable' } },
+      required: ['outcome', 'reason'],
+      dependentRequired: { reason: ['proposal_id'] },
+    },
+  ],
+};
+const transformed = enforceStrictSchema(source);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  retainsDependentRequired: transformed.oneOf[1].dependentRequired,
+  openArmHasOwnType: Object.hasOwn(transformed.oneOf[1], 'type'),
+}));
+`);
+
+  assert.deepEqual(result.retainsDependentRequired, { reason: ['proposal_id'] });
+  assert.equal(result.openArmHasOwnType, false, 'unsupported branch validators must prevent the rewrite');
+});
+
 test('GetMediaBuyDeliveryResponse isolates optional breakdown identifiers under unique compat titles', () => {
   const result = runGeneratorHarness(`
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -480,6 +768,32 @@ writeFileSync(__OUTPUT__, JSON.stringify({
   assert.ok(result.canonicalRequired.geo.includes('geo_code'));
 });
 
+test('reporting file transfer keeps the established audience activation type name distinct', () => {
+  const result = runGeneratorHarness(`
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { applyCodegenSchemaWorkarounds } from __GENERATOR__;
+
+const schema = JSON.parse(
+  readFileSync(path.join(__REPO_ROOT__, 'schemas/cache/latest/core/reporting-delivery-method.json'), 'utf8')
+);
+const transformed = applyCodegenSchemaWorkarounds(schema, 'ReportingDeliveryMethod');
+const nested = applyCodegenSchemaWorkarounds(
+  { properties: { reporting_delivery: schema } },
+  'MediaBuy'
+);
+writeFileSync(__OUTPUT__, JSON.stringify({
+  originalTitle: schema.oneOf[0].title,
+  transformedTitle: transformed.oneOf[0].title,
+  nestedTransformedTitle: nested.properties.reporting_delivery.oneOf[0].title,
+}));
+`);
+
+  assert.equal(result.originalTitle, 'File transfer');
+  assert.equal(result.transformedTitle, 'Reporting file transfer');
+  assert.equal(result.nestedTransformedTitle, 'Reporting file transfer');
+});
+
 test('every unconditional canonical core required property is required in generated TypeScript', () => {
   const requiredByType = new Map();
   let requiredCellCount = 0;
@@ -511,19 +825,28 @@ test('every unconditional canonical core required property is required in genera
     if (fields.size > 0) requiredByType.set(typeName, fields);
   }
 
-  const source = ts.createSourceFile(
-    CORE_TYPES_PATH,
-    fs.readFileSync(CORE_TYPES_PATH, 'utf8'),
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TS
-  );
   const declarations = new Map();
   const declarationsByCaseFoldedName = new Map();
-  for (const statement of source.statements) {
-    if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
-      declarations.set(statement.name.text, statement);
-      declarationsByCaseFoldedName.set(statement.name.text.toLowerCase(), statement);
+  // Async response variants live under core/ in the canonical bundle, but
+  // tool generation owns declarations that are already part of a tool's
+  // response union. Inspect both generated surfaces so required-field drift
+  // is checked at the declaration's actual ownership boundary.
+  for (const generatedTypesPath of [CORE_TYPES_PATH, TOOL_TYPES_PATH]) {
+    const source = ts.createSourceFile(
+      generatedTypesPath,
+      fs.readFileSync(generatedTypesPath, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS
+    );
+    for (const statement of source.statements) {
+      if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
+        if (!declarations.has(statement.name.text)) declarations.set(statement.name.text, statement);
+        const caseFoldedName = statement.name.text.toLowerCase();
+        if (!declarationsByCaseFoldedName.has(caseFoldedName)) {
+          declarationsByCaseFoldedName.set(caseFoldedName, statement);
+        }
+      }
     }
   }
 

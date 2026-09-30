@@ -92,8 +92,8 @@ Concrete wins:
 
 ## The merge seam — incremental migration
 
-`createAdcpServerFromPlatform(platform, opts)` accepts the v5 handler-style
-domains as `opts` alongside the v6 platform interface. **Platform-derived
+`createAdcpServerFromPlatform(platform, opts)` accepts v5 handler-style
+domains under `opts.legacyHandlers` alongside the v6 platform interface. **Platform-derived
 handlers WIN per-key**; adopter handlers fill gaps for tools the v6
 platform doesn't yet model. Migrate one specialism at a time.
 
@@ -105,10 +105,12 @@ createAdcpServerFromPlatform(myPlatform, {
   mergeSeam: 'strict',  // CI default — fail on collisions
 
   // v5 leftover handlers — keep until you migrate each specialism
-  brandRights: {
-    get_brand_identity: handleGetBrandIdentity,
-    get_rights: handleGetRights,
-    acquire_rights: handleAcquireRights,
+  legacyHandlers: {
+    brandRights: {
+      getBrandIdentity: handleGetBrandIdentity,
+      getRights: handleGetRights,
+      acquireRights: handleAcquireRights,
+    },
   },
   customTools: {
     update_rights: { /* schema + handler */ },
@@ -267,15 +269,22 @@ In-memory task registry refuses to construct outside `NODE_ENV=test/development`
 (production safety). For HITL-eligible production deployments:
 
 ```ts
-import { createPostgresTaskRegistry, getDecisioningTaskRegistryMigration } from '@adcp/sdk/server';
+import { createPostgresTaskRegistry, getDecisioningTaskRegistryBootstrap } from '@adcp/sdk/server';
 
-await pool.query(getDecisioningTaskRegistryMigration());
+const taskRegistryNamespace = 'tenant:my-agent';
+await pool.query(getDecisioningTaskRegistryBootstrap({ namespace: taskRegistryNamespace }));
 
 createAdcpServerFromPlatform(platform, {
   name: '...', version: '...',
-  taskRegistry: createPostgresTaskRegistry({ pool }),
+  taskRegistry: createPostgresTaskRegistry({ pool, namespace: taskRegistryNamespace }),
 });
 ```
+
+`getDecisioningTaskRegistryBootstrap()` is DDL for a new/empty table,
+not an application-boot upgrade for a populated pre-scope registry. Existing
+installations must follow the phased
+[`getDecisioningTaskRegistryScopeV1Upgrade()` runbook](./migration-task-registry-scoping.md#populated-postgresql-upgrade)
+before starting scoped writers.
 
 ## Common gotchas
 
@@ -313,7 +322,11 @@ createAdcpServerFromPlatform(platform, {
   (acquire_rights), `req.creative` (provide_performance_feedback).
 - **`accounts.resolve()` is mandatory.** Even single-tenant agents must
   declare `resolution: 'derived'` and return a synthetic singleton. The
-  framework calls `resolve()` on every request.
+  framework calls `resolve()` on every request. (**SDK 14 note:**
+  `'derived'` is now an upstream-managed account-id namespace — it also
+  requires `list_accounts` and a resolver that verifies the buyer-supplied
+  `account_id`. See
+  [13 → 14 § derived account resolution](./migration-13-to-14.md#derived-account-resolution-is-now-an-upstream-managed-account-id-namespace).)
 - **`mergeSeam: 'strict'` from day 1.** The default is `'warn'` for
   back-compat, but `'strict'` is what you want during migration — it
   surfaces collisions as `PlatformConfigError` at construction time
@@ -331,15 +344,15 @@ createAdcpServerFromPlatform(platform, {
   Symptoms: looks like a transient outage at first run; same call
   consistently fails the second time. Check that `opts.resolveIdempotencyPrincipal`
   is populated before you debug anything else.
-- **`ctx.account.authInfo` (specialism methods) vs `ctx.authInfo`
-  (`ResolveContext` only).** Inside your `accounts.resolve(ref, ctx)`,
-  the second arg is `ResolveContext` and exposes `ctx.authInfo`. Inside
-  a `SalesPlatform` / `AudiencePlatform` / etc. method, the second arg
-  is `RequestContext` and the auth principal lives at
-  `ctx.account.authInfo` — NOT `ctx.authInfo` (which doesn't exist
-  there). The migration doc shows the resolver signature first, so
-  adopters naturally try the same name in their handler bodies and hit
-  a TypeScript error. Distinct shapes; same field, different paths.
+- **`ctx.authInfo` (incoming caller) vs `ctx.account.authInfo` (upstream
+  platform credential).** Both `accounts.resolve(ref, ctx)` and native
+  `SalesPlatform` / `AudiencePlatform` / other specialism methods receive
+  the verified incoming principal at `ctx.authInfo`. It is request-local and
+  must not be persisted. `ctx.account.authInfo` is a distinct adopter-managed
+  credential model that may be refreshed by the framework for upstream API
+  calls. Do not copy the incoming bearer into the account merely to bridge
+  native handlers; background workers must re-resolve credentials, or retain
+  only a stable non-secret identity when durable work needs attribution.
 - **`mergeSeam: 'warn'` is the default.** Set `'strict'` in CI to catch
   silent migration regressions where v6.x adds a tool to a specialism
   interface and your prior v5 handler stops running.
@@ -462,15 +475,14 @@ createAdcpServerFromPlatform(platform, {
   `req.target_format_ids` (multi) vs `req.target_format_id` (single)
   and return the matching arm. Returning the wrong arm fails wire
   schema validation.
-- **`npm link` and `undici` peer drift.** The SDK depends on
-  `undici@^6.25.0`. Adopters using `npm link` (or `pnpm link`) to point
-  at a locally checked-out SDK during migration may find Node walks up
-  from the resolved canonical SDK path and binds the host workspace's
-  `undici` (often 7.x) instead — the SDK rejects 7.x at startup.
-  Workaround: run with `NODE_OPTIONS=--preserve-symlinks` so resolution
-  stays inside the SDK's own `node_modules`. Once the SDK is consumed
-  via published tarball (`npm install @adcp/sdk@x.y.z`), this
-  disappears — link mode is the only setup that triggers it.
+- **Node and Undici compatibility.** The SDK intentionally depends on
+  `undici@^6.28.0` for its fully supported runtime. The SDK requires Node
+  `^20.19.0 || >=22.12.0` so CommonJS consumers can load its ESM dependency
+  graph; Node 21 and Node 22.0–22.11 are outside that range.
+  A consumer override to `undici@>=7.29.0 <8` is best-effort and tested only
+  on Node `>=20.19.0`; older Undici 7 releases are below the reviewed security
+  floor. See [Node and Undici compatibility](./guides/NODE-UNDICI-COMPATIBILITY.md)
+  for the executable override fixture and supported matrix.
 - **`zod` is now a required peer dependency** (`^4.1.5` in 6.0.1; was
   `^4.1.0` in 6.0.0 — bumped to match the codegen tools' floors). The
   SDK's `ZodSchema` types must resolve to the same `zod` instance the
@@ -597,8 +609,8 @@ your DB-side existence check still gates the operation.
   separate specialisms — v6.0 routes these tools through `SalesPlatform`
   optional methods.
 - `taskCtx.update({ progress })` projection to `tasks_get`'s `progress`
-  field — interface ships in v6.0; framework wires the projection in
-  v6.1 alongside `taskRegistry.transition()`.
+  field — interface ships in v6.0; framework wiring follows in a later
+  runtime release.
 - Handoff support for `update_media_buy`, `build_creative`, `sync_catalogs`
   — blocked on [adcp#3392](https://github.com/adcontextprotocol/adcp/issues/3392)
   (per-tool response schemas don't include the `Submitted` arm even

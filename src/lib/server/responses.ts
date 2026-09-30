@@ -44,6 +44,7 @@ import type { GetMediaBuyDeliveryResponse } from '../types/tools.generated';
 import type { RequireCacheScopeWhenProducts, ServerPayload } from '../types/server-payload';
 import { validActionsForStatus } from './media-buy-helpers';
 import type { CancelMediaBuyInput } from './media-buy-helpers';
+import { projectReportingDeliveryConfigStates } from './reporting-delivery-config';
 import type {
   ListCreativeFormatsResponse,
   GetProductsResponse,
@@ -99,7 +100,12 @@ import type {
  */
 export interface McpToolResponse {
   [key: string]: unknown;
-  content: Array<{ type: 'text'; text: string }>;
+  content: Array<{
+    type: 'text';
+    text: string;
+    /** Optional MCP content-block metadata. */
+    _meta?: Record<string, unknown>;
+  }>;
   structuredContent?: Record<string, unknown>;
 }
 
@@ -189,7 +195,15 @@ function stripBusinessEntityBank<T extends object>(row: T, key: 'billing_entity'
 }
 
 function stripAccountWriteOnlyFields<T extends object>(account: T): T {
-  return stripBusinessEntityBank(stripNotificationConfigSecrets(account), 'billing_entity');
+  const stripped = stripBusinessEntityBank(stripNotificationConfigSecrets(account), 'billing_entity');
+  const reportingDeliveryConfigs = (stripped as { reporting_delivery_configs?: unknown }).reporting_delivery_configs;
+  if (reportingDeliveryConfigs === undefined) return stripped;
+  return {
+    ...stripped,
+    reporting_delivery_configs: projectReportingDeliveryConfigStates(
+      reportingDeliveryConfigs as Parameters<typeof projectReportingDeliveryConfigStates>[0]
+    ),
+  } as T;
 }
 
 function stripAccountsWriteOnlyFields<T extends { accounts?: unknown }>(data: T): T {

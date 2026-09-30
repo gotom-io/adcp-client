@@ -118,6 +118,67 @@ export class UnsupportedTaskError extends ADCPError {
   }
 }
 
+/** Seller did not declare the requested get_products buying mode. */
+export class UnsupportedBuyingModeError extends ADCPError {
+  readonly code = 'UNSUPPORTED_BUYING_MODE';
+
+  constructor(
+    public readonly requestedMode: string | undefined,
+    public readonly declaredModes: readonly string[]
+  ) {
+    const requested = requestedMode ?? 'an inferred wholesale mode';
+    const declared = declaredModes.length ? declaredModes.join(', ') : '(unknown)';
+    super(
+      `Seller does not support ${requested} buying mode. Declared modes: ${declared}. ` +
+        'Supply a brief or choose a declared buying_mode after probing get_adcp_capabilities.'
+    );
+    this.details = { requested_mode: requestedMode, declared_modes: [...declaredModes] };
+  }
+}
+
+/** A seller requires an account reference before an account-scoped request. */
+export class AccountRequiredError extends ADCPError {
+  readonly code = 'ACCOUNT_REQUIRED';
+
+  constructor(
+    public readonly accountModel: 'explicit' | 'implicit',
+    public readonly taskName: string,
+    reason?: string
+  ) {
+    super(
+      reason ??
+        `${taskName} requires an account for this ${accountModel}-account seller. ` +
+          (accountModel === 'explicit'
+            ? 'Call resolveAccount() to discover an account_id, then pass account: { account_id }.'
+            : 'Call resolveAccount({ brand, operator }) to sync the account, then pass its natural key.')
+    );
+    this.details = { account_model: accountModel, task_name: taskName };
+  }
+}
+
+/** Account provisioning succeeded but the seller has not approved its use. */
+export class AccountPendingApprovalError extends ADCPError {
+  readonly code = 'ACCOUNT_PENDING_APPROVAL';
+
+  constructor(
+    public readonly account: import('../types').AccountReference,
+    public readonly accountId?: string
+  ) {
+    super('The seller is reviewing this account. Wait for approval before making account-scoped requests.');
+    this.details = { status: 'pending_approval', account_id: accountId, account };
+  }
+}
+
+/** More than one active account matches the caller's selection hints. */
+export class AccountAmbiguousError extends ADCPError {
+  readonly code = 'ACCOUNT_AMBIGUOUS';
+
+  constructor(public readonly candidates: readonly string[]) {
+    super('Multiple eligible accounts. Supply brand/operator or a select callback.');
+    this.details = { candidate_count: candidates.length };
+  }
+}
+
 /**
  * Error thrown when protocol communication fails
  */
@@ -304,6 +365,45 @@ export class AuthenticationRequiredError extends ADCPError {
    */
   get suggestedScheme(): string | undefined {
     return this.challenge?.scheme;
+  }
+}
+
+/**
+ * A configured non-interactive credential reached the agent and was rejected.
+ * The transport error is retained as a non-enumerable cause so reflected
+ * credential material from an untrusted 401 body cannot enter JSON reports.
+ */
+export class AuthenticationCredentialsRejectedError extends AuthenticationRequiredError {
+  readonly subCode = 'credentials_rejected' as const;
+
+  constructor(agentUrl: string, cause?: unknown) {
+    const safeAgentUrl = sanitizeAgentUrlForError(agentUrl);
+    super(
+      safeAgentUrl,
+      undefined,
+      'The agent rejected the configured credential with HTTP 401. Verify or replace the saved credential and retry.'
+    );
+    this.name = 'AuthenticationCredentialsRejectedError';
+    if (cause !== undefined) {
+      Object.defineProperty(this, 'cause', {
+        value: cause,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
+}
+
+function sanitizeAgentUrlForError(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return 'invalid_url';
   }
 }
 
@@ -616,7 +716,7 @@ export type ActionNotAllowedAttemptedAction = string;
 
 export interface ActionNotAllowedAvailableAction {
   action: ActionNotAllowedAttemptedAction;
-  mode: 'self_serve' | 'conditional_self_serve' | 'requires_proposal' | 'requires_approval';
+  mode: 'self_serve' | 'conditional_self_serve' | 'seller_managed' | 'requires_proposal' | 'requires_approval';
   sla?: unknown;
   terms_ref?: string;
 }
@@ -624,6 +724,7 @@ export interface ActionNotAllowedAvailableAction {
 export type ActionNotAllowedRecovery =
   | { kind: 'createProposal'; message: string }
   | { kind: 'waitForApproval'; message: string }
+  | { kind: 'waitForTask'; message: string }
   | { kind: 'reissueAsDirect'; message: string };
 
 function buildActionNotAllowedMessage(details: ActionNotAllowedErrorDetails): string {
@@ -644,6 +745,11 @@ function buildModeMismatchRecovery(details: ActionNotAllowedErrorDetails): Actio
   const match = details.currently_available_actions?.find(a => a.action === details.attempted_action);
   if (!match) return undefined;
   switch (match.mode) {
+    case 'seller_managed':
+      return {
+        kind: 'waitForTask',
+        message: 'Use the declared task and follow its submitted/working/completed lifecycle.',
+      };
     case 'requires_proposal':
       return {
         kind: 'createProposal',
@@ -843,6 +949,7 @@ function isActionMode(value: string): value is ActionNotAllowedAvailableAction['
   return (
     value === 'self_serve' ||
     value === 'conditional_self_serve' ||
+    value === 'seller_managed' ||
     value === 'requires_proposal' ||
     value === 'requires_approval'
   );

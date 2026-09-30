@@ -19,8 +19,9 @@
  *   (Shape B, returns just `resolve`).
  * - **Publisher ops curates the roster** → `createRosterAccountStore`
  *   (Shape C, complete AccountStore).
- * - **No account concept — auth principal IS the tenant** → `createDerivedAccountStore`
- *   (Shape D, `resolution: 'derived'`).
+ * - **An upstream platform owns the roster and you front it** → `createDerivedAccountStore`
+ *   (Shape D, `resolution: 'derived'` — buyers discover ids via `list_accounts`
+ *   and address accounts by `account_id`).
  *
  * @see docs/guides/account-resolution.md
  * @public
@@ -111,8 +112,10 @@ export interface ImplicitAccountStoreOptions<TCtxMeta = Record<string, unknown>>
 
   /**
    * Sync-linkage TTL in milliseconds. Entries stored by `upsert()` expire
-   * after this duration; `resolve()` returns `null` (→ `ACCOUNT_NOT_FOUND`)
-   * for expired entries, prompting the buyer to call `sync_accounts` again.
+   * after this duration; `resolve()` returns `null`. A request that omitted
+   * account then gets `ACCOUNT_REQUIRED`, prompting the buyer to call
+   * `sync_accounts` again; a supplied unresolved reference remains
+   * `ACCOUNT_NOT_FOUND`.
    *
    * **Default:** `86_400_000` (24 hours). Align with your platform's session
    * or token lifetime; longer TTLs risk serving stale account state.
@@ -172,7 +175,7 @@ interface StoredEntry<TCtxMeta> {
  * 2. Buyer calls any tool (e.g. `create_media_buy`) without `ext.account_ref`
  *    → framework calls `resolve(undefined, ctx)` → store looks up by `authKey`.
  * 3. If no prior sync: `resolve()` returns `null` → framework emits
- *    `ACCOUNT_NOT_FOUND`. Do NOT return `AUTH_REQUIRED` — that signals
+ *    `ACCOUNT_REQUIRED`. Do NOT return `AUTH_REQUIRED` — that signals
  *    missing credentials, not a missing pre-sync.
  *
  * This class is intentionally minimal. Copy-and-adapt for durable stores
@@ -224,7 +227,8 @@ export class InMemoryImplicitAccountStore<TCtxMeta = Record<string, unknown>> im
    * Resolve the caller's account from the auth-principal→account mapping
    * populated by a prior `sync_accounts` call.
    *
-   * Returns `null` (→ `ACCOUNT_NOT_FOUND`) when:
+   * Returns `null` (→ `ACCOUNT_REQUIRED` on an account-required operation
+   * whose request omitted account) when:
    * - No prior `sync_accounts` was called for this principal
    * - The stored entry has exceeded `ttlMs`
    * - `ctx.authInfo` is absent or carries no extractable key
