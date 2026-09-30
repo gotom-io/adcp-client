@@ -328,7 +328,7 @@ describe('ReliableReportingService', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'reporting-revision-test',
       version: '1.0.0',
-      adcpVersion: '3.2.0-rc.4',
+      adcpVersion: '3.2.0-rc.7',
       validation: { requests: 'strict', responses: 'strict' },
     });
     const wireExact = await server.dispatchTestRequest(
@@ -367,7 +367,7 @@ describe('ReliableReportingService', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'reporting-service-test',
       version: '1.0.0',
-      adcpVersion: '3.2.0-rc.4',
+      adcpVersion: '3.2.0-rc.7',
       validation: { requests: 'strict', responses: 'strict' },
     });
     const result = await server.dispatchTestRequest({
@@ -573,7 +573,7 @@ describe('ReliableReportingService', () => {
     const server = createAdcpServerFromPlatform(observed, {
       name: 'consumer-scope-test',
       version: '1.0.0',
-      adcpVersion: '3.2.0-rc.4',
+      adcpVersion: '3.2.0-rc.7',
       validation: { requests: 'off', responses: 'off' },
       idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
       // Shared by both seats, exactly as the credential is.
@@ -590,6 +590,78 @@ describe('ReliableReportingService', () => {
               account: { account_id: 'account-a' },
               idempotency_key: 'reporting-status-e2e-operator-0001',
               statuses: [{ reporting_status_id: 'reporting-status-e2e-0001' }],
+            },
+          },
+        },
+        {
+          authInfo: {
+            operator,
+            credential: { kind: 'oauth', client_id: 'shared-oauth-client', scopes: [], expires_at: null },
+          },
+        }
+      );
+
+    for (const operator of ['seat-a', 'seat-b']) {
+      const result = await call(operator);
+      assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    }
+    assert.deepEqual(seen, ['seat-a', 'seat-b'], 'each resolved consumer must deposit its own receipt');
+  });
+
+  test('scopes reconciled-billing receipt replay by the resolved consumer', async () => {
+    const { service } = serviceFixture({ resolveConsumerId: context => `consumer-${context.authInfo.operator}` });
+    const seen = [];
+    const platform = service.install({
+      capabilities: { specialisms: [], config: {} },
+      accounts: {
+        resolution: 'explicit',
+        resolve: async ref => ({ id: ref?.account_id ?? 'account-a', ctx_metadata: {} }),
+        upsert: async () => [],
+      },
+    });
+    const observed = {
+      ...platform,
+      reporting: {
+        ...platform.reporting,
+        syncReportingReceipts: async (request, context) => {
+          seen.push(context.authInfo.operator);
+          return {
+            status: 'completed',
+            results: request.receipts.map(receipt => ({
+              result: 'accepted',
+              reporting_receipt_id: receipt.reporting_receipt_id,
+            })),
+          };
+        },
+      },
+    };
+    const { createIdempotencyStore, memoryBackend } = require('../../dist/lib/server/idempotency/index.js');
+    const server = createAdcpServerFromPlatform(observed, {
+      name: 'reporting-receipt-consumer-scope-test',
+      version: '1.0.0',
+      adcpVersion: '3.2.0-rc.7',
+      validation: { requests: 'off', responses: 'off' },
+      idempotency: createIdempotencyStore({ backend: memoryBackend({ sweepIntervalMs: 0 }) }),
+      resolveSessionKey: () => 'shared-oauth-client',
+    });
+    const call = operator =>
+      server.dispatchTestRequest(
+        {
+          method: 'tools/call',
+          params: {
+            name: 'sync_reporting_receipts',
+            arguments: {
+              account: { account_id: 'account-a' },
+              idempotency_key: 'reporting-receipts-e2e-operator-0001',
+              receipts: [
+                {
+                  reporting_receipt_id: 'reporting-receipt-e2e-0001',
+                  reporting_obligation_id: 'obligation-e2e-0001',
+                  reporting_revision_id: 'revision-e2e-0001',
+                  reporting_materialization_id: 'materialization-e2e-0001',
+                  status: 'accepted',
+                },
+              ],
             },
           },
         },
@@ -634,7 +706,7 @@ describe('ReliableReportingService', () => {
             resolveCurrency: () => 'USD',
             resolveCoverage: account => ({ constituents: [authorizedConstituent(account.id)] }),
           }),
-        /Core API delivery only/
+        /createPostgresReliableReportingProductionService/
       );
     }
 
@@ -669,7 +741,7 @@ describe('ReliableReportingService', () => {
     const platform = service.install({
       capabilities: {
         specialisms: [],
-        supported_versions: ['3.1', '3.2-rc.4'],
+        supported_versions: ['3.1', '3.2-rc.7'],
         config: {},
       },
       accounts: {
@@ -681,7 +753,7 @@ describe('ReliableReportingService', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'version-bound-reporting-service',
       version: '1.0.0',
-      adcpVersion: '3.2.0-rc.4',
+      adcpVersion: '3.2.0-rc.7',
       defaultAdcpVersion: '3.1',
       validation: { requests: 'strict', responses: 'strict' },
     });
@@ -692,7 +764,7 @@ describe('ReliableReportingService', () => {
     });
     const currentTools = await server.dispatchTestRequest({
       method: 'tools/list',
-      params: { _meta: { adcp_version: '3.2-rc.4' } },
+      params: { _meta: { adcp_version: '3.2-rc.7' } },
     });
     for (const tool of ['get_reporting_status', 'get_media_buy_delivery']) {
       assert.equal(
@@ -718,7 +790,7 @@ describe('ReliableReportingService', () => {
       method: 'tools/call',
       params: {
         name: 'get_adcp_capabilities',
-        arguments: { adcp_version: '3.2-rc.4' },
+        arguments: { adcp_version: '3.2-rc.7' },
       },
     });
     assert.notEqual(legacyCapabilities.isError, true, JSON.stringify(legacyCapabilities.structuredContent));
@@ -881,7 +953,7 @@ describe('ReliableReportingService', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'reporting-rows-test',
       version: '1.0.0',
-      adcpVersion: '3.2.0-rc.4',
+      adcpVersion: '3.2.0-rc.7',
       validation: { requests: 'strict', responses: 'strict' },
     });
     const wire = await server.dispatchTestRequest(
@@ -986,7 +1058,7 @@ describe('ReliableReportingService', () => {
       {
         name: 'shared-delivery-handler-test',
         version: '1.0.0',
-        adcpVersion: '3.2.0-rc.4',
+        adcpVersion: '3.2.0-rc.7',
         // Projection, not schema validation, is the behavior under test.
         validation: { requests: 'off', responses: 'off' },
       }
@@ -1070,14 +1142,14 @@ describe('ReliableReportingService', () => {
     );
 
     assert.throws(
-      () => zonedFixture('America/New_York'),
+      () => zonedFixture('America/New_York', { periodDuration: 'PT24H' }),
       /UTC offset|schedule-origin offset/,
-      'a pinned DST zone cannot hold local midnight and must not be advertised'
+      'an elapsed PT24H grid cannot hold local midnight in a DST zone'
     );
 
     // The same zone behind an account_resolved policy is unknown until install,
     // so install-time validation is what has to catch it.
-    const lateDst = zonedFixture('America/New_York', { accountResolved: true });
+    const lateDst = zonedFixture('America/New_York', { accountResolved: true, periodDuration: 'PT24H' });
     await assert.rejects(
       lateDst.service.installConfiguration(
         configuration({
@@ -1107,7 +1179,7 @@ describe('ReliableReportingService', () => {
     // periods being generated now. Asia/Almaty held UTC+6 through 2023 and
     // moved to UTC+5 on 2024-03-01, so a 2022 generation looks stable for its
     // first year and every currently generated boundary sits at 23:00 local.
-    const almaty = zonedFixture('Asia/Almaty', { accountResolved: true });
+    const almaty = zonedFixture('Asia/Almaty', { accountResolved: true, periodDuration: 'PT24H' });
     await assert.rejects(
       almaty.service.installConfiguration(
         configuration({
@@ -1165,7 +1237,7 @@ describe('ReliableReportingService', () => {
       {
         name: 'legacy-cumulative-delivery-test',
         version: '1.0.0',
-        adcpVersion: '3.2.0-rc.4',
+        adcpVersion: '3.2.0-rc.7',
         validation: { requests: 'off', responses: 'off' },
         legacyHandlers: {
           mediaBuy: {
@@ -1442,7 +1514,7 @@ describe('ReliableReportingService', () => {
     // "now + horizon" would put the span end before its start, so the loop body
     // would never run and a DST zone would install.
     for (const timezone of ['America/Santiago', 'Australia/Sydney']) {
-      const zone = zonedFixture(timezone, { accountResolved: true });
+      const zone = zonedFixture(timezone, { accountResolved: true, periodDuration: 'PT24H' });
       await assert.rejects(
         zone.service.installConfiguration(
           configuration({
@@ -1538,7 +1610,7 @@ describe('ReliableReportingService', () => {
       {
         name: 'strict-merge-seam-test',
         version: '1.0.0',
-        adcpVersion: '3.2.0-rc.4',
+        adcpVersion: '3.2.0-rc.7',
         validation: { requests: 'off', responses: 'off' },
         mergeSeam: 'strict',
         legacyHandlers: {
@@ -2149,7 +2221,7 @@ describe('ReliableReportingService', () => {
     assert.equal(installed.sourceTimezone, 'Asia/Tehran', 'history the planner never reaches must not refuse');
 
     // A zone whose offset moves inside the operational window is still refused.
-    const dst = zonedFixture('America/New_York', { accountResolved: true });
+    const dst = zonedFixture('America/New_York', { accountResolved: true, periodDuration: 'PT24H' });
     const nyOrigin = reportingScheduleOriginV1('source_timezone', 'America/New_York');
     const recent = nyOrigin + Math.ceil((Date.now() - nyOrigin) / 86_400_000) * 86_400_000;
     await assert.rejects(
@@ -2219,13 +2291,13 @@ describe('ReliableReportingService', () => {
     }
   });
 
-  test('never advertises a zone whose protocol grid has no installable anchor', async () => {
+  test('never advertises an elapsed grid with no source-midnight anchor', async () => {
     // Stable today, but their offset moved after the 1970 origin, so every
     // boundary derived from that origin misses local midnight by 30 or 15
-    // minutes and no P1D anchor can ever install.
+    // minutes and no PT24H anchor can ever install. P1D now resolves civil dates.
     for (const timezone of ['Asia/Singapore', 'Asia/Kathmandu']) {
       assert.throws(
-        () => zonedFixture(timezone),
+        () => zonedFixture(timezone, { periodDuration: 'PT24H' }),
         /no longer observes its schedule-origin offset/,
         `${timezone} has no installable protocol anchor and must not be advertised`
       );
@@ -2573,7 +2645,7 @@ describe('ReliableReportingService', () => {
     const server = createAdcpServerFromPlatform(platform, {
       name: 'null-revision-test',
       version: '1.0.0',
-      adcpVersion: '3.2.0-rc.4',
+      adcpVersion: '3.2.0-rc.7',
       // Production shape: a null is never stripped before routing.
       validation: { requests: 'off', responses: 'off' },
     });
@@ -2603,7 +2675,7 @@ describe('ReliableReportingService', () => {
     // calendar days through local civil time. A P1D America/New_York
     // generation anchored at 05:00Z keeps computing 05:00Z after the spring
     // transition, where civil time says 04:00Z.
-    const { service } = serviceFixture();
+    const { service } = zonedFixture('America/New_York');
     const input = configuration();
     const { expectedCurrency, expectedSourceTimezone, sourceSettings, ...ledgerInput } = input;
     const install = (schedule, overrides = {}) =>

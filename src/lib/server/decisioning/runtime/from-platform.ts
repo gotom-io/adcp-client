@@ -2862,6 +2862,9 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
         ...(platform.reporting?.syncReportingStatus !== undefined && {
           sync_reporting_status: exactReportingRange,
         }),
+        ...(platform.reporting?.syncReportingReceipts !== undefined && {
+          sync_reporting_receipts: exactReportingRange,
+        }),
         ...(liveMediaBuyDelivery === undefined && {
           get_media_buy_delivery: exactReportingRange,
         }),
@@ -3287,9 +3290,9 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
         );
       }
     },
-    // Auth-derived path: framework calls this for tools whose wire request
-    // doesn't carry an `account` field (`provide_performance_feedback`,
-    // `list_creative_formats`, `tasks_get`). The platform's resolver runs
+    // Auth-derived path: framework calls this when the request omits
+    // `account` (`provide_performance_feedback`, `list_creative_formats`,
+    // `tasks_get`). The platform's resolver runs
     // with `undefined` ref + `authInfo` available — adopters of any
     // `resolution` mode can return a non-null Account here:
     //
@@ -3773,20 +3776,32 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
           const refFromContext = (input.context as { account?: AccountReference } | undefined)?.account;
           const accountRef = refFromTop ?? refFromContext;
 
-          // Same per-mode reference-shape contract the buyer-facing
-          // dispatchers enforce. Outside the try below on purpose: a refused
-          // reference is a buyer-fixable INVALID_REQUEST, not a resolver
-          // failure to swallow. This call site historically skipped the
-          // check; with `'derived'` now accepting `{ account_id }`, the
-          // controller must not be the one path where a reference bypasses
-          // it.
-          enforceAccountRefShapeForResolution(platform.accounts.resolution, accountRef);
+          if (accountRef !== undefined && (typeof accountRef !== 'object' || Array.isArray(accountRef))) {
+            return adcpError('INVALID_REQUEST', { message: 'account must be an object' });
+          }
 
+          // Enforce the same per-mode reference shape as buyer dispatch. The
+          // check runs inside the try so its typed INVALID_REQUEST becomes a
+          // structured AdCP error rather than a raw MCP exception.
+          // The controller's account_id arm also carries a sandbox assertion.
+          // It is not part of the core AccountReference accepted by account
+          // stores; the resolved account mode remains the authority.
+          const requestedAccountId = refAccountId(accountRef);
+          if (
+            requestedAccountId !== undefined &&
+            (typeof requestedAccountId !== 'string' ||
+              requestedAccountId.length === 0 ||
+              (accountRef !== undefined && ('brand' in accountRef || 'operator' in accountRef)))
+          ) {
+            return adcpError('INVALID_REQUEST', { message: 'Invalid account_id reference' });
+          }
+          const resolverRef = requestedAccountId === undefined ? accountRef : { account_id: requestedAccountId };
           let resolvedAccount: Account | null = null;
           const agent = principalAuthority.agent;
           try {
+            enforceAccountRefShapeForResolution(platform.accounts.resolution, accountRef);
             resolvedAccount = await platform.accounts.resolve(
-              accountRef,
+              resolverRef,
               toResolveCtx(
                 {
                   ...(extra?.authInfo !== undefined && { authInfo: extra.authInfo }),
@@ -3799,10 +3814,17 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
                 input
               )
             );
-          } catch {
-            // Resolver failures fall through to the wire-ref / env fallbacks.
-            // Treat as "no account resolved" — fail-closed by default unless a
-            // fallback admits.
+          } catch (err) {
+            if (err instanceof AccountNotFoundError || (err instanceof AdcpError && err.code === 'ACCOUNT_NOT_FOUND')) {
+              resolvedAccount = null;
+            } else if (err instanceof AdcpError) {
+              return adcpError(err.code, err.toStructuredError());
+            } else {
+              fwLogger.error?.('Account resolution failed during comply controller dispatch', {
+                error_type: err instanceof Error ? err.name : typeof err,
+              });
+              return adcpError('SERVICE_UNAVAILABLE', { message: 'Account resolution failed' });
+            }
           }
           resolvedAccount = assertResolvedAccountMatchesRef(
             platform.accounts.resolution,
@@ -3823,8 +3845,9 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
           // resolver wins. The buyer's wire claim never overrides a
           // resolved live account.
           //
-          // The fallback is scoped to refs that name no account: a buyer who
-          // DID name an account and had it refused by the resolver must not
+          // The fallback uses the original accountRef and is scoped to refs
+          // that name no account. A buyer who named an account and had it
+          // refused by the resolver must not
           // re-admit themselves by asserting `sandbox: true` alongside it.
           // Fail-closed resolvers (`createDerivedAccountStore` and any
           // verified `'derived'` store) make `resolvedAccount == null`
@@ -6610,7 +6633,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
   };
 
   const reportingContext = (
-    tool: 'get_media_buy_delivery' | 'get_reporting_status' | 'sync_reporting_status',
+    tool: 'get_media_buy_delivery' | 'get_reporting_status' | 'sync_reporting_status' | 'sync_reporting_receipts',
     params: Readonly<Record<string, unknown>>,
     ctx: HandlerContext<Account>
   ): RequestContext<Account> => {
@@ -7313,6 +7336,16 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
         ),
     }),
 
+    ...(reporting?.syncReportingReceipts && {
+      syncReportingReceipts: async (
+        ...[params, ctx]: Parameters<NonNullable<MediaBuyHandlers<Account>['syncReportingReceipts']>>
+      ) =>
+        projectSync(
+          () => reporting.syncReportingReceipts!(params, reportingContext('sync_reporting_receipts', params, ctx)),
+          value => value
+        ),
+    }),
+
     // Optional methods — return UNSUPPORTED_FEATURE when the platform omits
     // them. Adopters that haven't migrated to the v6 platform interface for
     // these specific tools can still pass raw handlers via opts.legacyHandlers.mediaBuy
@@ -7413,7 +7446,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
       ) => {
         const reqCtx = ctxFor(ctx, params);
         return projectSync(
-          () => sales!.listCreativeFormatsLegacy!(params, reqCtx),
+          () => sales!.listCreativeFormatsLegacy!(asValidatedDomainRequest(params), reqCtx),
           r => r
         );
       },
@@ -7550,9 +7583,9 @@ function buildCreativeHandlers<P extends DecisioningPlatform<any, any>>(
       );
     },
 
-    // No-account tool — `list_creative_formats` request schema doesn't carry
-    // `account`. The framework's `resolveAccountFromAuth` runs and accepts a
-    // null return; the platform method receives `ctx.account` possibly
+    // Optional-account tool — `list_creative_formats` may carry `account`
+    // in rc.7. With no account, `resolveAccountFromAuth` accepts a null
+    // return; the platform method receives `ctx.account` possibly
     // undefined per `NoAccountCtx`. Wired identically on both
     // `CreativeBuilderPlatform` and `CreativeAdServerPlatform`.
     listCreativeFormats: async (params, ctx) => {
@@ -7566,7 +7599,8 @@ function buildCreativeHandlers<P extends DecisioningPlatform<any, any>>(
       }
       const reqCtx = ctxFor(ctx, params);
       return projectSync(
-        () => (creative as CreativeBuilderPlatform).listCreativeFormatsLegacy!(params, reqCtx),
+        () =>
+          (creative as CreativeBuilderPlatform).listCreativeFormatsLegacy!(asValidatedDomainRequest(params), reqCtx),
         r => r
       );
     },
@@ -9012,16 +9046,22 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
       // assertions for every adopter, regardless of `CursorPage` output.
       // See adcontextprotocol/adcp#5723 for the reproduction from a 3.1 seller.
       return projectSync(
-        () => accounts.list!(filter, resolveCtx),
-        page => ({
-          status: 'completed' as const,
-          accounts: page.items.map(toWireAccount),
-          pagination: {
-            has_more: page.nextCursor != null,
-            ...(page.nextCursor != null && { cursor: page.nextCursor }),
-            ...(page.totalCount !== undefined && { total_count: page.totalCount }),
-          },
-        })
+        async () => {
+          const page = await accounts.list!(filter, resolveCtx);
+          const response = {
+            status: 'completed' as const,
+            accounts: page.items.map(toWireAccount),
+            pagination: {
+              has_more: page.nextCursor != null,
+              ...(page.nextCursor != null && { cursor: page.nextCursor }),
+              ...(page.totalCount !== undefined && { total_count: page.totalCount }),
+            },
+          };
+          return platform.reporting?.projectListAccounts
+            ? platform.reporting.projectListAccounts(filter, response, resolveCtx)
+            : response;
+        },
+        response => response
       );
     };
   }

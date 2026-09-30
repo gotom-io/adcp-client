@@ -1306,11 +1306,14 @@ function postProcessPostalCountrySystemSchema(content: string): string {
 /** Restore the closed beta.4 SDK-local continuation schema exactly. */
 function postProcessCompatibilityPurchaseCoordinatorInput(content: string): string {
   const startMarker = 'export const CompatibilityPurchaseCoordinatorInputSchema = ';
-  const endMarker = '\n\nexport const OutcomeTargetSchema = ';
   const start = content.indexOf(startMarker);
   if (start < 0) throw new Error('CompatibilityPurchaseCoordinatorInputSchema was not generated.');
-  const end = content.indexOf(endMarker, start);
+  const end = content.indexOf('\n\nexport const ', start + 1);
   if (end < 0) throw new Error('Could not locate the end of CompatibilityPurchaseCoordinatorInputSchema.');
+  const block = content.slice(start, end);
+  if ((block.match(/export const /g) ?? []).length !== 1) {
+    throw new Error('CompatibilityPurchaseCoordinatorInputSchema post-processing would remove other exports.');
+  }
   const replacement = `export const CompatibilityPurchaseCoordinatorInputSchema = z.object({
     idempotency_key: z.uuid(),
     continuation_token: z.string().min(16),
@@ -2831,8 +2834,10 @@ type CanonicalPrimitiveConstraints = {
  * after every structural Zod rewrite has run. The TypeScript intermediary can
  * lose JSDoc when a transitive occurrence wins first-definition ownership;
  * this pass makes the canonical document authoritative without relying on a
- * growing allowlist of field names. Array cardinality is reconciled separately
- * by `postProcessArrayMaxItems`.
+ * growing allowlist of field names. Titled nested schemas are reconciled
+ * against their own generated blocks rather than only against the root
+ * document's block. Array cardinality is reconciled separately by
+ * `postProcessArrayMaxItems`.
  *
  * Constraints are applied by property name only when every occurrence of that
  * name inside the canonical document has the same constraint set. Ambiguous
@@ -2840,12 +2845,17 @@ type CanonicalPrimitiveConstraints = {
  * in the wrong context. Defaults are not materialized, and array cardinality
  * is handled by the dedicated source-aware pass.
  */
-function postProcessCanonicalPrimitiveConstraints(content: string): string {
+export function postProcessCanonicalPrimitiveConstraints(content: string): string {
   const cacheRoot = path.join(__dirname, '../schemas/cache/latest');
   const schemaFiles: string[] = [];
+  const excludedSchemaDirectories = new Set(['bundled', 'mcp', 'tmp']);
   const visitDirectory = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (entry.name === 'bundled') continue;
+      // Bundled documents and transport projections repeat canonical titles
+      // after dereferencing or adapting them. Treating those copies as
+      // additional authorities can add transport-only constraints to the
+      // modular public schema that owns the generated Zod block.
+      if (entry.isDirectory() && excludedSchemaDirectories.has(entry.name)) continue;
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) visitDirectory(absolute);
       else if (entry.isFile() && entry.name.endsWith('.json')) schemaFiles.push(absolute);
@@ -2877,6 +2887,15 @@ function postProcessCanonicalPrimitiveConstraints(content: string): string {
     }
     return constraints;
   };
+  const envelopeProperties = (file: string): Record<string, Record<string, unknown>> => {
+    const schema = JSON.parse(readFileSync(path.join(cacheRoot, 'core', file), 'utf8')) as Record<string, unknown>;
+    if (!schema.properties || typeof schema.properties !== 'object' || Array.isArray(schema.properties)) {
+      throw new Error(`Canonical ${file} properties are unavailable`);
+    }
+    return schema.properties as Record<string, Record<string, unknown>>;
+  };
+  const versionEnvelopeProperties = envelopeProperties('version-envelope.json');
+  const protocolEnvelopeProperties = envelopeProperties('protocol-envelope.json');
 
   const constrainExpression = (expression: string, constraints: CanonicalPrimitiveConstraints): string => {
     let result = expression;
@@ -2930,21 +2949,49 @@ function postProcessCanonicalPrimitiveConstraints(content: string): string {
     return result;
   };
 
-  for (const schemaFile of schemaFiles.sort()) {
-    const schema = JSON.parse(readFileSync(schemaFile, 'utf8')) as Record<string, unknown>;
+  const generatedSchemaNames = new Set([...content.matchAll(/^export const (\w+)Schema\b/gm)].map(match => match[1]));
+  const generatedSchemaName = (schema: Record<string, unknown>): string | undefined => {
     const rawSchemaName = typeof schema.title === 'string' ? schema.title.replace(/[^A-Za-z0-9]/g, '') : '';
-    const schemaName = [rawSchemaName, rawSchemaName && rawSchemaName[0].toUpperCase() + rawSchemaName.slice(1)].find(
-      candidate => candidate && content.includes(`export const ${candidate}Schema`)
+    return [rawSchemaName, rawSchemaName && rawSchemaName[0].toUpperCase() + rawSchemaName.slice(1)].find(
+      candidate => candidate && generatedSchemaNames.has(candidate)
     );
-    if (!schemaName) continue;
+  };
+
+  const titledSchemas = (value: unknown): Array<{ schemaName: string; schema: Record<string, unknown> }> => {
+    const result: Array<{ schemaName: string; schema: Record<string, unknown> }> = [];
+    const visit = (candidate: unknown): void => {
+      if (Array.isArray(candidate)) {
+        for (const member of candidate) visit(member);
+        return;
+      }
+      if (!candidate || typeof candidate !== 'object') return;
+      const schema = candidate as Record<string, unknown>;
+      const schemaName = generatedSchemaName(schema);
+      if (schemaName) result.push({ schemaName, schema });
+      for (const child of Object.values(schema)) visit(child);
+    };
+    visit(value);
+    return result;
+  };
+
+  const reconcileSchema = (schemaName: string, schema: unknown): void => {
     const exportStart = content.indexOf(`export const ${schemaName}Schema`);
-    if (exportStart < 0) continue;
+    if (exportStart < 0) return;
     const exportEndCandidate = content.indexOf('\n\nexport const ', exportStart + 1);
     const exportEnd = exportEndCandidate < 0 ? content.length : exportEndCandidate;
     let block = content.slice(exportStart, exportEnd);
 
-    const rootConstraints = constraintsFor(schema);
-    if (Object.keys(rootConstraints).length > 0) {
+    const rootConstraintsBySignature = new Map<string, CanonicalPrimitiveConstraints>();
+    for (const candidate of Array.isArray(schema) ? schema : [schema]) {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+      const constraints = constraintsFor(candidate as Record<string, unknown>);
+      rootConstraintsBySignature.set(JSON.stringify(constraints), constraints);
+    }
+    const rootConstraints =
+      rootConstraintsBySignature.size === 1
+        ? (rootConstraintsBySignature.values().next().value as CanonicalPrimitiveConstraints)
+        : undefined;
+    if (rootConstraints && Object.keys(rootConstraints).length > 0) {
       const rootExpression = new RegExp(`^(export const ${schemaName}Schema(?:[^=]*)= )([^;\\n]+);$`, 'm');
       block = block.replace(rootExpression, (_line, prefix: string, expression: string) => {
         return `${prefix}${constrainExpression(expression, rootConstraints)};`;
@@ -2952,9 +2999,15 @@ function postProcessCanonicalPrimitiveConstraints(content: string): string {
     }
 
     const occurrences = new Map<string, Map<string, CanonicalPrimitiveConstraints>>();
+    const references = new Set<string>();
     const visitSchema = (value: unknown): void => {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+      if (Array.isArray(value)) {
+        for (const member of value) visitSchema(member);
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
       const node = value as Record<string, unknown>;
+      if (typeof node.$ref === 'string') references.add(node.$ref);
       if (node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)) {
         for (const [propertyName, propertySchema] of Object.entries(node.properties)) {
           if (!propertySchema || typeof propertySchema !== 'object' || Array.isArray(propertySchema)) continue;
@@ -2972,18 +3025,144 @@ function postProcessCanonicalPrimitiveConstraints(content: string): string {
     };
     visitSchema(schema);
 
-    for (const [propertyName, bySignature] of occurrences) {
-      if (bySignature.size !== 1) continue;
-      const constraints = bySignature.values().next().value as CanonicalPrimitiveConstraints;
-      if (Object.keys(constraints).length === 0) continue;
+    const constrainProperty = (propertyName: string, constraints: CanonicalPrimitiveConstraints): void => {
+      if (Object.keys(constraints).length === 0) return;
       const escapedName = escapeRegExp(propertyName);
       const propertyLine = new RegExp(`^(\\s*)(?:${escapedName}|${JSON.stringify(propertyName)}): ([^\\n]+)$`, 'gm');
       block = block.replace(propertyLine, (line, indent: string, expression: string) => {
         return `${indent}${line.slice(indent.length, line.length - expression.length)}${constrainExpression(expression, constraints)}`;
       });
+    };
+
+    for (const [propertyName, bySignature] of occurrences) {
+      if (bySignature.size !== 1) continue;
+      constrainProperty(propertyName, bySignature.values().next().value as CanonicalPrimitiveConstraints);
+    }
+    // allOf/$ref inheritance disappears in the JSON Schema -> TypeScript
+    // intermediary. Restore only the fields from the exact canonical envelope
+    // a titled schema references; this avoids globally constraining unrelated
+    // properties that happen to reuse names such as `adcp_version`.
+    const inherits = (file: string): boolean => [...references].some(ref => ref.endsWith(`/core/${file}`));
+    if (inherits('version-envelope.json')) {
+      for (const propertyName of ['adcp_version', 'adcp_major_version']) {
+        constrainProperty(propertyName, constraintsFor(versionEnvelopeProperties[propertyName]!));
+      }
+    }
+    if (inherits('protocol-envelope.json')) {
+      for (const propertyName of ['timestamp', 'governance_context']) {
+        constrainProperty(propertyName, constraintsFor(protocolEnvelopeProperties[propertyName]!));
+      }
     }
 
     content = content.slice(0, exportStart) + block + content.slice(exportEnd);
+  };
+
+  const schemasByName = new Map<string, unknown[]>();
+  for (const schemaFile of schemaFiles.sort()) {
+    const schema = JSON.parse(readFileSync(schemaFile, 'utf8')) as Record<string, unknown>;
+    for (const titled of titledSchemas(schema)) {
+      const schemas = schemasByName.get(titled.schemaName) ?? [];
+      schemas.push(titled.schema);
+      schemasByName.set(titled.schemaName, schemas);
+    }
+  }
+  // Reconcile each generated block exactly once. Applying repeated titled
+  // copies sequentially lets a later, less-constrained transport projection
+  // erase constraints restored from the canonical owner. Combining every
+  // occurrence first makes the existing unanimity rule conservative: only a
+  // constraint shared by all copies can alter the generated block.
+  for (const [schemaName, schemas] of [...schemasByName].sort(([left], [right]) => left.localeCompare(right))) {
+    reconcileSchema(schemaName, schemas);
+  }
+  return content;
+}
+
+/** Restore goal target bounds from the owning schema. Other titled copies of
+ * these goals omit the bound, so the general unanimity pass leaves it out. */
+function postProcessOptimizationGoalTargetBounds(content: string): string {
+  for (const [file, schemaName] of [
+    ['optimization-goal.json', 'OptimizationGoal'],
+    ['canonical-optimization-goal.json', 'CanonicalOptimizationGoal'],
+  ] as const) {
+    const source = JSON.parse(
+      readFileSync(path.join(__dirname, '../schemas/cache/latest/core', file), 'utf8')
+    ) as Record<string, unknown>;
+    const arms = source.oneOf;
+    if (!Array.isArray(arms)) throw new Error(`${file}: expected oneOf goal arms`);
+    let boundedTargets = 0;
+    for (const arm of arms) {
+      const target = arm?.properties?.target;
+      if (!target) continue;
+      for (const variant of Array.isArray(target.oneOf) ? target.oneOf : [target]) {
+        const value = variant?.properties?.value;
+        if (!value) continue;
+        if (value.type !== 'number' || value.exclusiveMinimum !== 0) {
+          throw new Error(`${file}: unsupported target.value bound`);
+        }
+        boundedTargets++;
+      }
+    }
+    const start = content.indexOf(`export const ${schemaName}Schema`);
+    if (start < 0) throw new Error(`${schemaName}Schema is missing`);
+    const next = content.indexOf('\n\nexport const ', start + 1);
+    const end = next < 0 ? content.length : next;
+    const block = content.slice(start, end);
+    const occurrences = [...block.matchAll(/\bvalue: z\.number\(\)(?:\.gt\(0\))?/g)].length;
+    if (occurrences !== boundedTargets) {
+      throw new Error(`${schemaName}Schema has ${occurrences} target values; expected ${boundedTargets}`);
+    }
+    const bounded = block.replace(/\bvalue: z\.number\(\)(?!\.gt\(0\))/g, 'value: z.number().gt(0)');
+    content = content.slice(0, start) + bounded + content.slice(end);
+  }
+  return content;
+}
+
+/** Draft-07 goal conditionals disappear in the TypeScript intermediary. */
+function postProcessOptimizationGoalConditionals(content: string): string {
+  for (const [file, schemaName] of [
+    ['optimization-goal.json', 'OptimizationGoal'],
+    ['canonical-optimization-goal.json', 'CanonicalOptimizationGoal'],
+  ] as const) {
+    const source = JSON.parse(
+      readFileSync(path.join(__dirname, '../schemas/cache/latest/core', file), 'utf8')
+    ) as Record<string, any>;
+    const metricArm = source.oneOf?.find((arm: any) => arm.properties?.kind?.const === 'metric');
+    const targetProperties: Record<string, unknown> = { value: { maximum: 1 } };
+    if (schemaName === 'OptimizationGoal') targetProperties.kind = { const: 'threshold_rate' };
+    const expected = [
+      {
+        if: { properties: { metric: { const: 'viewable_rate' } }, required: ['metric'] },
+        then: { required: ['standard'], properties: { target: { properties: targetProperties } } },
+      },
+      {
+        if: { properties: { metric: { enum: ['viewable_rate', 'viewed_seconds'] } }, required: ['metric'] },
+        else: { not: { anyOf: [{ required: ['standard'] }, { required: ['vendor'] }] } },
+      },
+    ];
+    if (!metricArm || !isDeepStrictEqual(metricArm.allOf, expected)) {
+      throw new Error(`${file}: unsupported metric goal conditionals`);
+    }
+    const start = content.indexOf(`export const ${schemaName}Schema`);
+    const next = content.indexOf('\n\nexport const ', start + 1);
+    if (start < 0 || next < 0) throw new Error(`${schemaName}Schema block is missing`);
+    const block = content.slice(start, next);
+    if (!block.endsWith(';') || block.includes('.superRefine(')) {
+      throw new Error(`${schemaName}Schema has an unexpected generated shape`);
+    }
+    const refinement = `.superRefine((goal, ctx) => {
+    if (goal.kind !== "metric") return;
+    if (goal.metric === "viewable_rate") {
+        if (goal.standard == null) ctx.addIssue({ code: "custom", path: ["standard"], message: "viewable_rate requires standard" });
+        if (goal.target != null) {
+            if (goal.target.kind !== "threshold_rate") ctx.addIssue({ code: "custom", path: ["target", "kind"], message: "viewable_rate requires threshold_rate target" });
+            if (goal.target.value > 1) ctx.addIssue({ code: "custom", path: ["target", "value"], message: "viewable_rate target must be at most 1" });
+        }
+    } else if (goal.metric !== "viewed_seconds") {
+        if (goal.standard !== undefined) ctx.addIssue({ code: "custom", path: ["standard"], message: "standard is only allowed for viewability metrics" });
+        if (goal.vendor !== undefined) ctx.addIssue({ code: "custom", path: ["vendor"], message: "vendor is only allowed for viewability metrics" });
+    }
+})`;
+    content = content.slice(0, start) + block.slice(0, -1) + refinement + ';' + content.slice(next);
   }
   return content;
 }
@@ -3161,7 +3340,25 @@ function postProcessPricingOptionConstraints(content: string): string {
     const endCandidate = content.indexOf('\n\nexport const ', start + 1);
     const end = endCandidate < 0 ? content.length : endCandidate;
     const block = content.slice(start, end);
+    const alreadyConstrained = block.indexOf(after);
+    if (alreadyConstrained >= 0) {
+      if (block.indexOf(after, alreadyConstrained + after.length) >= 0) {
+        throw new Error(
+          `postProcessPricingOptionConstraints: expected exactly one ${JSON.stringify(after)} in ${schemaName}Schema.`
+        );
+      }
+      return;
+    }
     const first = block.indexOf(before);
+    if (first < 0) {
+      // zod-from-ts may already project a canonical numeric constraint with
+      // a different fluent spelling/order (for example `.min(1).int()`).
+      // The canonical guard above remains authoritative; accept one native
+      // projection instead of coupling this compatibility pass to its text.
+      const property = before.slice(0, before.indexOf(':') + 1);
+      const propertyMatches = block.split(property).length - 1;
+      if (propertyMatches === 1) return;
+    }
     if (first < 0 || block.indexOf(before, first + before.length) >= 0) {
       throw new Error(
         `postProcessPricingOptionConstraints: expected exactly one ${JSON.stringify(before)} in ${schemaName}Schema.`
@@ -5475,6 +5672,8 @@ async function generateZodSchemas() {
     // Reconcile canonical primitive constraints last, after structural and
     // exact-schema rewrites that may replace earlier generated blocks.
     zodSchemas = postProcessCanonicalPrimitiveConstraints(zodSchemas);
+    zodSchemas = postProcessOptimizationGoalTargetBounds(zodSchemas);
+    zodSchemas = postProcessOptimizationGoalConditionals(zodSchemas);
     zodSchemas = postProcessCanonicalVastAudioConstraints(zodSchemas);
     zodSchemas = postProcessPricingOptionConstraints(zodSchemas);
     zodSchemas = postProcessJsonSchemaUriFormats(zodSchemas);
@@ -5536,6 +5735,7 @@ if (require.main === module) {
 }
 
 export const __test__ = {
+  postProcessCompatibilityPurchaseCoordinatorInput,
   postProcessForPassthrough,
   postProcessTupleRestArrays,
   postProcessArrayMaxItems,

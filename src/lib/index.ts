@@ -729,6 +729,10 @@ export {
   AuthenticationRequiredError,
   FeatureUnsupportedError,
   ProtocolFeatureUnsupportedError,
+  UnsupportedBuyingModeError,
+  AccountRequiredError,
+  AccountPendingApprovalError,
+  AccountAmbiguousError,
   SDK_ERROR_TO_PROTOCOL_ERROR_CODE,
   VersionUnsupportedError,
   IdempotencyConflictError,
@@ -1880,6 +1884,7 @@ export {
   type CanonicalCreativeAsset,
   type CanonicalCreativeAsset as CreativeAsset,
   type CanonicalSyncCreativeAsset,
+  type CanonicalCreateMediaBuyInput,
   type CanonicalCreateMediaBuyRequest,
   type CanonicalCreateMediaBuyRequest as CreateMediaBuyRequest,
   type CanonicalCreateMediaBuyResponse,
@@ -2012,6 +2017,7 @@ export {
   supportsPropertyListFiltering,
   supportsContentStandards,
   supportsSyncCreatives,
+  supportsBuyingMode,
   requiresOperatorAuth,
   requiresAccountForProducts,
   supportsSandbox,
@@ -2033,10 +2039,12 @@ export type {
   AdcpMajorVersion,
   AdcpProtocol,
   AccountCapabilities,
+  BuyingMode,
   MediaBuyFeatures,
   ToolInfo,
   FeatureName,
 } from './utils/capabilities';
+export type { ResolveAccountOptions, ListedAccount } from './core/account-resolution';
 
 // Buyer-side creative delivery helpers
 export { inlineCreativesForPackages, inlineCreativesForPackagesLegacy } from './utils/creative-delivery';

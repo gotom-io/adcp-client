@@ -4,7 +4,7 @@
 
 ## Recommended: install the lifecycle service
 
-`createReliableReportingService` is the adapter-first production path. A
+`createReliableReportingService` is the adapter-first Core path. A
 provider adapter supplies one bounded slice fetch and two immutable offering
 descriptions; the service reuses the PostgreSQL ledger, source executor,
 producer, handlers, and decisioning-platform account resolver.
@@ -59,12 +59,33 @@ reporting.start({ intervalMilliseconds: 60_000, deploymentWide: true });
 process.once('SIGTERM', () => void reporting.stop());
 ```
 
-The service advertises Reliable Reporting Core only. An inline adapter cannot
-turn on Managed Delivery, Reconciled Billing, receipts, webhook activity, or
-reporting notifications. `sync_reporting_status` is advertised only when
+The service advertises Reliable Reporting Core only. `sync_reporting_status` is advertised only when
 `resolveConsumerId` is installed and the supplied ledger implements its
-atomic consumer-status methods. Follow-up work adds those higher tiers; do not
-place them in a manual capability override.
+atomic consumer-status methods. Do not place higher tiers in a manual
+capability override.
+
+For the complete seller deployment, use the async
+`createPostgresReliableReportingProductionService`. It assembles Core, Managed
+Delivery, reconciled receipts when the offering requests them, all three
+reporting notification types, durable webhook retries, principal-scoped
+webhook activity, fair per-account delivery work, and coordinated shutdown.
+Pass `applyMigrations` to bridge the returned ordered SQL into your migration
+runner; the constructor publishes no capability object until every table and
+worker dependency probes successfully and the advertised managed policy is
+durably adopted. Its `platform` mounts `sync_reporting_receipts` through
+`createAdcpServerFromPlatform`, and its scheduler drives production, managed
+delivery, notification recovery, retry recovery, and bounded retention cleanup
+together. `stop()` aborts and awaits both worker loops.
+The production scheduler and `recoverOnce()` require the explicit
+`deploymentWide: true` option because notification and webhook recovery scan
+the entire configured namespace. Use an isolated namespace and publisher scope
+for each independently operated tenant partition. The Core-only scheduler may
+still use an `accountIds` roster. Production setup requires
+`activity.tenantScopeForAccount`; when an offering uses `consumer_receipt`, it
+also requires a trusted `obligatedConsumers` callback so lifecycle health can
+become reconciled only after every obligated consumer has accepted.
+See the [integrated seller example](../../examples/reliable-reporting-service/README.md#integrated-seller-production-service)
+for the full option shape.
 
 Install a buyer declaration after the account and its media-buy scope have
 been authorized and resolved. `installConfiguration` intentionally accepts no
@@ -141,7 +162,76 @@ await sweepExpiredReportingLedgerState(pool);
 
 Pass `getReportingStatus` and `getMediaBuyDelivery` directly to the matching `createAdcpServer` slots. The delivery helper serves only exact `reporting_revision_id` reads and returns the row payload bound by the ledger revision. Advertise `media_buy.reporting_delivery` in `experimental_features` together with a `media_buy.reporting_delivery` capability whose Reliable Reporting version is `1.0` only after both handlers are wired. Configure account resolution on the server: both handlers require the framework-resolved, caller-scoped account identity and never trust a request-body identity as an authorization boundary. If two callers can name the same upstream account, the resolver must issue distinct internal account IDs for their ledger namespaces. Install immutable delivery-configuration generations through `producer.installConfiguration`, call `planObligations()` after period close, and run `runWorker()` from a durable scheduler. Multiple workers are safe: PostgreSQL claims use `SKIP LOCKED`, expiring leases, and fencing generations.
 
-The planner uses fixed millisecond periods and an explicitly frozen IANA source timezone. Calendar or billing-cycle schedules should be expanded by the seller into immutable period boundaries before installation; the SDK intentionally has no Temporal dependency. At period end, the obligation freezes the constituent denominator and coverage. A zero-row source object commits like any other revision. Absence remains an empty revision association. A deployment with per-tenant workers should pass the resolved `account_id` to both `planObligations()` and `runWorker()`; omitting it intentionally runs a deployment-wide worker.
+The planner supports fixed millisecond schedules and an explicit source-calendar
+day schedule. For the latter, set the existing schedule identity fields to
+`periodDuration: 'P1D'`, `alignment: 'source_timezone'`, and
+`periodTimezone: sourceTimezone`, with an IANA timezone and a source-local
+midnight `anchor`. Keep `periodMilliseconds: 86_400_000` as the nominal day;
+it does not determine the elapsed width on this path. Boundaries are resolved
+independently from local 1970-01-01 and their civil-day ordinal, so New York's
+spring and fall days span 23 and 25 hours. The service fills these identity
+fields from its delivery offering; callers of the producer directly must supply
+them explicitly. `PT24H` continues to mean an elapsed 24 hours.
+
+The new calendar path supports a fixed-time SLA, for example
+`deliverySlaDuration: 'PT4H'` with `deliverySlaMilliseconds: 14_400_000`.
+The deadline is the resolved period end plus that elapsed duration. Source
+window bounds, local-midnight representability and authoritative finalization
+must remain feasible; installation checks the operational 400-day horizon,
+and planning checks each actual period's intrinsic calendar boundaries.
+An elapsed `PT24H` source window cannot stand in for a calendar `P1D` window
+across DST. Other calendar durations, calendar SLAs and billing-cycle expansion
+remain seller responsibilities; this adds no Temporal dependency.
+
+Whole skipped civil dates, such as Apia's 2011-12-30, have no representable
+boundary. Requesting that ordinal refuses instead of aliasing the next date or
+renumbering later ordinals. Valid neighboring boundary lookups keep their
+identities. A floor lookup identifies a representable start; it does not certify
+the next endpoint. Ceil inside the preceding day refuses its missing endpoint,
+and every interval used for planning, coverage, status eligibility or deadline
+projection must have both representable boundaries and a positive, lossless
+source-local day. Ordinary midnight gap/fold point resolution is unchanged;
+the separate lossless-midnight source requirement still applies to periods.
+Source feasibility is an acceptance-time fact. Withdrawing or changing the
+process-local offering later does not suppress an elapsed obligation: the
+planner commits it independently, and an unavailable source proceeds through
+the normal seller-responsible production issue and `action_required` path.
+
+Existing numeric schedules and immutable generation replays are preserved. A
+calendar generation has a distinct semantic fingerprint even when its current
+boundaries equal an elapsed grid. The fingerprint binds the runtime's canonical
+IANA timezone, tzdb version and ICU version; every resolver fails closed if the
+host no longer matches those frozen rules. Use a mixed-replica handoff for a
+runtime/tzdata upgrade: keep an old-runtime replica active, upgrade another
+replica, and install the successor from the new replica so it freezes the new
+rules. The new replica fails closed on planning until every period the
+predecessor owns is frozen. Meanwhile the old replica continues to resolve the
+predecessor and skips the foreign-rule successor. A mid-period cutover belongs
+to the predecessor, so the old replica must plan its straddling period after
+that period closes; an exact-boundary cutover has no straddler. Once that drain
+completes, retire the old replica and let the new one plan the successor. The
+generation persists its old-rules first-owned ordinal and boundary. Planning
+seals a mismatched predecessor only when contiguous durable obligations from
+that boundary reach the handoff, or when the handoff precedes the boundary and
+the generation owns no periods. The new host never recomputes the ownership
+range as proof, and a missing edge or interior ordinal still fails closed. This keeps
+historical reads and the successor usable without letting mixed replicas derive
+different periods. The PostgreSQL store also fences one obligation per
+configuration and civil ordinal, independently of its resolved timestamps.
+The SDK refuses to reinterpret an old fixed-period
+generation whose optional labels would now imply different civil boundaries;
+install an explicit new configuration version before the boundaries diverge.
+The same guard applies if a later timezone database changes a previously fixed
+grid. Every finite legacy floor/ceil lookup, including instants before
+installation or the anchor, must retain its numeric ordinal and enclosing
+period boundaries or require a new generation. Authored obligations are never
+rewritten to migrate a schedule.
+
+At period end, the obligation freezes the constituent denominator and coverage.
+A zero-row source object commits like any other revision. Absence remains an
+empty revision association. A deployment with per-tenant workers should pass
+the resolved `account_id` to both `planObligations()` and `runWorker()`;
+omitting it intentionally runs a deployment-wide worker.
 
 ### Migrating an existing manual lifecycle
 
@@ -242,6 +332,15 @@ const reportingDelivery = managed.reportingDeliveryCapabilities;
 await managed.runWorker({ maxIterations: 100 });
 ```
 
+Deployment-wide materialization planning is durably round-robin. The PostgreSQL
+store advances an agent-wide cursor before processing its bounded account page
+and gives every selected account a first-pass share before unused capacity
+returns to a hot tenant. A crash can defer a selected account until the ring
+wraps, but a lexically early account cannot consume every page, and an account
+added after the cursor receives bounded progress on the next eligible sweep.
+Apply `REPORTING_MANAGED_DELIVERY_MIGRATION` on upgrade so the cursor column is
+available before any unscoped `planMaterializations()` call.
+
 `automated_recovery_window_seconds` is published once per agent, in one capability document, while Core `schedule.recoveryWindowMilliseconds` is per configuration. The advertised value is a **maximum** — the longest a due obligation may stay `delayed` while automated recovery continues before it becomes `action_required` — so one agent-wide number is truthful exactly when it is at least every installed window. `createReportingManagedDeliveryRuntime` enforces that bound and nothing more: advertising less than the widest installed window is refused with the offending value named, advertising more is conservative and allowed, sub-second Core windows are rounded up to the whole second the capability is expressed in, and a deployment with no managed binding — a fresh install, or one that has just offboarded its last managed tenant — starts normally. Heterogeneous tenants behind one agent therefore need no separate endpoint per cohort: advertise the widest window they run. The bound is enforced on the write path as well as at startup — `adoptAdvertisedPolicies` validates existing bindings while exclusively locking the same durable policy sentinel as `installBinding`, and `installBinding` refuses a later Core configuration whose recovery window exceeds the durable bound. `listInstalledRecoveryWindowSeconds` is optional direct-store introspection, not an authoritative publication check: an install can otherwise land between a list and a later adoption.
 
 All four capability promises are durable and database-wide. The atomic hook adopts recovery and authorization-revocation maximums in the stronger, decreasing direction, and status and resource-retention minimums in the stronger, increasing direction. It returns those effective values so a weaker replica still runs its worker to the strongest policy already registered; PostgreSQL also enforces resource retention at settlement and authorization revocation at claim time for direct callers. A rejected binding check or policy write leaves all four columns unchanged, and a later replica can never weaken an adopted promise. Custom stores used by `createReportingManagedDeliveryRuntime` must provide the same atomic, binding-fenced contract; the optional separate recovery/status hooks remain only for compatible direct-store use and are not sufficient for capability publication. Apply `REPORTING_MANAGED_DELIVERY_MIGRATION` on upgrade as well as first install: it adds the resource-retention and revocation columns to an existing two-column registry without replacing prior promises.
@@ -260,7 +359,16 @@ Managed-only changes are lifecycle candidates in their own right. A settlement, 
 
 The managed tables are additive and do not alter the Core tables. This is the schema boundary coordinated with #2943: that work owns transactional reporting notification/activity intent and the existing webhook delivery/credential plane. Managed Delivery does not create a second webhook sender, outbox, credential store, or subscriber model. Apply both feature migrations after the Core migration in either order; each owns separate tables and both reuse the Core authority.
 
-## Transactional status notifications and account activity
+## Transactional reporting notifications and account activity
+
+The activity outbox covers the complete Reliable Reporting event surface. A
+newly committed revision or adjustment records `reporting.ledger_changed` in
+the same transaction as the immutable ledger row; a successfully settled
+managed materialization records `reporting.delivery_ready` in the same
+transaction as its terminal state; and health transitions record
+`reporting.status_changed`. Network I/O always happens later through recovery.
+Event `fired_at` values come from the database clock, and replaying an already
+committed ledger record does not create another event.
 
 Production deployments can join every health or observed-finality transition to
 a compact account-operator activity record. Health transitions additionally
@@ -400,6 +508,84 @@ capacity and alert on the operational error instead of dropping durable intent.
 This is an SDK/adopter API only: AdCP defines the complete health-notification
 wire payload but no public account-activity read task, so do not expose `listActivity()`
 as an invented wire extension.
+
+`listActivity()` preserves the lifecycle-only compatibility surface. Use
+`listNotificationActivity()` for the complete internal revision, adjustment,
+and delivery-ready event stream. It remains an SDK/admin API, not an AdCP wire
+task.
+
+That lifecycle activity is distinct from the protocol's webhook transport
+diagnostics. To support `list_accounts({ include_webhook_activity: true })`,
+wire the principal-scoped attempt log into the same notification runtime:
+
+This manual composition replaces the earlier `const notifications` block; it
+reuses that block's `attemptCheckpoint` and installs exactly one notification
+runtime. Prefer the production composer for new deployments.
+
+```ts
+import {
+  composeNotificationDeliveryAttemptCheckpoints,
+  composeWebhookAttemptResultObservers,
+  createPostgresReportingWebhookActivityV1,
+  projectListAccountsReportingWebhookActivityV1,
+} from '@adcp/sdk';
+
+const webhookActivity = createPostgresReportingWebhookActivityV1({
+  db: pool,
+  namespace: 'seller-production',
+  retentionDays: 30, // protocol minimum
+});
+
+const notifications = createPostgresPersistentNotificationRuntime({
+  db: pool,
+  publisherScope: 'seller-production',
+  checkpointDeliveryAttempt: composeNotificationDeliveryAttemptCheckpoints(
+    attemptCheckpoint, // pin the recipient before publishing buyer-visible evidence
+    webhookActivity.checkpointDeliveryAttempt, // diagnostics are the final pre-POST write
+  ),
+  webhooks: {
+    ...webhookOptions,
+    onAttemptResult: composeWebhookAttemptResultObservers(
+      webhookActivity.emitterObservers.onAttemptResult,
+      webhookOptions.onAttemptResult,
+    ),
+    onAttemptObserverError(error, phase) {
+      webhookMetrics.recordObserverFailure(error, phase);
+    },
+  },
+  ...notificationOptions,
+});
+
+for (const sql of webhookActivity.migrations.all) await pool.query(sql);
+await webhookActivity.probe();
+
+const response = await authoritativeListAccounts(params, ctx);
+return projectListAccountsReportingWebhookActivityV1({
+  response,
+  request: params,
+  tenantId: ctx.tenant.id,
+  principalId: ctx.agent.agent_url,
+  activity: webhookActivity,
+});
+```
+
+Both scope values must come from authenticated context. The projector can only
+decorate accounts already returned by the authoritative handler; it never
+resolves additional accounts. It strips adopter-supplied `webhook_activity`
+even when the buyer did not request the field, preventing permissive response
+shapes from leaking arbitrary diagnostics. Rows are isolated by tenant,
+principal, and account and ordered newest first.
+
+The pre-POST reservation records `pending` before network I/O. The emitter's
+awaited result observer completes it as `success`, `failed`, `timeout`, or
+`connection_error`; observer failures never turn a successful remote POST into
+a retry. A completion outage therefore leaves the honest `pending` record
+rather than risking a duplicate send. Query strings, fragments, userinfo, and
+all non-allowlisted path segments are removed before storage. Error text is a
+fixed classification and never includes headers, bodies, exception prose, or
+credentials. Schedule bounded `pruneCompleted()` calls; pending attempts are
+retained for investigation. Advertise `supports_webhook_activity: true` only
+after migrations and both notification/activity probes succeed.
 
 Projected activity defaults to 90-day retention measured from projection (or
 from commit for finality-only records that require no wire projection).
@@ -698,13 +884,13 @@ queue schema, or migration ordering.
 
 When `get_reporting_status` omits a period, the operational default horizon is the 24 hours ending at `ledger_as_of`. The `health` and `finality` arrays filter periods-view output only; they do not rewrite summary health or the underlying obligation projection.
 
-In AdCP 3.2.0-rc.4, `next_expected_at` has two deliberately different summary meanings. An open summary reports the next obligation due time (period end plus the frozen delivery SLA). A `complete` summary instead reports the nearest future period start, strictly after `ledger_as_of`, across configuration generations active in the selected scope. A periods response never carries this summary forecast. This wire-projection rule does not rewrite an obligation's immutable `expected_at`, historical snapshots, callback timing, or the installed schedule from which future boundaries are derived.
+Since AdCP 3.2.0-rc.6, `next_expected_at` has two deliberately different summary meanings. An open summary reports the next obligation due time (period end plus the frozen delivery SLA). A `complete` summary instead reports the nearest future period start, strictly after `ledger_as_of`, across configuration generations active in the selected scope. A periods response never carries this summary forecast. This wire-projection rule does not rewrite an obligation's immutable `expected_at`, historical snapshots, callback timing, or the installed schedule from which future boundaries are derived.
 
 `projectReportingObligationHealthV1` is the pure five-state projection. Before `expectedAt`, missing evidence is `waiting`; during recovery it is `delayed`; after the recovery deadline it is `action_required`; readable qualifying evidence is `healthy` for an open scope and `complete` for a closed scope. An unfiltered closed scope with no caller-owned configurations or no due periods is vacuously `complete`; an explicitly unknown configuration returns `lookup_unavailable`, and a snapshot with missing elapsed obligations fails closed. The simplified lifecycle persists deterministic issues and `reporting.status_changed` transitions. In legacy mode it then calls only subscribers already authorized and supplied by the host; with the transactional port, finality-only changes stay in internal activity and health changes flow through the durable AdCP notification runtime. When the store implements the optional `getManagedLifecycleProjection`, the reconciler folds Managed Delivery through the same projection the read path uses, so a persisted transition and its webhook report the health a read of that obligation would return instead of Core health alone. Every managed instant is written at database precision: a JS `Date` holds milliseconds, so taking the batch instant through one truncated `recorded_at` below the microsecond watermark written from the same clock and the reconcile it should have triggered could never become due. The lifecycle projection reads each chain's leaf **as of the cutoff** — the receipt nothing recorded by then supersedes — rather than its whole history, because the leaf is the only thing the verdict uses. Asking which row is current *now* and only then applying the cutoff answered "neither" for a rejection an acceptance had since repaired, and persisted `RECEIPT_REQUIRED` over a rejection the buyer had already filed. Reading the history instead made an obligation whose subject was repaired more times than a snapshot page may carry — a state the receipt store admits — permanently unreconcilable. A leaf also stops being a leaf when its successor is pruned — the tombstone records what it superseded — or retention handed a settled subject back to the rejection its acceptance had replaced. The read path applies the same rule at the verdict: a tombstoned acceptance outranks a rejection it superseded, so `reconciliation_status` cannot report `rejected` for a subject the lifecycle considers settled. Evidence recorded after the cutoff is out of scope at that cutoff: revisions and adjustments alike are filtered by it exactly as receipts are — a revision committed after the cutoff arrives with no materialization and no receipt in scope and would read as an unmet consumer obligation, while the compare-and-set still fences on the full revision set, which is a concurrency check rather than a statement about an instant — by the store's own ordering column, not by the producer-authored `createdAt` on the body, because a producer clock running ahead otherwise hid a committed correction from the lifecycle while the public read, which orders by that column, kept demanding a receipt for it — and pruned conclusions carry the instant they concluded, so a historical reconcile cannot settle on an acceptance or a delivery that had not happened yet. The bound is now one leaf per (consumer, subject), which is the product of two dimensions the store admits independently, and crossing it — like an oversized roster or conclusion set — truncates at a deterministic boundary and reports `receiptEvidenceComplete: false` rather than failing: a bound the write path can legitimately cross must never be a hard error, and an incomplete projection is treated exactly as an unproven roster is, so it can never report an obligation reconciled. Wire counters are computed on the read path, which still sees every row. A projection that cannot be published is reported by `runWorker` as `reconcilesDeferred` rather than aborting the sweep — the durable write already committed and the obligation stays due, so the deadline sweep, which isolates and backs off per obligation, owns the retry. Reads are scoped to one authenticated consumer while a transition is account-level, so the reconciler keeps the most severe consumer: the seller's obligation is not reconciled until every consumer that owes a receipt has accepted. Consumer-specific issue codes — `RECEIPT_REQUIRED`, `RECEIPT_REJECTED`, `ADJUSTMENT_RECEIPT_REQUIRED`, `ADJUSTMENT_RECEIPT_REJECTED` — are deliberately excluded from that persisted set and from transition `issueIds`, because the issue store is keyed by obligation with no consumer dimension and reads republish persisted issues to whichever consumer is asking; publishing them would hand one consumer another's rejection state and exact receipt ingest timing. Their severity still reaches the account-level `health`, and each caller's own issues are recomputed per read. Aggregation runs over `obligatedConsumerIds`, not over whoever happens to have submitted, so a silent authorized consumer cannot vanish when another accepts. The managed tables carry no consumer dimension on destination authorizations or bindings, so the built-in PostgreSQL store cannot prove the roster is complete and reports `obligatedConsumerRosterComplete: false`; while that is false the reconciler keeps one zero-receipt consumer in the fold and never reports a `consumer_receipt` obligation reconciled. Supply the roster from your own authorization layer through the store's `obligatedConsumers` option — `(input: { reporting_obligation_id, account_id }) => Promise<{ ids, complete }>` — and return `complete: true` to get accurate reconciled transitions. Because the conservative default holds a `consumer_receipt` obligation at `action_required` from first delivery, and the per-consumer receipt issues are deliberately not persisted, the reconciler restates that state once per obligation as a `RECEIPT_REQUIRED` issue anchored to the obligation's own `expected_at`. It names no principal and carries no receipt timing, so a degraded persisted health is never unexplained and the leak stays closed.
 
 ## Consumer status ingest
 
-The SDK is pinned to AdCP 3.2.0-rc.4 and exposes `sync_reporting_status` from the ledger subpath. Its request, response, consumer-status, obligation, issue, delivery-capabilities, and reporting-status types come from the published rc.4 schema bundle.
+The SDK is pinned to AdCP 3.2.0-rc.7 and exposes `sync_reporting_status` from the ledger subpath. Its request, response, consumer-status, obligation, issue, delivery-capabilities, and reporting-status types come from the published rc.7 schema bundle.
 
 ```ts
 const syncReportingStatus = createSyncReportingStatusHandler(store, {
@@ -903,9 +1089,10 @@ recipient identity. Obligations sharing the same account, report definition,
 period, media-buy scope, and canonical content therefore reuse one revision,
 including fan-out across direct-Core and managed-materialization consumers.
 
-For account-local calendar periods, expand each boundary externally into an
-immutable configuration generation. Do not model a local day as a constant
-86,400,000 ms across daylight-saving changes. For example, the New York daily
+For account-local calendar periods outside the stock `P1D` +
+`source_timezone` path, expand each boundary externally into an immutable
+configuration generation. Do not model a local day as a constant 86,400,000 ms
+across daylight-saving changes. For example, the New York daily
 periods `2026-03-08T05:00:00Z` → `2026-03-09T04:00:00Z` and
 `2026-11-01T04:00:00Z` → `2026-11-02T05:00:00Z` use 82,800,000 and 90,000,000
 milliseconds respectively. Give each generated boundary its own delivery

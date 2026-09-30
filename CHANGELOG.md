@@ -1,5 +1,118 @@
 # Changelog
 
+## 14.0.0-rc.53
+
+### Minor Changes
+
+- b051298: Add `ComplyOptions.routeStoryboard`, a per-storyboard routing hook so hosted graders can run `requires: [multi_agent]` storyboards inside `comply()` (adcontextprotocol/adcp#7758). The hook receives each applicable storyboard plus `{ agent_url, profile }` (the profile is agent-reported, untrusted input). It may return `undefined` (unchanged single-URL run), `{ agents, default_agent, context?, storyboard? }` (routed `runStoryboard('', storyboard, { ...runOptions, agents, default_agent, context })`; the result flows into tracks, failures, `storyboards_executed` and `bundle_results`), or `{ skip: reason }` (recorded as the same whole-storyboard `requirement_unmet` row an unrouted `multi_agent` storyboard gets, with the sanitized reason as `skip.detail`, so the bundle stays `partial`). Storyboards whose root capability predicate the agent under test does not satisfy are not passed to the hook and stay `not_applicable`.
+
+  Routed results are graded against the agent under test only: a failed step or discovery failure on another routed agent becomes a `prerequisite_failed` coverage gap (`partial`, never `failing`), and a routed storyboard with no passing step served by the agent under test cannot reach `passing`.
+
+  `comply()` enforces credential and network isolation for routed runs: `default_agent` must be the agent under test; every entry that sets `auth` must set a real credential object, and only an agent-under-test entry may omit it (the run-level credential is pinned onto that entry and dropped from the shared routed options); routing is refused while run-level `headers` are set; a replacement storyboard must keep its id and grading shape; storyboards that would send `$test_kit.auth` / `from_test_kit` credentials through a step not pinned to the agent under test are recorded as skips; run-level `transport` (including `trustedFetchFn`) is shared by every routed agent. New exported types: `ComplyStoryboardRoute`, `ComplyStoryboardSkip`, `ComplyStoryboardRouting`, `ComplyRouteStoryboardContext`.
+
+### Patch Changes
+
+- 65bb5a7: fix(signing): reject Base64URL sf-binary under the AdCP 3.2 request-signing profile (#3073).
+
+  A verifier pinned to AdCP 3.2 (`adcpVersion`, or the `createAdcpServer` auto-wired verifier on a 3.2 server) now parses `Signature` and `Content-Digest` only as RFC 8941 padded standard Base64, regardless of `covers_content_digest`. A Base64URL `Signature` fails with `request_signature_header_malformed` at checklist step 1, before the window and crypto checks, so `profile-3.2/negative/001-base64url-sf-binary` passes even when graded at a live clock. A Base64URL or unpadded `Content-Digest` fails with `request_signature_header_malformed` instead of `request_signature_digest_mismatch`. The whole `Signature` dictionary is parsed strictly, and standard Base64 whose byte length needs no `=` padding is now accepted.
+
+  This removes the SDK 14 rolling-upgrade fallback in which a 3.2-pinned verifier with internal `covers_content_digest: 'either'` also accepted SDK 13 Base64URL signatures. The spec forbids a 3.2 verifier from retrying a legacy token. Serve legacy signers from an endpoint pinned to 3.0/3.1 instead. Verifiers pinned to 3.0/3.1 and unpinned verifiers keep accepting both serializations. Endpoints that advertise 3.2 must pass a trusted `adcpVersion`: an unpinned verifier cannot tell a legacy request from the 3.2 negative vector.
+
+## 14.0.0-rc.52
+
+### Patch Changes
+
+- 57594b4: Describe the SDK's buyer, server, and conformance surfaces in the npm README.
+
+## 14.0.0-rc.51
+
+### Minor Changes
+
+- 39469e6: Honor seller-declared buying modes and account requirements before get_products dispatch. Calls without a brief no longer assume wholesale unless the seller declares it. Add a public account resolver that selects a single active seller-assigned account or syncs a buyer-declared natural key, and use it in media-buy storyboards.
+
+### Patch Changes
+
+- 7ab0bdc: Evaluate routed storyboard capability gates against the default agent when set, keeping route-specific applicability without a default, match governance task modes as subsets, and keep AdCP 3.2 governed requests identical to the payload approved by check_governance. The approved payload now includes the wire version envelope, fixture bindings, and run-scoped brand and sandbox fields. Governed requests use the raw wire route and bypass buyer normalization, creative wire hints, and seller-schema field stripping after approval; canonical creative methods reject the internal preservation option before they can reshape approved arguments. A missing approved idempotency key fails its storyboard step before dispatch. AdCP 3.1 governance retains its existing runner defaults. Routed storyboard applicability can change when governance steps use a separate agent.
+
+## 14.0.0-rc.50
+
+### Minor Changes
+
+- 80d46a1: Grade the request-signing 3.2 profile vectors when selected, including their negative mutations and storyboard steps. Keep the missing-content-digest refusal gradable for agents that require digest coverage.
+- f3562ac: Seed storyboard fixtures through the routed agent that owns each fixture's state. A read-only peer no longer needs a test controller, and routed runs preserve each selected agent's auth and controller capabilities during pre-flight seeding.
+
+### Patch Changes
+
+- ab47b6c: Honor explicit account IDs and operators in account, creative, and reporting controller storyboard steps while forcing sandbox routing and keeping the run brand. Exact reporting-revision delivery reads keep their authored account, so they query the revision that the controller published. Media-buy simulations and seeding retain their create/read account scope, sandbox-only hints fall back to the resolved account, and `seed_account` keeps the authorized caller scope.
+- a1c50b9: Keep `serve()` connections open while a client validates schemas between MCP calls, avoiding half-closed sockets in multi-step flows.
+- 95ff79a: Refresh the maintained AdCP 3.1 compatibility schema and compliance bundle to 3.1.24, and advertise compatibility through the latest 3.1 patch.
+- 08dee7d: Project account ID controller targets to core account references before resolution. Resolvers no longer receive the controller-only `sandbox` assertion on ID refs. Unexpected resolver failures now return a safe `SERVICE_UNAVAILABLE` error and never admit through the sandbox fallback; return `null` or throw `AccountNotFoundError` for missing accounts. The sandbox authority gate remains fail closed.
+- 08e19ce: Resolve type-generation schema references from the verified local AdCP bundle instead of the live schema host, preventing nondeterministic generated output during release checks.
+
+## 14.0.0-rc.49
+
+### Minor Changes
+
+- 03fe08b: Adopt the signed AdCP 3.2.0-rc.7 schema and compliance bundles as the default
+  wire release.
+
+  The generated types and validators now include the `viewable_rate` optimization
+  metric and optional account-scoped creative-format discovery. Account resolvers
+  must authorize any buyer-supplied `account_id`, including this new discovery
+  path. Reporting schemas retain their rc.6 wire shape; the shipped consumer-status
+  golden fixture remains byte-exact at rc.6. The packaged principal and
+  reporting-core storyboards are rebound to the signed rc.7 bundle. As with earlier 3.2
+  prereleases, rc.7 replaces rc.6 in the advertised compatible versions;
+  communicating peers should upgrade together or select the exact `3.2-rc.7`
+  alias.
+
+- 888d48f: Expose a focused `@adcp/sdk/reporting/consumer` buyer entrypoint and publish an
+  existing-application worker example with PostgreSQL persistence, signed webhook
+  intake, buyer-retained expectations, and explicit adjustment policy. Include
+  seller/principal scope and run reason in buyer worker results and error context;
+  emit a credential-safe structured warning when background errors have no
+  observer. Result objects now include `consumerScope`, and an omitted or failed
+  error observer produces a structured warning on stderr.
+
+## 14.0.0-rc.48
+
+### Minor Changes
+
+- c0c01e8: Add a production buyer reporting worker with durable incremental repair, fenced multi-replica execution, polling, authenticated webhook hints, bounded concurrency, and graceful shutdown.
+- c0c01e8: Add durable, principal-scoped reporting webhook activity for list_accounts, pre-POST reservations, sanitized diagnostics, retention, and async-safe emitter observers.
+- c0c01e8: Emit durable transactional `reporting.ledger_changed` and `reporting.delivery_ready` notifications alongside status changes.
+- c0c01e8: Harden Reliable Reporting tenant isolation, webhook recovery auditing, receipt replay scope, optional pagination compatibility, buyer deadlines and dynamic rosters, durable lease fencing, fair recovery, and bounded production database work. Buyer reconciliation now independently verifies post-official adjustments and durably submits adjustment receipts. Pending consumer-status stores require seller/principal scope, checkpoint identities include a versioned immutable-context fingerprint, production notification installation requires `accounts.list`, authenticated notification routing requires `consumerScope`, and subscriber IDs enforce the protocol's 64-character identifier grammar. Exact-revision reads now default to a configurable 32 MiB decoded-byte ceiling (`maxRevisionBytes`; use 256 MiB for pre-14 behavior). Webhook attempt observers are now awaitable and time-bounded, and signing plus each POST has a configurable 30 second default deadline; failures remain isolated through `onAttemptObserverError`. Reporting webhook attempt ordinals are allocated only at the final durable pre-POST barrier, remain dense across retryable authorization failures and restarts, and age out with their activity retention window.
+- c0c01e8: Project Reliable Reporting webhook activity through the real `list_accounts`
+  runtime using trusted authenticated scope, publish shared Python/TypeScript
+  canonical JSON fixtures, and add production parity and operations runbooks.
+- c0c01e8: Harden the Reliable Reporting buyer runtime with durable notification deduplication and authenticated seller/principal scope binding.
+- c0c01e8: Add a probed PostgreSQL production composer for Reliable Reporting, including Managed Delivery, all notification types, webhook activity, recovery workers, and receipt routing.
+
+### Patch Changes
+
+- c0c01e8: Make deployment-wide Managed Delivery planning durably fair across reporting accounts. PostgreSQL now persists a round-robin cursor and gives each selected account a bounded first-pass share before a hot tenant can consume spare capacity, so later and newly added accounts cannot be starved by the lexically first account.
+- 3d11a65: Expose registry runner capability versions and refresh-restoration tracking issue metadata.
+- c0c01e8: Add durable PostgreSQL buyer reporting checkpoints, pending status statements, change cursors, and fenced work leases.
+
+## 14.0.0-rc.47
+
+### Minor Changes
+
+- 1910f0d: Adopt the signed AdCP 3.2.0-rc.6 schema and compliance bundles as the default wire release.
+
+  The generated surface adds the `sales-exchange`, `sales-retail-media`, and
+  `sales-streaming-tv` specialisms; retry-safe asynchronous `get_creative_features` contracts;
+  request-signing error codes; seller-policy decline reasons; and the terminal
+  `COMMITTED_RESOURCE_PURGED` idempotency outcome. Compact buy and proposal-acceptance
+  requests can also carry the new optional media-buy `name`.
+
+  As with earlier 3.2 prereleases, rc.6 replaces rc.4 in
+  `COMPATIBLE_ADCP_VERSIONS`; communicating peers should upgrade together or use the
+  `3.2-rc.6` release-precision alias carried by this SDK build.
+
+- 22223b6: Add stock P1D source-timezone planning with civil-day boundaries and fixed-time SLAs. Use the same schedule for producer planning, source feasibility, coverage, deadline projection and consumer-status eligibility, while preserving numeric schedules and requiring a new generation when stored fixed boundaries would change.
+- 404c5cb: Complete caller-supplied `reporting_webhook` preferences with the client's configured webhook URL and authentication before validating canonical `create_media_buy` requests.
+
 ## 14.0.0-rc.46
 
 ### Patch Changes

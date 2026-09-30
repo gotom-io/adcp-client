@@ -90,7 +90,16 @@ const MAX_UNPACKED_PACKAGE_BYTES = 120 * 1024 * 1024;
 // module set (+4 files); byte and schema budgets stay fixed.
 // Acceptance-policy storyboard verification adds one internal dual-format
 // runtime/declaration module set (+4 files); byte and schema budgets stay fixed.
-const MAX_PACKED_FILE_COUNT = 6_135 + 34 + 4 + 10 + 4 + 4 + 4 + 9 + 16 + 4 + 1 + 5 + 8 + 4 + 4;
+// AdCP 3.2.0-rc.6 replaces the rc.4 schema/compliance bundle and adds eleven
+// publishable schema, storyboard, and packaged-skill artifacts in aggregate.
+// Calendar-day source boundaries add the internal reporting/ledger/schedule module:
+// schedule.js, schedule.mjs, schedule.d.ts, and schedule.d.mts (+4 files).
+// Reliable Reporting adds three dual-format runtime/declaration modules (+12)
+// and one packaged operations guide (+1); byte budgets remain unchanged.
+// The focused buyer entrypoint adds four dual-format runtime/declaration files,
+// and its published existing-app worker and guide add two more (+6).
+// Public account resolution adds one dual-format runtime/declaration module (+4).
+const MAX_PACKED_FILE_COUNT = 6_135 + 34 + 4 + 10 + 4 + 4 + 4 + 9 + 16 + 4 + 1 + 5 + 8 + 4 + 4 + 11 + 4 + 13 + 6 + 4;
 const MAX_BUNDLED_SCHEMA_BYTES = 1280 * 1024;
 const MAX_CJS_SCHEMA_DECLARATION_BYTES = 45 * 1024 * 1024;
 const MAX_ESM_SCHEMA_FACADE_BYTES = 1024;

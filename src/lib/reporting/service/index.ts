@@ -1,4 +1,4 @@
-import type { Account } from '../../server/decisioning/account';
+import type { Account, ResolveContext } from '../../server/decisioning/account';
 import type { RequestContext } from '../../server/decisioning/context';
 import type { DecisioningPlatform } from '../../server/decisioning/platform';
 import type { ReliableReportingPlatform } from '../../server/decisioning/specialisms/reporting';
@@ -6,9 +6,20 @@ import { scanArgsForCredentials } from '../../server/credential-policy';
 import { canonicalize } from '../../utils/jcs';
 import { redactCredentialPatterns } from '../../utils/redact-credential-patterns';
 import type { ReportingDeliveryCapabilities, ReportingDeliveryOffering } from '../../types/tools.generated';
-import { ReportingDeliveryOfferingSchema } from '../../types/schemas.generated';
+import { ReportingDeliveryCapabilitiesSchema, ReportingDeliveryOfferingSchema } from '../../types/schemas.generated';
+import {
+  createPostgresPersistentNotificationRuntime,
+  type CreatePostgresPersistentNotificationRuntimeOptions,
+  type PostgresPersistentNotificationRuntime,
+} from '../../server/notification-subscriptions';
 import {
   REPORTING_LEDGER_MIGRATION,
+  REPORTING_MANAGED_DELIVERY_MIGRATION,
+  PostgresReportingLedgerStore,
+  PostgresReportingManagedDeliveryStore,
+  createPostgresReportingNotificationActivityRuntime,
+  createPostgresReportingNotificationAttemptCheckpoint,
+  createReportingManagedDeliveryRuntime,
   assertReportingConsumerMismatchEscalation,
   reportingConsumerStatusCapabilityV1,
   reportingEffectiveConsumerMismatchEscalationV1,
@@ -23,9 +34,23 @@ import {
   type ReportingLedgerStore,
   type ReportingProducerContactV1,
   type ReportingProducerV1,
+  type ReportingManagedDeliveryAdapterV1,
+  type ReportingManagedDeliveryRuntimeV1,
+  type PostgresReportingManagedDeliveryStoreOptions,
+  type PostgresReportingNotificationActivityOptions,
+  type PostgresReportingNotificationActivityRuntime,
+  type ReportingPgPool,
   type ReportingSourceWithReaderV1,
 } from '../ledger';
+import {
+  composeNotificationDeliveryAttemptCheckpoints,
+  composeWebhookAttemptResultObservers,
+  createPostgresReportingWebhookActivityV1,
+  projectListAccountsReportingWebhookActivityV1,
+  type PostgresReportingWebhookActivityV1,
+} from '../webhook-activity';
 import type { InlineReportingReplayRetentionV1 } from '../source';
+import { assertReportingCalendarDaySource, reportingCalendarDayOrigin } from '../ledger/schedule';
 import {
   ReportingCoverageConstituentIdentityV1Schema,
   SOURCE_BATCH_MANIFEST_MAX_METRIC_AVAILABILITY_V1,
@@ -43,6 +68,7 @@ import {
 } from '../source';
 
 const ADAPTER_SCOPE_KEY = '_adcp_reporting_adapter';
+const PRODUCTION_MANAGED_COMPOSITION = Symbol('production-managed-reporting-composition');
 
 /** The intentionally small provider boundary: one bounded slice fetch plus immutable metadata. */
 export interface ReliableReportingAdapterV1 {
@@ -92,6 +118,7 @@ type LedgerInstallInput = Omit<
   | 'configurationId'
   | 'installedAt'
   | 'semanticFingerprint'
+  | 'calendarRules'
   | 'account'
   | 'sourceScope'
   | 'sourceTimezone'
@@ -124,6 +151,12 @@ interface ReliableReportingSchedulerBaseOptionsV1 {
   intervalMilliseconds: number;
   maxObligationsPerAccount?: number;
   maxWorkerIterationsPerAccount?: number;
+  /** Bounded transactional notification claims per auxiliary pass. Defaults to 25. */
+  notificationRecoveryLimit?: number;
+  /** Independent notification recovery workers. Defaults to 4. */
+  notificationRecoveryConcurrency?: number;
+  /** Bounded webhook-outbox claims per auxiliary pass. Defaults to 10. */
+  webhookRecoveryLimit?: number;
   retryDelayMilliseconds?: number;
   executionDeadlineMilliseconds?: number;
   settlementGraceMilliseconds?: number;
@@ -251,6 +284,12 @@ export interface ReliableReportingServiceV1<TCtxMeta = Record<string, unknown>> 
 export function createReliableReportingService<TCtxMeta = Record<string, unknown>>(
   options: CreateReliableReportingServiceOptionsV1<TCtxMeta>
 ): ReliableReportingServiceV1<TCtxMeta> {
+  const allowManagedDelivery =
+    (
+      options as CreateReliableReportingServiceOptionsV1<TCtxMeta> & {
+        [PRODUCTION_MANAGED_COMPOSITION]?: boolean;
+      }
+    )[PRODUCTION_MANAGED_COMPOSITION] === true;
   const adapterEntries = Object.entries(options.adapters);
   if (adapterEntries.length === 0) throw new TypeError('Reliable reporting requires at least one adapter');
   positiveInteger(options.automatedRecoveryWindowSeconds, 'automatedRecoveryWindowSeconds');
@@ -291,7 +330,7 @@ export function createReliableReportingService<TCtxMeta = Record<string, unknown
     }
     // Validated against the routed offering, so the narrowing the inline
     // executor applies (media_buy applicability, one format) is authoritative.
-    validateDeliveryOffering(routedOffering, deliveryOffering);
+    validateDeliveryOffering(routedOffering, deliveryOffering, allowManagedDelivery);
     sources.set(adapterId, source);
     // Keyed by adapter, not by offering ID: the route must resolve to the exact
     // executor instance whose contract was validated here. A global offering
@@ -437,7 +476,7 @@ export function createReliableReportingService<TCtxMeta = Record<string, unknown
       ) {
         throw new TypeError('Trusted reporting timezone conflicts with the configuration timezone assertion');
       }
-      assertSupportedScheduleSemantics(frozenInput.schedule, deliveryOffering, normalizedTimezone);
+      assertSupportedScheduleSemantics(frozenInput.schedule, deliveryOffering, normalizedTimezone, offering);
       const { constituents, mediaBuyIds } = trustedCoverage(coverage, frozenInput.requestedMetrics);
       if (
         configuration.expectedMediaBuyIds !== undefined &&
@@ -556,6 +595,450 @@ export function createReliableReportingService<TCtxMeta = Record<string, unknown
     },
   };
 
+  return service;
+}
+
+type ProductionNotificationOptions = Omit<
+  CreatePostgresPersistentNotificationRuntimeOptions,
+  'db' | 'publisherScope' | 'checkpointDeliveryAttempt' | 'supportedAccountEventTypes'
+>;
+
+export type CreatePostgresReliableReportingProductionServiceOptionsV1<TCtxMeta = Record<string, unknown>> = Omit<
+  CreateReliableReportingServiceOptionsV1<TCtxMeta>,
+  'store' | 'subscribers'
+> & {
+  db: ReportingPgPool;
+  /** Stable, non-secret deployment namespace shared by reporting workers. */
+  namespace: string;
+  /** Stable webhook publisher identity; credentials must never be used here. */
+  publisherScope: string;
+  /** Explicit acknowledgement required by the authoritative Core store. */
+  acknowledgeIsolatedDatabase: true;
+  notifications: ProductionNotificationOptions;
+  managedDelivery: {
+    adapter: ReportingManagedDeliveryAdapterV1;
+    resourceRetentionDays: number;
+    authorizationRevocationSeconds: number;
+    store?: Omit<PostgresReportingManagedDeliveryStoreOptions, 'notificationActivityPort'>;
+  };
+  activity: Omit<
+    PostgresReportingNotificationActivityOptions,
+    'db' | 'notifications' | 'namespace' | 'attemptCheckpoint' | 'tenantScopeForAccount'
+  > & {
+    tenantScopeForAccount(accountId: string): string;
+  };
+  webhookActivity?: { tableName?: string; retentionDays?: number };
+  /** Resolve activity visibility from verified auth/registry state, never request fields. */
+  resolveWebhookActivityScope(
+    context: ResolveContext
+  ): { tenantId: string; principalId: string } | Promise<{ tenantId: string; principalId: string }>;
+  /** Trusted complete roster of consumers that owe receipts for an obligation. */
+  obligatedConsumers?: (input: {
+    reporting_obligation_id: string;
+    account_id: string;
+  }) => Promise<{ ids: readonly string[]; complete: boolean; version?: string }>;
+  /** Optional migration-system bridge. Called before any capability probe. */
+  applyMigrations?: (migrations: readonly string[]) => Promise<void>;
+};
+
+export interface PostgresReliableReportingProductionServiceV1<TCtxMeta = Record<string, unknown>> {
+  readonly setup: {
+    readonly component: 'reliable-reporting-production';
+    readonly migrations: readonly string[];
+  };
+  readonly capabilities: ReportingDeliveryCapabilities;
+  readonly platform: ReliableReportingPlatform<TCtxMeta>;
+  readonly core: ReliableReportingServiceV1<TCtxMeta>;
+  readonly managed: ReportingManagedDeliveryRuntimeV1<RequestContext<Account<TCtxMeta>>>;
+  readonly notifications: PostgresPersistentNotificationRuntime;
+  readonly notificationActivity: PostgresReportingNotificationActivityRuntime;
+  readonly webhookActivity: PostgresReportingWebhookActivityV1;
+  readonly stores: {
+    core: PostgresReportingLedgerStore;
+    managed: PostgresReportingManagedDeliveryStore;
+  };
+  readonly running: boolean;
+  installConfiguration: ReliableReportingServiceV1<TCtxMeta>['installConfiguration'];
+  install<TPlatform extends DecisioningPlatform<unknown, TCtxMeta>>(
+    platform: TPlatform
+  ): TPlatform & { reporting: ReliableReportingPlatform<TCtxMeta> };
+  runCycle(options: ReliableReportingCycleOptionsV1): Promise<{
+    core: Awaited<ReturnType<ReliableReportingServiceV1<TCtxMeta>['runCycle']>>;
+    managed: Awaited<ReturnType<ReportingManagedDeliveryRuntimeV1['runWorker']>>;
+  }>;
+  recoverOnce(options: { deploymentWide: true }): Promise<{
+    activity: Awaited<ReturnType<PostgresReportingNotificationActivityRuntime['recoverOnce']>>;
+    webhookOutbox: Awaited<ReturnType<PostgresPersistentNotificationRuntime['recoverOnce']>>;
+  }>;
+  start(options: ReliableReportingSchedulerOptionsV1 & { deploymentWide: true }): void;
+  stop(): Promise<void>;
+}
+
+/**
+ * Assemble and probe the complete seller-side Reliable Reporting production
+ * chain. Capability publication happens only after every durable component is
+ * present and the managed policy has been adopted.
+ */
+export async function createPostgresReliableReportingProductionService<TCtxMeta = Record<string, unknown>>(
+  options: CreatePostgresReliableReportingProductionServiceOptionsV1<TCtxMeta>
+): Promise<PostgresReliableReportingProductionServiceV1<TCtxMeta>> {
+  if (!options.db || typeof options.db.query !== 'function' || typeof options.db.connect !== 'function') {
+    throw new TypeError('Reliable Reporting production service requires a PostgreSQL pool');
+  }
+  if (!/^[A-Za-z0-9_.:-]{1,255}$/.test(options.namespace)) {
+    throw new TypeError('Reliable Reporting production namespace must be a bounded non-secret identifier');
+  }
+  if (!/^[A-Za-z0-9_.:-]{1,255}$/.test(options.publisherScope)) {
+    throw new TypeError('Reliable Reporting publisherScope must be a bounded non-secret identifier');
+  }
+  if (typeof options.resolveWebhookActivityScope !== 'function') {
+    throw new TypeError('Reliable Reporting production service requires resolveWebhookActivityScope');
+  }
+  if (typeof options.activity?.tenantScopeForAccount !== 'function') {
+    throw new TypeError('Reliable Reporting production service requires activity.tenantScopeForAccount');
+  }
+  if (
+    Object.values(options.adapters).some(
+      adapter => adapter.deliveryOffering.reconciliation_mode === 'consumer_receipt'
+    ) &&
+    typeof options.obligatedConsumers !== 'function'
+  ) {
+    throw new TypeError('Reconciled Billing production offerings require a trusted obligatedConsumers roster');
+  }
+
+  const recipientCheckpoint = createPostgresReportingNotificationAttemptCheckpoint({
+    db: options.db,
+    namespace: options.namespace,
+    ...(options.activity?.tableName !== undefined ? { tableName: options.activity.tableName } : {}),
+  });
+  const webhookActivity = createPostgresReportingWebhookActivityV1({
+    db: options.db,
+    namespace: options.namespace,
+    ...(options.webhookActivity?.tableName !== undefined ? { tableName: options.webhookActivity.tableName } : {}),
+    ...(options.webhookActivity?.retentionDays !== undefined
+      ? { retentionDays: options.webhookActivity.retentionDays }
+      : {}),
+  });
+  const composedAttemptCheckpoint = composeNotificationDeliveryAttemptCheckpoints(
+    recipientCheckpoint,
+    webhookActivity.checkpointDeliveryAttempt
+  );
+  const attemptCheckpoint = Object.assign(
+    async (input: Parameters<typeof recipientCheckpoint>[0]) => composedAttemptCheckpoint(input),
+    { activityStore: recipientCheckpoint.activityStore }
+  );
+  const adopterAttemptResult = options.notifications.webhooks.onAttemptResult;
+  const adopterAttemptObserverError = options.notifications.webhooks.onAttemptObserverError;
+  const notifications = createPostgresPersistentNotificationRuntime({
+    ...options.notifications,
+    db: options.db,
+    publisherScope: options.publisherScope,
+    checkpointDeliveryAttempt: attemptCheckpoint,
+    supportedAccountEventTypes: ['reporting.ledger_changed', 'reporting.status_changed', 'reporting.delivery_ready'],
+    webhooks: {
+      ...options.notifications.webhooks,
+      onAttemptResult: composeWebhookAttemptResultObservers(
+        webhookActivity.emitterObservers.onAttemptResult,
+        adopterAttemptResult
+      ),
+      onAttemptObserverError(error, phase) {
+        if (adopterAttemptObserverError) {
+          try {
+            adopterAttemptObserverError(error, phase);
+            return;
+          } catch (observerError) {
+            console.warn(
+              `[adcp/reporting] webhook observer-error hook failed: ${safeMessage(observerError)}; original: ${safeMessage(error)}`
+            );
+            return;
+          }
+        }
+        console.warn(`[adcp/reporting] webhook ${phase} observer failed: ${safeMessage(error)}`);
+      },
+    },
+  });
+  const notificationActivity = createPostgresReportingNotificationActivityRuntime({
+    ...options.activity,
+    db: options.db,
+    notifications,
+    namespace: options.namespace,
+    attemptCheckpoint,
+    tenantScopeForAccount: options.activity.tenantScopeForAccount,
+  });
+  const coreStore = new PostgresReportingLedgerStore(options.db, {
+    acknowledgeIsolatedDatabase: options.acknowledgeIsolatedDatabase,
+    managedDelivery: true,
+    ...(options.obligatedConsumers ? { obligatedConsumers: options.obligatedConsumers } : {}),
+    ...(options.consumerMismatchEscalation ? { consumerMismatchEscalation: options.consumerMismatchEscalation } : {}),
+    notificationActivityPort: notificationActivity.port,
+  });
+  const managedStore = new PostgresReportingManagedDeliveryStore(options.db, {
+    ...options.managedDelivery.store,
+    statusRetentionDays: options.statusRetentionDays,
+    advertisedRecoveryWindowSeconds: options.automatedRecoveryWindowSeconds,
+    notificationActivityPort: notificationActivity.port,
+  });
+  const coreOptions = {
+    ...options,
+    store: coreStore,
+    [PRODUCTION_MANAGED_COMPOSITION]: true,
+  } as CreateReliableReportingServiceOptionsV1<TCtxMeta> & { [PRODUCTION_MANAGED_COMPOSITION]: true };
+  const core = createReliableReportingService(coreOptions);
+  const migrations = Object.freeze([
+    REPORTING_LEDGER_MIGRATION,
+    REPORTING_MANAGED_DELIVERY_MIGRATION,
+    ...notifications.migrations.all,
+    ...notificationActivity.migrations.all,
+    ...webhookActivity.migrations.all,
+  ]);
+  await options.applyMigrations?.(migrations);
+  await notifications.probe();
+  await notificationActivity.probe();
+  await webhookActivity.probe();
+
+  const managed = await createReportingManagedDeliveryRuntime<RequestContext<Account<TCtxMeta>>>({
+    coreStore,
+    store: managedStore,
+    adapter: options.managedDelivery.adapter,
+    offerings: core.capabilities.offerings,
+    automatedRecoveryWindowSeconds: options.automatedRecoveryWindowSeconds,
+    statusRetentionDays: options.statusRetentionDays,
+    resourceRetentionDays: options.managedDelivery.resourceRetentionDays,
+    authorizationRevocationSeconds: options.managedDelivery.authorizationRevocationSeconds,
+    ...(options.resolveConsumerId ? { resolveConsumerId: options.resolveConsumerId } : {}),
+    ...(options.consumerMismatchEscalation ? { consumerMismatchEscalation: options.consumerMismatchEscalation } : {}),
+  });
+  const capabilities = deepFreeze(
+    ReportingDeliveryCapabilitiesSchema.parse({
+      ...core.capabilities,
+      ...managed.reportingDeliveryCapabilities,
+      ledger_notification: 'reporting.ledger_changed',
+      status_notification: 'reporting.status_changed',
+      readiness_notification: 'reporting.delivery_ready',
+      supports_webhook_activity: true,
+    }) as ReportingDeliveryCapabilities
+  );
+  const platform: ReliableReportingPlatform<TCtxMeta> = {
+    capabilities,
+    getReportingStatus: (request, context) => managed.getReportingStatus(request, context as never),
+    getMediaBuyDelivery: (request, context) => managed.getMediaBuyDelivery(request, context as never),
+    ...(core.platform.syncReportingStatus
+      ? {
+          syncReportingStatus: core.platform.syncReportingStatus,
+          resolveConsumerId: core.platform.resolveConsumerId,
+        }
+      : {}),
+    ...(managed.syncReportingReceipts
+      ? {
+          syncReportingReceipts: (request, context) => managed.syncReportingReceipts!(request, context),
+        }
+      : {}),
+    async projectListAccounts(request, response, context) {
+      const withoutDiagnostics = () =>
+        projectListAccountsReportingWebhookActivityV1({
+          request: { ...request, include_webhook_activity: false },
+          response,
+          tenantId: 'diagnostics-not-requested',
+          principalId: 'diagnostics-not-requested',
+          activity: webhookActivity,
+        });
+      if (request.include_webhook_activity !== true) return withoutDiagnostics();
+      try {
+        const scope = await options.resolveWebhookActivityScope(context);
+        return await projectListAccountsReportingWebhookActivityV1({
+          request,
+          response,
+          tenantId: scope.tenantId,
+          principalId: scope.principalId,
+          activity: webhookActivity,
+        });
+      } catch (error) {
+        // Transport diagnostics are a debug aid. A logging-store outage must
+        // not take down the authoritative account roster or leak stale
+        // adopter-supplied activity fields.
+        defaultSchedulerWarn(`[adcp/reporting] webhook activity projection unavailable: ${safeMessage(error)}`);
+        return withoutDiagnostics();
+      }
+    },
+  };
+
+  let auxiliaryAbort: AbortController | undefined;
+  let auxiliaryPromise: Promise<void> | undefined;
+  let auxiliaryRotation = 0;
+  const reportAuxiliaryError = async (
+    scheduler: ReliableReportingSchedulerOptionsV1,
+    error: unknown
+  ): Promise<void> => {
+    if (scheduler.onError) {
+      try {
+        await scheduler.onError(error);
+        return;
+      } catch (observerError) {
+        warnSchedulerFailure(scheduler, { phase: 'cycle' }, error, observerError);
+        return;
+      }
+    }
+    warnSchedulerFailure(scheduler, { phase: 'cycle' }, error);
+  };
+  const runAuxiliaryPass = async (
+    scheduler: ReliableReportingSchedulerOptionsV1,
+    signal: AbortSignal
+  ): Promise<void> => {
+    signal.throwIfAborted();
+    try {
+      const totalLimit = scheduler.notificationRecoveryLimit ?? 25;
+      const concurrency = Math.min(scheduler.notificationRecoveryConcurrency ?? 4, totalLimit);
+      const baseLimit = Math.floor(totalLimit / concurrency);
+      const remainder = totalLimit % concurrency;
+      await Promise.all(
+        Array.from({ length: concurrency }, (_, index) =>
+          notificationActivity.recoverOnce({
+            limit: baseLimit + (index < remainder ? 1 : 0),
+            signal,
+            onError: error => reportAuxiliaryError(scheduler, error),
+          })
+        )
+      );
+    } catch (error) {
+      if (!signal.aborted) await reportAuxiliaryError(scheduler, error);
+    }
+    signal.throwIfAborted();
+    try {
+      await notifications.recoverOnce({ limit: scheduler.webhookRecoveryLimit ?? 10 });
+    } catch (error) {
+      if (!signal.aborted) await reportAuxiliaryError(scheduler, error);
+    }
+    signal.throwIfAborted();
+    const pruneResults = await Promise.allSettled([
+      notificationActivity.pruneProjected({ limit: 1_000 }),
+      webhookActivity.pruneCompleted({ limit: 1_000 }),
+    ]);
+    for (const result of pruneResults) {
+      if (result.status === 'rejected' && !signal.aborted) await reportAuxiliaryError(scheduler, result.reason);
+    }
+    const accountIds = rotate(await deploymentWideAccountIds(coreStore), auxiliaryRotation);
+    auxiliaryRotation += 1;
+    for (const accountId of accountIds) {
+      signal.throwIfAborted();
+      try {
+        await managed.runWorker({
+          signal,
+          ...(accountId ? { account_id: accountId } : {}),
+          ...(scheduler.maxWorkerIterationsPerAccount !== undefined
+            ? { maxIterations: scheduler.maxWorkerIterationsPerAccount }
+            : {}),
+        });
+        if (accountId) await managedStore.pruneExpiredEvidence?.({ account_id: accountId, limit: 1_000 });
+      } catch (error) {
+        if (!signal.aborted) await reportAuxiliaryError(scheduler, error);
+      }
+    }
+  };
+
+  const service: PostgresReliableReportingProductionServiceV1<TCtxMeta> = {
+    setup: Object.freeze({ component: 'reliable-reporting-production', migrations }),
+    capabilities,
+    platform,
+    core,
+    managed,
+    notifications,
+    notificationActivity,
+    webhookActivity,
+    stores: Object.freeze({ core: coreStore, managed: managedStore }),
+    get running() {
+      return core.running || auxiliaryPromise !== undefined;
+    },
+    installConfiguration: core.installConfiguration.bind(core),
+    install<TPlatform extends DecisioningPlatform<unknown, TCtxMeta>>(target: TPlatform) {
+      if (typeof target.accounts.upsert !== 'function') {
+        throw new TypeError('Reliable reporting requires accounts.upsert');
+      }
+      if (typeof target.accounts.list !== 'function') {
+        throw new TypeError(
+          'Reliable reporting production webhook activity requires accounts.list so list_accounts can serve the advertised diagnostics'
+        );
+      }
+      if (target.reporting && target.reporting !== platform) {
+        throw new TypeError('DecisioningPlatform already has a reporting lifecycle installed');
+      }
+      if (!target.reporting) {
+        Object.defineProperty(target, 'reporting', {
+          value: platform,
+          enumerable: true,
+          configurable: false,
+          writable: false,
+        });
+      }
+      return target as TPlatform & { reporting: ReliableReportingPlatform<TCtxMeta> };
+    },
+    async runCycle(cycle) {
+      const coreResult = await core.runCycle(cycle);
+      const managedResult = await managed.runWorker({
+        ...(cycle.signal ? { signal: cycle.signal } : {}),
+        ...(!cycle.deploymentWide ? { account_id: cycle.accountId } : {}),
+        ...(cycle.maxWorkerIterations !== undefined ? { maxIterations: cycle.maxWorkerIterations } : {}),
+      });
+      return { core: coreResult, managed: managedResult };
+    },
+    async recoverOnce(recoveryOptions) {
+      if (recoveryOptions?.deploymentWide !== true) {
+        throw new TypeError('Reliable Reporting production recovery requires deploymentWide: true');
+      }
+      const activityResult = await notificationActivity.recoverOnce();
+      const webhookOutbox = await notifications.recoverOnce();
+      return { activity: activityResult, webhookOutbox };
+    },
+    start(scheduler) {
+      if (auxiliaryPromise) throw new Error('Reliable Reporting production scheduler is already running');
+      if (scheduler.deploymentWide !== true) {
+        throw new TypeError('Reliable Reporting production scheduler requires deploymentWide: true');
+      }
+      if (
+        scheduler.notificationRecoveryLimit !== undefined &&
+        (!Number.isSafeInteger(scheduler.notificationRecoveryLimit) ||
+          scheduler.notificationRecoveryLimit < 1 ||
+          scheduler.notificationRecoveryLimit > 1_000)
+      ) {
+        throw new TypeError('notificationRecoveryLimit must be an integer from 1 through 1000');
+      }
+      if (
+        scheduler.notificationRecoveryConcurrency !== undefined &&
+        (!Number.isSafeInteger(scheduler.notificationRecoveryConcurrency) ||
+          scheduler.notificationRecoveryConcurrency < 1 ||
+          scheduler.notificationRecoveryConcurrency > 64)
+      ) {
+        throw new TypeError('notificationRecoveryConcurrency must be an integer from 1 through 64');
+      }
+      if (
+        scheduler.webhookRecoveryLimit !== undefined &&
+        (!Number.isSafeInteger(scheduler.webhookRecoveryLimit) ||
+          scheduler.webhookRecoveryLimit < 1 ||
+          scheduler.webhookRecoveryLimit > 1_000)
+      ) {
+        throw new TypeError('webhookRecoveryLimit must be an integer from 1 through 1000');
+      }
+      core.start(scheduler);
+      auxiliaryAbort = new AbortController();
+      const signal = auxiliaryAbort.signal;
+      auxiliaryPromise = (async () => {
+        while (!signal.aborted) {
+          try {
+            await runAuxiliaryPass(scheduler, signal);
+          } catch (error) {
+            if (!signal.aborted) await reportAuxiliaryError(scheduler, error);
+          }
+          if (!signal.aborted) await abortableDelay(scheduler.intervalMilliseconds, signal);
+        }
+      })().finally(() => {
+        auxiliaryAbort = undefined;
+        auxiliaryPromise = undefined;
+      });
+    },
+    async stop() {
+      auxiliaryAbort?.abort();
+      await Promise.all([core.stop(), auxiliaryPromise]);
+    },
+  };
   return service;
 }
 
@@ -892,7 +1375,11 @@ function keylessPredecessorScope(
   return structuredClone(predecessor.sourceScope);
 }
 
-function validateDeliveryOffering(source: ReportingSourceOfferingV1, delivery: ReportingDeliveryOffering): void {
+function validateDeliveryOffering(
+  source: ReportingSourceOfferingV1,
+  delivery: ReportingDeliveryOffering,
+  allowManagedDelivery = false
+): void {
   if (delivery.offering_id !== source.offeringId) throw new TypeError('Source and delivery offering IDs differ');
   if (delivery.report_definition_id !== source.contract.report_definition_id) {
     throw new TypeError('Source and delivery report definitions differ');
@@ -910,11 +1397,14 @@ function validateDeliveryOffering(source: ReportingSourceOfferingV1, delivery: R
     throw new TypeError('Delivery offering does not describe the source contract');
   }
   if (
-    delivery.method !== undefined ||
-    delivery.reconciliation_mode !== 'delivery_only' ||
-    delivery.feed_purpose === 'billing'
+    !allowManagedDelivery &&
+    (delivery.method !== undefined ||
+      delivery.reconciliation_mode !== 'delivery_only' ||
+      delivery.feed_purpose === 'billing')
   ) {
-    throw new TypeError('ReliableReportingService currently installs Core API delivery only');
+    throw new TypeError(
+      'Managed Delivery and Reconciled Billing require createPostgresReliableReportingProductionService from @adcp/sdk/reporting/service'
+    );
   }
   // Refused here rather than at install: capabilities are built from these
   // offerings, so accepting one whose alignment can never be installed would
@@ -931,6 +1421,10 @@ function validateDeliveryOffering(source: ReportingSourceOfferingV1, delivery: R
   // every install, because only the official branch parsed the SLA.
   const advertisedSla = parseAdvertisedDuration(delivery.schedule.delivery_sla, 'delivery_sla');
   parseAdvertisedDuration(delivery.schedule.period_duration, 'period_duration');
+  const calendarDay =
+    delivery.schedule.period_duration === 'P1D' &&
+    delivery.schedule.alignment === 'source_timezone' &&
+    /^PT/.test(delivery.schedule.delivery_sla);
   if (delivery.supported_finality.includes('official') && source.publicationClass !== 'AUTHORITATIVE') {
     throw new TypeError('Official delivery finality requires an authoritative source offering');
   }
@@ -974,14 +1468,29 @@ function validateDeliveryOffering(source: ReportingSourceOfferingV1, delivery: R
       );
     }
   }
-  // When the zone is pinned by either offering, its feasibility is decidable
-  // here. Publishing a fixed America/New_York schedule, or `utc` alignment over
-  // a nonzero-offset zone, advertises a schedule every installation refuses.
+  // Decide pinned-zone feasibility before advertising the offering. Civil
+  // P1D uses the shared resolver; elapsed grids still require a stable offset.
   const pinnedTimezone =
     delivery.schedule.period_timezone_policy === 'fixed'
       ? delivery.schedule.period_timezone
       : source.sourceTimezone.ianaTimezone;
-  if (pinnedTimezone) {
+  if (pinnedTimezone && calendarDay) {
+    assertReportingCalendarDaySource(
+      {
+        anchor: new Date(reportingCalendarDayOrigin(pinnedTimezone)).toISOString(),
+        periodMilliseconds: DAY_MILLISECONDS,
+        deliverySlaMilliseconds: advertisedSla,
+        recoveryWindowMilliseconds: DAY_MILLISECONDS,
+        periodDuration: 'P1D',
+        alignment: 'source_timezone',
+        periodTimezone: pinnedTimezone,
+        deliverySlaDuration: delivery.schedule.delivery_sla,
+      },
+      pinnedTimezone,
+      source,
+      Date.now()
+    );
+  } else if (pinnedTimezone) {
     const now = Date.now();
     if (delivery.schedule.alignment === 'utc' && reportingUtcOffsetMinutesV1(pinnedTimezone, now) !== 0) {
       throw new TypeError('UTC-aligned reporting requires a source timezone whose UTC offset is zero');
@@ -1183,10 +1692,9 @@ const OFFSET_FORWARD_HORIZON_DAYS = 400;
 /**
  * Refuse a schedule the installed executor could never satisfy.
  *
- * `createInlineReportingSourceExecutor` requires both period boundaries to land
- * exactly on source-local midnight, and the ledger generates boundaries as
- * `anchor + n * periodMilliseconds`. Two things therefore have to hold, and the
- * spec decides both:
+ * The explicit P1D source-calendar path resolves each civil boundary and checks
+ * source feasibility. Other supported schedules retain the elapsed grid
+ * `anchor + n * periodMilliseconds` and its two existing constraints:
  *
  *  - **Phase.** `core/reporting-schedule.json` fixes interval zero: `utc` uses
  *    1970-01-01T00:00:00Z, `source_timezone` uses local midnight on that date
@@ -1206,7 +1714,8 @@ const OFFSET_FORWARD_HORIZON_DAYS = 400;
 function assertSupportedScheduleSemantics(
   schedule: ReliableReportingConfigurationInputV1['schedule'],
   offering: ReportingDeliveryOffering,
-  sourceTimezone: string
+  sourceTimezone: string,
+  sourceOffering: ReportingSourceOfferingV1
 ): void {
   const { alignment } = offering.schedule;
   if (alignment !== 'utc' && alignment !== 'source_timezone') {
@@ -1225,6 +1734,26 @@ function assertSupportedScheduleSemantics(
   }
   const anchorMs = Date.parse(schedule.anchor);
   if (!Number.isFinite(anchorMs)) throw new TypeError('Reporting configuration anchor must be a valid instant');
+
+  if (
+    alignment === 'source_timezone' &&
+    offering.schedule.period_duration === 'P1D' &&
+    /^PT/.test(offering.schedule.delivery_sla)
+  ) {
+    assertReportingCalendarDaySource(
+      {
+        ...schedule,
+        periodDuration: 'P1D',
+        alignment,
+        periodTimezone: sourceTimezone,
+        deliverySlaDuration: offering.schedule.delivery_sla,
+      },
+      sourceTimezone,
+      sourceOffering,
+      Date.now()
+    );
+    return;
+  }
 
   // A property of the alignment/zone pairing rather than of this anchor, so it
   // is reported before any phase or boundary arithmetic derived from it.

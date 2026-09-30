@@ -209,7 +209,16 @@ function summarizeResponseFields(schema: any): { required: string[]; optional: s
     return prohibited;
   };
 
-  const summarizeBranch = (branch: any) => {
+  const dereferenceBranch = (branch: any): any => {
+    if (!branch?.$ref) return branch;
+    const resolved = branch.$ref.startsWith('#') ? resolveSchemaFragment(schema, branch.$ref) : loadSchema(branch.$ref);
+    if (!resolved) return branch;
+    const { $ref: _ref, ...overrides } = branch;
+    return { ...resolved, ...overrides };
+  };
+
+  const summarizeBranch = (rawBranch: any) => {
+    const branch = dereferenceBranch(rawBranch);
     const prohibited = new Set([...prohibitedFields(schema.not), ...prohibitedFields(branch.not)]);
     const properties = Object.fromEntries(
       Object.entries({ ...(schema.properties || {}), ...(branch.properties || {}) }).filter(
@@ -619,6 +628,9 @@ function generateLlmsTxt(
   );
   ln(`- **Buyer** (calling a seller): read \`docs/guides/BUYER-QUICKSTART-3.2.md\` first.`);
   ln(
+    `- **Buyer Reliable Reporting**: import reconciliation, PostgreSQL persistence, and the worker from \`@adcp/sdk/reporting/consumer\`; see \`docs/guides/REPORTING-RECONCILIATION.md\`.`
+  );
+  ln(
     `- **Before proposal acceptance:** use \`verifyProposalCommercialTerms\` from \`@adcp/sdk/negotiation/verification\` with a complete, independently reviewed snapshot and the seller-served schema version. Never use an unreviewed candidate as its own expected terms. See \`docs/guides/PROPOSAL-TERMS-VERIFICATION.md\`.`
   );
   ln(
@@ -689,7 +701,7 @@ function generateLlmsTxt(
   );
   ln();
   ln(
-    `**Four reference \`AccountStore\` shapes.** Pick the one whose onboarding model matches yours. **Shape A — \`InMemoryImplicitAccountStore\`**: \`resolution: 'implicit'\`, buyer-driven \`sync_accounts\` populates the auth-principal → accounts map. **Shape B — \`createOAuthPassthroughResolver\`**: \`resolution: 'explicit'\`, returns just the \`resolve\` function for adapters fronting an upstream OAuth listing endpoint (Snap, Meta, TikTok, LinkedIn — \`extract bearer → GET /me/adaccounts → match by id\`). **Shape C — \`createRosterAccountStore\`**: \`resolution: 'explicit'\`, returns a complete \`AccountStore\` for adopters who own the roster (storefront table, admin-UI-managed JSON). Supports \`resolveWithoutRef\` for tools that send no \`account\` field on the wire (\`list_creative_formats\`, \`preview_creative\`, \`provide_performance_feedback\`) — set it to return a synthetic publisher-wide entry instead of \`null\`. **Shape D — \`createDerivedAccountStore\`**: \`resolution: 'derived'\`, an upstream-managed account-id namespace — the platform you front owns the roster (Meta / Snap ad accounts, audiostack, flashtalking, single-namespace retail-media). Buyers discover ids through \`list_accounts\` and send \`account: { account_id }\`; the framework refuses the \`{ brand, operator }\` arm for this mode and \`accounts.list\` is required (\`createAdcpServerFromPlatform\` throws \`PlatformConfigError\` without it). Provide \`toAccount(ctx)\` when a credential reaches exactly one account or \`listAccounts(ctx)\` when it reaches many (plus optional \`lookupAccount(id, ctx)\` for large rosters); the factory verifies buyer-supplied \`account_id\` against what the caller's credential can reach, returns \`null\` on a miss, auto-selects the account on ref-less tools only when exactly one is reachable, wires a filtered and paged \`list_accounts\`, and still emits legacy-compatible \`AUTH_REQUIRED\` on missing-credential calls. The framework backstops hand-rolled \`'derived'\` stores: a resolved account whose \`id\` isn't the one the buyer named is refused with \`ACCOUNT_NOT_FOUND\`, and \`sync_accounts\` / \`sync_governance\` entries are resolved against the caller's reachable set before any write. Buyer code must continue to handle \`AUTH_REQUIRED\` alongside \`AUTH_MISSING\` / \`AUTH_INVALID\`. Changed in SDK 14 (adcp-client#1647 / adcp#5062) — Shape D previously refused inline \`account_id\` and was documented as single-tenant-only. All four live at \`@adcp/sdk/server\`.`
+    `**Four reference \`AccountStore\` shapes.** Pick the one whose onboarding model matches yours. **Shape A — \`InMemoryImplicitAccountStore\`**: \`resolution: 'implicit'\`, buyer-driven \`sync_accounts\` populates the auth-principal → accounts map. **Shape B — \`createOAuthPassthroughResolver\`**: \`resolution: 'explicit'\`, returns just the \`resolve\` function for adapters fronting an upstream OAuth listing endpoint (Snap, Meta, TikTok, LinkedIn — \`extract bearer → GET /me/adaccounts → match by id\`). **Shape C — \`createRosterAccountStore\`**: \`resolution: 'explicit'\`, returns a complete \`AccountStore\` for adopters who own the roster (storefront table, admin-UI-managed JSON). Supports \`resolveWithoutRef\` when \`list_creative_formats\` omits its optional rc.7 \`account\` field, and for \`preview_creative\` and \`provide_performance_feedback\` — set it to return a synthetic publisher-wide entry instead of \`null\`. Scope buyer-supplied account ids to the authenticated principal in \`lookup\`. **Shape D — \`createDerivedAccountStore\`**: \`resolution: 'derived'\`, an upstream-managed account-id namespace — the platform you front owns the roster (Meta / Snap ad accounts, audiostack, flashtalking, single-namespace retail-media). Buyers discover ids through \`list_accounts\` and send \`account: { account_id }\`; the framework refuses the \`{ brand, operator }\` arm for this mode and \`accounts.list\` is required (\`createAdcpServerFromPlatform\` throws \`PlatformConfigError\` without it). Provide \`toAccount(ctx)\` when a credential reaches exactly one account or \`listAccounts(ctx)\` when it reaches many (plus optional \`lookupAccount(id, ctx)\` for large rosters); the factory verifies buyer-supplied \`account_id\` against what the caller's credential can reach, returns \`null\` on a miss, auto-selects the account on ref-less tools only when exactly one is reachable, wires a filtered and paged \`list_accounts\`, and still emits legacy-compatible \`AUTH_REQUIRED\` on missing-credential calls. The framework backstops hand-rolled \`'derived'\` stores: a resolved account whose \`id\` isn't the one the buyer named is refused with \`ACCOUNT_NOT_FOUND\`, and \`sync_accounts\` / \`sync_governance\` entries are resolved against the caller's reachable set before any write. Buyer code must continue to handle \`AUTH_REQUIRED\` alongside \`AUTH_MISSING\` / \`AUTH_INVALID\`. Changed in SDK 14 (adcp-client#1647 / adcp#5062) — Shape D previously refused inline \`account_id\` and was documented as single-tenant-only. All four live at \`@adcp/sdk/server\`.`
   );
   ln();
   ln(
@@ -1316,6 +1328,8 @@ function generateLlmsTxt(
     ['Conformance (property-based fuzzing)', 'guides/CONFORMANCE.md'],
     ['Reporting source executor (seller adapters)', 'guides/REPORTING-SOURCE-EXECUTOR.md'],
     ['Seller reporting ledger', 'guides/REPORTING-LEDGER.md'],
+    ['Buyer reporting reconciliation', 'guides/REPORTING-RECONCILIATION.md'],
+    ['Reliable Reporting production operations', 'guides/REPORTING-OPERATIONS.md'],
     ['Validate your agent (5-command checklist)', 'guides/VALIDATE-YOUR-AGENT.md'],
     ['Async patterns (polling, webhooks, deferred)', 'guides/ASYNC-DEVELOPER-GUIDE.md'],
     ['Async API reference', 'guides/ASYNC-API-REFERENCE.md'],
@@ -1372,6 +1386,13 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln();
   ln(
     `Curated reference of the types that matter for using the AdCP client. For full generated types see \`src/lib/types/tools.generated.ts\` and \`src/lib/types/core.generated.ts\`.`
+  );
+  ln();
+
+  ln('## Buyer Reliable Reporting');
+  ln();
+  ln(
+    'Import `reconcileReportingCoreV1`, `reconcileReporting`, `createPostgresReportingConsumerRuntimeV1`, and `createReliableReportingConsumerV1` from `@adcp/sdk/reporting/consumer`. `ReliableReportingConsumerRunResultV1` and `ReliableReportingConsumerErrorContextV1` identify a run with `consumerScope`, `accountId`, and `reason`. Retain `expectedPeriods` from buyer commitments, use a non-secret seller/principal `consumerScope`, and make post-official adjustment acceptance an explicit `evaluateAdjustment` policy decision. Verify RFC 9421 with `@adcp/sdk/signing/server` before calling `handleAuthenticatedNotification`. See [Reporting reconciliation](guides/REPORTING-RECONCILIATION.md) and the [existing-app buyer worker](../examples/reliable-reporting-buyer/README.md).'
   );
   ln();
 
@@ -2094,7 +2115,7 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`## Seller Reporting Source Contract`);
   ln();
   ln(
-    `Import from \`@adcp/sdk/reporting/source\`. This is a provider-neutral adapter boundary; the existing buyer-side \`reconcileReporting\` API is separate.`
+    `Import from \`@adcp/sdk/reporting/source\`. This is a provider-neutral adapter boundary; buyer reconciliation and worker APIs live at \`@adcp/sdk/reporting/consumer\`.`
   );
   ln();
   ln('```typescript');
@@ -2248,6 +2269,14 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln();
   ln(
     `Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free \`sourceScope\`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply \`account\`, \`sourceScope\`, \`sourceTimezone\`, \`contract\`, \`currency\`, \`constituents\`, or \`mediaBuyIds\`; \`mediaBuyIds\` is derived from \`resolveCoverage\`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires \`platform.accounts.upsert\`, which owns the advertised \`sync_accounts\` configuration path.`
+  );
+  ln();
+  ln(
+    `For complete seller production assembly, use async \`createPostgresReliableReportingProductionService\` from \`@adcp/sdk/reporting/service\`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply \`activity.tenantScopeForAccount\`; Reconciled Billing offerings also require a trusted \`obligatedConsumers\` roster. Its scheduler and \`recoverOnce\` require explicit \`deploymentWide: true\` because recovery scans the whole namespace. See \`docs/guides/REPORTING-LEDGER.md\` and \`docs/guides/REPORTING-OPERATIONS.md\`.`
+  );
+  ln();
+  ln(
+    `Buyer production processes use \`createPostgresReportingConsumerRuntimeV1\` with \`createReliableReportingConsumerV1\` from the package root. Verify webhook signatures before passing authenticated hints, preserve seller/principal scope, and configure \`evaluateAdjustment\` to authorize integrity-valid post-official corrections; the default defers them. See \`docs/guides/REPORTING-RECONCILIATION.md\`.`
   );
   ln();
 

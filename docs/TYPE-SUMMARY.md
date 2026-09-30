@@ -1,9 +1,13 @@
 # AdCP Type Summary
 
-> Generated at: 2026-09-22
-> @adcp/sdk v14.0.0-rc.46
+> Generated at: 2026-09-30
+> @adcp/sdk v14.0.0-rc.53
 
 Curated reference of the types that matter for using the AdCP client. For full generated types see `src/lib/types/tools.generated.ts` and `src/lib/types/core.generated.ts`.
+
+## Buyer Reliable Reporting
+
+Import `reconcileReportingCoreV1`, `reconcileReporting`, `createPostgresReportingConsumerRuntimeV1`, and `createReliableReportingConsumerV1` from `@adcp/sdk/reporting/consumer`. `ReliableReportingConsumerRunResultV1` and `ReliableReportingConsumerErrorContextV1` identify a run with `consumerScope`, `accountId`, and `reason`. Retain `expectedPeriods` from buyer commitments, use a non-secret seller/principal `consumerScope`, and make post-official adjustment acceptance an explicit `evaluateAdjustment` policy decision. Verify RFC 9421 with `@adcp/sdk/signing/server` before calling `handleAuthenticatedNotification`. See [Reporting reconciliation](guides/REPORTING-RECONCILIATION.md) and the [existing-app buyer worker](../examples/reliable-reporting-buyer/README.md).
 
 ## MediaBuy Action Assessment Types
 
@@ -1008,6 +1012,7 @@ _Request:_
   start_time: Start Timing  // required
   end_time: string  // required
   adcp_version: string
+  name: string
   brand: Brand Key
   advertiser_industry: Advertiser Industry
   pricing_version: string
@@ -1043,6 +1048,7 @@ _Request:_
   proposal_id: string  // required
   proposal_terms_digest: string  // required
   adcp_version: string
+  name: string
   total_budget: object
   daily_budget_cap: number
   budget_cap_timezone: string
@@ -1126,6 +1132,7 @@ _Request:_
   disclosure_persistence: Disclosure Persistence[]
   output_format_ids: Format Id[]
   input_format_ids: Format Id[]
+  account: Account Ref
   pagination: Pagination Request
   context: Context
 }
@@ -2430,8 +2437,10 @@ _Request:_
 ```
 {
   creative_manifest: Creative Manifest  // required
+  idempotency_key: string
   feature_ids: string[]
   account: Account Ref
+  push_notification_config: Push Notification Config
   context: Context
 }
 ```
@@ -2440,6 +2449,7 @@ _Response (success branch):_
 ```
 {
   results: Creative Feature Result[]  // required
+  evaluation_id: string
   detail_url: string
   audit_observations: Audit Observation[]
   pricing_option_id: string
@@ -2819,7 +2829,7 @@ Source of truth: `schemas/cache/{version}/brand.json` and `adagents.json` — re
 
 ## Seller Reporting Source Contract
 
-Import from `@adcp/sdk/reporting/source`. This is a provider-neutral adapter boundary; the existing buyer-side `reconcileReporting` API is separate.
+Import from `@adcp/sdk/reporting/source`. This is a provider-neutral adapter boundary; buyer reconciliation and worker APIs live at `@adcp/sdk/reporting/consumer`.
 
 ```typescript
 type ReportingSourceManifestLevelV1 = 'basic' | 'evidenced';
@@ -2949,6 +2959,10 @@ await reporting.stop();
 ```
 
 Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free `sourceScope`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply `account`, `sourceScope`, `sourceTimezone`, `contract`, `currency`, `constituents`, or `mediaBuyIds`; `mediaBuyIds` is derived from `resolveCoverage`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires `platform.accounts.upsert`, which owns the advertised `sync_accounts` configuration path.
+
+For complete seller production assembly, use async `createPostgresReliableReportingProductionService` from `@adcp/sdk/reporting/service`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply `activity.tenantScopeForAccount`; Reconciled Billing offerings also require a trusted `obligatedConsumers` roster. Its scheduler and `recoverOnce` require explicit `deploymentWide: true` because recovery scans the whole namespace. See `docs/guides/REPORTING-LEDGER.md` and `docs/guides/REPORTING-OPERATIONS.md`.
+
+Buyer production processes use `createPostgresReportingConsumerRuntimeV1` with `createReliableReportingConsumerV1` from the package root. Verify webhook signatures before passing authenticated hints, preserve seller/principal scope, and configure `evaluateAdjustment` to authorize integrity-valid post-official corrections; the default defers them. See `docs/guides/REPORTING-RECONCILIATION.md`.
 
 ## Key Enums
 

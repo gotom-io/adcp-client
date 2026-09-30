@@ -11,18 +11,18 @@ below as the publication/deployment gate.
 
 | Fact | Value |
 | --- | --- |
-| Exact npm package | `@adcp/sdk@14.0.0-rc.46` |
-| npm integrity | registry-derived after publication; run `npm view @adcp/sdk@14.0.0-rc.46 dist.integrity` |
+| Exact npm package | `@adcp/sdk@14.0.0-rc.53` |
+| npm integrity | registry-derived after publication; run `npm view @adcp/sdk@14.0.0-rc.53 dist.integrity` |
 | Node.js runtime | `^20.19.0 || >=22.12.0` |
-| Default AdCP wire release | `3.2.0-rc.4` |
-| Maintained wire releases | `v2.5`, `v2.6`, `v3`, `3.0.0`, `3.0`, `3.0.1`, `3.0.2`, `3.0.3`, `3.0.4`, `3.0.5`, `3.0.6`, `3.0.7`, `3.0.8`, `3.0.9`, `3.0.10`, `3.0.11`, `3.0.12`, `3.0.13`, `3.0.14`, `3.0.15`, `3.0.16`, `3.0.17`, `3.0.18`, `3.0.19`, `3.0.20`, `3.0.21`, `3.0.22`, `3.0.23`, `3.0.24`, `3.0.25`, `3.1.0`, `3.1`, `3.1.1`, `3.1.2`, `3.1.3`, `3.1.4`, `3.1.5`, `3.1.6`, `3.1.7`, `3.1.8`, `3.1.9`, `3.1.10`, `3.1.11`, `3.1.12`, `3.1.13`, `3.1.14`, `3.1.15`, `3.1.16`, `3.1.17`, `3.1.18`, `3.2.0-rc.4`, `3.2-rc.4` |
+| Default AdCP wire release | `3.2.0-rc.7` |
+| Maintained wire releases | `v2.5`, `v2.6`, `v3`, `3.0.0`, `3.0`, `3.0.1`, `3.0.2`, `3.0.3`, `3.0.4`, `3.0.5`, `3.0.6`, `3.0.7`, `3.0.8`, `3.0.9`, `3.0.10`, `3.0.11`, `3.0.12`, `3.0.13`, `3.0.14`, `3.0.15`, `3.0.16`, `3.0.17`, `3.0.18`, `3.0.19`, `3.0.20`, `3.0.21`, `3.0.22`, `3.0.23`, `3.0.24`, `3.0.25`, `3.1.0`, `3.1`, `3.1.1`, `3.1.2`, `3.1.3`, `3.1.4`, `3.1.5`, `3.1.6`, `3.1.7`, `3.1.8`, `3.1.9`, `3.1.10`, `3.1.11`, `3.1.12`, `3.1.13`, `3.1.14`, `3.1.15`, `3.1.16`, `3.1.17`, `3.1.18`, `3.1.19`, `3.1.20`, `3.1.21`, `3.1.22`, `3.1.23`, `3.1.24`, `3.2.0-rc.7`, `3.2-rc.7` |
 | Canonical migration notes | [13.x → 14](./migration-13-to-14.md) |
 
 Install exact production inputs rather than a moving prerelease range:
 
 ```bash
-npm install --save-exact '@adcp/sdk@14.0.0-rc.46'
-npm view '@adcp/sdk@14.0.0-rc.46' dist.integrity
+npm install --save-exact '@adcp/sdk@14.0.0-rc.53'
+npm view '@adcp/sdk@14.0.0-rc.53' dist.integrity
 ```
 
 ### Required and optional peers
@@ -60,7 +60,7 @@ ESM example:
 import { getCanonicalToolValidator } from '@adcp/sdk/schemas';
 
 const validate = getCanonicalToolValidator('get_reporting_status', 'sync', {
-  adcpVersion: '3.2.0-rc.4',
+  adcpVersion: '3.2.0-rc.7',
 });
 if (!validate) throw new Error('Requested protocol schema is unavailable');
 
@@ -83,7 +83,7 @@ CommonJS uses the same packed-artifact export:
 ```js
 const { getCanonicalToolValidator } = require('@adcp/sdk/schemas');
 const validate = getCanonicalToolValidator('get_reporting_status', 'sync', {
-  adcpVersion: '3.2.0-rc.4',
+  adcpVersion: '3.2.0-rc.7',
 });
 if (!validate) throw new Error('Requested protocol schema is unavailable');
 if (validate({ status: 'completed', view: 'summary' })) {
@@ -104,3 +104,48 @@ the rc.2 wire pin; it does not change when a later SDK candidate is released.
 5. Run mixed-version integration coverage for every release your deployment still advertises, then deploy all rc.2-speaking peers before sending rc.2-only payloads.
 
 The complete behavioral inventory, including server-default separation and A2A 1.0 peer requirements, is in the [13.x → 14 migration guide](./migration-13-to-14.md).
+
+## Reliable Reporting durable-state upgrade
+
+- Pending consumer-status keys now include a stable, non-secret seller and
+  authenticated-principal `consumerScope`; custom stores must migrate or retire
+  unscoped pending rows before enabling the worker.
+- Configure `pendingConsumerStatusScope` whenever a custom
+  `pendingConsumerStatusStore` is supplied. This prevents one seller/principal
+  from replaying another caller's exact status body.
+- Receipt checkpoint keys now include a versioned immutable-context
+  fingerprint. Existing PostgreSQL rows are not reused under the new key and
+  are retained until an operator archives them; the SDK does not time-prune
+  receipt checkpoints or unconfirmed pending statuses. Delete old-key rows
+  only after the seller's authoritative ledger confirms the receipt/status and
+  the deployment's evidence-retention window has elapsed. Custom checkpoint
+  stores must include optional key fields when deriving storage identity.
+- Exact-revision consumption now defaults to a 32 MiB decoded-byte ceiling.
+  Set `ledgerLimits.maxRevisionBytes` to `268435456` to preserve the pre-14
+  256 MiB ceiling while measuring and migrating large reporting periods.
+- `ledgerLimits.maxRecords` is now one aggregate safety budget across ledger
+  records and consumer-status history. Deployments that previously sized those
+  histories independently should measure their combined peak and set an
+  explicit bounded value before upgrading.
+- Webhook signing plus each external POST now has a 30 second default deadline.
+  Set `webhooks.deliveryTimeoutMs` explicitly if an existing receiver has a
+  different bounded acknowledgement SLO.
+- Webhook attempt observers are awaited before each POST and after its result,
+  with a 5 second default observer deadline. Set
+  `webhooks.attemptObserverTimeoutMs` for a different bounded telemetry SLO;
+  a slow observer adds delivery latency.
+- Notification `subscriber_id` now always enforces the protocol grammar
+  `^[A-Za-z0-9_.:-]{1,64}$`, including when server request validation is off.
+  Rename non-conforming retained subscriber IDs. The activity log keeps
+  delivering older 65–255 character IDs during migration, but replacement
+  registrations must use the new grammar.
+- Reconciled Billing production composition now requires a trusted
+  `obligatedConsumers` roster; a missing roster cannot establish complete
+  billing health. The production recovery worker requires explicit
+  `deploymentWide: true` because it scans the whole namespace.
+- Buyer reconciliation defers integrity-valid post-official adjustments until
+  the adopter supplies `evaluateAdjustment`; wire the buyer's financial policy
+  before expecting accepted adjustment receipts.
+- Buyer change-cursor stores should implement `clear(key, expected)` so a seller
+  that retires or rotates its opaque checkpoint cannot leave the worker in a
+  permanent failed-drain loop.

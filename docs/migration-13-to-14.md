@@ -1,6 +1,6 @@
 # Migrating from 13.x to the 14 prerelease
 
-SDK 14 adopts AdCP `3.2.0-rc.4` while preserving the canonical creative boundary introduced in SDK 13. Most SDK 13 applications can install the prerelease and continue using the established 3.x tools unchanged; adopt the compact 3.2 lifecycle only after the remote agent advertises it.
+SDK 14 adopts AdCP `3.2.0-rc.7` while preserving the canonical creative boundary introduced in SDK 13. Most SDK 13 applications can install the prerelease and continue using the established 3.x tools unchanged; adopt the compact 3.2 lifecycle only after the remote agent advertises it.
 
 Legacy signal-discovery adapters may keep supplying `opts.signals.getSignals`
 (or `legacyHandlers.signals.getSignals`) while declaring the truthful
@@ -10,11 +10,11 @@ now satisfies platform validation without requiring adopters to invent an
 
 AdCP 3.2 prereleases are exact protocol pins: beta.6 replaces beta.5 in the
 SDK's compatible-version list rather than extending a rolling 3.2-beta range.
-Likewise, `3.2.0-rc.4` replaces `3.2.0-rc.3`; callers pinned to rc.3 must
+Likewise, `3.2.0-rc.7` replaces `3.2.0-rc.6`; callers pinned to rc.6 must
 upgrade both peers together because the SDK does not advertise superseded 3.2
 prereleases as compatible wire releases and ships only the current
-prerelease's schema bundle. Pinning `adcpVersion: '3.2-rc'` follows whichever
-3.2 release candidate this SDK build carries; pinning a superseded exact
+prerelease's schema bundle. Pin `adcpVersion: '3.2-rc.7'`; the moving family
+alias `'3.2-rc'` is intentionally rejected. Pinning a superseded exact
 prerelease such as `'3.2.0-rc.2'` raises a configuration error at schema load
 rather than silently validating against a different contract.
 Beta.1 restored `adcp_major_version` on `buy_products`,
@@ -28,6 +28,50 @@ convergence, webhook retry horizons, and crash-safe continuation generation
 replacement. Beta.6 adds coordinated placements, seller-rendered stateful
 display, creative component assets, and A2A 1.0 request-signing method names.
 
+### Configure replay safety for creative-feature evaluation
+
+AdCP `3.2.0-rc.6` classified `get_creative_features` as a mutating evaluation;
+rc.7 retains that rule.
+SDK clients now generate an `idempotency_key` when callers omit one and include
+that key in request signing. Servers that register `getCreativeFeatures` must
+therefore configure an idempotency store whose replay TTL is at least 86,400
+seconds:
+
+```ts
+import {
+  createAdcpServer,
+  createIdempotencyStore,
+  pgBackend,
+} from '@adcp/sdk/server';
+
+const idempotency = createIdempotencyStore({
+  backend: pgBackend(pool),
+  ttlSeconds: 86_400,
+});
+
+const server = createAdcpServer({
+  name: 'Creative governance agent',
+  version: '1.0.0',
+  idempotency,
+  governance: {
+    getCreativeFeatures: evaluateCreativeFeatures,
+  },
+});
+```
+
+Use `memoryBackend()` only for single-process development or tests; production
+replicas need a shared durable backend such as `pgBackend()` or
+`redisBackend()`. Outside development and test, registering this handler
+without a store fails server startup. A configured TTL below 86,400 seconds
+fails startup in every environment.
+
+For wire compatibility, an older peer may still send a keyless
+`get_creative_features` request; the server accepts and evaluates it without
+replay protection. Because such calls can execute more than once, the MCP tool
+metadata does not advertise unconditional `idempotentHint`. New callers should
+let the SDK inject a key or supply a stable UUID v4 when retrying the same
+logical evaluation.
+
 ### Separate the server default from its supported ceiling
 
 An SDK 14 server can advertise and serve 3.2 without silently moving
@@ -35,9 +79,9 @@ unversioned callers off 3.1:
 
 ```ts
 const server = createAdcpServer({
-  adcpVersion: '3.2.0-rc.4',
-  defaultAdcpVersion: '3.1.18',
-  capabilities: { supported_versions: ['3.1.18', '3.2.0-rc.4'] },
+  adcpVersion: '3.2.0-rc.7',
+  defaultAdcpVersion: '3.1.24',
+  capabilities: { supported_versions: ['3.1.24', '3.2.0-rc.7'] },
   // handlers...
 });
 ```
@@ -56,7 +100,7 @@ SDK 14's AdCP 3.2 transport requires `@a2a-js/sdk` 1.x. Upgrade the peer
 alongside the AdCP SDK:
 
 ```bash
-npm install '@adcp/sdk@^14.0.0-0' @a2a-js/sdk@^1.0.1
+npm install @adcp/sdk@rc @a2a-js/sdk@^1.0.1
 ```
 
 The client and server use the official 1.0 Agent Card and JSON-RPC APIs and
@@ -258,7 +302,7 @@ tasks. A failed response may carry both the top-level summary `error` and a
 canonical `result.errors[]`; they describe the same failure.
 
 ```bash
-npm install '@adcp/sdk@^14.0.0-0'
+npm install @adcp/sdk@rc
 ```
 
 The untagged npm install remains SDK 13. Keep that line for production AdCP 3.1 deployments until the 3.2 application and its counterparties have completed beta validation.
@@ -470,7 +514,7 @@ be read are classified as before (no new failures from an unparseable
 
 ## Upgrade checklist
 
-1. Pin SDK 14 with the `beta` tag or an exact `14.0.0-beta.*` version. Do not rely on npm `latest` for beta rollout.
+1. Pin SDK 14 with the `rc` tag or an exact `14.0.0-rc.*` version. Do not rely on npm `latest` for RC rollout.
 2. Move compact-first applications to `agent.negotiateMediaBuyLifecycle()` so the SDK owns capability-gated established fallbacks and their declared loss boundaries.
 3. If you use request signing, propagate the negotiated or configured agent version into signing and verification. Expect standard padded Base64 plus mandatory `Content-Digest` only for AdCP 3.2.
 4. Return `media_buy_status`, not top-level `status`, from new media-buy server handlers.
@@ -931,12 +975,16 @@ SDK 13 used the legacy AdCP 3.0/3.1 representation. SDK 14 selects between two p
 
 High-level A2A/MCP clients carry the configured agent version automatically. Low-level signing integrations should pass their trusted version context and can inspect the signature encoding with `requestSigningEncodingForVersion()`. For SDK 13 source compatibility, a low-level verifier with no `adcpVersion` accepts either signature encoding and applies its configured digest-coverage policy; an explicit trusted 3.2 pin keeps mandatory digest coverage.
 
-For a staged server rollout, set the internal verifier option
-`signedRequests.covers_content_digest: 'either'` to accept SDK 13 Base64URL
-signatures and SDK 14's 3.2 encoding on the same endpoint. Continue advertising
-`covers_content_digest: 'required'` in the 3.2 capability document; SDK 14
-projects that strict public contract automatically. Move the internal verifier
-to `required` after legacy callers are gone.
+A verifier pinned to AdCP 3.2 parses `Signature` and `Content-Digest` only as
+RFC 8941 padded standard Base64. It rejects an SDK 13 Base64URL token with
+`request_signature_header_malformed` at parse time (checklist step 1 for
+`Signature`), even when the internal verifier policy is
+`signedRequests.covers_content_digest: 'either'`; the spec forbids a 3.2
+verifier from retrying a legacy token through a second decoder. To keep
+accepting SDK 13 signers, serve them from a separately configured endpoint
+pinned to 3.0/3.1, or coordinate the cutover before the shared endpoint
+advertises 3.2. A 3.0/3.1-pinned endpoint in `'either'` mode still accepts both
+serializations.
 
 Do not select a signing profile from a version value inside an unverified request body or header. On the server, bind the version to the endpoint, tenant, or authenticated agent configuration. Webhook signatures do not move to the 3.2 request profile.
 
@@ -944,7 +992,10 @@ Low-level `verifyRequestSignature()` calls that omit `adcpVersion` tolerate both
 the legacy Base64URL and 3.2 RFC 8941 Base64 serialization so frozen 3.0/3.1
 integrations do not inherit the SDK's own protocol pin. This does not relax
 digest policy: `capability.covers_content_digest` remains authoritative. Pass a
-trusted `adcpVersion` whenever one is available for deterministic diagnostics.
+trusted `adcpVersion` whenever one is available. An endpoint that advertises
+3.2 must pass `adcpVersion: '3.2'` (or its exact 3.2 release): an unpinned
+verifier accepts a Base64URL token that a 3.2 verifier must reject, so it fails
+the `profile-3.2/negative/001-base64url-sf-binary` conformance vector.
 
 ## Cross-role governance is capability-gated
 
@@ -1108,7 +1159,7 @@ import { getToolInputSchema, getToolResponseSchema } from '@adcp/sdk/schemas';
 
 const request = getToolInputSchema('create_media_buy', { adcpVersion: '3.0' });
 const response = getToolResponseSchema('create_media_buy', {
-  adcpVersion: '3.2.0-rc.4',
+  adcpVersion: '3.2.0-rc.7',
   variant: 'sync',
 });
 
