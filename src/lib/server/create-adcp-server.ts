@@ -2183,6 +2183,16 @@ export interface AdcpServerConfig<TAccount = unknown> {
   validation?: {
     requests?: import('../validation/client-hooks').ValidationMode;
     responses?: import('../validation/client-hooks').ValidationMode;
+    /**
+     * Tools whose requests are validated in `'warn'` mode even where the
+     * framework would otherwise enforce the official schema strictly. For
+     * tools whose spec demands a per-entry domain rejection of a
+     * schema-invalid entry — e.g. `sync_accounts` must fail the one account
+     * whose `notification_configs[].event_types` names a media-buy-anchored
+     * type (storyboard `notification_config_event_scope`), not the request.
+     * The handler then owns that validation.
+     */
+    warnOnlyRequestTools?: readonly string[];
   };
 
   /**
@@ -5247,10 +5257,13 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   const isProduction = process.env.NODE_ENV === 'production';
   const requestValidationMode = validationConfig?.requests ?? (isProduction ? 'off' : 'strict');
   const responseValidationMode = validationConfig?.responses ?? (isProduction ? 'off' : 'strict');
-  const effectiveRequestValidationMode = (extra: unknown): 'off' | 'warn' | 'strict' =>
-    (extra as { enforceRequestSchema?: unknown } | undefined)?.enforceRequestSchema === true
+  const warnOnlyRequestTools: ReadonlySet<string> = new Set(validationConfig?.warnOnlyRequestTools ?? []);
+  const effectiveRequestValidationMode = (extra: unknown, toolName?: string): 'off' | 'warn' | 'strict' => {
+    if (toolName !== undefined && warnOnlyRequestTools.has(toolName)) return 'warn';
+    return (extra as { enforceRequestSchema?: unknown } | undefined)?.enforceRequestSchema === true
       ? 'strict'
       : requestValidationMode;
+  };
 
   // Split the `idempotency` config field into "the active store" and
   // "explicitly opted out" so existing call sites keep working with a
@@ -6101,7 +6114,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
 
       const wrap = meta?.wrap ?? ((data: any, summary?: string) => genericResponse(toolName, data, summary));
       const toolHandler = async (params: any, extra: any) => {
-        const callRequestValidationMode = effectiveRequestValidationMode(extra);
+        const callRequestValidationMode = effectiveRequestValidationMode(extra, toolName);
         const releaseSelection = selectServedAdcpRelease(params, capConfig, adcpVersion, defaultAdcpVersion);
         let releaseError: McpToolResponse | undefined;
         let requestRelease: ServedAdcpRelease;
