@@ -1691,13 +1691,7 @@ export {
   DEFAULT_MAX_RESPONSE_BYTES,
   SSE_CUMULATIVE_BUDGET_MULTIPLIER,
 } from './protocols';
-export {
-  toReleasePrecisionWire,
-  validateAdcpVersionWire,
-  registerSchemaOverlay,
-  clearSchemaOverlays,
-} from './validation/schema-loader';
-export { validateRequest } from './validation/schema-validator';
+export { toReleasePrecisionWire, validateAdcpVersionWire } from './validation/schema-loader';
 export type {
   CallToolOptions,
   TransportActivity,
@@ -2180,7 +2174,6 @@ export {
   isCompatibleWith,
   getCompatibleVersions,
   parseAdcpMajorVersion,
-  toReleasePrecisionVersion,
   ADCP_VERSION,
   ADCP_MAJOR_VERSION,
   LIBRARY_VERSION,

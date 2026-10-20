@@ -17,8 +17,6 @@ export {
   registerExternalSchemaRoot,
   unregisterExternalSchemaRoot,
   withExternalSchemaRoot,
-  registerSchemaOverlay,
-  clearSchemaOverlays,
   withServedReleaseSchemaRoots,
 } from './schema-loader';
 export type { Direction, ResponseVariant } from './schema-loader';

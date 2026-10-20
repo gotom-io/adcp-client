@@ -38,10 +38,6 @@ export { defineOperationalPlatform } from './operational-platform';
 export type { OperationalPlatform, OperationalContext } from './operational-platform';
 
 export { pickWireSpecFields, scrubExtensions, WIRE_SPEC_FIELDS } from './wire-safe';
-// Each dist entry bundles its own copy of the schema loader, so an overlay
-// meant for the server's request validator must be registered through this
-// entry — the root export only reaches the client-side validators.
-export { registerSchemaOverlay, clearSchemaOverlays } from '../validation/schema-loader';
 export type { WireSafe, WireSpecRequestName, ScrubExtensionsOptions } from './wire-safe';
 export type { RequireCacheScopeWhenProducts, ServerPayload } from '../types/server-payload';
 export type {
@@ -863,7 +859,6 @@ export {
 } from './socket-mode';
 
 export { createAdcpServerFromPlatform } from './decisioning/runtime/from-platform';
-export { createInMemoryTaskRegistry } from './decisioning/runtime/task-registry';
 export { mediaBuyActionResolver } from './media-buy-action-resolver';
 export type {
   SellerActionDecision,

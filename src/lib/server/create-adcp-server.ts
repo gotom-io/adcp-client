@@ -2268,16 +2268,6 @@ export interface AdcpServerConfig<TAccount = unknown> {
   validation?: {
     requests?: import('../validation/client-hooks').ValidationMode;
     responses?: import('../validation/client-hooks').ValidationMode;
-    /**
-     * Tools whose requests are validated in `'warn'` mode even where the
-     * framework would otherwise enforce the official schema strictly. For
-     * tools whose spec demands a per-entry domain rejection of a
-     * schema-invalid entry — e.g. `sync_accounts` must fail the one account
-     * whose `notification_configs[].event_types` names a media-buy-anchored
-     * type (storyboard `notification_config_event_scope`), not the request.
-     * The handler then owns that validation.
-     */
-    warnOnlyRequestTools?: readonly string[];
   };
 
   /**
@@ -5596,13 +5586,10 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   const isProduction = process.env.NODE_ENV === 'production';
   const requestValidationMode = validationConfig?.requests ?? (isProduction ? 'off' : 'strict');
   const responseValidationMode = validationConfig?.responses ?? (isProduction ? 'off' : 'strict');
-  const warnOnlyRequestTools: ReadonlySet<string> = new Set(validationConfig?.warnOnlyRequestTools ?? []);
-  const effectiveRequestValidationMode = (extra: unknown, toolName?: string): 'off' | 'warn' | 'strict' => {
-    if (toolName !== undefined && warnOnlyRequestTools.has(toolName)) return 'warn';
-    return (extra as { enforceRequestSchema?: unknown } | undefined)?.enforceRequestSchema === true
+  const effectiveRequestValidationMode = (extra: unknown): 'off' | 'warn' | 'strict' =>
+    (extra as { enforceRequestSchema?: unknown } | undefined)?.enforceRequestSchema === true
       ? 'strict'
       : requestValidationMode;
-  };
 
   // Split the `idempotency` config field into "the active store" and
   // "explicitly opted out" so existing call sites keep working with a
@@ -6459,7 +6446,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         if (authorizationFailure) return webBotAuthToolFailure(authorizationFailure, servedAdcpVersion);
         if (config.identity33 && !isIdentity33SchemaScope())
           return withIdentity33SchemaScope(() => toolHandler(params, extra));
-        const callRequestValidationMode = effectiveRequestValidationMode(extra, toolName);
+        const callRequestValidationMode = effectiveRequestValidationMode(extra);
         let notificationFailureRows = new Map<number, Record<string, unknown>>();
         const releaseSelection = selectServedAdcpRelease(params, capConfig, adcpVersion, defaultAdcpVersion);
         let releaseError: McpToolResponse | undefined;
