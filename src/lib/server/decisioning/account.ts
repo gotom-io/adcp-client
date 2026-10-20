@@ -382,6 +382,8 @@ export interface ResolvedAuthInfo {
 }
 
 export interface ResolveContext {
+  /** True only for provisioning tasks. Discovery/negotiation MUST use lookup only. */
+  readonly provisioning?: boolean;
   /** Authenticated principal extracted by `serve({ authenticate })`. Undefined when no `authenticate` is configured. */
   authInfo?: ResolvedAuthInfo;
   /** Tool the buyer is calling — useful for tool-aware tenant routing. */
@@ -415,6 +417,8 @@ export interface ResolveContext {
    *   before the platform method runs; treat fields the buyer sent as
    *   authoritative, but expect framework-injected entities (e.g.
    *   hydrated product / media-buy refs) to be visible here too.
+   *   Account-sync guard lookups and upsert receive independent input
+   *   copies so callback normalization cannot rewrite framework checks.
    * - **Buyer-controlled untrusted data.** Free-text fields (`brief`,
    *   `message`, creative snippets, etc.) are attacker-controlled.
    *   Don't log `ctx.input` wholesale — secret fields like
@@ -449,6 +453,25 @@ export interface ResolveContext {
 export interface AccountToolContext<TCtxMeta = Record<string, unknown>> extends ResolveContext {
   /** Resolved Account from `accounts.resolve()`. Populated by the framework before dispatch. */
   account: Account<TCtxMeta>;
+}
+
+/** Pre-write snapshots aligned with the accepted entries passed to `upsert`. */
+export interface AccountUpsertContext<TCtxMeta = Record<string, unknown>> extends ResolveContext {
+  /** Null for an unresolved or ID-keyed entry. Lookup uses `provisioning: false`. */
+  readonly existing?: readonly (Account<TCtxMeta> | null)[];
+}
+
+/** A sync/list contract violation, delivered only to the seller. */
+export interface AccountSyncDiagnostic {
+  readonly code:
+    | 'ACCOUNT_SYNC_IDEMPOTENCY_VIOLATION'
+    | 'ACCOUNT_SYNC_PAYMENT_TERMS_MISMATCH'
+    | 'ACCOUNT_SYNC_BILLING_MISMATCH'
+    | 'ACCOUNT_SYNC_LOOKUP_UNSUPPORTED'
+    | 'ACCOUNT_BILLING_FIELDS_MISSING';
+  readonly toolName: 'sync_accounts' | 'list_accounts';
+  /** Original request index for sync; page index for list. */
+  readonly index: number;
 }
 
 /**
@@ -565,6 +588,15 @@ export function isAccountResolutionMode(value: unknown): value is AccountResolut
 }
 
 export interface AccountStore<TCtxMeta = Record<string, unknown>> {
+  /**
+   * Convert sync contract violations to per-row failures. Default: diagnostics only.
+   * This is post-write response validation, not a transaction or rollback.
+   * For accept-or-reject guarantees, upsert must check these contracts before
+   * committing too (createKeyedAccountStore does so for its own backend).
+   */
+  readonly strictIdempotency?: boolean;
+  /** Server-side diagnostics; never includes credentials or account metadata. Async hooks are fire-and-forget, with failures isolated from dispatch. */
+  readonly onDiagnostic?: (diagnostic: AccountSyncDiagnostic) => void;
   /**
    * How buyers reference accounts on this platform. Three onboarding models,
    * aligned with the account-reference taxonomy clarified upstream in
@@ -738,7 +770,7 @@ export interface AccountStore<TCtxMeta = Record<string, unknown>> {
    * verified `agent_url` from `credential.kind === 'http_sig'` when
    * `agentRegistry` is not configured).
    */
-  upsert?(refs: AccountReference[], ctx?: ResolveContext): Promise<SyncAccountsHandlerResult>;
+  upsert?(refs: AccountReference[], ctx?: AccountUpsertContext<TCtxMeta>): Promise<SyncAccountsHandlerResult>;
 
   /**
    * sync_governance API surface. Buyers register governance agent endpoints

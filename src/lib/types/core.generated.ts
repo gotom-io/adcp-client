@@ -1,5 +1,5 @@
-// Generated AdCP core types from official schemas v3.2.1
-// Generated at: 2026-09-30T20:17:14.543Z
+// Generated AdCP core types from official schemas v3.2.5
+// Generated at: 2026-10-16T21:29:50.280Z
 
 // ACCOUNTCURRENCYMODE CANONICAL ENUM
 /**
@@ -8344,6 +8344,18 @@ export interface PackageSignalTargetingGroup {
  */
 export interface DemographicTargetingIntent {
   age: DemographicAgeRange & {
+    /**
+     * User-level age determination bases the buyer permits for this predicate. Sellers MUST use only these bases or reject the request; they MUST NOT silently fall back to another basis. When omitted, the buyer imposes no determination-basis constraint beyond product capability and any age_restriction. population_estimate is structurally unavailable because aggregate evidence cannot identify an eligible user.
+     *
+     * @minItems 1
+     */
+    accepted_bases?: [AgeDeterminationBasis, ...AgeDeterminationBasis[]];
+    /**
+     * Verification methods acceptable when verified is an accepted basis. This field narrows verified demographic execution; age_restriction.accepted_methods independently governs legal eligibility and the two sets are intersected when both are present.
+     *
+     * @minItems 1
+     */
+    accepted_verification_methods?: [AgeVerificationMethod, ...AgeVerificationMethod[]];
   };
 }
 /**
@@ -13322,7 +13334,7 @@ export type None2 = None;
 export type AccountReference =
   | {
       /**
-       * Seller-assigned account identifier. For upstream-managed account namespaces, this value comes from list_accounts; for seller-defined namespaces without a list_accounts surface, it is supplied out-of-band. Buyer-declared account sellers MAY echo account_id from sync_accounts as an internal handle, but they MUST continue accepting the account's current natural-key AccountRef on subsequent calls. A former key tombstoned by identity reconciliation returns ACCOUNT_MOVED to authorized callers.
+       * Seller-assigned account identifier. For upstream-managed account namespaces, this value comes from list_accounts; for seller-defined namespaces without a list_accounts surface, it is supplied out-of-band. Buyer-declared account sellers MAY echo account_id from sync_accounts as an internal handle, but they MUST continue accepting the account's current natural-key AccountRef on subsequent calls. Buyers of buyer-declared accounts send the natural key; a seller MAY also accept its echoed account_id, and buyers MUST NOT assume it does. A former key tombstoned by identity reconciliation returns ACCOUNT_MOVED to authorized callers.
        */
       account_id: string;
     }
@@ -16456,6 +16468,7 @@ export type ReportingPackageID = string;
  */
 export type ReportingStatusIssue = {
 } & {
+} & {
   /**
    * Seller-issued stable identifier for this logical issue: re-emissions and later polls of the same unresolved condition reuse it, and resolution retires it, so consumers can project AdCP reporting issues into durable work items. A recurrence after resolution receives a new id.
    */
@@ -16470,6 +16483,7 @@ export type ReportingStatusIssue = {
     | 'RESOURCE_EXPIRED'
     | 'READER_INCOMPATIBLE'
     | 'HISTORY_UNAVAILABLE'
+    | 'REVISION_UNREADABLE'
     | 'RECEIPT_REQUIRED'
     | 'RECEIPT_REJECTED'
     | 'ADJUSTMENT_RECEIPT_REQUIRED'
@@ -16503,6 +16517,10 @@ export type ReportingStatusIssue = {
    */
   message?: string;
   reporting_obligation_id?: string;
+  /**
+   * Published revision this issue concerns. Required when code is REVISION_UNREADABLE.
+   */
+  reporting_revision_id?: string;
   /**
    * Current authenticated consumer status statement that caused this mismatch.
    */
@@ -16536,6 +16554,7 @@ export type ReportingStatusIssue = {
     | 'RESOURCE_EXPIRED'
     | 'READER_INCOMPATIBLE'
     | 'HISTORY_UNAVAILABLE'
+    | 'REVISION_UNREADABLE'
     | 'RECEIPT_REQUIRED'
     | 'RECEIPT_REJECTED'
     | 'ADJUSTMENT_RECEIPT_REQUIRED'
@@ -16569,6 +16588,10 @@ export type ReportingStatusIssue = {
    */
   message?: string;
   reporting_obligation_id?: string;
+  /**
+   * Published revision this issue concerns. Required when code is REVISION_UNREADABLE.
+   */
+  reporting_revision_id?: string;
   /**
    * Current authenticated consumer status statement that caused this mismatch.
    */
@@ -20699,6 +20722,18 @@ export type GetProductsRejected = AdCPVersionEnvelope &
     ext?: ExtensionObject;
   };
 /**
+ * Bounded submitted envelope shared by the compact lifecycle tools.
+ */
+export type CompactTaskSubmitted = AdCPVersionEnvelope &
+  ProtocolEnvelope & {
+    status: 'submitted';
+    task_id: string;
+    message?: string;
+    errors?: Error[];
+    context?: ContextObject;
+    ext?: ExtensionObject;
+  };
+/**
  * Resolved selected pricing terms. Optional on buy_products input, where pricing_option_id plus the versioned feed identifies the offer; required inside accepted commercial_terms. Its pricing_option_id MUST match the sibling field.
  */
 export type CanonicalPricingOption = {
@@ -22143,7 +22178,7 @@ export interface MCPWebhookPayload {
   result?: AdCPAsyncResponseData;
 }
 /**
- * Release-precision AdCP protocol version negotiation fields. Composed via `allOf` into every AdCP request and response schema so the version semantics live in exactly one place. Distinct from `core/protocol-envelope.json`, which wraps responses at the transport layer (context_id / task_id / status / payload). This envelope is part of the payload itself.
+ * Release-precision AdCP protocol version negotiation fields. Composed via `allOf` into AdCP request schemas and shared response components so the version semantics live in one place. Strict (`additionalProperties: false`) request schemas also redeclare these two fields in their own `properties` via `$ref`, because draft-07 does not evaluate properties across `allOf`. The Trusted Match match requests are the exception: they inline both fields for their strict privacy boundary. Distinct from `core/protocol-envelope.json`, which wraps responses at the transport layer (context_id / task_id / status / payload). This envelope is part of the payload itself.
  */
 export interface AdCPVersionEnvelope {
   /**
@@ -22421,17 +22456,6 @@ export interface GetProductsAsyncSubmitted {
   /**
    * Optional advisory errors accompanying the submitted envelope. Use only for non-blocking warnings (e.g., throttled_severity advisories, governance observations). Terminal failures belong in the error branch, not here.
    */
-  errors?: Error[];
-  context?: ContextObject;
-  ext?: ExtensionObject;
-}
-/**
- * Bounded submitted envelope shared by the compact lifecycle tools.
- */
-export interface CompactTaskSubmitted {
-  status: 'submitted';
-  task_id: string;
-  message?: string;
   errors?: Error[];
   context?: ContextObject;
   ext?: ExtensionObject;
@@ -26637,7 +26661,7 @@ export interface CollectionListChangedWebhook {
    */
   cache_valid_until?: string;
   /**
-   * HMAC-SHA256 webhook signature over {unix_timestamp}.{raw_http_body_bytes} using the secret exchanged out-of-band when the seller registered with the governance agent. Recipients MUST verify against the X-ADCP-Signature and X-ADCP-Timestamp headers using timing-safe comparison and MUST reject requests where |now - timestamp| > 300 seconds. The body copy of this field is a convenience only — the headers are authoritative. See docs/building/implementation/security#webhook-security.
+   * HMAC-SHA256 webhook signature over {unix_timestamp}.{raw_http_body_bytes} using the secret exchanged out-of-band when the seller registered with the governance agent. Recipients MUST verify against the X-ADCP-Signature and X-ADCP-Timestamp headers using timing-safe comparison and MUST reject requests where |now - timestamp| > 300 seconds. The body copy of this field is a convenience only — the headers are authoritative. See docs/building/by-layer/L1/security#webhook-security.
    */
   signature: string;
   ext?: ExtensionObject;
@@ -29012,7 +29036,7 @@ export type AudienceSelector =
  */
 export interface AuthorizedAgentBaseFields {
   /**
-   * The authorized agent's API endpoint URL. Callers comparing this URL against a registry (sales-agent list, signal-provider registry, TMP provider lookup, etc.) MUST canonicalize both sides per the AdCP URL canonicalization rules, not byte-equality — two URLs that differ only in case, default port, or percent-encoding of unreserved characters are the same agent. See docs/reference/url-canonicalization.
+   * The authorized agent's protocol endpoint URL: the exact agent URL buyers are given and send AdCP requests to, including the path (e.g., `https://agent.example.com/mcp`). A bare origin matches only an agent served at the root. An agent reachable at more than one agent URL (for example, separate MCP and A2A endpoints) needs one entry per URL. Callers comparing this URL against a registry (sales-agent list, signal-provider registry, TMP provider lookup, etc.) MUST canonicalize both sides per the AdCP URL canonicalization rules, not byte-equality — two URLs that differ only in case, default port, or percent-encoding of unreserved characters are the same agent. See docs/reference/url-canonicalization.
    */
   url: string;
   /**
@@ -36599,7 +36623,7 @@ export interface ReportingWebhook {
   token?: string;
   /**
    * @deprecated
-   * Legacy authentication configuration for webhook delivery (A2A-compatible). Opts the receiver into Bearer or HMAC-SHA256 signing. Both schemes are deprecated; the preferred signing profile for new integrations is RFC 9421, where the seller signs with a key published at its brand.json agents[] entry and the buyer verifies against the seller's JWKS — no shared secret crosses the wire (see docs/building/implementation/security.mdx#webhook-callbacks). This field is required in AdCP 3.x; the requirement is removed in AdCP 4.0 when the default RFC 9421 path becomes the only path.
+   * Legacy authentication configuration for webhook delivery (A2A-compatible). Opts the receiver into Bearer or HMAC-SHA256 signing. Both schemes are deprecated; the preferred signing profile for new integrations is RFC 9421, where the seller signs with a key published at its brand.json agents[] entry and the buyer verifies against the seller's JWKS — no shared secret crosses the wire (see docs/building/by-layer/L1/security.mdx#webhook-callbacks). This field is required in AdCP 3.x; the requirement is removed in AdCP 4.0 when the default RFC 9421 path becomes the only path.
    */
   authentication: {
     /**
@@ -42599,7 +42623,7 @@ export type TMPProviderRegistration = (
    */
   provider_id: string;
   /**
-   * Base URL the router calls. The router appends /context for Context Match and /identity for Identity Match. MUST be HTTPS in production, validated against the canonical reserved IPv4 and IPv6 ranges, with the TCP connection pinned to the validated IP (DNS re-resolution alone is insufficient against rebinding). Publishers comparing two provider registrations for the same `endpoint` MUST canonicalize both per the AdCP URL canonicalization rules; two registrations differing only in case, default port, or path-slash collapsing are the same provider. See docs/trusted-match/specification#provider-registration-security, docs/building/implementation/security#webhook-url-validation-ssrf, and docs/reference/url-canonicalization.
+   * Base URL the router calls. The router appends /context for Context Match and /identity for Identity Match. MUST be HTTPS in production, validated against the canonical reserved IPv4 and IPv6 ranges, with the TCP connection pinned to the validated IP (DNS re-resolution alone is insufficient against rebinding). Publishers comparing two provider registrations for the same `endpoint` MUST canonicalize both per the AdCP URL canonicalization rules; two registrations differing only in case, default port, or path-slash collapsing are the same provider. See docs/trusted-match/specification#provider-registration-security, docs/building/by-layer/L1/security#webhook-url-validation-ssrf, and docs/reference/url-canonicalization.
    */
   endpoint: string;
   /**

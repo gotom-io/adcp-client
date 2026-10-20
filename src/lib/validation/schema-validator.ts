@@ -7,9 +7,9 @@
 
 import type { ErrorObject } from 'ajv';
 import { getValidator, getRegisteredSchemaIds, type Direction, type ResponseVariant } from './schema-loader';
-import { parseAdcpMajorVersion } from '../version';
 import { findHint } from './hints';
 import { injectLegacyEnvelopeStatus } from '../utils/envelope-status-compat';
+import { boundValidationIssues } from './diagnostic-limits';
 
 /**
  * One variant of a `oneOf` / `anyOf` that the caller's payload could have
@@ -294,6 +294,82 @@ function resolveSchemaPath(rootSchema: unknown, schemaPath: string): unknown {
     cursor = (cursor as Record<string, unknown>)[decoded];
   }
   return cursor;
+}
+
+/** Expand only unconditional single-property presence guards; keep other not rules intact. */
+function* expandNotErrors(
+  errors: readonly ErrorObject[],
+  rootSchema: unknown,
+  payload: unknown
+): Generator<ErrorObject> {
+  for (const error of errors) {
+    const rule = error.keyword === 'not' ? resolveSchemaPath(rootSchema, error.schemaPath) : undefined;
+    const branches = rule && typeof rule === 'object' ? (rule as { anyOf?: unknown }).anyOf : undefined;
+    if (!Array.isArray(branches) || branches.length === 0 || Object.keys(rule as object).length !== 1) {
+      yield error;
+      continue;
+    }
+    let instance = payload;
+    if (error.instancePath) {
+      for (const encoded of error.instancePath.slice(1).split('/')) {
+        const key = encoded.replace(/~1/g, '/').replace(/~0/g, '~');
+        if (instance == null || typeof instance !== 'object' || !Object.hasOwn(instance, key)) {
+          instance = undefined;
+          break;
+        }
+        instance = (instance as Record<string, unknown>)[key];
+      }
+    }
+    const keys = new Set<string>();
+    let opaqueBranch = false;
+    if (instance != null && typeof instance === 'object' && !Array.isArray(instance)) {
+      for (const branch of branches) {
+        if (
+          branch == null ||
+          typeof branch !== 'object' ||
+          Object.keys(branch).length !== 1 ||
+          !Array.isArray(branch.required) ||
+          branch.required.length !== 1 ||
+          typeof branch.required[0] !== 'string'
+        ) {
+          opaqueBranch = true;
+          continue;
+        }
+        const key = branch.required[0] as string;
+        if (Object.hasOwn(instance, key) && (instance as Record<string, unknown>)[key] !== undefined) keys.add(key);
+      }
+    }
+    if (keys.size === 0) {
+      yield error;
+      continue;
+    }
+    for (const key of keys) {
+      yield {
+        ...error,
+        instancePath: `${error.instancePath}/${key.replace(/~/g, '~0').replace(/\//g, '~1')}`,
+        message: `${key} cannot be set here`,
+      };
+    }
+    // Mixed guards can also reject field combinations. Preserve their opaque
+    // diagnostic instead of claiming each field is independently forbidden.
+    if (opaqueBranch) yield error;
+  }
+}
+
+function formatValidationIssues(
+  errors: readonly ErrorObject[],
+  ctx: FormatContext,
+  payload: unknown
+): ValidationIssue[] {
+  function* formatted(): Generator<ValidationIssue> {
+    for (const error of expandNotErrors(compactUnionErrors(errors, ctx.rootSchema), ctx.rootSchema, payload)) {
+      yield enrichWithVariants(formatIssue(error, ctx), ctx.rootSchema);
+    }
+  }
+  // sync_accounts uses the complete issue set to isolate failed entries before
+  // dispatching valid siblings. Its serialized error builders still apply the
+  // same bounds; truncating this internal set would change batch semantics.
+  return ctx.toolName === 'sync_accounts' ? [...formatted()] : boundValidationIssues(formatted());
 }
 
 /**
@@ -611,55 +687,12 @@ export function validateRequest(toolName: string, payload: unknown, version?: st
   if (valid) return { valid: true, issues: [], variant: 'request', ...(rootSchemaId && { schemaId: rootSchemaId }) };
   const registeredIds = getRegisteredSchemaIds(version);
   const ctx: FormatContext = { rootSchema, registeredIds, toolName };
-  const compacted = compactUnionErrors(validator.errors ?? [], rootSchema);
   return {
     valid: false,
-    issues: compacted.map(e => formatIssue(e, ctx)).map(i => enrichWithVariants(i, rootSchema)),
+    issues: formatValidationIssues(validator.errors ?? [], ctx, payload),
     variant: 'request',
     ...(rootSchemaId && { schemaId: rootSchemaId }),
   };
-}
-
-/**
- * Strip top-level optional fields whose value is `null` but whose declared
- * schema type is not nullable (`type` does not include `'null'`).
- *
- * Applies only when validating against a v2.x schema bundle. v2.5 sellers
- * (Pydantic-origin) commonly emit `errors: null`, `context: null`, `ext: null`
- * to signal "nothing here" rather than omitting the key. The v2.5 schemas
- * don't include `null` in those types, so Ajv spuriously rejects them.
- *
- * Gated to v2.x only — in v3, `errors` is a required field on failure
- * branches, and silently stripping it across all versions would mask real
- * bugs in v3 seller responses.
- *
- * Returns a shallow clone with the offending keys removed, or the original
- * object unchanged if nothing was stripped. Safe to pass to an Ajv validator:
- * Ajv 8 (without `removeAdditional`/`useDefaults`/`coerceTypes`) does not
- * mutate its input.
- */
-function stripEnvelopeNulls(payload: unknown, schema: unknown): unknown {
-  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return payload;
-  const s = schema as Record<string, unknown> | null;
-  if (!s) return payload;
-  const properties = s.properties as Record<string, unknown> | undefined;
-  if (!properties) return payload;
-  const required = new Set<string>(Array.isArray(s.required) ? (s.required as string[]) : []);
-  const payloadObj = payload as Record<string, unknown>;
-  let cloned: Record<string, unknown> | null = null;
-  for (const [key, value] of Object.entries(payloadObj)) {
-    if (value !== null) continue;
-    if (required.has(key)) continue;
-    const propSchema = properties[key] as Record<string, unknown> | undefined;
-    if (!propSchema) continue;
-    const type = propSchema.type;
-    const isNullable = type === 'null' || (Array.isArray(type) && (type as string[]).includes('null'));
-    if (!isNullable) {
-      if (!cloned) cloned = { ...payloadObj };
-      delete cloned[key];
-    }
-  }
-  return cloned ?? payload;
 }
 
 /**
@@ -704,11 +737,7 @@ export function validateResponse(toolName: string, payload: unknown, version?: s
   const effective = validator ?? (variant !== 'sync' ? getValidator(toolName, 'sync', version) : undefined);
   if (!effective) return OK;
   const rootSchema = (effective as { schema?: unknown }).schema;
-  // v2.x sellers (Pydantic-origin) emit optional envelope fields as null instead
-  // of omitting them. Strip before Ajv to avoid spurious type errors on `errors`,
-  // `context`, and `ext`. Gated to v2.x only — see stripEnvelopeNulls JSDoc.
-  const isV2Bundle = version != null && parseAdcpMajorVersion(version) === 2;
-  const normalizedPayload = isV2Bundle ? stripEnvelopeNulls(compatPayload, rootSchema) : compatPayload;
+  const normalizedPayload = compatPayload;
   const valid = effective(normalizedPayload) as boolean;
   const usedVariant: Direction = validator ? variant : 'sync';
   const variantFallback = !validator && variant !== 'sync';
@@ -730,10 +759,9 @@ export function validateResponse(toolName: string, payload: unknown, version?: s
   }
   const registeredIds = getRegisteredSchemaIds(version);
   const ctx: FormatContext = { rootSchema, registeredIds, toolName };
-  const compacted = compactUnionErrors(effective.errors ?? [], rootSchema);
   return {
     valid: false,
-    issues: compacted.map(e => formatIssue(e, ctx)).map(i => enrichWithVariants(i, rootSchema)),
+    issues: formatValidationIssues(effective.errors ?? [], ctx, normalizedPayload),
     variant: usedVariant,
     ...(rootSchemaId && { schemaId: rootSchemaId }),
     ...fallbackFields,

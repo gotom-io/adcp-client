@@ -24,6 +24,189 @@ accounts: {
 }
 ```
 
+For buyer setup and opt-in lifecycle management, see
+[First call to a seller](./FIRST-CALL-TO-A-SELLER.md).
+For upgrading an existing integration, use the
+[14.0-to-14.1 checklist](../migration-14.0-to-14.1.md).
+
+### Account sync contracts
+
+For platform `accounts.upsert`, the framework looks up accepted natural-key
+entries with `provisioning: false` before calling the batch method. The optional
+`ctx.existing` array is aligned with the entries passed to `upsert`; each element
+is the pre-write account snapshot or `null`. All natural-key dimensions are
+preserved, including brand countries, operator unit, currency, timezone and sandbox.
+Natural-key snapshots require the resolved account's own brand and operator;
+identity-free singleton resolvers supply no snapshot rather than matching every key.
+Use these snapshots to update the existing ID instead of creating another account.
+Snapshots are advisory: enforce uniqueness atomically in your own storage too.
+
+The framework emits typed, server-side `accounts.onDiagnostic` events for
+`ACCOUNT_SYNC_IDEMPOTENCY_VIOLATION`, `ACCOUNT_SYNC_PAYMENT_TERMS_MISMATCH`, and
+`ACCOUNT_BILLING_FIELDS_MISSING`, plus `ACCOUNT_SYNC_BILLING_MISMATCH` when an
+active result silently replaces requested agent billing with another party
+(strict mode rejects it with `BILLING_NOT_SUPPORTED`). ID-only resolvers that reject natural-key
+lookups remain usable and emit `ACCOUNT_SYNC_LOOKUP_UNSUPPORTED`; their
+identity checks require store-level enforcement. Events contain only the code, tool and original
+row index. Development logs also receive warnings. Callback exceptions do not
+change the result of a committed write. The default behavior preserves existing
+responses. Set `accounts.strictIdempotency: true` to return per-row failures for
+changed IDs, `created` on an existing key, or an active account that omits or
+changes requested terms (`PAYMENT_TERMS_NOT_SUPPORTED`). Identity violations
+return `SERVICE_UNAVAILABLE`. These post-write checks cannot roll back adopter writes.
+
+Missing sync billing/terms are filled only from a stored account whose ID matches
+the result, never from the buyer's requested terms. Agent-billed list rows without
+terms also emit a diagnostic. Low-level handler-bag overrides do not use this
+platform-store guard.
+
+### Persistent keyed accounts
+
+`createKeyedAccountStore` from `@adcp/sdk/server` supplies deterministic IDs and
+additive, non-expiring account syncs. Choose `memoryKeyedAccountBackend()` for one
+process, `pgKeyedAccountBackend(pool)` for PostgreSQL, or
+`redisKeyedAccountBackend(client)` for a persistent Redis deployment with eviction
+disabled. Custom KV backends can implement `KeyedAccountBackend` using native
+atomic compare-and-swap; ordinary read followed by write is insufficient.
+
+```ts
+import {
+  createKeyedAccountStore,
+  getKeyedAccountMigration,
+  pgKeyedAccountBackend,
+} from '@adcp/sdk/server';
+
+await pool.query(getKeyedAccountMigration());
+const accounts = createKeyedAccountStore({
+  namespace: 'seller-production', // trusted deployment namespace
+  backend: pgKeyedAccountBackend(pool),
+  resolution: 'implicit',
+  buildAccount: async (entry, { accountId, existing, dryRun, ctx }) => {
+    // Your onboarding code accepts the requested terms or throws AdcpError.
+    // It must use accountId for idempotent upstream writes too.
+    return onboardAdvertiser(entry, { accountId, existing, dryRun, authInfo: ctx?.authInfo });
+  },
+});
+```
+
+`buildAccount` is required and returns the actual account, using the supplied
+`accountId`. The store validates active payment terms before committing; a
+rejected update leaves the stored account intact. It strips `authInfo` before
+persistence; credentials must also stay out of `ctx_metadata`. By default the
+store partitions accounts by stable OAuth client, API key ID or verified agent
+URL. Override `principalKey` only with a trusted authorization partition, never
+buyer-supplied request fields. Use distinct namespaces for different sellers.
+
+Concurrent writes retry atomic CAS up to ten times, re-running `buildAccount`
+against fresh state. Its external side effects must therefore be idempotent on
+the supplied account ID. A crash between an upstream write and the local CAS
+still requires that upstream idempotency. The backend stores one roster per
+principal with a default `maxAccounts` limit of 1000 and suits modest rosters; large sellers should use indexed account
+tables with unique natural-key constraints. Share the memory backend across
+server factories; use persistent storage across restarts.
+
+Dry runs do not persist; `buildAccount` receives `dryRun: true` and must preview
+without upstream writes or other side effects. Only the seller-returned account
+determines sandbox authority; the buyer's sandbox flag participates in identity
+and never grants test-tool access. Settings updates cannot provision a missing natural-key
+account. `delete_missing` and operator identity reconciliation are explicitly
+unsupported; close accounts through your lifecycle code. List cursors are bound
+to the principal, filters and roster revision and become stale after a write.
+An unknown ID-keyed entry rejects the batch before any `buildAccount` callback:
+this interface requires brand/operator on failed rows, and unauthorized account
+identities must not be invented or exposed. Failed known-account updates retain
+the account's actual status and leave persisted state intact.
+
+Run [the account sync storyboard](../../examples/storyboards/account-sync-contract.yaml)
+with one authenticated sandbox caller. Its `account.sync_contract` invariant
+checks repeat syncs with fresh request keys, exact accepted terms and billing
+fields on list rows. The fixture is SDK-authored; canonical protocol storyboards
+remain unchanged. A seller rejecting the fixture's terms needs an accepted-terms
+fixture to exercise successful repeat provisioning.
+
+Account resolvers receive `ctx.provisioning`. It is false on discovery and
+negotiation (`get_products`, `list_products`, `get_signals`, and proposal
+request/refine/decline); these tasks MUST use lookup only. It is true on spend
+commitments, `activate_signal`, and `sync_*` tasks. Lazy provisioning must be
+explicitly gated:
+
+```ts
+resolve: async (ref, ctx) => {
+  const existing = await db.findAuthorizedAccount(ref, ctx?.authInfo);
+  if (existing || !ctx?.provisioning) return existing;
+  return await db.createAuthorizedAccount(ref, ctx?.authInfo);
+},
+```
+
+When `resolveAccount` is configured, a supplied unknown reference returns
+`ACCOUNT_NOT_FOUND`, even on optional account tools.
+
+### Strict account references (`strictAccountReferences`)
+
+SDK 14 keeps four compatibility behaviors that strict mode removes:
+
+- A buyer-supplied `account` still reaches a raw handler-bag seller that has
+  no reference-aware `resolveAccount`: the handler sees `params.account` and
+  `ctx.account` is undefined. An auth-only `resolveAccountFromAuth` does not
+  authorize an arbitrary reference.
+- A seller that declares `capabilities.account.requiredForProducts` still
+  serves `get_products` when the request carries no account and
+  authentication resolves none.
+- `list_accounts.account` is resolved through `resolveAccount` as the
+  request's account (an unknown or unauthorized filter returns
+  `ACCOUNT_NOT_FOUND`). Strict mode treats it as a filter instead.
+- On `createAdcpServerFromPlatform` with `resolution: 'implicit'`, an account
+  whose returned identity metadata disagrees with the supplied natural key is
+  still used.
+
+Each logs a deprecation warning once per process per warning code (through
+`logger.warn`, plus `process.emitWarning` outside `NODE_ENV=production`);
+later occurrences log at debug level. Codes:
+`ADCP_UNRESOLVED_ACCOUNT_REFERENCE`, `ADCP_REQUIRED_FOR_PRODUCTS_NOT_ENFORCED`,
+`ADCP_LIST_ACCOUNTS_FILTER_RESOLVED`, and
+`ADCP_IMPLICIT_ACCOUNT_IDENTITY_MISMATCH`.
+
+**Strict mode remains an explicit opt-in in SDK 15.** Set `strictAccountReferences: true`:
+
+```ts
+createAdcpServer({
+  name: 'Seller',
+  version: '1.0.0',
+  strictAccountReferences: true,
+  resolveAccount: (ref, ctx) => authorizedAccounts.find(ref, ctx.authInfo),
+  mediaBuy: {
+    getProducts: (params, ctx) => catalog.forAccount(ctx.account, params),
+  },
+});
+```
+
+With `strictAccountReferences: true`:
+
+- A supplied reference on a server without `resolveAccount` fails with
+  `ACCOUNT_NOT_FOUND` before the handler runs.
+- A `requiredForProducts` seller refuses account-less `get_products` with
+  `ACCOUNT_REQUIRED`.
+- `list_accounts.account` is a filter: `resolveAccount` is not called for it
+  and `ctx.account` comes from `resolveAccountFromAuth`.
+- An implicit-mode account whose returned identity metadata (`brand`,
+  `operator`, `operator_unit`, `currency`, `timezone`, `sandbox`) disagrees
+  with the supplied natural key is refused with `ACCOUNT_NOT_FOUND`. Fields
+  your store does not return are not compared.
+
+Migration for handler-bag sellers: move account authorization out of
+individual handlers and into `resolveAccount`, then set the flag.
+`authorizedAccounts.find` must return null on an unknown reference or a
+reference owned by another principal. Public discovery may omit `account`;
+resource creation and spend commitments need an authorized account. Implicit
+stores should resolve by the complete natural key and return identity
+metadata that echoes it, or omit the metadata.
+
+`InMemoryImplicitAccountStore` matches supplied refs on the complete natural
+key, including operator unit, currency, timezone, and sandbox. It retains its
+24-hour TTL and replacement sync semantics. Set `mergeOnUpsert: true` for
+additive batches and revoke individual refs with `remove(ref, ctx)`; passing
+`delete_missing: true` in `sync_accounts` retains replacement semantics.
+
 **Each mode has exactly one spelling.** `'derived'` keeps its name even
 though [adcp#5062](https://github.com/adcontextprotocol/adcp/pull/5062)
 calls the shape an *upstream-managed account-id namespace*: `resolution` is
@@ -47,28 +230,52 @@ construction, not a silent fallback.
 
 ### 1 · How it works
 
-1. Buyer calls `sync_accounts` with `AccountReference[]`.
+1. Buyer calls `sync_accounts` with natural-key provisioning entries.
 2. Framework calls your `accounts.upsert()` — you create/find accounts and
    store the `authPrincipal → accounts` mapping.
-3. Buyer calls any tool (e.g. `create_media_buy`) without `ext.account_ref`.
-4. Framework calls `accounts.resolve(undefined, ctx)` — you look up the
-   account by `ctx.authInfo`.
+3. On subsequent account-scoped calls, the buyer supplies top-level
+   `account: { brand, operator, ... }`. The framework calls
+   `accounts.resolve(ref, ctx)` with that natural key. Look it up within the
+   authenticated caller's synced roster; do not substitute another account.
+4. When a request omits `account`, the framework instead calls
+   `accounts.resolve(undefined, ctx)`. This is a separate auth-derived lookup
+   path. A null result is allowed for account-optional tools and yields
+   `ACCOUNT_REQUIRED` for account-required operations.
+
+Implicit sellers refuse the `{ account_id }` reference arm. A seller handle
+returned by `sync_accounts` does not replace the natural key on later calls.
 
 ### 2 · Key derivation
 
 Extract the principal key from `ctx.authInfo.credential`:
 
 ```ts
-resolve: async (_ref, ctx) => {
+resolve: async (ref, ctx) => {
   const cred = ctx?.authInfo?.credential;
   const key = cred?.kind === 'oauth'    ? `oauth:${cred.client_id}`
             : cred?.kind === 'api_key'  ? `api_key:${cred.key_id}`
             : cred?.kind === 'http_sig' ? `http_sig:${cred.agent_url}`
             : undefined;
   if (!key) return null;
+  if (ref !== undefined) {
+    // Match the full natural key within THIS principal's synced roster.
+    // An unknown or unauthorized ref returns null, without a fallback.
+    return await db.findSyncedAccountByNaturalKey(key, ref);
+  }
+  // Account omitted: use your existing auth-derived selection policy.
   return await db.findAccountByPrincipalKey(key);
 },
 ```
+
+The `db` methods above are operations you implement in your own store.
+`findSyncedAccountByNaturalKey` must compare the complete brand identity
+(domain, optional brand ID and countries), operator, operator-unit ID,
+currency, timezone, and sandbox within the principal's roster. Use consistent
+normalization at sync and lookup, including country ordering and omitted/false
+sandbox. It must not create an account or match on brand/operator alone.
+`findAccountByPrincipalKey` handles only the omitted-reference path according
+to your documented selection policy. The built-in `InMemoryImplicitAccountStore`
+keeps its historical first-account selection for that path.
 
 **Why `credential.client_id`, not `authInfo.sub`?**
 
@@ -101,14 +308,24 @@ receiving auth errors will refresh credentials or escalate, not call
 
 ```ts
 // ✓ Correct
-resolve: async (_ref, ctx) => {
-  const account = await db.findByPrincipal(extractKey(ctx?.authInfo));
-  return account ?? null;  // omitted account → ACCOUNT_REQUIRED
+resolve: async (ref, ctx) => {
+  const key = extractKey(ctx?.authInfo);
+  if (!key) return null;
+  const account = ref === undefined
+    ? await db.findAccountByPrincipalKey(key)
+    : await db.findSyncedAccountByNaturalKey(key, ref);
+  // Missing: supplied account → ACCOUNT_NOT_FOUND;
+  // omitted account on an account-required operation → ACCOUNT_REQUIRED.
+  return account ?? null;
 },
 
 // ✗ Wrong — misleads buyers about how to recover
-resolve: async (_ref, ctx) => {
-  const account = await db.findByPrincipal(extractKey(ctx?.authInfo));
+resolve: async (ref, ctx) => {
+  const key = extractKey(ctx?.authInfo);
+  if (!key) return null;
+  const account = ref === undefined
+    ? await db.findAccountByPrincipalKey(key)
+    : await db.findSyncedAccountByNaturalKey(key, ref);
   if (!account) throw new AdcpError('AUTH_MISSING', { message: 'call sync_accounts first' });
   return account;
 },
@@ -501,3 +718,9 @@ const accounts = {
 **Hand-rolled stores.** For stores that don't use `createRosterAccountStore`,
 handle `resolve(undefined, ctx)` in your own `resolve` implementation by
 checking `ref === undefined` before the id-arm branch.
+
+### Callback boundaries
+
+A custom `principalKey` may be synchronous or asynchronous, and must return a nonempty primitive string derived from trusted authentication state. Missing, object, numeric, boolean, or blank values fail closed before backend access. Use a stable tenant identity, keep it deterministic across repeated calls in one request, and bound callback I/O durations.
+
+`createKeyedAccountStore` captures dry-run intent before callbacks and gives each CAS retry fresh copies of sync entries and request input. Mutating callback request arguments cannot change the original request or turn a preview into a committed write. Framework commercial checks also retain an independent request snapshot. Async diagnostic hooks are fire-and-forget; their failures are isolated from dispatch.

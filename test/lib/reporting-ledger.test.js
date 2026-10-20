@@ -3,9 +3,9 @@ const { createHash } = require('node:crypto');
 const { describe, test } = require('node:test');
 
 const {
-  REPORTING_LEDGER_MIGRATION,
-  REPORTING_NOTIFICATION_ACTIVITY_MIGRATION,
+  REPORTING_STATUS_REVISION_VIEW_MAX_ROWS,
   ReportingLedgerSnapshotUnavailableError,
+  ReportingRowStoreError,
   aggregateReportingCoverageV1,
   aggregateReportingHealthV1,
   createReportingProducer,
@@ -25,6 +25,9 @@ const {
   redactedReportingSourceOfferingV1,
   redactedReportingSourceRequestV1,
 } = require('../../dist/lib/reporting/source/index.js');
+const { AdcpError } = require('../../dist/lib/server/decisioning/async-outcome.js');
+const { createAdcpServer } = require('../../dist/lib/server/create-adcp-server.js');
+const { InMemoryStateStore } = require('../../dist/lib/server/legacy/v5/index.js');
 const { GetReportingStatusResponseSchema } = require('../../dist/lib/schemas/index.js');
 const { validateResponse } = require('../../dist/lib/validation/schema-validator.js');
 
@@ -1060,6 +1063,135 @@ describe('seller reporting ledger', () => {
     await Promise.all(calls.slice(0, 16));
   });
 
+  test('unreadable published revisions degrade health until the issue retires', async () => {
+    const store = new MemoryLedgerStore();
+    const obligation = healthObligation();
+    store.obligations.set(obligation.reporting_obligation_id, obligation);
+    store.ledgerAsOf = obligation.recoveryDeadlineAt;
+    store.revisions.set('revision-unreadable-1', {
+      reporting_revision_id: 'revision-unreadable-1',
+      reporting_obligation_id: obligation.reporting_obligation_id,
+      revisionNumber: 1,
+      finality: 'official',
+      createdAt: obligation.expectedAt,
+    });
+    const handler = createReportingStatusHandler(store);
+    const read = view => handler({ account: obligation.account, view }, { account: obligation.account });
+    assert.equal((await read('summary')).health, 'complete');
+    const issue = {
+      issueId: 'revision_unreadable_1',
+      reporting_obligation_id: obligation.reporting_obligation_id,
+      reporting_revision_id: 'revision-unreadable-1',
+      code: 'REVISION_UNREADABLE',
+      responsibleParty: 'seller',
+      openedAt: obligation.expectedAt,
+      observedAt: obligation.expectedAt,
+    };
+    for (const [severity, recommendedAction] of [
+      ['delayed', 'wait_for_retry'],
+      ['action_required', 'contact_seller'],
+    ]) {
+      await store.putIssue({ ...issue, severity, recommendedAction });
+      for (const view of ['summary', 'periods']) {
+        const result = await read(view);
+        const projection = view === 'summary' ? result : result.periods[0];
+        assert.equal(projection.health, severity);
+        const unreadable = projection.issues.find(value => value.code === 'REVISION_UNREADABLE');
+        assert.ok(unreadable);
+        assert.equal(unreadable.responsible_party, 'seller');
+        assert.equal(unreadable.reporting_obligation_id, obligation.reporting_obligation_id);
+        assert.equal(unreadable.reporting_revision_id, 'revision-unreadable-1');
+      }
+    }
+    for (const issueState of ['resolved', 'waived']) {
+      await store.putIssue({ ...issue, severity: 'action_required', recommendedAction: 'contact_seller', issueState });
+      assert.equal((await read('summary')).health, 'complete');
+      assert.equal((await read('summary')).issues.length, 0);
+    }
+  });
+
+  test('invalid owned unreadable revisions fail safely without exposing issue data', async () => {
+    const store = new MemoryLedgerStore();
+    const obligation = healthObligation();
+    store.obligations.set(obligation.reporting_obligation_id, obligation);
+    store.ledgerAsOf = obligation.recoveryDeadlineAt;
+    store.revisions.set('revision-unreadable-1', {
+      reporting_revision_id: 'revision-unreadable-1',
+      reporting_obligation_id: obligation.reporting_obligation_id,
+      revisionNumber: 1,
+      finality: 'official',
+      createdAt: obligation.expectedAt,
+    });
+    store.revisions.set('other-tenant-revision', {
+      reporting_revision_id: 'other-tenant-revision',
+      reporting_obligation_id: 'other-tenant-obligation',
+      revisionNumber: 1,
+      finality: 'official',
+      createdAt: obligation.expectedAt,
+    });
+    const issue = {
+      issueId: 'revision_unreadable_1',
+      reporting_obligation_id: obligation.reporting_obligation_id,
+      reporting_revision_id: 'revision-unreadable-1',
+      code: 'REVISION_UNREADABLE',
+      severity: 'action_required',
+      responsibleParty: 'seller',
+      recommendedAction: 'contact_seller',
+      openedAt: obligation.expectedAt,
+      observedAt: obligation.expectedAt,
+    };
+    const handler = createReportingStatusHandler(store);
+    for (const change of [
+      { reporting_revision_id: undefined },
+      { reporting_revision_id: 'other-tenant-revision' },
+      { reporting_revision_id: 'https://seller.example/revision' },
+      { responsibleParty: 'buyer' },
+      { recommendedAction: 'wait_for_retry' },
+    ]) {
+      await store.putIssue({ ...issue, ...change });
+      for (const view of ['summary', 'periods']) {
+        const result = await handler({ account: obligation.account, view }, { account: obligation.account });
+        assert.equal(result.status, 'failed');
+        assert.equal(result.failure_kind, 'operational');
+        assert.equal(result.health, undefined);
+        assert.equal(result.issues, undefined);
+        assert.equal(result.periods, undefined);
+        assert.equal(JSON.stringify(result).includes('other-tenant-revision'), false);
+        assert.equal(JSON.stringify(result).includes('seller.example'), false);
+      }
+    }
+    await store.putIssue({ ...issue, reporting_obligation_id: 'scope' });
+    const scopeResult = await handler(
+      { account: obligation.account, view: 'summary' },
+      { account: obligation.account }
+    );
+    assert.equal(scopeResult.health, 'complete');
+    assert.equal(scopeResult.issues.length, 0);
+  });
+
+  test('unreadable support preserves existing persisted issue health', async () => {
+    const store = new MemoryLedgerStore();
+    const obligation = healthObligation();
+    store.obligations.set(obligation.reporting_obligation_id, obligation);
+    store.ledgerAsOf = obligation.expectedAt;
+    await store.putIssue({
+      issueId: 'existing_issue',
+      reporting_obligation_id: obligation.reporting_obligation_id,
+      code: 'ACCESS_REQUIRED',
+      severity: 'action_required',
+      responsibleParty: 'seller',
+      recommendedAction: 'repair_access',
+      openedAt: obligation.expectedAt,
+      observedAt: obligation.expectedAt,
+    });
+    const result = await createReportingStatusHandler(store)(
+      { account: obligation.account, view: 'summary' },
+      { account: obligation.account }
+    );
+    assert.equal(result.health, 'delayed');
+    assert.ok(result.issues.some(issue => issue.code === 'ACCESS_REQUIRED'));
+  });
+
   test('advances terminal failures when their recovery deadline elapses', async () => {
     const store = new MemoryLedgerStore();
     const obligation = { ...healthObligation(), state: 'terminal' };
@@ -1478,6 +1610,25 @@ describe('seller reporting ledger', () => {
     const parsedExact = GetReportingStatusResponseSchema.safeParse(exact);
     assert.equal(parsedExact.success, true, parsedExact.success ? undefined : JSON.stringify(parsedExact.error.issues));
     assert.equal(validateResponse('get_reporting_status', exact, '3.2.1').valid, true);
+    // Revisions above the inline cap omit rows from the status view; their
+    // rows stay pageable through the exact delivery read.
+    const oversizedStore = Object.create(store);
+    oversizedStore.getRevisionMetadata = async (...args) => {
+      const metadata = await store.getRevisionMetadata(...args);
+      return (
+        metadata && {
+          ...metadata,
+          binding: { ...metadata.binding, rowCount: REPORTING_STATUS_REVISION_VIEW_MAX_ROWS + 1 },
+        }
+      );
+    };
+    const oversizedExact = await createReportingStatusHandler(oversizedStore)(
+      { account: request.account, view: 'revision', reporting_revision_id: revisions[0].reporting_revision_id },
+      context
+    );
+    assert.equal(oversizedExact.revision.reporting_revision_id, revisions[0].reporting_revision_id);
+    assert.equal('reporting_rows' in oversizedExact, false);
+    assert.equal(validateResponse('get_reporting_status', oversizedExact, '3.2.1').valid, true);
     const deliveryHandler = createReportingDeliveryHandler(store);
     const delivery = await deliveryHandler(
       {
@@ -1499,18 +1650,100 @@ describe('seller reporting ledger', () => {
     );
     assert.deepEqual(remainingDelivery.reporting_rows, revisions[0].rows.slice(1));
     assert.equal(remainingDelivery.pagination.has_more, false);
+    // Every exact-read miss is the same nondisclosing REFERENCE_NOT_FOUND on
+    // reporting_revision_id: unknown revision, another account's revision and
+    // an unusable cursor are indistinguishable, and none is transient.
+    const isRevisionNotFound = error => {
+      assert.ok(
+        error instanceof AdcpError,
+        'must be an AdcpError so createAdcpServer does not project it as transient'
+      );
+      assert.equal(error.code, 'REFERENCE_NOT_FOUND');
+      assert.equal(error.field, 'reporting_revision_id');
+      assert.notEqual(error.recovery, 'transient');
+      assert.equal(error.message, 'Reporting revision is unavailable');
+      return true;
+    };
+    const revisionId = revisions[0].reporting_revision_id;
+    const deliver = (body, ctx = context) => deliveryHandler({ account: request.account, ...body }, ctx);
+    const forgedCursor = value => Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+    await assert.rejects(() => deliver({ reporting_revision_id: 'rrev_unknown' }), isRevisionNotFound);
+    await assert.rejects(
+      () => deliver({ reporting_revision_id: revisionId }, { account: { account_id: 'another-account' } }),
+      isRevisionNotFound
+    );
+    for (const cursor of [
+      'invalid-cursor',
+      forgedCursor({ revisionId: 'rrev_other', offset: 1 }),
+      forgedCursor({ revisionId, offset: -1 }),
+      forgedCursor({ revisionId, offset: 1.5 }),
+      forgedCursor({ revisionId, offset: revisions[0].binding.rowCount }),
+      forgedCursor({ revisionId }),
+    ]) {
+      await assert.rejects(
+        () => deliver({ reporting_revision_id: revisionId, pagination: { cursor } }),
+        isRevisionNotFound,
+        `cursor ${cursor}`
+      );
+    }
+    await assert.rejects(
+      () => deliver({}),
+      error =>
+        error instanceof AdcpError && error.code === 'VALIDATION_ERROR' && error.field === 'reporting_revision_id'
+    );
+    // Rows that expired read like an unknown revision; any other row-store
+    // failure on a retained revision is an integrity failure, never not-found.
+    const rowStoreFailing = code => {
+      const failing = Object.create(store);
+      failing.readRevisionRows = async () => {
+        throw new ReportingRowStoreError(code, 'fixture');
+      };
+      return createReportingDeliveryHandler(failing);
+    };
+    await assert.rejects(
+      () => rowStoreFailing('ROWS_EXPIRED')({ account: request.account, reporting_revision_id: revisionId }, context),
+      isRevisionNotFound
+    );
+    for (const code of ['ROWS_INTEGRITY_FAILED', 'ROWS_UNAVAILABLE']) {
+      await assert.rejects(
+        () => rowStoreFailing(code)({ account: request.account, reporting_revision_id: revisionId }, context),
+        error => error instanceof AdcpError && error.code === 'SERVICE_UNAVAILABLE'
+      );
+    }
+    const mismatched = Object.create(store);
+    mismatched.readRevisionRows = async input => {
+      const revision = await store.getRevision(input.reporting_revision_id, input.account_id);
+      return { rows: revision.rows.slice(input.offset, input.offset + input.limit), total: revision.rows.length + 1 };
+    };
     await assert.rejects(
       () =>
-        deliveryHandler(
-          {
-            account: request.account,
-            reporting_revision_id: revisions[0].reporting_revision_id,
-            pagination: { cursor: 'invalid-cursor' },
-          },
+        createReportingDeliveryHandler(mismatched)(
+          { account: request.account, reporting_revision_id: revisionId },
           context
         ),
-      /cursor is invalid/
+      error => error instanceof AdcpError && error.code === 'SERVICE_UNAVAILABLE'
     );
+    // Through createAdcpServer the miss reaches the buyer as the terminal
+    // not-found envelope, not SERVICE_UNAVAILABLE with transient recovery.
+    const server = createAdcpServer({
+      name: 'reporting-not-found',
+      version: '1.0.0',
+      mediaBuy: { getMediaBuyDelivery: deliveryHandler },
+      stateStore: new InMemoryStateStore(),
+      resolveAccount: async () => ({ id: request.account.account_id }),
+      validation: { requests: 'off', responses: 'off' },
+    });
+    const wire = await server.dispatchTestRequest({
+      method: 'tools/call',
+      params: {
+        name: 'get_media_buy_delivery',
+        arguments: { account: request.account, reporting_revision_id: 'rrev_unknown' },
+      },
+    });
+    assert.equal(wire.isError, true);
+    assert.equal(wire.structuredContent.adcp_error.code, 'REFERENCE_NOT_FOUND');
+    assert.equal(wire.structuredContent.adcp_error.field, 'reporting_revision_id');
+    assert.notEqual(wire.structuredContent.adcp_error.recovery, 'transient');
     assert.equal(delivery.reporting_revision_binding.content_sha256, revisions[0].binding.sha256);
     const validatedDelivery = validateResponse('get_media_buy_delivery', delivery, '3.2.1');
     if (!validatedDelivery.valid) throw new Error(JSON.stringify(validatedDelivery));
@@ -1870,24 +2103,5 @@ describe('seller reporting ledger', () => {
     const parsedExact = GetReportingStatusResponseSchema.safeParse(exact);
     assert.equal(parsedExact.success, true, parsedExact.success ? undefined : JSON.stringify(parsedExact.error.issues));
     assert.equal(validateResponse('get_reporting_status', exact, '3.2.1').valid, true);
-  });
-
-  test('exports one idempotent migration for the complete store surface', () => {
-    for (const table of [
-      'configurations',
-      'obligations',
-      'revisions',
-      'adjustments',
-      'consumer_statuses',
-      'issues',
-      'snapshots',
-      'checkpoints',
-    ]) {
-      assert.match(REPORTING_LEDGER_MIGRATION, new RegExp(`CREATE TABLE IF NOT EXISTS adcp_reporting_${table}`));
-    }
-    assert.match(
-      REPORTING_NOTIFICATION_ACTIVITY_MIGRATION,
-      /CREATE TABLE IF NOT EXISTS "adcp_reporting_notification_activity"/
-    );
   });
 });

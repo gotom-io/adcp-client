@@ -199,6 +199,8 @@ export interface DayParting {
  * OAuth tokens for agent authentication
  */
 export interface AgentOAuthTokens {
+  /** Authorization server that issued these tokens. Required when reusing a refresh token. */
+  issuer?: string;
   /** OAuth access token */
   access_token: string;
   /** OAuth refresh token (for token renewal) */
@@ -217,6 +219,8 @@ export interface AgentOAuthTokens {
  * OAuth client information (from dynamic registration)
  */
 export interface AgentOAuthClient {
+  /** Authorization server where this client was registered. Required when reusing a client secret. */
+  issuer?: string;
   /** OAuth client ID */
   client_id: string;
   /** OAuth client secret (for confidential clients) */
@@ -340,6 +344,8 @@ export type AgentRequestSigningConfig = AgentRequestSigningConfigInline | AgentR
 
 /** Operation-list overrides shared by both `request_signing` shapes. */
 export interface AgentRequestSigningOperationOverrides {
+  /** Experimental 3.3 opt-in. Omitted retains the RFC 9421 AdCP profile. */
+  profile?: 'rfc9421' | 'web-bot-auth';
   /**
    * AdCP operation names to sign regardless of the seller's advertisement.
    * Useful during pilots before a counterparty flips an op into `required_for`.
@@ -422,6 +428,8 @@ export interface AgentRequestSigningConfigProvider extends AgentRequestSigningOp
    * KMS adapter.
    */
   provider: SigningProvider;
+  /** Required for Web Bot Auth: public JWK used to derive the RFC 7638 kid. */
+  public_key?: import('../signing/types').AdcpJsonWebKey;
   /** Agent base URL — same semantics as the inline shape. */
   agent_url: string;
 }
@@ -475,6 +483,9 @@ export interface AgentConfig {
    * @internal
    */
   oauth_code_verifier?: string;
+
+  /** Opaque discovery state paired with the pending PKCE verifier; persist and return verbatim. */
+  oauth_discovery_state?: import('@modelcontextprotocol/sdk/client/auth.js').OAuthDiscoveryState;
 
   /**
    * Additional HTTP headers to include in every request to this agent.

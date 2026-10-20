@@ -3,7 +3,7 @@
 import type { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { randomUUID } from 'node:crypto';
 import type { AccountReference, AgentConfig } from '../types';
-import type { ResolveAccountOptions } from './account-resolution';
+import type { ResolveAccountOptions, ResolveAccountResult } from './account-resolution';
 import type {
   MCPWebhookPayload,
   GetBrandIdentityRequest,
@@ -175,6 +175,7 @@ import type {
   CanonicalProduct,
   CanonicalSyncCreativesRequest,
   CanonicalUpdateMediaBuyRequest,
+  CreativeFormatWireMode,
 } from '../v2/projection/creative-delivery';
 export type { CanonicalGetProductsResponse } from '../v2/projection/creative-delivery';
 
@@ -350,7 +351,6 @@ export type InProcessAgentClientConfig = Pick<
   | 'canonicalFormatLegacyResolver'
   | 'validateFeatures'
   | 'requireV3ForMutations'
-  | 'allowV2'
   | 'workingTimeout'
   | 'defaultMaxClarifications'
   | 'persistConversations'
@@ -440,6 +440,10 @@ interface PendingTaskHandle {
 }
 
 export class AgentClient {
+  get accounts() {
+    return this.client.accounts;
+  }
+
   private client: SingleAgentClient;
   private currentContextId?: string;
   private pendingTask?: PendingTaskHandle;
@@ -1478,9 +1482,35 @@ export class AgentClient {
     return this.client.getCapabilities(options);
   }
 
+  /**
+   * Resolve the creative wire mode used by canonical writes without sending a
+   * mutation. Uses capabilities, this tool's input schema, and the client wire
+   * pin. Older peers with insufficient evidence return `unknown`; a matching
+   * seller-advertised product option can establish canonical delivery for an
+   * individual 3.1 write. Otherwise projection requires an unambiguous legacy
+   * reference. Conflicting evidence
+   * or unproven support with a 3.2+ buyer pin throws `CreativeFormatCapabilityError`.
+   */
+  async resolveCreativeFormatWireMode(
+    taskType: 'sync_creatives' | 'create_media_buy' | 'update_media_buy',
+    options?: Pick<TaskOptions, 'signal' | 'transport'>
+  ): Promise<CreativeFormatWireMode> {
+    return this.client.resolveCreativeFormatWireMode(taskType, options);
+  }
+
   /** Scope token for a tenant-bound, application-owned capability preflight. */
   getCapabilityEvidenceScope(): import('./SingleAgentClient').CapabilityEvidenceScope {
     return this.client.getCapabilityEvidenceScope();
+  }
+
+  /** Drop this client's discovery evidence and its shared `discoveryCache` entry. */
+  invalidateDiscoveryCache(options?: Pick<TaskOptions, 'transport'>): Promise<void> {
+    return this.client.invalidateDiscoveryCache(options);
+  }
+
+  /** Pre-seed the shared `discoveryCache` so peer clients skip discovery within the TTL. */
+  primeDiscoveryCache(seed: import('./SingleAgentClient').AgentDiscoverySeed): Promise<boolean> {
+    return this.client.primeDiscoveryCache(seed);
   }
 
   /** Install fresh capability evidence without making a redundant probe. */
@@ -1492,7 +1522,6 @@ export class AgentClient {
    * Return the seller's declared `adcp.idempotency.replay_ttl_seconds`, or
    * throw when a v3 seller omits the (required) declaration.
    *
-   * Returns `undefined` for v2 agents — v2 pre-dates the idempotency envelope.
    */
   async getIdempotencyReplayTtlSeconds(): Promise<number | undefined> {
     return this.client.getIdempotencyReplayTtlSeconds();
@@ -1501,7 +1530,7 @@ export class AgentClient {
   /**
    * Assert that the seller's capabilities corroborate this client's pinned
    * AdCP major (per `getAdcpVersion()`). Throws `VersionUnsupportedError`
-   * otherwise. Set `ADCP_ALLOW_V2=1` to bypass.
+   * otherwise.
    */
   async requireSupportedMajor(taskType: string = 'request'): Promise<void> {
     return this.client.requireSupportedMajor(taskType);
@@ -1585,7 +1614,22 @@ export class AgentClient {
   }
 
   /** Resolve the seller's account contract into a reusable wire account reference. */
-  async resolveAccount(hints: ResolveAccountOptions = {}, options?: TaskOptions): Promise<AccountReference> {
+  async resolveAccount(
+    hints: ResolveAccountOptions & { includeDetails: true },
+    options?: TaskOptions
+  ): Promise<ResolveAccountResult>;
+  async resolveAccount(
+    hints?: ResolveAccountOptions & { includeDetails?: false },
+    options?: TaskOptions
+  ): Promise<AccountReference>;
+  async resolveAccount(
+    hints: ResolveAccountOptions & { includeDetails?: boolean },
+    options?: TaskOptions
+  ): Promise<AccountReference | ResolveAccountResult>;
+  async resolveAccount(
+    hints: ResolveAccountOptions & { includeDetails?: boolean } = {},
+    options?: TaskOptions
+  ): Promise<AccountReference | ResolveAccountResult> {
     return this.client.resolveAccount(hints, this.withSession('resolve_account', options), result =>
       this.retainSession(result)
     );
@@ -1969,6 +2013,11 @@ export class AgentClient {
    */
   getProtocol(): 'mcp' | 'a2a' {
     return this.client.getProtocol();
+  }
+
+  /** Resolved MCP endpoint already used by this client; never performs discovery. */
+  getDiscoveredMcpEndpoint(): string | undefined {
+    return this.client.getDiscoveredMcpEndpoint();
   }
 
   /**

@@ -586,6 +586,10 @@ function generateLlmsTxt(
 ): string {
   const groups = groupByDomain(tools);
   const version = getLibraryVersion();
+  // Match this reference's release train without steering beta APIs to stable.
+  const installVersion = version.includes('-')
+    ? version.split('-')[1].split('.')[0]
+    : version.split('.').slice(0, 2).join('.');
   const now = new Date().toISOString().split('T')[0];
 
   const lines: string[] = [];
@@ -613,20 +617,23 @@ function generateLlmsTxt(
   ln();
 
   // --- Client vs. server routing ---
-  ln(`## Start here: SDK 14 and AdCP 3.2`);
+  ln(`## Start here: AdCP 3.2`);
   ln();
   ln(
-    `SDK 14 requires Node.js \`^20.19.0 || >=22.12.0\`; install it with \`npm install @adcp/sdk\`, or pin the AdCP 3.2 line with \`@adcp/sdk@adcp-3.2\`.`
+    `The SDK requires Node.js \`^20.19.0 || >=22.12.0\`. Install this reference's release train with \`npm install @adcp/sdk@${installVersion}\`; use the documentation from the exact published SDK version you install. For reproducible CLI runs, pin that exact SDK version. After installation, \`node -p "require('@adcp/sdk').ADCP_VERSION"\` reports its protocol pin; \`ls node_modules/@adcp/sdk/compliance/cache\` lists its packaged compliance versions. The legacy \`adcp-3.2\` npm tag selects SDK 14 and does not receive the refreshed compliance caches.`
   );
   ln();
   ln(
-    `SDK 14 is compact-lifecycle first: \`list_products → buy_products → control_media_buy\`, with \`request_proposals → refine_proposals → accept_proposal\` when terms need negotiation.`
+    `The SDK is compact-lifecycle first: \`list_products → buy_products → control_media_buy\`, with \`request_proposals → refine_proposals → accept_proposal\` when terms need negotiation.`
   );
   ln();
   ln(
     '- **MediaBuy change rights:** use `assessMediaBuyAction` from `@adcp/sdk/media-buy/actions` for possible / promised / available-now assessment, and `mediaBuyActionResolver` from `@adcp/sdk/server` for explicit seller acceptance and current projection. See `docs/guides/MEDIA-BUY-ACTION-ASSESSMENT.md`.'
   );
   ln(`- **Buyer** (calling a seller): read \`docs/guides/BUYER-QUICKSTART-3.2.md\` first.`);
+  ln(
+    `- **Account setup and first discovery:** read \`docs/guides/FIRST-CALL-TO-A-SELLER.md\` for the provisioning registry, account policies, billing terms, and product cache.`
+  );
   ln(
     `- **Buyer Reliable Reporting**: import reconciliation, PostgreSQL persistence, and the worker from \`@adcp/sdk/reporting/consumer\`; see \`docs/guides/REPORTING-RECONCILIATION.md\`.`
   );
@@ -791,6 +798,10 @@ function generateLlmsTxt(
   ln();
   ln(
     `**Existing applications.** The [thin existing-platform recipe](./guides/EXISTING-PLATFORM.md) shows one SDK task inside application-owned auth and transactions, durable submitted-task recording, the error/cancellation matrix, non-blocking bounded diagnostics, and same-instance capability evidence reuse with \`AgentClient.createWithCapabilityPreflight()\` (or the lower-level \`getCapabilityEvidenceScope()\` + \`primeCapabilities()\` pair). The SDK 14 release represented by the checkout, its registry integrity check, peer/runtime ranges, wire pin, and a historical rc.33/rc.35 → rc.36 example are generated in [the release worksheet](./migration-14.x-rc-worksheet.md).`
+  );
+  ln();
+  ln(
+    `**Request-local clients.** Share endpoint and capability discovery with an application-owned \`discoveryCache\` and explicit authorization identity. The public \`withMCPConnectionScope()\` groups a workflow's MCP calls onto reusable sessions; correlation headers, cancellation and deadlines remain per call. See [Discovery cache and session reuse](./guides/DISCOVERY-CACHE-AND-SESSION-REUSE.md).`
   );
   ln();
 
@@ -1314,6 +1325,10 @@ function generateLlmsTxt(
     ['Seller quick start (AdCP 3.2)', 'guides/SELLER-QUICKSTART-3.2.md'],
     ['Production durability checklist', 'guides/PRODUCTION-DURABILITY.md'],
     ['Persistent notification subscriptions', 'guides/PERSISTENT-NOTIFICATION-RUNTIME.md'],
+    [
+      'Reliable Reporting storage moved to @adcp/reporting-storage (SDK 16 beta)',
+      'migration-reporting-storage-package.md',
+    ],
     ['Migrating SDK 13 → 14', 'migration-13-to-14.md'],
     ['Getting started / install', 'getting-started.md'],
     ['Build a server-side agent', 'guides/BUILD-AN-AGENT.md'],
@@ -1328,8 +1343,10 @@ function generateLlmsTxt(
     ['Conformance (property-based fuzzing)', 'guides/CONFORMANCE.md'],
     ['Reporting source executor (seller adapters)', 'guides/REPORTING-SOURCE-EXECUTOR.md'],
     ['Seller reporting ledger', 'guides/REPORTING-LEDGER.md'],
+    ['Reporting ledger cutover from custom tables', 'guides/REPORTING-LEDGER-CUTOVER.md'],
     ['Buyer reporting reconciliation', 'guides/REPORTING-RECONCILIATION.md'],
     ['Reliable Reporting production operations', 'guides/REPORTING-OPERATIONS.md'],
+    ['Reliable Reporting stability policy (experimental storage package)', 'guides/REPORTING-STABILITY.md'],
     ['Validate your agent (5-command checklist)', 'guides/VALIDATE-YOUR-AGENT.md'],
     ['Async patterns (polling, webhooks, deferred)', 'guides/ASYNC-DEVELOPER-GUIDE.md'],
     ['Async API reference', 'guides/ASYNC-API-REFERENCE.md'],
@@ -1454,6 +1471,11 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`}`);
   ln();
   ln(`interface TransportOptions {`);
+  ln(`  // Defaults to 4 MiB (DEFAULT_MAX_RESPONSE_BYTES); only 0 opts out`);
+  ln(`  // (Infinity / negatives fall back to the default).`);
+  ln(`  // SSE is bounded per event plus \`maxResponseBytes * 2\` cumulative per call.`);
+  ln(`  // Over-cap responses throw ResponseTooLargeError; nothing is truncated.`);
+  ln(`  // A per-call \`transport\` replaces this object; it does not merge.`);
   ln(`  maxResponseBytes?: number;`);
   ln(`  trustedFetchFn?: typeof fetch;`);
   ln(`  allowPrivateIp?: boolean;`);
@@ -1461,7 +1483,41 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  legacyCompat?: A2ALegacyCompatOptions; // A2A only`);
   ln(`}`);
   ln();
+  ln(`// Selected transport observer fields; correlate all events by transportRequestId.`);
+  ln(`type TransportActivityType = 'request_started' | 'response_received' | 'response_completed' | 'request_failed';`);
+  ln(`type TransportResponseOutcome = 'ended' | 'errored' | 'aborted' | 'cancelled';`);
+  ln(`interface TransportActivity {`);
+  ln(`  type: TransportActivityType;`);
+  ln(`  transportRequestId: string;`);
+  ln(`  durationMs?: number; // response_received: time to headers; response_completed: total time`);
+  ln(`  streaming?: boolean; // Uncaptured body: terminal observation follows consumption or abort`);
+  ln(`  outcome?: TransportResponseOutcome; // response_completed only`);
+  ln(`  bytes?: number; // Bytes forwarded before the terminal outcome; no stream payload retained`);
+  ln(`}`);
+  ln();
+  ln(`// Share discovery across request-local clients using an application-owned authorization identity.`);
+  ln(`interface AgentDiscoveryCacheConfig {`);
+  ln(`  cache: AgentDiscoveryCache; // get / set / delete; synchronous or asynchronous`);
+  ln(`  authIdentity: string; // Trusted principal and authorization scope; never a token`);
+  ln(`  ttlMs?: number; // Default: five minutes; maximum: 24 hours`);
+  ln(`}`);
+  ln(`const discoveryCache = createInMemoryAgentDiscoveryCache({ maxEntries: 256 });`);
+  ln(`const client = new SingleAgentClient(agentConfig, {`);
+  ln(`  discoveryCache: { cache: discoveryCache, authIdentity: 'tenant:buyer-scope', ttlMs: 300_000 },`);
+  ln(`});`);
+  ln(`// Public from @adcp/sdk, @adcp/sdk/client, and @adcp/sdk/advanced.`);
+  ln(`await withMCPConnectionScope(async () => { await client.getCapabilities(); /* ...tool calls... */ });`);
+  ln(`// closeScopedConnections() can close the current workflow early.`);
+  ln(`interface AgentDiscoverySeed {`);
+  ln(`  capabilities: AdcpCapabilities; // Authoritative evidence, never synthetic`);
+  ln(`  toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;`);
+  ln(`  endpoint?: { agentUri: string; mcpEra?: 'legacy' | 'modern' }; // Same origin, no URL userinfo`);
+  ln(`}`);
+  ln(`// client.primeDiscoveryCache(seed): Promise<boolean>; also available on AgentClient.`);
+  ln(`// client.invalidateDiscoveryCache(): Promise<void>; refresh after a seller change.`);
+  ln();
   ln(`interface TaskOptions {`);
+  ln(`  skipStatusHandlers?: boolean; // Skip inline completion handlers, including continuations`);
   ln(`  timeout?: number;             // Absolute whole-task deadline`);
   ln(`  signal?: AbortSignal;         // Caller cancellation`);
   ln(`  // Direct A2A mutation route, bound to authenticated principal + account scope.`);
@@ -2161,10 +2217,24 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`## Seller Reporting Ledger`);
   ln();
   ln(
-    `Ledger symbols import from \`@adcp/sdk/reporting/ledger\`; \`createPostgresPersistentNotificationRuntime\` is a server symbol and imports from \`@adcp/sdk/server\`.`
+    `The ledger interface, handlers and producer import from \`@adcp/sdk/reporting/ledger\`. The PostgreSQL store, its migrations, row storage and maintenance import from \`@adcp/reporting-storage\`, managed delivery from \`@adcp/reporting-storage/managed\` and notification activity from \`@adcp/reporting-storage/notifications\` (install \`@adcp/reporting-storage\` next to \`@adcp/sdk\`; it is pre-1.0 and every export is experimental). \`createPostgresPersistentNotificationRuntime\` is a server symbol and imports from \`@adcp/sdk/server\`.`
   );
   ln();
   ln('```typescript');
+  ln(`import { Pool } from 'pg';`);
+  ln(`import { createPostgresPersistentNotificationRuntime } from '@adcp/sdk/server';`);
+  ln(`import {`);
+  ln(`  createReportingDeliveryHandler,`);
+  ln(`  createReportingProducer,`);
+  ln(`  createReportingStatusHandler,`);
+  ln(`  createSyncReportingStatusHandler,`);
+  ln(`} from '@adcp/sdk/reporting/ledger';`);
+  ln(`import { PostgresReportingLedgerStore, REPORTING_LEDGER_MIGRATION } from '@adcp/reporting-storage';`);
+  ln(`import {`);
+  ln(`  createPostgresReportingNotificationActivityRuntime,`);
+  ln(`  createPostgresReportingNotificationAttemptCheckpoint,`);
+  ln(`} from '@adcp/reporting-storage/notifications';`);
+  ln();
   ln(`// Build the notification path first: the store must be constructed with the`);
   ln(`// activity port, or lifecycle transitions record no activity and notify nobody.`);
   ln(`const attemptCheckpoint = createPostgresReportingNotificationAttemptCheckpoint({`);
@@ -2235,6 +2305,9 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   );
   ln();
   ln('```typescript');
+  ln(`import { createReliableReportingService } from '@adcp/sdk/reporting/service';`);
+  ln(`import { PostgresReportingLedgerStore, reportingLedgerMaintenance } from '@adcp/reporting-storage';`);
+  ln();
   ln(`interface ReliableReportingAdapterV1 {`);
   ln(`  readonly sourceOffering: ReportingSourceOfferingV1;`);
   ln(`  readonly deliveryOffering: ReportingDeliveryOffering;`);
@@ -2257,9 +2330,12 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`  resolveCurrency: account => currency,`);
   ln(`  resolveCoverage: account => ({ constituents }), // authorized media-buy/package denominator`);
   ln(`  resolveConsumerId, // optional; controls consumer-status handler/capability`);
+  ln(
+    `  maintenance: reportingLedgerMaintenance({ retention: { enabled: true } }), // optional factory from @adcp/reporting-storage`
+  );
   ln(`});`);
   ln();
-  ln(`await pool.query(reporting.setup.migrations[0]);`);
+  ln(`for (const sql of reporting.setup.migrations) await pool.query(sql);`);
   ln(`const installedPlatform = reporting.install(platform);`);
   ln(`await reporting.installConfiguration(configuration, { account: ctx.account });`);
   ln(`await reporting.runCycle({ accountId }); // tenant-partitioned`);
@@ -2272,7 +2348,7 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   );
   ln();
   ln(
-    `For complete seller production assembly, use async \`createPostgresReliableReportingProductionService\` from \`@adcp/sdk/reporting/service\`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply \`activity.tenantScopeForAccount\`; Reconciled Billing offerings also require a trusted \`obligatedConsumers\` roster. Its scheduler and \`recoverOnce\` require explicit \`deploymentWide: true\` because recovery scans the whole namespace. See \`docs/guides/REPORTING-LEDGER.md\` and \`docs/guides/REPORTING-OPERATIONS.md\`.`
+    `For complete seller production assembly, use async \`createPostgresReliableReportingProductionService\` from \`@adcp/reporting-storage/service\`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply \`activity.tenantScopeForAccount\`; Reconciled Billing offerings also require a trusted \`obligatedConsumers\` roster. Its scheduler and \`recoverOnce\` require explicit \`deploymentWide: true\` because recovery scans the whole namespace. See \`docs/guides/REPORTING-LEDGER.md\` and \`docs/guides/REPORTING-OPERATIONS.md\`.`
   );
   ln();
   ln(

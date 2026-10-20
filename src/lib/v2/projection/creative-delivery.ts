@@ -28,6 +28,7 @@ import {
   migratedFormatOptionId,
   projectV1ProductToV2,
   resolveCanonicalFormatKind,
+  withDualEmissionLegacyRefs,
 } from './v1-to-v2';
 import type { LegacyFormatConverter } from './v1-to-v2';
 import { CanonicalFormatLegacyResolutionError, resolveCanonicalFormatLegacyRefs } from './v2-to-v1';
@@ -39,6 +40,9 @@ import {
   transferLegacyCreativeMetadata,
 } from './legacy-metadata';
 import type { CanonicalFormatDeclaration } from './legacy-metadata';
+import type { UndeclaredFormatOptionSelector } from './legacy-routes';
+import { canonicalize as canonicalizeJson } from '../../utils/jcs';
+import { lookupV1Format, type V1FormatDefinition } from './catalog';
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, Extract<keyof T, K>> : never;
 
@@ -124,25 +128,43 @@ export type CanonicalCreateMediaBuyRequest = Omit<CanonicalCreativeResponse<Crea
   packages?: CanonicalPackageRequest[];
 };
 type CanonicalReportingWebhook = NonNullable<CanonicalCreateMediaBuyRequest['reporting_webhook']>;
-type ReportingWebhookPreferences = Omit<CanonicalReportingWebhook, 'url' | 'authentication' | 'reporting_frequency'> & {
-  reporting_frequency?: CanonicalReportingWebhook['reporting_frequency'];
+/**
+ * Client-facing form of a wire reporting webhook `W`. Every field is optional:
+ * the SDK can supply the callback `url`, `reporting_frequency` and the
+ * `authentication` block from client configuration.
+ *
+ * `authentication` is optional even with a caller-supplied `url`. AdCP 3.3
+ * makes it optional on the wire when the seller signs webhooks under its
+ * profile (`webhook_signing.supported`), and the experimental 3.3 client sends
+ * the registration without it once it has negotiated that. Below 3.3 the wire
+ * still requires it: with `webhookUrlTemplate` configured the client throws
+ * rather than send a caller URL without credentials (it never pairs its own
+ * `webhookSecret` with a caller-controlled host), and request validation
+ * reports the missing field otherwise.
+ *
+ * Derived from `W` rather than restating its fields, so it accepts every
+ * reporting webhook the pinned schemas generate, whether they declare
+ * `authentication` required (3.2) or optional (3.3).
+ *
+ * Exported for the type tests only; not re-exported from the package root.
+ */
+export type ClientReportingWebhookInputFor<W extends { url: string; reporting_frequency: unknown }> = Omit<
+  W,
+  'url' | 'authentication' | 'reporting_frequency'
+> & {
+  url?: W['url'];
+  reporting_frequency?: W['reporting_frequency'];
+  /** Atomic: `schemes` and `credentials` always come from the same source. */
+  authentication?: W extends { authentication?: infer A } ? (unknown extends A ? never : A) : never;
 };
-type ClientReportingWebhookInput =
-  | (ReportingWebhookPreferences & {
-      url?: never;
-      authentication?: CanonicalReportingWebhook['authentication'];
-    })
-  | (ReportingWebhookPreferences & {
-      url: CanonicalReportingWebhook['url'];
-      authentication: CanonicalReportingWebhook['authentication'];
-    });
+type ClientReportingWebhookInput = ClientReportingWebhookInputFor<CanonicalReportingWebhook>;
 /**
  * Client-facing create request. The SDK may supply the reporting callback URL
  * and its complete authentication block from client configuration; the wire
  * request remains a strict {@link CanonicalCreateMediaBuyRequest}.
  */
 export type CanonicalCreateMediaBuyInput = Omit<CanonicalCreateMediaBuyRequest, 'reporting_webhook'> & {
-  reporting_webhook?: ClientReportingWebhookInput;
+  reporting_webhook?: ClientReportingWebhookInput & { signing_profile?: 'adcp/webhook-signing/v1' | 'web-bot-auth' };
 };
 export type CanonicalUpdateMediaBuyRequest = Omit<
   CanonicalCreativeResponse<UpdateMediaBuyRequest>,
@@ -638,6 +660,8 @@ export interface CreativeFormatSelectorContainer {
 /** Canonical package/product selectors accepted by the primary sync API. */
 export interface CanonicalCreativeFormatSelectorContainer {
   package_id?: string;
+  /** Target product, used to recover seller declarations after serializing selectors. */
+  product_id?: string;
   format_options?: ReadonlyArray<CanonicalFormatDeclaration>;
   format_option_refs?: ReadonlyArray<FormatOptionReference>;
   format_kind?: CanonicalFormatKind;
@@ -788,26 +812,15 @@ function candidatesFromContainer(
     );
   }
   const candidates: LegacyCandidate[] = [];
-  const containerKind = typeof container.format_kind === 'string' ? container.format_kind : undefined;
-  for (const key of ['format_ids', 'formats'] as const) {
-    for (const ref of refsFromValue(container[key])) {
-      candidates.push({
-        ref,
-        formatKind: resolveCanonicalFormatKind(ref.id) ?? containerKind,
-        selectorParams: container.params,
-      });
-    }
-  }
-  const formatOptions = [
-    ...(Array.isArray(container.format_options) ? container.format_options : []),
-    ...selectedFormatOptions(container),
-  ];
-  for (const optionValue of formatOptions) {
+  const nativeOptions = Array.isArray(container.format_options) ? container.format_options : [];
+  const formatOptions = [...nativeOptions, ...selectedFormatOptions(container)];
+  const resolvedOptions = formatOptions.map(optionValue => {
     const option = record(optionValue);
-    if (!option) continue;
+    if (!option) return optionValue;
     const formatKind = typeof option.format_kind === 'string' ? option.format_kind : undefined;
     const formatOptionRef = optionReference(option);
     let refs = [...legacyFormatRefsForDeclaration(option)];
+    if (refs.length > 0) return optionValue;
     if (refs.length === 0 && option.canonical_formats_only !== true && formatKind) {
       try {
         refs =
@@ -826,8 +839,35 @@ function candidatesFromContainer(
         );
       }
     }
-    for (const ref of refs) {
+    return refs.length > 0 ? { ...option, v1_format_ref: refs } : optionValue;
+  });
+  // Explicit resolver routes (including restored sidecars) precede index
+  // inference and can disprove the alignment for the whole product.
+  const pairedOptions = [
+    ...withDualEmissionLegacyRefs(resolvedOptions.slice(0, nativeOptions.length), container.format_ids),
+    ...resolvedOptions.slice(nativeOptions.length),
+  ];
+  for (const optionValue of pairedOptions) {
+    const option = record(optionValue);
+    if (!option) continue;
+    const formatKind = typeof option.format_kind === 'string' ? option.format_kind : undefined;
+    const formatOptionRef = optionReference(option);
+    for (const ref of legacyFormatRefsForDeclaration(option)) {
       candidates.push({ ref, formatKind, formatOptionRef, selectorParams: option.params ?? container.params });
+    }
+  }
+  const linkedRefs = new Set(candidates.map(candidate => candidateKey({ ref: candidate.ref })));
+  const containerKind = typeof container.format_kind === 'string' ? container.format_kind : undefined;
+  for (const key of ['format_ids', 'formats'] as const) {
+    for (const ref of refsFromValue(container[key])) {
+      // A linked option already represents this reference with richer selector
+      // evidence. Adding a bare copy would make an unpinned creative ambiguous.
+      if (linkedRefs.has(candidateKey({ ref }))) continue;
+      candidates.push({
+        ref,
+        formatKind: resolveCanonicalFormatKind(ref.id) ?? containerKind,
+        selectorParams: container.params,
+      });
     }
   }
   return uniqueCandidates(candidates);
@@ -926,15 +966,40 @@ function creativeFormatParameterConstraints(
   return { width, height, durationMs };
 }
 
+function legacyRefParameterConstraints(ref: V1FormatId): CreativeFormatParameterConstraints {
+  // Catalog dimensions fill missing constraints without changing the seller's wire reference.
+  const params =
+    typeof ref.width !== 'number' || typeof ref.height !== 'number'
+      ? record(canonicalDeclarationFromBareId(ref.id, { agentUrl: ref.agent_url })?.params)
+      : undefined;
+  return {
+    width: typeof ref.width === 'number' ? ref.width : typeof params?.width === 'number' ? params.width : undefined,
+    height:
+      typeof ref.height === 'number' ? ref.height : typeof params?.height === 'number' ? params.height : undefined,
+    durationMs: ref.duration_ms,
+  };
+}
+
 function refContradictsConstraints(ref: V1FormatId, constraints: CreativeFormatParameterConstraints): boolean {
-  if (constraints.width !== undefined && typeof ref.width === 'number' && ref.width !== constraints.width) return true;
-  if (constraints.height !== undefined && typeof ref.height === 'number' && ref.height !== constraints.height) {
+  const refConstraints = legacyRefParameterConstraints(ref);
+  if (
+    constraints.width !== undefined &&
+    refConstraints.width !== undefined &&
+    refConstraints.width !== constraints.width
+  ) {
+    return true;
+  }
+  if (
+    constraints.height !== undefined &&
+    refConstraints.height !== undefined &&
+    refConstraints.height !== constraints.height
+  ) {
     return true;
   }
   if (
     constraints.durationMs !== undefined &&
-    typeof ref.duration_ms === 'number' &&
-    ref.duration_ms !== constraints.durationMs
+    typeof refConstraints.durationMs === 'number' &&
+    refConstraints.durationMs !== constraints.durationMs
   ) {
     return true;
   }
@@ -942,9 +1007,10 @@ function refContradictsConstraints(ref: V1FormatId, constraints: CreativeFormatP
 }
 
 function refPinsConstraints(ref: V1FormatId, constraints: CreativeFormatParameterConstraints): boolean {
-  if (constraints.width !== undefined && typeof ref.width !== 'number') return false;
-  if (constraints.height !== undefined && typeof ref.height !== 'number') return false;
-  if (constraints.durationMs !== undefined && typeof ref.duration_ms !== 'number') return false;
+  const refConstraints = legacyRefParameterConstraints(ref);
+  if (constraints.width !== undefined && refConstraints.width === undefined) return false;
+  if (constraints.height !== undefined && refConstraints.height === undefined) return false;
+  if (constraints.durationMs !== undefined && typeof refConstraints.durationMs !== 'number') return false;
   return true;
 }
 
@@ -961,28 +1027,33 @@ function legacyIdPinsDimensions(ref: V1FormatId): boolean | undefined {
 }
 
 function refConstraintKey(ref: V1FormatId): string {
-  return [agentIdentity(ref.agent_url), ref.width ?? '', ref.height ?? '', ref.duration_ms ?? ''].join('|');
+  const constraints = legacyRefParameterConstraints(ref);
+  return [
+    agentIdentity(ref.agent_url),
+    constraints.width ?? '',
+    constraints.height ?? '',
+    constraints.durationMs ?? '',
+  ].join('|');
 }
 
 /**
  * Most-constrained-wins for a canonical creative facing several legacy refs of
- * its kind. Drop refs that contradict the creative's own `format_parameters`,
+ * its kind. Compare explicit dimensions or the catalog-backed ID's dimensions
+ * with the creative's own `format_parameters`. Drop contradictory refs,
  * prefer refs that pin them, and among refs imposing identical constraints (a
  * seller listing `display_html` at 300x250 next to `display_300x250_html`)
  * prefer the legacy id whose own declaration pins that size over a generic
- * parametrized id. Refs that still differ in their constraints stay ambiguous
- * and the caller keeps failing closed.
+ * parametrized id. No compatible ref, or refs that still differ in their
+ * constraints, leave the caller failing closed.
  */
 function preferMostConstrainedLegacyCandidates(
   candidates: LegacyCandidate[],
   creative: Record<string, unknown>
 ): LegacyCandidate[] {
-  if (candidates.length <= 1) return candidates;
   let remaining = candidates;
   const constraints = creativeFormatParameterConstraints(creative);
   if (constraints) {
-    const compatible = remaining.filter(candidate => !refContradictsConstraints(candidate.ref, constraints));
-    if (compatible.length > 0) remaining = compatible;
+    remaining = remaining.filter(candidate => !refContradictsConstraints(candidate.ref, constraints));
     const pinned = remaining.filter(candidate => refPinsConstraints(candidate.ref, constraints));
     if (pinned.length > 0) remaining = pinned;
   }
@@ -1047,11 +1118,73 @@ function selectLegacyRef(
   return matching.length === 1 ? matching[0]!.ref : undefined;
 }
 
-function projectCreative<T extends Record<string, unknown>>(creative: T, formatId: V1FormatId): T {
+function projectLegacyAssetKeys(assetsValue: unknown, definition: V1FormatDefinition | undefined): unknown {
+  const assets = record(assetsValue);
+  if (!assets || !Array.isArray(definition?.assets)) return assetsValue;
+  const slots = definition.assets.filter(slot => record(slot) !== undefined);
+  // Group membership needs a separate mapping contract; never flatten it into
+  // a standalone slot just because the asset types happen to agree.
+  if (slots.some(slot => slot.item_type !== undefined && slot.item_type !== 'individual')) return assetsValue;
+  const declaredIds = new Set(slots.map(slot => slot.asset_id));
+  const availableSlots = slots.filter(
+    slot =>
+      (slot.item_type === undefined || slot.item_type === 'individual') &&
+      typeof slot.asset_id === 'string' &&
+      slot.asset_id.length > 0 &&
+      !Object.hasOwn(assets, slot.asset_id)
+  );
+  const targetBySource = new Map<string, string>();
+  const sourcesByTarget = new Map<string, string[]>();
+  for (const [key, value] of Object.entries(assets)) {
+    if (declaredIds.has(key)) continue;
+    const asset = record(value);
+    if (!asset || typeof asset.asset_type !== 'string') continue;
+    const matches = availableSlots.filter(slot => {
+      if (slot.asset_type !== asset.asset_type) return false;
+      if (asset.asset_type === 'url') {
+        return typeof asset.url_type === 'string' && asset.url_type === slot.requirements?.url_type;
+      }
+      if (asset.asset_type === 'pixel_tracker') {
+        return (
+          typeof asset.event === 'string' &&
+          asset.event === slot.event &&
+          (asset.event !== 'custom' ||
+            (typeof asset.custom_event_name === 'string' && asset.custom_event_name === slot.custom_event_name))
+        );
+      }
+      return true;
+    });
+    if (matches.length !== 1) continue;
+    const target = matches[0]!.asset_id!;
+    targetBySource.set(key, target);
+    const sources = sourcesByTarget.get(target) ?? [];
+    sources.push(key);
+    sourcesByTarget.set(target, sources);
+  }
+  // Resolve against the original keys. Two assets competing for one slot must
+  // both survive, and object insertion order must never choose a winner.
+  for (const sources of sourcesByTarget.values()) {
+    if (sources.length > 1) for (const source of sources) targetBySource.delete(source);
+  }
+  if (targetBySource.size === 0) return assetsValue;
+  return Object.fromEntries(Object.entries(assets).map(([key, value]) => [targetBySource.get(key) ?? key, value]));
+}
+
+function projectCreative<T extends Record<string, unknown>>(
+  creative: T,
+  formatId: V1FormatId,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
+): T {
   const next: Record<string, unknown> = { ...creative };
   delete next.format_kind;
   delete next.format_option_ref;
   next.format_id = { ...formatId };
+  const supplied = legacyFormatDefinitions?.filter(definition => {
+    const ref = legacyRef(record(definition)?.format_id);
+    return ref !== undefined && sameLegacyIdentity(ref, formatId);
+  });
+  const definition = supplied?.length ? (supplied.length === 1 ? supplied[0] : undefined) : lookupV1Format(formatId);
+  if (Object.hasOwn(creative, 'assets')) next.assets = projectLegacyAssetKeys(creative.assets, definition);
   return next as T;
 }
 
@@ -1328,13 +1461,19 @@ function canonicalizeCreative<T extends Record<string, unknown>>(
   return next as T;
 }
 
+/**
+ * Project identity and asset keys for the selected wire mode. Optional
+ * `legacyFormatDefinitions` override bundled definitions by exact format owner
+ * and ID; ambiguous definitions leave asset keys unchanged.
+ */
 export function projectCreativeForDelivery<T extends CreativeAsset>(
   creative: T,
   selectorContainer: CreativeFormatSelectorContainer,
   wireMode?: 'canonical',
   operation?: string,
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): CanonicalProjectedCreative<T>;
 export function projectCreativeForDelivery<T extends CreativeAsset>(
   creative: T,
@@ -1342,7 +1481,8 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
   wireMode: 'legacy' | 'unknown',
   operation?: string,
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): LegacyProjectedCreative<T>;
 export function projectCreativeForDelivery<T extends CreativeAsset>(
   creative: T,
@@ -1350,7 +1490,8 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
   wireMode: CreativeFormatWireMode,
   operation?: string,
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): CanonicalProjectedCreative<T> | LegacyProjectedCreative<T>;
 export function projectCreativeForDelivery<T extends CreativeAsset>(
   creative: T,
@@ -1358,7 +1499,8 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
   wireMode: CreativeFormatWireMode = 'canonical',
   operation = 'creative_delivery',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): CanonicalProjectedCreative<T> | LegacyProjectedCreative<T> {
   const inputRecord = creative as unknown as Record<string, unknown>;
   const originalLegacyRef = legacyRef(inputRecord.format_id);
@@ -1367,7 +1509,11 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
   if (originalLegacyRef) {
     const selectedOriginal = selectLegacyRef(inputRecord, selectorContainer, canonicalFormatLegacyResolver, operation);
     if (selectedOriginal) {
-      return projectCreative(creativeRecord, selectedOriginal) as unknown as LegacyProjectedCreative<T>;
+      return projectCreative(
+        creativeRecord,
+        selectedOriginal,
+        legacyFormatDefinitions
+      ) as unknown as LegacyProjectedCreative<T>;
     }
     throw new CreativeFormatProjectionError(
       operation,
@@ -1376,7 +1522,8 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
     );
   }
   const formatId = selectLegacyRef(creativeRecord, selectorContainer, canonicalFormatLegacyResolver, operation);
-  if (formatId) return projectCreative(creativeRecord, formatId) as unknown as LegacyProjectedCreative<T>;
+  if (formatId)
+    return projectCreative(creativeRecord, formatId, legacyFormatDefinitions) as unknown as LegacyProjectedCreative<T>;
 
   if (typeof creativeRecord.format_kind === 'string') {
     const creativeId = typeof creativeRecord.creative_id === 'string' ? creativeRecord.creative_id : '(unknown)';
@@ -1414,10 +1561,19 @@ export function projectCreativeForDelivery<T extends CreativeAsset>(
         'canonical format legacy resolver returned an invalid or ambiguous creative mapping'
       );
     }
-    if (resolved) return projectCreative(creativeRecord, resolved[0]!) as unknown as LegacyProjectedCreative<T>;
+    if (resolved)
+      return projectCreative(
+        creativeRecord,
+        resolved[0]!,
+        legacyFormatDefinitions
+      ) as unknown as LegacyProjectedCreative<T>;
     const pinned = optionReference(creativeRecord.format_option_ref) !== undefined;
     if (candidates.length === 1 && !pinned) {
-      return projectCreative(creativeRecord, candidates[0]!.ref) as unknown as LegacyProjectedCreative<T>;
+      return projectCreative(
+        creativeRecord,
+        candidates[0]!.ref,
+        legacyFormatDefinitions
+      ) as unknown as LegacyProjectedCreative<T>;
     }
     if (candidates.length > 1) {
       throw new CreativeFormatProjectionError(
@@ -1439,28 +1595,32 @@ export function projectMediaBuyCreativesForDelivery<T>(
   wireMode: 'canonical',
   operation?: 'create_media_buy' | 'update_media_buy',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedMediaBuyCreativeRequest<T, 'canonical'>;
 export function projectMediaBuyCreativesForDelivery<T>(
   request: T,
   wireMode: 'legacy' | 'unknown',
   operation?: 'create_media_buy' | 'update_media_buy',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedMediaBuyCreativeRequest<T, 'legacy'>;
 export function projectMediaBuyCreativesForDelivery<T>(
   request: T,
   wireMode: CreativeFormatWireMode,
   operation?: 'create_media_buy' | 'update_media_buy',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedMediaBuyCreativeRequest<T, 'canonical'> | ProjectedMediaBuyCreativeRequest<T, 'legacy'>;
 export function projectMediaBuyCreativesForDelivery<T>(
   request: T,
   wireMode: CreativeFormatWireMode = 'canonical',
   operation: 'create_media_buy' | 'update_media_buy' = 'create_media_buy',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedMediaBuyCreativeRequest<T, 'canonical'> | ProjectedMediaBuyCreativeRequest<T, 'legacy'> {
   const requestRecord = record(request);
   if (!requestRecord) return request as ProjectedMediaBuyCreativeRequest<T, 'canonical'>;
@@ -1482,7 +1642,8 @@ export function projectMediaBuyCreativesForDelivery<T>(
               wireMode,
               operation,
               legacyFormatConverter,
-              canonicalFormatLegacyResolver
+              canonicalFormatLegacyResolver,
+              legacyFormatDefinitions
             );
             if (projected !== creativeValue) changed = true;
             return projected;
@@ -1509,28 +1670,32 @@ export function projectSyncCreativesForDelivery<T>(
   selectorContainers: ReadonlyArray<CreativeFormatSelectorContainer>,
   wireMode: 'canonical',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedSyncCreativeRequest<T, 'canonical'>;
 export function projectSyncCreativesForDelivery<T>(
   request: T,
   selectorContainers: ReadonlyArray<CreativeFormatSelectorContainer>,
   wireMode: 'legacy' | 'unknown',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedSyncCreativeRequest<T, 'legacy'>;
 export function projectSyncCreativesForDelivery<T>(
   request: T,
   selectorContainers: ReadonlyArray<CreativeFormatSelectorContainer>,
   wireMode: CreativeFormatWireMode,
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedSyncCreativeRequest<T, 'canonical'> | ProjectedSyncCreativeRequest<T, 'legacy'>;
 export function projectSyncCreativesForDelivery<T>(
   request: T,
   selectorContainers: ReadonlyArray<CreativeFormatSelectorContainer>,
   wireMode: CreativeFormatWireMode = 'canonical',
   legacyFormatConverter?: LegacyFormatConverter,
-  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver
+  canonicalFormatLegacyResolver?: CanonicalFormatLegacyResolver,
+  legacyFormatDefinitions?: readonly V1FormatDefinition[]
 ): ProjectedSyncCreativeRequest<T, 'canonical'> | ProjectedSyncCreativeRequest<T, 'legacy'> {
   const requestRecord = record(request);
   if (!requestRecord || !Array.isArray(requestRecord.creatives)) {
@@ -1563,7 +1728,8 @@ export function projectSyncCreativesForDelivery<T>(
       wireMode,
       'sync_creatives',
       legacyFormatConverter,
-      canonicalFormatLegacyResolver
+      canonicalFormatLegacyResolver,
+      legacyFormatDefinitions
     );
     if (projected !== creativeValue) changed = true;
     return projected;
@@ -1571,6 +1737,136 @@ export function projectSyncCreativesForDelivery<T>(
   return (changed ? { ...requestRecord, creatives } : request) as
     | ProjectedSyncCreativeRequest<T, 'canonical'>
     | ProjectedSyncCreativeRequest<T, 'legacy'>;
+}
+
+export type { UndeclaredFormatOptionSelector } from './legacy-routes';
+
+/**
+ * Looks up a format option the SDK derived from a seller's legacy `format_ids`.
+ * Returns undefined for options the seller declared in its own `format_options[]`.
+ */
+export type UndeclaredFormatOptionLookup = (
+  ref: FormatOptionReference,
+  productId: string | undefined
+) => UndeclaredFormatOptionSelector | undefined;
+
+function stripUndeclaredCreativeOptionRef(
+  creativeValue: unknown,
+  productId: string | undefined,
+  operation: string,
+  lookup: UndeclaredFormatOptionLookup
+): unknown {
+  const creative = record(creativeValue);
+  const ref = creative ? optionReference(creative.format_option_ref) : undefined;
+  if (!creative || !ref) return creativeValue;
+  const selector = lookup(ref, productId);
+  if (!selector) return creativeValue;
+  if (selector.unrepresentable || creative.format_kind === 'custom') {
+    throw new CreativeFormatProjectionError(
+      operation,
+      typeof creative.creative_id === 'string' ? creative.creative_id : '(unknown)',
+      'the seller did not declare this format option and its schema identity cannot be expressed without a seller-declared format_option_ref'
+    );
+  }
+  const next: Record<string, unknown> = { ...creative };
+  delete next.format_option_ref;
+  return next;
+}
+
+function directSelectorForUndeclaredOptions(
+  pkg: Record<string, unknown>,
+  operation: string,
+  lookup: UndeclaredFormatOptionLookup
+): Record<string, unknown> {
+  const refs = Array.isArray(pkg.format_option_refs)
+    ? pkg.format_option_refs.flatMap(value => {
+        const ref = optionReference(value);
+        return ref ? [ref] : [];
+      })
+    : [];
+  const productId = typeof pkg.product_id === 'string' ? pkg.product_id : undefined;
+  const selectors = refs.map(ref => lookup(ref, productId));
+  if (!selectors.some(selector => selector !== undefined)) return pkg;
+  if (
+    refs.length !== (pkg.format_option_refs as unknown[]).length ||
+    selectors.some(selector => selector?.unrepresentable)
+  ) {
+    throw new CreativeFormatProjectionError(
+      operation,
+      '(package selector)',
+      'the selected undeclared format options cannot be expressed as a direct selector; custom formats require a seller-declared format option'
+    );
+  }
+  const distinct = [
+    ...new Map(
+      selectors.map(selector => [
+        selector ? canonicalizeJson({ format_kind: selector.format_kind, params: selector.params ?? null }) : '',
+        selector,
+      ])
+    ).values(),
+  ];
+  const selector = distinct.length === 1 ? distinct[0] : undefined;
+  if (!selector || pkg.format_kind !== undefined || pkg.params !== undefined) {
+    throw new CreativeFormatProjectionError(
+      operation,
+      '(package selector)',
+      'the seller did not declare the selected format options in its product format_options; select options that one format_kind + params selector can express'
+    );
+  }
+  const next: Record<string, unknown> = { ...pkg, format_kind: selector.format_kind };
+  delete next.format_option_refs;
+  if (selector.params !== undefined) next.params = structuredClone(selector.params);
+  return next;
+}
+
+/**
+ * Canonical-wire counterpart to legacy downgrade for format options the seller
+ * never declared. AdCP 3.x products may carry only legacy `format_ids`; the SDK
+ * upgrades them for the buyer and mints the option ids itself. A seller only
+ * resolves `format_option_refs` against its own `format_options[]`, so a
+ * package selecting such options is sent as the equivalent `format_kind` +
+ * `params` selector, and creative pins to them are dropped. A selection that
+ * one direct selector cannot express fails closed before dispatch.
+ */
+export function projectUndeclaredFormatOptionSelectors<T>(
+  request: T,
+  operation: 'create_media_buy' | 'update_media_buy' | 'sync_creatives',
+  lookup: UndeclaredFormatOptionLookup
+): T {
+  const requestRecord = record(request);
+  if (!requestRecord) return request;
+  let changed = false;
+  const next: Record<string, unknown> = { ...requestRecord };
+  for (const key of ['packages', 'new_packages'] as const) {
+    const packages = requestRecord[key];
+    if (!Array.isArray(packages)) continue;
+    next[key] = packages.map(packageValue => {
+      const pkg = record(packageValue);
+      if (!pkg) return packageValue;
+      const productId = typeof pkg.product_id === 'string' ? pkg.product_id : undefined;
+      let projected = directSelectorForUndeclaredOptions(pkg, operation, lookup);
+      if (Array.isArray(pkg.creatives)) {
+        const creatives = pkg.creatives.map(creative =>
+          stripUndeclaredCreativeOptionRef(creative, productId, operation, lookup)
+        );
+        if (creatives.some((creative, index) => creative !== (pkg.creatives as unknown[])[index])) {
+          projected = { ...projected, creatives };
+        }
+      }
+      if (projected !== pkg) changed = true;
+      return projected;
+    });
+  }
+  if (Array.isArray(requestRecord.creatives)) {
+    const creatives = requestRecord.creatives.map(creative =>
+      stripUndeclaredCreativeOptionRef(creative, undefined, operation, lookup)
+    );
+    if (creatives.some((creative, index) => creative !== (requestRecord.creatives as unknown[])[index])) {
+      next.creatives = creatives;
+      changed = true;
+    }
+  }
+  return (changed ? next : request) as T;
 }
 
 type CreativeProtocolRelease = { major: number; minor: number; label: string };
@@ -1669,4 +1965,11 @@ export function resolveCreativeFormatWireMode(
   if (explicitCanonical === true) return 'canonical';
   if (explicitCanonical === false) return 'legacy';
   return 'unknown';
+}
+
+/** @internal Product acceptance can refine an unknown wire decision only for a proven 3.1 peer. */
+export function canUseProductOptionsForCreativeWire(capabilities: unknown, requestedVersion: string): boolean {
+  const caps = record(capabilities);
+  const negotiated = mutuallyServedRelease(caps, record(caps?._raw), requestedVersion);
+  return negotiated?.major === 3 && negotiated.minor === 1;
 }

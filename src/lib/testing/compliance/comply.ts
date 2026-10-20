@@ -8,7 +8,14 @@
  * Resolution priority: explicit storyboards > capability-driven.
  */
 
-import { createTestClient, discoverAgentProfile, seedTestClientSigningCapability } from '../client';
+import {
+  createTestClient,
+  getOrCreateClientResolution,
+  getOrDiscoverProfile,
+  seedTestClientSigningCapability,
+  seedAuthRejectedTestClientProfile,
+  withTestClientScope,
+} from '../client';
 import type { TestOptions, TestResult, AgentProfile, TestStepResult } from '../types';
 import { collectDetachedAssertionFailures, mapStoryboardResultsToTrackResult, TRACK_LABELS } from './storyboard-tracks';
 import {
@@ -73,7 +80,7 @@ import { detectController, hasTestController } from '../test-controller';
 import type { ControllerDetection } from '../test-controller';
 import { randomBytes } from 'crypto';
 import { isPre31AdcpVersion } from '../../utils/adcp-version-config';
-import { withExternalSchemaRoot } from '../../validation/schema-loader';
+import { withExternalSchemaRoot, withServedReleaseSchemaRoots } from '../../validation/schema-loader';
 import { redactOAuthUrlForOutput, redactOAuthUrlsInText } from '../storyboard/oauth-metadata-graph';
 import { LIBRARY_VERSION } from '../../version';
 import { validationFailsStep } from '../storyboard/validations';
@@ -774,13 +781,18 @@ export async function comply(agentUrl: string, options: ComplyOptions = {}): Pro
         `Production agents MUST terminate TLS. Pass { allow_http: true } (or --allow-http) for local development.`
     );
   }
-  return withMCPConnectionScope(async () => {
-    try {
-      return await complyImpl(agentUrl, options);
-    } finally {
-      await closeScopedConnections(options.protocol);
-    }
-  });
+  return withTestClientScope(() =>
+    withMCPConnectionScope(
+      async () => {
+        try {
+          return await complyImpl(agentUrl, options);
+        } finally {
+          await closeScopedConnections(options.protocol);
+        }
+      },
+      { isolate: true }
+    )
+  );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1402,25 +1414,16 @@ function inferDiscoveredServerAdcpVersion(profile: AgentProfile, complianceVersi
   }
   if (profile.adcp_build_version) return profile.adcp_build_version;
   if (isLegacyPre31TypescriptSdkProfile(profile)) return '3.0';
-  if (isLegacyV2Profile(profile)) return 'v2.5';
   return undefined;
 }
 
 function negotiateVersionEnvelope(profile: AgentProfile, complianceVersion: string): VersionEnvelopeMode | undefined {
-  if (isLegacyV2Profile(profile)) return 'none';
   const supported = profile.adcp_supported_versions;
   if (supported?.length && supported.every(isPre31AdcpVersion)) return 'major-only';
   if (profile.adcp_build_version && isPre31AdcpVersion(profile.adcp_build_version)) return 'major-only';
   if (isLegacyPre31TypescriptSdkProfile(profile)) return 'major-only';
   if (isPre31AdcpVersion(complianceVersion) && isLegacyV3Profile(profile)) return 'major-only';
   return undefined;
-}
-
-function isLegacyV2Profile(profile: AgentProfile): boolean {
-  if (profile.adcp_version === 'v2') return true;
-  const majors = profile.adcp_major_versions ?? [];
-  if (majors.length > 0) return majors.includes(2) && !majors.includes(3);
-  return !profile.tools.includes('get_adcp_capabilities');
 }
 
 function isLegacyV3Profile(profile: AgentProfile): boolean {
@@ -1634,6 +1637,17 @@ async function runComplyStoryboard(
   profile: AgentProfile,
   routeStoryboard: ComplyOptions['routeStoryboard']
 ): Promise<StoryboardResult> {
+  runOptions = { ...runOptions, _discoveryPass: {} };
+  // Refresh before applicability or routing can consult a profile invalidated
+  // by an earlier storyboard. Successful observations are run-local cache hits.
+  const resolution = getOrCreateClientResolution(agentUrl, runOptions);
+  const discovered = await getOrDiscoverProfile(resolution.client, runOptions);
+  if (discovered.step.passed) {
+    profile = discovered.profile;
+    runOptions = { ...runOptions, _profile: profile, agentTools: profile.tools };
+  } else {
+    runOptions = { ...runOptions, _profile: undefined, agentTools: undefined };
+  }
   // Applicability comes before routing: a storyboard whose root capability
   // predicate the agent under test does not satisfy keeps the runner's
   // `not_applicable` verdict (no network call), so a hook skip can never turn
@@ -2264,7 +2278,13 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
   // not abort discovery or the storyboard currently in flight.
   const signal = externalSignal;
 
-  return await withExternalSchemaRoot(complianceIndex.adcp_version, scopedSchemaRoot, async () => {
+  // `servedReleaseSchemaRoots` stays in `testOptions` so routed and nested
+  // storyboard runs see it too; scoping it here also covers discovery.
+  return await withExternalSchemaRoot(complianceIndex.adcp_version, scopedSchemaRoot, () =>
+    withServedReleaseSchemaRoots(testOptions.servedReleaseSchemaRoots, () => complyInSchemaScope())
+  );
+
+  async function complyInSchemaScope(): Promise<ComplianceResult> {
     let effectiveOptions: TestOptions = applyAdcpVersionRunOptions(complianceIndex.adcp_version, {
       ...testOptions,
       // `comply()` has always defaulted an unset transport to MCP when it built
@@ -2303,7 +2323,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       profile,
       step: profileStep,
       caughtError: profileCaughtError,
-    } = await discoverAgentProfile(discoveryClient, signal, complianceIndex.adcp_version);
+    } = await getOrDiscoverProfile(discoveryClient, { ...discoveryOptions, signal }, complianceIndex.adcp_version);
     if (
       testOptions.versionEnvelope === undefined &&
       profile.tools.includes('get_adcp_capabilities') &&
@@ -2316,7 +2336,11 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
         effectiveOptions.protocol ?? 'mcp',
         legacyDiscoveryOptions
       );
-      const legacyDiscovery = await discoverAgentProfile(legacyDiscoveryClient, signal, complianceIndex.adcp_version);
+      const legacyDiscovery = await getOrDiscoverProfile(
+        legacyDiscoveryClient,
+        { ...legacyDiscoveryOptions, signal },
+        complianceIndex.adcp_version
+      );
       if (legacyDiscovery.profile.raw_capabilities !== undefined) {
         discoveryOptions = legacyDiscoveryOptions;
         discoveryClient = legacyDiscoveryClient;
@@ -2334,7 +2358,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
     const client =
       discoveryOptions === effectiveOptions
         ? discoveryClient
-        : createTestClient(agentUrl, effectiveOptions.protocol ?? 'mcp', effectiveOptions);
+        : getOrCreateClientResolution(agentUrl, effectiveOptions).client;
     // Negotiation may replace the discovery client with one configured for a
     // different wire version. Seed that selected client from the capability
     // response we already trust so its first functional dispatch cannot be
@@ -2431,6 +2455,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
         if (runnable.length > 0) {
           allObservations.push(...authCheck.observations);
           effectiveOptions._profile = degraded;
+          seedAuthRejectedTestClientProfile(client, degraded, complianceIndex.adcp_version);
           // Skip the rest of the "reachable" setup — no test controller, no
           // capability-warning observations — and jump straight to storyboard
           // execution below with the filtered, runnable subset.
@@ -2697,7 +2722,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
       total_duration_ms: Date.now() - start,
       notices: noticesDedup,
     };
-  });
+  }
 }
 
 function hasComplyTimeoutBudgetExpired(start: number, timeout_ms: number | undefined, now = Date.now()): boolean {

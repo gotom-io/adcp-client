@@ -3,6 +3,7 @@
 import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { compile } from 'json-schema-to-typescript';
 import path from 'path';
+import ts from 'typescript';
 import { injectJsdocConstraints, removeArrayLengthConstraints } from './schema-utils';
 import { resolveSchemaRefInCache, schemaRefToCacheRelativePath } from './schema-cache-ref';
 import { relaxArrayCardinalityTypes } from './typescript-array-cardinality';
@@ -1183,7 +1184,7 @@ export function nameTargetingInputForCodegen(schema: any): any {
   return namedSchema;
 }
 
-/** Ensure referenced targeting input gets the same names as an inline root. */
+/** Ensure referenced schemas receive the same emit projections as inline roots. */
 export function codegenRefResolvers(refResolver: any, readTargetingInput = loadCachedSchema) {
   return {
     // The built-in HTTP resolver runs at order 200. A custom resolver with no
@@ -1192,7 +1193,21 @@ export function codegenRefResolvers(refResolver: any, readTargetingInput = loadC
     // a reference is absent from the verified local cache.
     http: false,
     file: false,
-    cache: { ...refResolver, order: 2 },
+    cache: {
+      ...refResolver,
+      order: 2,
+      read: async (file: { url: string }) => {
+        const schema = await refResolver.read(file);
+        // jsts drops age's sibling properties when its inline allOf member
+        // also carries conditional allOf validation (#3115). Normalize this
+        // referenced document just as we normalize direct compilation roots.
+        // Keep minItems here so the accepted constraints remain non-empty.
+        // Runtime validation still reads the untouched verified schema.
+        return schemaRefToCacheRelativePath(file.url) === 'core/demographic-targeting-intent.json'
+          ? enforceStrictSchema(schema)
+          : schema;
+      },
+    },
     targetingInput: {
       order: 1,
       canRead: (file: { url: string }) => schemaRefToCacheRelativePath(file.url) === 'core/targeting-input.json',
@@ -3204,12 +3219,72 @@ function widenPostalAreaSupportIndexSignature(typeDefinitions: string): string {
   );
 }
 
-/** Widen boolean feature maps for the one structured 3.2 capability value. */
-function widenMediaBuyFeaturesIndexSignature(typeDefinitions: string): string {
-  return typeDefinitions.replace(
-    /(export interface (?:ExternalCore1)?(?:Canonical)?MediaBuyFeatures \{[\s\S]*?bidding_policy\?: (\w*BiddingPolicyCapability);[\s\S]*?)\[k: string\]: boolean \| undefined;/g,
-    '$1[k: string]: boolean | $2 | undefined;'
-  );
+/**
+ * JSON Schema's boolean additionalProperties excludes named feature fields.
+ * TypeScript's index signature includes them, so include each structured field's
+ * own type in its union, including capabilities emitted inline.
+ * The source additionalProperties rule stays unchanged; TypeScript alone cannot
+ * express the named-field exemption.
+ */
+export function widenMediaBuyFeaturesIndexSignature(typeDefinitions: string): string {
+  const source = ts.createSourceFile('features.ts', typeDefinitions, ts.ScriptTarget.Latest, true);
+  const edits: { start: number; end: number; replacement: string }[] = [];
+  const normalizedType = (type: ts.TypeNode): string => {
+    while (ts.isParenthesizedTypeNode(type)) type = type.type;
+    return type.getText(source);
+  };
+
+  for (const declaration of source.statements) {
+    if (
+      !ts.isInterfaceDeclaration(declaration) ||
+      !/^(?:ExternalCore\d+)?(?:Canonical)?MediaBuyFeatures\d*$/.test(declaration.name.text)
+    )
+      continue;
+
+    const index = declaration.members.find(ts.isIndexSignatureDeclaration);
+    if (!index?.type) continue;
+    const existing = index.type.getText(source);
+    const alternatives = ts.isUnionTypeNode(index.type) ? index.type.types : [index.type];
+    const included = new Set(alternatives.map(normalizedType));
+    const namedTypes = declaration.members.flatMap(member => {
+      if (
+        !ts.isPropertySignature(member) ||
+        !member.type ||
+        member.type.kind === ts.SyntaxKind.BooleanKeyword ||
+        !(ts.isIdentifier(member.name) || ts.isStringLiteral(member.name))
+      )
+        return [];
+      const type = member.type.getText(source);
+      const normalized = normalizedType(member.type);
+      const needsGrouping =
+        ts.isUnionTypeNode(member.type) ||
+        ts.isIntersectionTypeNode(member.type) ||
+        ts.isFunctionTypeNode(member.type) ||
+        ts.isConstructorTypeNode(member.type) ||
+        ts.isConditionalTypeNode(member.type);
+      const additions = included.has(normalized) ? [] : [needsGrouping ? `(${type})` : type];
+      included.add(normalized);
+      if (member.questionToken && !included.has('undefined')) {
+        additions.push('undefined');
+        included.add('undefined');
+      }
+      return additions;
+    });
+    if (!namedTypes.length) continue;
+    edits.push({
+      start: index.type.getStart(source),
+      end: index.type.end,
+      replacement: existing.endsWith(' | undefined')
+        ? `${existing.slice(0, -' | undefined'.length)} | ${namedTypes.join(' | ')} | undefined`
+        : `${existing} | ${namedTypes.join(' | ')}`,
+    });
+  }
+
+  let result = typeDefinitions;
+  for (const edit of edits.reverse()) {
+    result = result.slice(0, edit.start) + edit.replacement + result.slice(edit.end);
+  }
+  return result;
 }
 
 /**
@@ -3332,6 +3407,46 @@ function alignOptionalWithNullish(typeDefinitions: string): string {
 }
 
 // Remove numbered type duplicates like EventType1, Catalog1 that are identical to EventType, Catalog.
+function collectNormalizedTypeBodies(typeDefinitions: string): Map<string, string> {
+  const bodies = new Map<string, string>();
+  const typePattern = /^(export (?:type|interface) (\w+)(?:[^{=]*?)(?:\{[^}]*\}|=[^;]+;))/gm;
+  let match;
+  while ((match = typePattern.exec(typeDefinitions)) !== null) {
+    const [, fullDef, name] = match;
+    bodies.set(name, fullDef.replace(/\s+/g, ' ').trim());
+  }
+  return bodies;
+}
+
+// A priority extracted type keeps only its own declaration, so a reference to a
+// numbered auxiliary from the same compile (json-schema-to-typescript numbers a
+// $ref repeated across union branches) would dangle. Point each such reference
+// at its base when the compile emitted an identical body for both; leave
+// genuine variants alone and say so, since they need an explicit alias.
+export function collapseSuppressedNumberedReferences(
+  extractedType: string,
+  compiledTypes: string,
+  typeName: string
+): string {
+  const bodies = collectNormalizedTypeBodies(compiledTypes);
+  let result = extractedType;
+  for (const [name, body] of bodies) {
+    if (name === typeName) continue;
+    const base = name.match(/^(.+?)\d+$/)?.[1];
+    if (!base || !bodies.has(base)) continue;
+    if (!new RegExp(`\\b${name}\\b`).test(result)) continue;
+    const reference = new RegExp(`\\b${name}\\b`, 'g');
+    if (body.replace(reference, base) === bodies.get(base)) {
+      result = result.replace(reference, base);
+    } else {
+      console.warn(
+        `⚠️  ${typeName} references ${name}, which differs from ${base}; add an explicit numberedReferenceAliases entry if they are equivalent`
+      );
+    }
+  }
+  return result;
+}
+
 // The json-schema-to-typescript compiler appends numbers when it encounters the same $ref multiple
 // times within a single compilation unit. We replace all references to the numbered variant with
 // the canonical name and remove the duplicate definition.
@@ -3350,12 +3465,7 @@ function removeNumberedTypeDuplicatesOnce(
   // (SignalID1, EventType1, etc.) are all union types that use the =[^;]+; branch, which works
   // correctly. Interface duplicates with nested objects (e.g. CreativeManifest1) pre-exist in
   // the upstream generator output and are not regressed by this function.
-  const typePattern = /^(export (?:type|interface) (\w+)(?:[^{=]*?)(?:\{[^}]*\}|=[^;]+;))/gm;
-  let match;
-  while ((match = typePattern.exec(typeDefinitions)) !== null) {
-    const [, fullDef, name] = match;
-    typeBodyMap.set(name, fullDef.replace(/\s+/g, ' ').trim());
-  }
+  for (const [name, body] of collectNormalizedTypeBodies(typeDefinitions)) typeBodyMap.set(name, body);
 
   for (const [name] of typeBodyMap) {
     const numberedMatch = name.match(/^(.+?)(\d+)$/);
@@ -4609,6 +4719,7 @@ async function generateTypes() {
       for (const baseName of numberedReferenceAliases) {
         extractedType = extractedType.replace(new RegExp(`\\b${baseName}\\d+\\b`, 'g'), baseName);
       }
+      extractedType = collapseSuppressedNumberedReferences(extractedType, types, typeName);
       if (!new RegExp(`^export (?:type|interface) ${typeName}\\b`, 'm').test(extractedType)) {
         throw new Error(`Unable to isolate ${typeName} from ${ref}`);
       }

@@ -23,6 +23,7 @@ test/lib/v2-projection-fixtures/
 
 # Portable reporting vectors are byte/hash pinned across SDK implementations.
 test/fixtures/reporting-reconciliation/
+test/fixtures/reporting-interop/resources/
 
 # Vendored AdCP media-buy action schemas (enumMetadata sources for
 # scripts/generate-media-buy-update-fields.ts). Byte-identical to the upstream
@@ -34,3 +35,9 @@ test/fixtures/reporting-consumer-status/canonical-rc3.json
 
 # Canonical supply-path verdict vectors, byte-identical to the upstream corpus.
 test/fixtures/supply-path/vectors.json
+test/fixtures/request-signing-a2a/
+# Web Bot Auth profile vectors, byte-identical to adcp#7894 (see PINNED.json).
+test/fixtures/wba-profile/
+
+# Local agent worktrees (Claude Code); not part of the repo tree.
+.claude/

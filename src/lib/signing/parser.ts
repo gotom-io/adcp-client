@@ -1,4 +1,4 @@
-import { ParseError, parseDictionary, serializeInnerList, type InnerList } from 'structured-headers';
+import { ParseError, parseDictionary, serializeInnerList, serializeItem, type InnerList } from 'structured-headers';
 import { RequestSignatureError } from './errors';
 import { isPaddedStandardBase64, type SfBinaryEncoding } from './content-digest';
 
@@ -35,7 +35,7 @@ function malformed(message: string): never {
   throw new RequestSignatureError('request_signature_header_malformed', 1, message);
 }
 
-export function parseSignatureInput(headerValue: string): ParsedSignatureInput {
+export function parseSignatureInput(headerValue: string, expectedLabel?: string): ParsedSignatureInput {
   rejectDuplicateDictionaryKeys(headerValue, 'Signature-Input');
   let dict;
   try {
@@ -45,15 +45,27 @@ export function parseSignatureInput(headerValue: string): ParsedSignatureInput {
     throw e;
   }
   if (dict.size === 0) malformed('Signature-Input header is empty');
-  const label = dict.has('sig1') ? 'sig1' : (dict.keys().next().value as string);
-  const entry = dict.get(label)!;
+  const label = expectedLabel ?? (dict.has('sig1') ? 'sig1' : (dict.keys().next().value as string));
+  if (!dict.has(label)) malformed('Signature-Input label is missing');
+  return parseSignatureInputMember(label, dict.get(label)!);
+}
+
+/**
+ * {@link parseSignatureInput} for one member of an already parsed (and
+ * duplicate-checked) `Signature-Input` dictionary, so a caller that needs
+ * every label parses the field once.
+ */
+export function parseSignatureInputMember(label: string, entry: unknown): ParsedSignatureInput {
   if (!isInnerList(entry)) {
     malformed('Signature-Input value must be a parenthesized component list');
   }
   const components: string[] = [];
   for (const [bare, itemParams] of entry[0]) {
     if (typeof bare !== 'string') malformed('Signature-Input components must all be strings');
-    components.push(itemParams instanceof Map && itemParams.get('req') === true ? `${bare};req` : bare);
+    // Preserve parameters rather than verifying a different component when
+    // a sender selects a dictionary member or an unsupported parameter.
+    const serialized = serializeItem([bare, itemParams]);
+    components.push(`${bare}${serialized.slice(serialized.indexOf('"', 1) + 1)}`);
   }
   const params: Record<string, string | number> = {};
   for (const [key, value] of entry[1]) {
@@ -89,21 +101,21 @@ export function parseSignature(
   const rawBytes = headerValue.match(new RegExp(`(?:^|,\\s*)${escapedLabel}\\s*=\\s*:([^:]+):`))?.[1];
   if (!rawBytes) malformed(`Signature header does not contain a byte sequence for label "${expectedLabel}"`);
   if (encoding === 'rfc8941-base64') {
-    // AdCP 3.2: RFC 8941 sf-binary is padded standard Base64. Reject the
+    // RFC 8941 sf-binary is padded standard Base64. Reject the
     // Base64URL alphabet (`-`/`_`) and missing padding here, at step 1, so a
     // legacy token never reaches the window or crypto checks.
     if (!isPaddedStandardBase64(rawBytes)) {
-      malformed('Signature value must use padded standard Base64 for AdCP 3.2+');
+      malformed('Signature value must use padded standard Base64 for the selected signing profile');
     }
   } else if (!/^[A-Za-z0-9_-]+$/.test(rawBytes)) {
-    malformed('Signature value must use unpadded Base64URL for AdCP 3.0/3.1');
+    malformed('Signature value must use unpadded Base64URL for the selected signing profile');
   }
   let dict;
   try {
-    // AdCP 3.2 parses the whole field as a strict RFC 8941 Dictionary, so a
-    // Base64URL byte sequence under any label is malformed. The 3.0/3.1
-    // profile encoded byte sequences as Base64URL (`-`/`_`); translate those
-    // characters inside byte-sequence delimiters before the strict parser.
+    // RFC 8941 mode parses the whole field strictly, so a Base64URL byte
+    // sequence under any label is malformed. Legacy request signing and
+    // webhook-v1 use Base64URL (`-`/`_`); translate those characters inside
+    // byte-sequence delimiters before the strict parser.
     dict = parseDictionary(encoding === 'rfc8941-base64' ? headerValue : normalizeByteSequenceBase64(headerValue));
   } catch (e: unknown) {
     if (e instanceof ParseError) {
@@ -127,93 +139,118 @@ function isInnerList(entry: unknown): entry is InnerList {
 }
 
 /**
- * RFC 8941 §3.2 parsers deduplicate by keeping the last value. The AdCP
- * profile (step 1) overrides that: duplicate keys are a downgrade vector —
- * a proxy could smuggle a weaker component set past a verifier that reads
- * the first. Detect duplicates at the raw-header level before the library
- * silently drops them.
+ * RFC 8941 / RFC 9651 parsers deduplicate dictionary keys and parameter keys
+ * by keeping the last value. The AdCP profile (step 1) overrides that:
+ * duplicates are a cross-implementation differential and a downgrade vector
+ * (a proxy could smuggle a weaker component set or a different `created`,
+ * `keyid` or `tag` past a verifier that reads the first). Detect them at the
+ * raw-header level before the library silently drops them: top-level
+ * dictionary keys, parameters on members and inner lists, and parameters on
+ * each inner-list item.
  */
 export function rejectDuplicateDictionaryKeys(headerValue: string, headerName: string): void {
-  const keys = extractTopLevelDictKeys(headerValue);
-  const seen = new Set<string>();
-  for (const key of keys) {
-    if (seen.has(key)) {
-      malformed(`${headerName} header declares key "${key}" more than once`);
-    }
-    seen.add(key);
-  }
+  const duplicate = findDuplicateStructuredKey(headerValue);
+  if (duplicate?.kind === 'member') malformed(`${headerName} header declares key "${duplicate.key}" more than once`);
+  if (duplicate) malformed(`${headerName} header declares parameter "${duplicate.key}" more than once`);
 }
 
-function extractTopLevelDictKeys(input: string): string[] {
-  const keys: string[] = [];
+/**
+ * Tolerant RFC 8941 dictionary walk that only reports duplicate keys. Syntax
+ * it does not recognise ends the walk; the strict parser rejects it later.
+ */
+function findDuplicateStructuredKey(input: string): { kind: 'member' | 'parameter'; key: string } | undefined {
   let i = 0;
-  const len = input.length;
-  let atEntryStart = true;
-  while (i < len) {
-    if (atEntryStart) {
-      while (i < len && (input[i] === ' ' || input[i] === '\t')) i++;
-      const keyStart = i;
-      while (i < len && /[A-Za-z0-9_*-]/.test(input[i]!)) i++;
-      if (i > keyStart) keys.push(input.slice(keyStart, i).toLowerCase());
-      atEntryStart = false;
-      continue;
-    }
-    const ch = input[i]!;
-    if (ch === '"') {
+  const n = input.length;
+  const ows = () => {
+    while (i < n && (input[i] === ' ' || input[i] === '\t')) i++;
+  };
+  const key = () => {
+    const start = i;
+    while (i < n && /[A-Za-z0-9_.*-]/.test(input[i]!)) i++;
+    return input.slice(start, i).toLowerCase();
+  };
+  const bareItem = () => {
+    if (input[i] === '%' && input[i + 1] === '"') {
+      // RFC 9651 display string: percent-encoded, so a backslash is an
+      // ordinary character and the next '"' always ends it.
+      i += 2;
+      while (i < n && input[i] !== '"') i++;
       i++;
-      while (i < len) {
-        if (input[i] === '\\' && i + 1 < len) {
+      return;
+    }
+    if (input[i] === '"') {
+      i++;
+      while (i < n) {
+        if (input[i] === '\\') {
           i += 2;
           continue;
         }
-        if (input[i] === '"') {
-          i++;
-          break;
-        }
-        i++;
+        if (input[i++] === '"') return;
       }
-      continue;
+      return;
     }
-    if (ch === ':') {
+    if (input[i] === ':') {
       i++;
-      while (i < len && input[i] !== ':') i++;
-      if (i < len) i++;
-      continue;
+      while (i < n && input[i] !== ':') i++;
+      i++;
+      return;
     }
-    if (ch === '(') {
+    while (i < n && !/[;,()\s"]/.test(input[i]!)) i++;
+  };
+  const parameters = (): string | undefined => {
+    const seen = new Set<string>();
+    while (i < n && input[i] === ';') {
       i++;
-      let depth = 1;
-      while (i < len && depth > 0) {
-        const c = input[i]!;
-        if (c === '"') {
-          i++;
-          while (i < len) {
-            if (input[i] === '\\' && i + 1 < len) {
-              i += 2;
-              continue;
-            }
-            if (input[i] === '"') {
-              i++;
-              break;
-            }
+      ows();
+      const k = key();
+      if (!k) return undefined;
+      if (seen.has(k)) return k;
+      seen.add(k);
+      if (input[i] === '=') {
+        i++;
+        bareItem();
+      }
+    }
+    return undefined;
+  };
+  const members = new Set<string>();
+  while (i < n) {
+    ows();
+    const k = key();
+    if (!k) return undefined;
+    if (members.has(k)) return { kind: 'member', key: k };
+    members.add(k);
+    let duplicate: string | undefined;
+    if (input[i] === '=') {
+      i++;
+      if (input[i] === '(') {
+        i++;
+        for (;;) {
+          while (i < n && input[i] === ' ') i++;
+          if (i >= n) return undefined;
+          if (input[i] === ')') {
             i++;
+            break;
           }
-          continue;
+          const before = i;
+          bareItem();
+          duplicate = parameters();
+          if (duplicate) return { kind: 'parameter', key: `${k}: ${duplicate}` };
+          if (i === before) return undefined;
         }
-        if (c === '(') depth++;
-        else if (c === ')') depth--;
-        i++;
+        duplicate = parameters();
+      } else {
+        bareItem();
+        duplicate = parameters();
       }
-      continue;
-    }
-    if (ch === ',') {
-      atEntryStart = true;
-      i++;
-      continue;
-    }
+    } else duplicate = parameters();
+    if (duplicate) return { kind: 'parameter', key: `${k}: ${duplicate}` };
+    ows();
+    if (i >= n) return undefined;
+    if (input[i] !== ',') return undefined;
     i++;
   }
-  return keys;
+  return undefined;
 }
 
 /**

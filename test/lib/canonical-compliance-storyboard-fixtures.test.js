@@ -3,6 +3,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const { ADCP_VERSION } = require('@adcp/sdk');
 
 const {
   loadCanonicalPrincipalStoryboard,
@@ -63,9 +64,14 @@ function assertCanonicalPackagedFixture({
   assert.equal(loadedVersion, fixtureSetProvenance.protocol_version);
   assert.equal(loadedComplianceDirectory, getComplianceCacheDir({ version: fixtureSetProvenance.protocol_version }));
   assert.equal(Object.isFrozen(fixtureSetProvenance.files[fixtureName]), true);
-  assert.equal(fixtureSetProvenance.protocol_version, '3.2.1');
-  assert.equal(fixtureSetProvenance.source_commit, 'c32bd78c5389753e3b8f3ffd8a1c04b777854d83');
-  assert.equal(fixtureSetProvenance.bundle_sha256, '00b682c32a36dcc439ccc5e4f5a842f1e08e7b71c85dbbb033a5544365f90287');
+  assert.equal(
+    fixtureSetProvenance.protocol_version,
+    ADCP_VERSION,
+    'canonical fixture provenance must select the primary compliance cache shipped with this SDK'
+  );
+  assert.equal(fixtureSetProvenance.protocol_version, '3.2.5');
+  assert.equal(fixtureSetProvenance.source_commit, '3512882b67592622d2ae8bf5c853f565cf58043a');
+  assert.equal(fixtureSetProvenance.bundle_sha256, '5cc946062f3ed035f5332db7b1de68e3b6d2af8c01207e3959f2648addfe6e14');
 }
 
 test('packaged consumers receive the exact canonical universal/principal storyboard', () => {

@@ -4,6 +4,7 @@ import { initializeMcpSession, probeSignedRequest, type ProbeOptions, type Probe
 import { loadRequestSigningVectors, selectRequestSigningVectors, type LoadVectorsOptions } from './vector-loader';
 import { captureA2aRequest, operationFromVectorUrl, type CapturedA2aRequest } from './a2a-dispatch';
 import { loadSignedRequestsRunnerContract, type SignedRequestsRunnerContract } from './test-kit';
+import { gradeA2aOperationResolution, type A2aOperationResolutionSummary } from './a2a-operation-resolution';
 import {
   InMemoryReplayStore,
   InMemoryRevocationStore,
@@ -14,7 +15,7 @@ import {
   type AdcpJsonWebKey,
 } from '../../../signing';
 import { parseSignatureInput } from '../../../signing/parser';
-import type { NegativeVector, PositiveVector, VerifierCapabilityFixture } from './types';
+import type { A2aVectorTier, NegativeVector, PositiveVector, VerifierCapabilityFixture } from './types';
 
 export interface GradeOptions extends LoadVectorsOptions {
   /** Grade only authored 3.2 profile vectors. Omit for the legacy root corpus. */
@@ -111,12 +112,27 @@ export interface GradeOptions extends LoadVectorsOptions {
    */
   agentRequiredFor?: readonly string[];
   /**
+   * The agent's advertised `request_signing.protocol_methods_required_for`
+   * (JSON-RPC method names such as `SendMessage` or `tasks/cancel`). Only the
+   * A2A operation-resolution vectors consult it: negative/007 (an unsigned
+   * `SendMessage` rejected because the method itself is required) skips when
+   * the agent does not declare `SendMessage`, and unsigned positives skip when
+   * the agent requires their method. Has no effect when `agentCapability` is
+   * provided (its own `protocol_methods_required_for` governs).
+   */
+  agentProtocolMethodsRequiredFor?: readonly string[];
+  /**
    * Transport shape the agent speaks. `'mcp'` (default) wraps each
    * vector body in a JSON-RPC `tools/call` envelope and POSTs to the MCP
    * mount path (`agentUrl`) — use when grading an MCP agent whose verifier
    * sits as transport-layer middleware ahead of MCP dispatch.
    *
    * See adcontextprotocol/adcp-client#612 for the MCP-mode rationale.
+   *
+   * `'a2a'` additionally grades the A2A operation-resolution vectors
+   * (adcp#7945): `required_for` must be enforced against the operation named
+   * by the invocation DataPart's `skill`, not the JSON-RPC method. See
+   * `a2a-operation-resolution.ts`. Vector ids are prefixed `a2a/`.
    */
   transport?: 'raw' | 'mcp' | 'a2a';
   /** Trusted Agent Card fetch seam for A2A tests and custom runtimes. */
@@ -184,6 +200,12 @@ export interface VectorGradeResult {
   /** For negatives: the error code the spec says we should see. */
   expected_error_code?: string;
   http_status: number;
+  /**
+   * A2A operation-resolution vectors only: `contradiction-resolution` is MUST
+   * for a 3.2 verifier; `hardening` is SHOULD in 3.2.x and MUST from 3.3.
+   * Hardening failures still count as failures; the tier tells you which kind.
+   */
+  tier?: A2aVectorTier;
   /** Actual endpoint probed when it differs from the configured agent URL (notably A2A card routing). */
   probe_url?: string;
   diagnostic?: string;
@@ -223,6 +245,14 @@ export interface GradeReport {
   contract_loaded: boolean;
   positive: VectorGradeResult[];
   negative: VectorGradeResult[];
+  /**
+   * Present only on `transport: 'a2a'` runs. Per-tier tally of the A2A
+   * operation-resolution vectors, or `vectors_available: false` (with the
+   * reason) when the compliance bundle carries none, so an absent corpus is
+   * never mistaken for a clean pass. The vector rows themselves are in
+   * `positive` / `negative` under `a2a/` ids.
+   */
+  a2a_operation_resolution?: A2aOperationResolutionSummary;
   passed: boolean;
   passed_count: number;
   failed_count: number;
@@ -253,8 +283,10 @@ export async function gradeRequestSigning(agentUrl: string, options: GradeOption
   // Avoid allocating an MCP session (or making authenticated egress) when
   // every vector is skipped or handled entirely by the local verifier.
   const hasRunnableNetworkVector =
-    selected.positive.some(vector => !preflightSkip(vector, 'positive', contract, options)) ||
-    selected.negative.some(vector => !vector.jwks_override && !preflightSkip(vector, 'negative', contract, options));
+    selected.positive.some(vector => !preflightSkip(vector, 'positive', contract, options, agentUrl)) ||
+    selected.negative.some(
+      vector => !vector.jwks_override && !preflightSkip(vector, 'negative', contract, options, agentUrl)
+    );
 
   // Auto-initialize MCP session once before all vectors. A single session
   // covers the full batch — the session ID is injected post-signing so
@@ -288,7 +320,7 @@ export async function gradeRequestSigning(agentUrl: string, options: GradeOption
 
   const positive: VectorGradeResult[] = [];
   for (const vector of selected.positive) {
-    const skip = preflightSkip(vector, 'positive', contract, options);
+    const skip = preflightSkip(vector, 'positive', contract, options, agentUrl);
     if (skip) {
       positive.push(skip);
       continue;
@@ -301,7 +333,7 @@ export async function gradeRequestSigning(agentUrl: string, options: GradeOption
 
   const negative: VectorGradeResult[] = [];
   for (const vector of selected.negative) {
-    const skip = preflightSkip(vector, 'negative', contract, options);
+    const skip = preflightSkip(vector, 'negative', contract, options, agentUrl);
     if (skip) {
       negative.push(skip);
       continue;
@@ -312,6 +344,19 @@ export async function gradeRequestSigning(agentUrl: string, options: GradeOption
     negative.push(
       withA2aProbeUrl(await gradeNegative(vector, loaded, contract, probeOpts, buildOpts, options), buildOpts)
     );
+  }
+
+  // A2A runs also grade the operation-resolution corpus (adcp#7945). Rows join
+  // `positive` / `negative` so counts, `passed`, and every report consumer treat
+  // them like any other vector; the summary carries the tier split.
+  let a2aSummary: A2aOperationResolutionSummary | undefined;
+  if (transport === 'a2a') {
+    const a2a = await gradeA2aOperationResolution(agentUrl, loaded.keys, contract, options);
+    if (a2a) {
+      positive.push(...a2a.positive);
+      negative.push(...a2a.negative);
+      a2aSummary = a2a.summary;
+    }
   }
 
   const all = [...positive, ...negative];
@@ -330,6 +375,7 @@ export async function gradeRequestSigning(agentUrl: string, options: GradeOption
     contract_loaded: Boolean(contract),
     positive,
     negative,
+    ...(a2aSummary ? { a2a_operation_resolution: a2aSummary } : {}),
     passed,
     passed_count,
     failed_count,
@@ -359,7 +405,27 @@ const MCP_FLATTENED_VECTORS = new Set([
   'profile-3.2/positive/010-percent-encoded-slash-preserved',
   'profile-3.2/positive/011-ipv6-authority',
   'profile-3.2/positive/012-ipv6-authority-default-port-stripped',
+  '015-bracketed-ipv6-host-with-port',
+  'profile-3.2/positive/015-bracketed-ipv6-host-with-port',
 ]);
+
+// Positive vectors whose subject is a bracketed IPv6 literal with a non-default
+// port in the request authority. Under raw transport they are only a live
+// witness when the agent's own URL has that shape.
+const RAW_AUTHORITY_SHAPE_VECTORS = new Set([
+  '015-bracketed-ipv6-host-with-port',
+  'profile-3.2/positive/015-bracketed-ipv6-host-with-port',
+]);
+
+function targetCarriesBracketedIpv6WithPort(agentUrl: string): boolean {
+  try {
+    const target = new URL(agentUrl);
+    // `URL.port` is empty for the scheme's default port.
+    return target.hostname.startsWith('[') && target.port !== '';
+  } catch {
+    return false;
+  }
+}
 
 // Vectors whose failure mode can't reach a live agent through HTTP. Document
 // why each entry can't be graded via probe so adding a new entry isn't a
@@ -371,8 +437,18 @@ const TRANSPORT_UNGRADABLE: Record<string, string> = {
   // tests exercise this edge.
   '026-non-ascii-host':
     'HTTP transport punycodes U-labels before the request leaves the client; verified at the library level.',
+  'profile-3.2/negative/026-non-ascii-host':
+    'HTTP transport punycodes U-labels before the request leaves the client; verified at the library level.',
   'profile-3.2/negative/002-multiple-trailing-dots':
     'HTTP transport cannot route to an intentionally malformed DNS authority; verified at the library level.',
+  // The fault is a Host header the URL does not carry. fetch() derives Host
+  // from the request URL and ignores a caller-supplied value, so the agent would
+  // receive a well-formed Host and a valid signature, and a conformant verifier
+  // would correctly accept it.
+  '031-malformed-host-authority':
+    'HTTP transport derives the Host header from the request URL, so the malformed Host cannot reach the agent; verified at the library level.',
+  'profile-3.2/negative/031-malformed-host-authority':
+    'HTTP transport derives the Host header from the request URL, so the malformed Host cannot reach the agent; verified at the library level.',
 };
 
 /** A vector excluded on its own terms, independent of the run's transport. */
@@ -423,7 +499,8 @@ function preflightSkip(
   vector: PositiveVector | NegativeVector,
   kind: 'positive' | 'negative',
   contract: SignedRequestsRunnerContract | undefined,
-  options: GradeOptions
+  options: GradeOptions,
+  agentUrl: string
 ): VectorGradeResult | undefined {
   const expected_error_code = kind === 'negative' ? (vector as NegativeVector).expected_error_code : undefined;
   const base = {
@@ -509,6 +586,29 @@ function preflightSkip(
         `that ${options.transport ?? 'mcp'} mode neutralizes by routing every vector to the one ` +
         `endpoint the agent exposes. Grade this edge with \`--transport raw\` against a ` +
         `per-operation AdCP agent.`,
+    };
+  }
+  // Raw mode retargets the vector onto the agent's own authority and the HTTP
+  // client derives `Host` from that URL, so a vector whose subject is the
+  // authority itself reaches the agent only when the agent's authority already
+  // has that shape. Anything else would grade an ordinary request and report
+  // the edge as covered.
+  if (
+    kind === 'positive' &&
+    !flattensUrlEdges &&
+    RAW_AUTHORITY_SHAPE_VECTORS.has(vector.id) &&
+    !targetCarriesBracketedIpv6WithPort(agentUrl)
+  ) {
+    return {
+      ...base,
+      skipped: true,
+      skip_reason: 'transport_ungradable',
+      diagnostic:
+        `Vector ${vector.id} presents a bracketed IPv6 literal with a non-default port as the request ` +
+        `authority. Raw mode sends the request to the agent's own authority, which is not a bracketed ` +
+        `IPv6 literal with an explicit non-default port, so that authority never reaches the agent; ` +
+        `verified at the library level. Point the grader at such an endpoint (for example ` +
+        `http://[::1]:3001) to grade it live.`,
     };
   }
   if (kind === 'negative') {
@@ -657,7 +757,7 @@ export async function gradeOneVector(
       : selected.negative.find(v => v.id === vectorId);
   if (!vector) throw new Error(`Unknown ${kind} vector "${vectorId}"`);
 
-  const skip = preflightSkip(vector, kind, contract, options);
+  const skip = preflightSkip(vector, kind, contract, options, agentUrl);
   if (skip) return skip;
 
   // Per-vector session initialization for the storyboard-runner path.

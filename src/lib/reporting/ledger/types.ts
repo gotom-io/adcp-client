@@ -216,6 +216,29 @@ export interface ReportingLedgerAdjustmentV1 {
 
 export type ReportingLedgerRevisionSnapshotV1 = Omit<ReportingLedgerRevisionV1, 'rows'>;
 export type ReportingLedgerRevisionMetadataV1 = Omit<ReportingLedgerRevisionV1, 'rows'>;
+export type ReportingLedgerAdjustmentMetadataV1 = Omit<ReportingLedgerAdjustmentV1, 'rows'>;
+
+/**
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export interface ReportingRevisionRowsReadV1 {
+  reporting_revision_id: string;
+  account_id: string;
+  /** Zero-based ordinal of the first row to return. */
+  offset: number;
+  /** Maximum rows to return; at least 1. */
+  limit: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export interface ReportingRevisionRowsPageV1 {
+  rows: Record<string, unknown>[];
+  /** Total rows in the revision. */
+  total: number;
+}
 export type ReportingLedgerAdjustmentSnapshotV1 = Omit<ReportingLedgerAdjustmentV1, 'rows'>;
 
 export interface ReportingLedgerConsumerStatusV1 {
@@ -330,6 +353,7 @@ export interface ReportingLedgerIssueV1 {
     | 'RESOURCE_EXPIRED'
     | 'READER_INCOMPATIBLE'
     | 'HISTORY_UNAVAILABLE'
+    | 'REVISION_UNREADABLE'
     | 'RECEIPT_REQUIRED'
     | 'RECEIPT_REJECTED'
     | 'ADJUSTMENT_RECEIPT_REQUIRED'
@@ -353,6 +377,8 @@ export interface ReportingLedgerIssueV1 {
    * which is the variant to construct for that code.
    */
   reporting_status_id?: string;
+  /** Affected revision, required for REVISION_UNREADABLE. */
+  reporting_revision_id?: string;
   /**
    * When the seller first observed this logical condition.
    *
@@ -398,6 +424,16 @@ export interface ReportingLedgerIssueV1 {
   observedAt: string;
   resolvedAt?: string;
 }
+
+/** Seller-attributed unreadability of a previously published revision. */
+export type ReportingLedgerRevisionUnreadableIssueV1 = ReportingLedgerIssueV1 & {
+  code: 'REVISION_UNREADABLE';
+  reporting_revision_id: string;
+  responsibleParty: 'seller';
+} & (
+    | { severity: 'delayed'; recommendedAction: 'wait_for_retry' }
+    | { severity: 'action_required'; recommendedAction: 'contact_seller' }
+  );
 
 /**
  * Non-secret human escalation path for reporting issues the protocol cannot
@@ -465,7 +501,11 @@ export interface ReportingLedgerStatusTransitionV1 {
   notifiedAt?: string;
 }
 
-/** Minimum transaction surface used by the bundled PostgreSQL ledger. */
+/**
+ * Minimum transaction surface used by the bundled PostgreSQL ledger.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
 export interface ReportingLedgerTransactionV1 {
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     text: string,
@@ -597,6 +637,8 @@ export interface ReportingLedgerPageV1 {
  * Immutable opt-in binding between one Core configuration generation and one
  * caller-owned destination authorization generation. Core configurations do
  * not carry this shape and remain API-delivered.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
  */
 export interface ReportingManagedDeliveryBindingV1 {
   configurationId: string;
@@ -737,11 +779,55 @@ export interface ReportingManagedLifecycleProjectionV1 {
   obligatedConsumerRosterVersion?: string;
 }
 
+/**
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
 export interface ReportingLedgerLeaseV1 {
   obligation: ReportingLedgerObligationV1;
   owner: string;
   generation: number;
   expiresAt: string;
+}
+
+/**
+ * The writer's lease was lost before the commit completed.
+ *
+ * `ReportingLedgerLeaseLostError`, `ReportingLedgerPeriodRetiredError` and
+ * `ReportingLedgerContinuityError` are the errors every `ReportingLedgerStore` throws. The protocol
+ * layer recognizes them by `name`, so a store from another package (or another copy of the SDK) is
+ * understood as well as one built here. Store implementations should throw these classes.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export class ReportingLedgerLeaseLostError extends Error {
+  constructor(message = 'Reporting ledger lease was lost before commit') {
+    super(message);
+    this.name = 'ReportingLedgerLeaseLostError';
+  }
+}
+
+/**
+ * A planner or writer named a period whose ledger records were retired by retention.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export class ReportingLedgerPeriodRetiredError extends Error {
+  constructor(message = 'Reporting obligation period was retired by retention') {
+    super(message);
+    this.name = 'ReportingLedgerPeriodRetiredError';
+  }
+}
+
+/**
+ * A revision continuity invariant failed (a gap or a fork in the revision chain).
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export class ReportingLedgerContinuityError extends Error {
+  constructor(message = 'Reporting ledger revision continuity invariant failed') {
+    super(message);
+    this.name = 'ReportingLedgerContinuityError';
+  }
 }
 
 export class ReportingLedgerSnapshotUnavailableError extends Error {
@@ -762,7 +848,36 @@ export class ReportingConsumerStatusConflictError extends Error {
   }
 }
 
+/**
+ * Recognizes a store-contract error by its `name`, not its class. A host that loads the SDK once through
+ * `require` and once through `import` holds two copies of every class, and a store from another package can
+ * be built against either, so `instanceof` would miss an error the store legitimately threw.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export function isReportingLedgerErrorNamed(
+  error: unknown,
+  name:
+    | 'ReportingLedgerSnapshotUnavailableError'
+    | 'ReportingConsumerStatusConflictError'
+    | 'ReportingLedgerIssueIntegrityError'
+    | 'ReportingLedgerLeaseLostError'
+    | 'ReportingLedgerPeriodRetiredError'
+    | 'ReportingLedgerContinuityError'
+): boolean {
+  return error instanceof Error && error.name === name;
+}
+
+/**
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
 export interface ReportingLedgerStore {
+  /**
+   * Setup scripts the host applies before first use (SQL for a SQL store), in order and idempotent.
+   * `createReliableReportingService` surfaces them as `service.setup.migrations`. A store with nothing
+   * to install omits it.
+   */
+  readonly migrations?: readonly string[];
   /** Optional substrate identity for an add-on store that must prove shared authority. */
   readonly [REPORTING_LEDGER_AUTHORITY]?: ReportingLedgerAuthorityV1;
   /**
@@ -813,6 +928,11 @@ export interface ReportingLedgerStore {
   ): Promise<{ inserted: boolean; value: ReportingLedgerObligationV1 }>;
   getObligation(reporting_obligation_id: string, account_id?: string): Promise<ReportingLedgerObligationV1 | null>;
   listObligations(account_id?: string): Promise<ReportingLedgerObligationV1[]>;
+  /**
+   * Optional: periods whose ledger records were retired by retention. The
+   * planner treats them as already covered so it never re-creates them.
+   */
+  listRetiredObligationOrdinals?(account_id?: string): Promise<{ configurationId: string; periodOrdinal: number }[]>;
   listLifecycleDueObligations(input: {
     ledgerAsOf: string;
     account_id?: string;
@@ -837,12 +957,40 @@ export interface ReportingLedgerStore {
   ): Promise<{ inserted: boolean; value: ReportingLedgerRevisionV1 }>;
   /** Returns an exact row-bearing revision only when it belongs to the resolved account. */
   getRevision(reporting_revision_id: string, account_id: string): Promise<ReportingLedgerRevisionV1 | null>;
+  /**
+   * Optional row-free counterpart of `getRevision`, scoped to the resolved
+   * account. Exact-read handlers prefer it so they never load every row to
+   * serve one page.
+   */
+  getRevisionMetadata?(
+    reporting_revision_id: string,
+    account_id: string
+  ): Promise<ReportingLedgerRevisionMetadataV1 | null>;
+  /**
+   * Optional: one page of a revision's rows in ordinal order, only when the
+   * revision belongs to the resolved account. `total` is the revision's row
+   * count. Stores that keep rows outside the revision document verify every
+   * row they return against the committed binding before returning it.
+   */
+  readRevisionRows?(input: ReportingRevisionRowsReadV1): Promise<ReportingRevisionRowsPageV1 | null>;
   listRevisions(reporting_obligation_id: string): Promise<ReportingLedgerRevisionV1[]>;
+  /**
+   * Optional: every retained revision for one obligation without
+   * materializing rows. The producer, lifecycle reconciler and status ingest
+   * prefer it and otherwise fall back to `listRevisions` with rows dropped.
+   * When `account_id` is supplied, only that account's revisions are returned.
+   */
+  listRevisionMetadata?(
+    reporting_obligation_id: string,
+    account_id?: string
+  ): Promise<ReportingLedgerRevisionMetadataV1[]>;
   commitAdjustment(
     adjustment: ReportingLedgerAdjustmentV1,
     lease: ReportingLedgerLeaseV1
   ): Promise<{ inserted: boolean; value: ReportingLedgerAdjustmentV1 }>;
   listAdjustments(reporting_obligation_id: string): Promise<ReportingLedgerAdjustmentV1[]>;
+  /** Optional row-free counterpart of `listAdjustments`, preferred when present. */
+  listAdjustmentMetadata?(reporting_obligation_id: string): Promise<ReportingLedgerAdjustmentMetadataV1[]>;
   putConsumerStatus(
     status: ReportingLedgerConsumerStatusV1
   ): Promise<{ inserted: boolean; value: ReportingLedgerConsumerStatusV1 }>;
@@ -968,6 +1116,8 @@ export interface ReportingLedgerStore {
  * in duplicate-ID or duplicate-logical-chain groups, then atomically compare
  * the current leaf, append, and retain the original ordered batch result for
  * idempotent replay.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
  */
 export interface ReportingConsumerStatusLedgerStore {
   listConfigurations(account_id: string): Promise<ReportingLedgerConfigurationV1[]>;
@@ -1057,6 +1207,39 @@ export type ReportingDeliveryHandlerV1 = (
   request: AdcpToolMap['get_media_buy_delivery']['params'],
   context: HandlerContext<unknown>
 ) => Promise<AdcpToolMap['get_media_buy_delivery']['result']>;
+
+/**
+ * Exact-revision reader for revisions the SDK ledger does not own, typically a
+ * seller's pre-cutover ledger tables. It receives the same request and context
+ * as `get_media_buy_delivery` and returns the protocol response, or
+ * `null`/`undefined` when it has no such revision.
+ *
+ * Authorization is the reader's responsibility. The SDK has already resolved
+ * the account (`context.account`) and cannot tell whether a legacy revision
+ * belongs to it, so the reader MUST scope the lookup by that account and return
+ * `null` for a revision that belongs to another one. Never return a response
+ * for a revision the resolved account cannot read.
+ *
+ * @experimental Reliable Reporting storage surface: breaking changes may ship in minor releases. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/REPORTING-STABILITY.md
+ */
+export type ReportingLegacyRevisionReaderV1 = (
+  request: AdcpToolMap['get_media_buy_delivery']['params'],
+  context: HandlerContext<unknown>
+) => Promise<AdcpToolMap['get_media_buy_delivery']['result'] | null | undefined>;
+
+export interface CreateReportingDeliveryHandlerOptionsV1 {
+  /**
+   * Consulted only when the SDK ledger has no such revision for the resolved
+   * account (unknown id, or an id owned by a different account). Never
+   * consulted for an SDK-owned revision that is expired, has unavailable or
+   * corrupt rows, or carries an unusable cursor, nor for capacity or other
+   * errors: falling back there could serve different content under an id the
+   * SDK owns. A `null`/`undefined` result is the same nondisclosing
+   * `REFERENCE_NOT_FOUND` the SDK returns itself; an error the reader throws
+   * propagates unchanged.
+   */
+  legacyRevisionReader?: ReportingLegacyRevisionReaderV1;
+}
 
 export interface CreateReportingProducerOptionsV1 {
   store: ReportingLedgerStore;

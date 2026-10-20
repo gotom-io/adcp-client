@@ -25,27 +25,32 @@ const requiredPeers = Object.entries(pkg.peerDependencies ?? {})
       `| \`${name}\` | \`${range}\` | ${pkg.peerDependenciesMeta?.[name]?.optional === true ? 'Optional' : 'Required'} |`
   )
   .join('\n');
-const document = `# SDK 14 release-bound upgrade worksheet
+const document = `# SDK release-bound upgrade worksheet
 
-This page joins the release facts that adopters need before changing a production pin. It is generated from package and version metadata with \`npm run generate-release-worksheet\`; migration decisions remain documented in [Migrating from 13.x to 14](./migration-13-to-14.md).
+This page joins the release facts that adopters need before changing a production pin. It is generated from package and version metadata with \`npm run generate-release-worksheet\`. Before upgrading to SDK 15, review the [OAuth migration](./migration-oauth-issuer-bindings.md) and [issuer-binding and storage contract](./guides/OAUTH-ISSUER-BINDING.md). The [13.x → 14 migration](./migration-13-to-14.md) remains historical guidance.
 
 ## Release represented by this checkout
 
-The changesets version lifecycle regenerates this section whenever the package
-version changes. For an unpublished version, integrity is intentionally shown
-as unavailable until the registry assigns it; use the exact registry command
-below as the publication/deployment gate.
+This section describes the source checkout. Commits after a release can change
+the protocol bundle before Changesets assigns the next SDK version. Those
+changes are pending publication. Any version already on npm retains its
+released bundle. For production, use the worksheet and \`ADCP_VERSION\` from
+the exact npm tarball you install. The Changesets version
+lifecycle regenerates the version rows before publication.
+
+Registry integrity identifies the published tarball. Confirm the protocol
+pin using \`ADCP_VERSION\` inside that tarball.
 
 | Fact | Value |
 | --- | --- |
-| Exact npm package | \`${pkg.name}@${pkg.version}\` |
+| Checkout \`package.json\` version | \`${pkg.name}@${pkg.version}\` |
 | npm integrity | ${integrity} |
 | Node.js runtime | \`${pkg.engines?.node ?? 'not declared'}\` |
 | Default AdCP wire release | \`${pkg.adcp_version}\` |
 | Maintained wire releases | ${compatibleVersions.map(version => `\`${version}\``).join(', ')} |
-| Canonical migration notes | [13.x → 14](./migration-13-to-14.md) |
+| Canonical migration notes | [SDK 15 OAuth](./migration-oauth-issuer-bindings.md), [issuer-binding and storage](./guides/OAUTH-ISSUER-BINDING.md); historical [13.x → 14](./migration-13-to-14.md) |
 
-Install exact production inputs rather than a moving range or dist-tag:
+For a checkout at the published release commit, install the exact package version:
 
 \`\`\`bash
 npm install --save-exact '${pkg.name}@${pkg.version}'
@@ -80,10 +85,11 @@ the authored tool schema.
 ESM example:
 
 \`\`\`ts
+import { ADCP_VERSION } from '@adcp/sdk';
 import { getCanonicalToolValidator } from '@adcp/sdk/schemas';
 
 const validate = getCanonicalToolValidator('get_reporting_status', 'sync', {
-  adcpVersion: '${pkg.adcp_version}',
+  adcpVersion: ADCP_VERSION,
 });
 if (!validate) throw new Error('Requested protocol schema is unavailable');
 
@@ -104,9 +110,10 @@ console.error(validate.errors); // all collected normative violations
 CommonJS uses the same packed-artifact export:
 
 \`\`\`js
+const { ADCP_VERSION } = require('@adcp/sdk');
 const { getCanonicalToolValidator } = require('@adcp/sdk/schemas');
 const validate = getCanonicalToolValidator('get_reporting_status', 'sync', {
-  adcpVersion: '${pkg.adcp_version}',
+  adcpVersion: ADCP_VERSION,
 });
 if (!validate) throw new Error('Requested protocol schema is unavailable');
 if (validate({ status: 'completed', view: 'summary' })) {

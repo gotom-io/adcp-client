@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * Idempotent guard for the schema cache. Tests load schemas from
- * `schemas/cache/{current,3.1.24,3.0.25,v2.5}/` (gitignored, populated by
+ * `schemas/cache/{current,3.1.29,3.0.25,v2.5}/` (gitignored, populated by
  * `npm run sync-schemas:all`). Fresh clones, branch switches that wipe
  * the cache, and `git clean -fdx` all leave a dev environment that
  * silently fails ~9 test suites with "AdCP schema data for version 'v2.5'
@@ -26,7 +26,7 @@ const REPO_ROOT = path.join(__dirname, '..');
 const CACHE_ROOT = path.join(REPO_ROOT, 'schemas/cache');
 const COMPLIANCE_CACHE_ROOT = path.join(REPO_ROOT, 'compliance/cache');
 const STABLE_3_0_SCHEMA_VERSION = '3.0.25';
-const STABLE_3_1_SCHEMA_VERSION = '3.1.24';
+const STABLE_3_1_SCHEMA_VERSION = '3.1.29';
 
 function currentAdcpVersion(): string {
   return readFileSync(path.join(REPO_ROOT, 'ADCP_VERSION'), 'utf8').trim();
@@ -63,10 +63,6 @@ function hasStableV31ComplianceCache(): boolean {
   return existsSync(path.join(COMPLIANCE_CACHE_ROOT, STABLE_3_1_SCHEMA_VERSION));
 }
 
-function hasV25Cache(): boolean {
-  return existsSync(path.join(CACHE_ROOT, 'v2.5'));
-}
-
 function pointLatestAtCurrent(cacheRoot: string, current: string): void {
   if (!existsSync(path.join(cacheRoot, current))) return;
   const latest = path.join(cacheRoot, 'latest');
@@ -82,7 +78,6 @@ const stableV31Ok = hasStableV31Cache();
 const currentComplianceOk = hasCurrentComplianceCache();
 const stableV30ComplianceOk = hasStableV30ComplianceCache();
 const stableV31ComplianceOk = hasStableV31ComplianceCache();
-const v25Ok = hasV25Cache();
 
 const current = currentAdcpVersion();
 if (
@@ -91,8 +86,7 @@ if (
   stableV31Ok &&
   currentComplianceOk &&
   stableV30ComplianceOk &&
-  stableV31ComplianceOk &&
-  v25Ok
+  stableV31ComplianceOk
 ) {
   pointLatestAtCurrent(CACHE_ROOT, current);
   pointLatestAtCurrent(COMPLIANCE_CACHE_ROOT, current);
@@ -105,7 +99,6 @@ const scripts: string[] = [];
 if (!currentV3Ok || !currentComplianceOk) scripts.push('sync-schemas');
 if (!stableV30Ok || !stableV30ComplianceOk) scripts.push(`sync-schemas -- ${STABLE_3_0_SCHEMA_VERSION}`);
 if (!stableV31Ok || !stableV31ComplianceOk) scripts.push(`sync-schemas -- ${STABLE_3_1_SCHEMA_VERSION}`);
-if (!v25Ok) scripts.push('sync-schemas:v2.5');
 
 console.log(`[schemas:ensure] Missing or provenance-stale schema cache; running: ${scripts.join(', ')}`);
 

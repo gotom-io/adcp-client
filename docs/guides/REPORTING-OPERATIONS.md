@@ -5,6 +5,8 @@ consumer runtime. Reliable Reporting controls evidence used for billing and
 large media-spend decisions. Treat its PostgreSQL state, destination objects,
 signing keys, and authentication registry as financial infrastructure.
 
+> **Stability:** the storage this runbook operates lives in `@adcp/reporting-storage`, which is pre-1.0 and experimental. Pin it with `~` (for example `~0.1.0`) and read each minor's changeset before upgrading. See the [Reliable Reporting stability policy](REPORTING-STABILITY.md).
+
 ## Production topology
 
 Use one PostgreSQL primary with synchronous durability appropriate to the
@@ -71,6 +73,165 @@ operate over the whole namespace; isolate namespaces and publisher scopes when
 different operators own tenant partitions. For Reconciled Billing offerings,
 provide `obligatedConsumers` from a trusted authorization roster. A missing or
 incomplete roster cannot safely mark a billing obligation reconciled.
+
+## Adopting row storage, retention and the change feed
+
+Each of these features is opt-in and additive. Enable them one at a time on a
+running deployment. See the [ledger guide](REPORTING-LEDGER.md#row-storage)
+for configuration details.
+
+Running Core only, without the production service? Pass `maintenance:
+reportingLedgerMaintenance({ ... })` (from `@adcp/reporting-storage`) to
+`createReliableReportingService` so its scheduler (or `runMaintenance()`) does
+the retention, change-feed pruning and abandoned-upload sweeps the production
+service runs for you. See
+[Core-only setup](REPORTING-LEDGER.md#core-only-setup-with-row-storage-change-feed-and-retention).
+
+1. **Row storage.** Apply `REPORTING_ROW_STORAGE_MIGRATION` (PostgreSQL 13+),
+   or pass `rowStorage` to the production service, which adds it to
+   `setup.migrations`. Roll out with `rowStorage` set. New revisions store
+   verified chunks. Existing revisions keep their inline rows, and every
+   binary built with row storage reads both forms. Do not run a writer older
+   than this release once chunked revisions exist: it cannot read them.
+   Upgrading from 15.8.x? Row storage renamed its stored fields to AdCP's
+   names; re-apply the migration before starting new binaries (see
+   [Breaking: reporting row storage field alignment](../migration-reporting-row-storage-alignment.md)).
+2. **Existing inline rows (optional).** Run `migrateInlineRows` in bounded
+   batches from a maintenance job until it returns no cursor. Alert on any
+   `quarantined` IDs: those revisions no longer reproduce their committed
+   binding and are left untouched for investigation. Then reclaim space with
+   `VACUUM FULL` or an online repack in a maintenance window.
+3. **Object storage.** Create a dedicated private bucket, container or prefix
+   for rows, separate from Managed Delivery buckets. Configure the binding in
+   host code and run `runReportingRowObjectProviderConformanceV1` against a
+   test prefix first. S3 bucket versioning and Azure blob versioning are
+   **required**, and the providers' probes refuse unversioned buckets and
+   accounts: deletes must be fenced to one write, and ETags are content-derived,
+   so an ETag-pinned delayed delete (for example an intent sweep) could remove a
+   replacement object re-created with identical bytes at the same key. Deleting
+   a specific `VersionId` permanently removes that version (no delete marker),
+   so retention still frees storage. Do not
+   attach lifecycle rules that can delete live rows sooner than
+   `max(statusRetentionDays, recordRetentionDays)` plus the restatement window.
+   The GCS probe refuses them; for S3 and Azure, policies outside the client's
+   view are the operator's responsibility.
+4. **Change feed.** Apply `REPORTING_LEDGER_CHANGES_MIGRATION` (PostgreSQL 13+)
+   or pass `changeFeed`. Register each durable consumer with
+   `saveFeedConsumerCursor` (checkpoints are forward-only; pass `{ rewind: true }`
+   to move a consumer back), and size `maxFeedHoldDays` so one stalled consumer
+   cannot hold the table indefinitely.
+5. **Warehouse sink.** Apply `REPORTING_WAREHOUSE_SINK_MIGRATION`, create the
+   tables, and the `current_rows` view, then schedule `runOnce`. Point analysts
+   at `current_rows`. Set the sink's `location` to the dataset's location: replay
+   lookups of load jobs need it outside the US and EU multi-regions, and the sink
+   warns once per process when it is unset. When upgrading from 15.9.0, stop
+   every 15.9.0 sink worker before starting newer ones, then re-apply
+   `REPORTING_WAREHOUSE_SINK_MIGRATION`. A 15.9.0 worker cancels a load at its
+   deadline, so one running beside a newer worker on the same sink can cancel a
+   job the newer worker is waiting on; the job ends `DONE` with an error and the
+   attempt advances. Rows do not duplicate, but convergence slows.
+6. **Retention.** Enable `retention` last, after confirming the advertised
+   `status_retention_days` is the window you intend to keep. Retirement deletes
+   rows and ledger records for whole periods and cannot be undone. Keep backups
+   for any longer audit requirement.
+7. **Snapshot compaction (optional).** Off by default; enable `compaction`
+   (`maintenance.compaction` on the Core-only service) only to reclaim the
+   content of superseded snapshots. Do not enable it in production before the
+   next eligible AdCP minor after November 20, 2026, when the protocol takes
+   compaction into effect. Roll it out after retention, with a small `limit`,
+   and watch the `snapshot compaction` task's `failed` IDs. See
+   [Compacting superseded snapshots](REPORTING-LEDGER.md#compacting-superseded-snapshots-opt-in)
+   for the rule and what it keeps. Compaction cannot be undone; backups hold
+   any longer evidence.
+
+8. **Orphaned object collection (optional).** The intent sweep deletes only
+   what an intent lists. It cannot see an upload whose `PUT` succeeded before the
+   intent recorded it, an intent for a binding no running host configures, or an
+   intent lost to a database restore, and a bucket lifecycle rule cannot tell
+   those objects from committed ones. Enable `orphanCollection`
+   (`maintenance.orphanCollection` on the Core-only service) to list each
+   configured object binding under `{prefix}/{namespace_key}/` and delete what
+   nothing names. Roll it out in this order:
+   1. Run it with `dryRun: true` and read `candidates` in the
+      `orphan object collection` task result. Confirm they are objects you
+      expect to lose.
+   2. Enable it for real, with `acknowledgeExclusiveNamespace: true` (see
+      below), a modest `limit` (objects examined per binding per pass, default
+      1000) and one host.
+
+   It is built for a long period: a listing that does not finish within `limit`
+   continues on the next pass, and a finished one rests for `intervalSeconds`
+   (default one day) before the next starts. That position lives in the process,
+   so a restart begins a new listing; the cost is bounded by `limit` per pass
+   either way. Reduce `limit`, or lengthen `intervalSeconds`, to spend fewer list
+   requests.
+
+   An object is deleted only when all of these hold: its key is a `.jsonl` or
+   `.jsonl.gz` object under the binding's owned prefix; it was written more than
+   `minAgeSeconds` ago (default 7 days, never less than 1 day, which must stay
+   well above the write deadline plus intent expiry); no row set that is not yet
+   `pruned` has a chunk at that key and no write intent lists it, at any version;
+   and, under the per-object advisory lock every other delete takes, no `live` or
+   `unavailable` row set references that exact version and no open intent
+   created it, checked under every binding because two bindings can share a
+   bucket and prefix (a retired binding kept `readOnly` next to its successor).
+   `readOnly` bindings are skipped unless `includeReadOnly: true`. A binding
+   whose provider has no `list` is reported as `unsupported` (and as a
+   maintenance warning), never silently skipped. Everything under the owned prefix
+   with a row-object key counts as written by this SDK, so do not store other
+   `.jsonl` files there.
+
+   **Run it only against the ledger database that owns the namespace.** The
+   namespace key comes from the database's installation identity. A clone or
+   point-in-time copy of that database that still points at the same bucket
+   shares the key, and its collector would delete the objects of every row set
+   the original wrote after the copy was taken, because the copy has never heard
+   of them. The age threshold does not protect against that, which is why a real
+   (not dry) pass needs `acknowledgeExclusiveNamespace: true`: it is your statement
+   that this database is the only owner. A clone made by copying the deployment
+   copies the flag too, so the flag does not protect it: remove it, or the whole
+   option, from every copy. Disable the option on clones, and after
+   restoring a database in place expect the collector to delete the objects of the
+   row sets the restore lost, which is its purpose.
+   The cost grows with bucket size: one listing request per page, plus one
+   database query per page and one transaction per deleted object.
+
+Alert on these row-storage signals:
+
+- `ROWS_INTEGRITY_FAILED` or `ROWS_UNAVAILABLE` from reads. These are never
+  normal, and buyers see `SERVICE_UNAVAILABLE` for the affected revision.
+- A growing count of `adcp_reporting_row_write_intents` in `sweeping` state,
+  or `sweepRowWriteIntents` reporting failures. Provider deletes are failing;
+  failed intents back off (one minute, doubling, capped at six hours) rather than
+  blocking others. `skippedUnconfigured` counts expired uploads whose binding this
+  host does not configure, and `overdue` (expired more than 24 hours ago, still
+  unswept) means no host is handling them and their objects are leaking. The
+  maintenance helper reports both through `onError`.
+- The `orphan object collection` task reporting `failed` or `unsupported`
+  bindings (their provider cannot list, so nothing there is collected). A listing
+  that fails is retried from the page that failed (or from the start, if it was
+  the first page of a resumed listing). A delete that fails is counted and the
+  pass moves on, so one stuck object cannot hold up the rest; it is tried again on
+  the next full listing. `referenced` and
+  `tooYoung` are normal; a `foreign` count means the prefix holds objects this
+  SDK did not write as row objects, which it leaves alone.
+- The `snapshot compaction` task reporting `failed` revisions. Provider deletes
+  are failing; the revisions stay `pruning` (reads already answer not-found) and
+  the next pass resumes them.
+- `retireExpiredPeriods` returning `failed` IDs or a non-empty `stuck` list.
+  Usually a binding was removed from configuration while revisions still
+  reference it; keep retired bindings configured. A failing period retries with
+  backoff (up to six hours) and does not block other periods; `stuck` lists
+  those that have failed five or more times, with their cause.
+- `ReportingChangeCursorExpiredError` (`code === 'CURSOR_EXPIRED'`) in a
+  consumer. Usually it fell behind retention and must resynchronize from
+  `listCurrentRevisions`. A first read with no cursor can also throw it when a
+  prune commits mid-read; retry it. A new warehouse sink stuck on it after such
+  a race recovers with `sink.reset()`.
+- A non-empty `missing` from the warehouse sink's `runOnce()`. The sink was down
+  longer than `maxFeedHoldDays`, retention stopped waiting for it, and the
+  warehouse lacks those revisions. Backfill them or accept the gap, and keep
+  `maxFeedHoldDays` above your longest tolerated sink outage.
 
 ## Service objectives and alerts
 
@@ -146,7 +307,17 @@ Quarterly, restore into an isolated environment and verify:
 - notification recovery resumes without duplicate logical events;
 - buyer cursors/checkpoints resume and duplicate notification keys remain deduped;
 - a new lease fences an expired owner;
-- sampled manifest and canonical-content digests still verify.
+- sampled manifest and canonical-content digests still verify;
+- sampled chunked revisions read back through `getRevision`, including rows in
+  object-storage bindings.
+
+Row objects live outside the database. A database restore and the matching
+row buckets must come from the same point in time, or revisions committed
+after the bucket snapshot read as `ROWS_UNAVAILABLE`. A restored replica of
+the same authority keeps its installation identity. An independently writable
+clone, such as staging restored from production, must mint a new
+`adcp_persistence_installation` row and use new bindings before it writes or
+sweeps, so it can never delete production objects.
 
 After regional failover, fence the old primary before enabling writers. Ensure
 database time is healthy, then start canary workers and watch lease generation,
@@ -177,6 +348,25 @@ Disable notification-triggered acceleration if necessary, retain dedupe rows,
 and repair the authenticated seller/principal registry before resuming. Never
 choose an account based only on an untrusted webhook body.
 
+Row-storage integrity failure: stop serving the affected scope and do not
+re-upload over the recorded object. Compare the stored object's bytes and
+version with the chunk manifest, restore the exact recorded version from bucket
+versioning or backups, and verify by reading the revision through `getRevision`.
+Never edit a chunk manifest or digest to match the stored bytes.
+
+Multi-transport managed delivery: when one runtime delivers through several
+transports behind the managed-delivery router, key alerts on the per-route
+worker counts (`deliveryFailuresByRoute`, `revocationFailuresByRoute`,
+`overdueByRoute`) instead of the totals, so one failing transport is not
+averaged away. A non-zero `~unrouted` count is a configuration problem, not a
+provider outage: a binding or destination authorization has no route (often a
+legacy authorization with no recorded transport and no `legacyDefault`). List
+those authorizations with `listDestinationAuthorizationsWithoutContract()`,
+then add the route or a `legacyDefault`. A startup probe failure names the
+failing route; fix that route's provider access before restarting, because
+offerings are not withdrawn at runtime. See "Multi-transport delivery with the
+router" in `REPORTING-LEDGER.md`.
+
 Clock skew: remove the host from service. Lease and event times use PostgreSQL
 where correctness needs a shared clock, while provider deadlines and process
 timeouts still depend on healthy host clocks.
@@ -192,3 +382,199 @@ timeouts still depend on healthy host clocks.
   retention changes with independent protocol and security reviewers.
 - Capture dashboards, pages, runbook ownership, restore evidence, and capacity
   headroom before enabling financial decisions.
+
+For the optional GCS provider write-fence primitive and its bucket policy, inventory retention and cancellation requirements, see [Durable GCS reporting write fence](REPORTING-GCS-FENCE.md). Complete managed delivery integration remains a separate step.
+
+For complete GCS file-transfer delivery, private contracts and scoped buyer readers, see [Managed reporting delivery on GCS](REPORTING-GCS-MANAGED.md).
+
+## Live GCP validation
+
+`packages/reporting-storage/scripts/validate-reporting-gcp.mjs` (`npm run validate:reporting-gcp`) runs the built `@adcp/reporting-storage` against a real BigQuery
+project and a real GCS bucket. The in-memory doubles in the test suite cannot
+prove how BigQuery names jobs, where it stores load options, or what a real
+bucket policy looks like; this script does. It is not published with the
+package, so run it from a repository checkout.
+
+What it checks:
+
+- **BigQuery warehouse sink** (`@adcp/reporting-storage/bigquery`). It applies the
+  ledger migrations into fresh PostgreSQL schemas, commits revisions, creates a
+  uniquely named dataset in the destination project from `defaultTablesSql` and
+  `currentRowsViewSql`, and runs the sink. It verifies row and revision counts
+  and the JSON `row` column by query, that the load jobs exist in the
+  destination project and location under the deterministic job IDs, that a
+  crash after the rows load (an injected failing revisions load) replays with no
+  duplicate rows, and that `current_rows` returns one revision per obligation.
+  It also asserts (`PASS`/`FAIL`) that the sink sends no `labels` or
+  `jobTimeoutMs` inside `configuration.load`, where BigQuery silently drops
+  them. A deadline scenario runs a sink with the minimum 1-second load deadline
+  and holds the first load's result past it: the run must reject with the plan
+  and job ID unchanged and that table's persisted deadline grown, the job must
+  end `DONE` without an error (the sink never cancels it), and later runs under
+  the same sink name must converge with no duplicate rows, the same job ID and
+  no second upload. A slow-upload scenario runs a sink whose upload of a 50,000-row
+  batch outlasts its 1-second deadline and asserts that it converges within 8
+  runs, loads every row exactly once, never changes the job ID, and never
+  starts an upload after the job exists (a link fast enough to beat the
+  deadline passes and says so). A
+  `period_date` scenario checks that non-UTC periods land on their
+  source-timezone date.
+- **Cancel probe of the service** (`INFO`, never a failure). It cancels a
+  5000-row load the moment it is created and reports whether BigQuery stopped
+  it; in practice it accepts the cancel and lets the load finish, which is why
+  the sink never cancels a load and finds it by job ID instead.
+- **Overlapping runs** (`INFO`, never a failure). Two concurrent `runOnce()`
+  calls over one pending batch, and a deterministic reproduction of the stale-plan race: one
+  run reads its sink state, another completes the batch and a new revision
+  commits, then the first resumes. Without the fence the first run reloads
+  revisions the second already loaded (duplicate rows); with the plan fence it rejects as stale and nothing duplicates. Read the verdict in the
+  report; the exit status does not depend on it.
+- **Cross-project.** Set `GCP_CLIENT_PROJECT` to a project other than
+  `GCP_BQ_PROJECT`. Load jobs are then created in the destination project, and
+  the crash replay fails if the "job already exists" status check looks in the
+  client's default project instead.
+- **GCS row provider** (`@adcp/reporting-storage/gcs`). It prints the bucket policy,
+  runs the provider probe (uniform bucket-level access, public access
+  prevention, lifecycle rules) and `runReportingRowObjectProviderConformanceV1`,
+  then commits a revision through an object binding on the bucket and reads it
+  back verified (full read, ranged page, a second store instance, and a replayed
+  commit that uploads nothing). It also commits revisions for non-UTC periods and
+  checks that each object key has one `{period_date}` segment holding the
+  source-timezone date, and that each chunk's `native_version_ref` and
+  `size_bytes` match the stored object's generation and size.
+
+Everything it creates carries a per-run id: a dataset named
+`<GCP_DATASET_PREFIX><run id>`, objects under `<GCS_PREFIX>/<run id>/`, and
+PostgreSQL schemas `adcp_validation_<run id>_*`. All of it is deleted in
+`finally` (and on Ctrl-C) unless `KEEP=1`. Deletion is limited to those names:
+the script refuses to delete a dataset without the prefix, an object outside
+the run prefix, or a schema without the run id.
+
+### Setup
+
+```bash
+npm ci && npm run build
+# Optional peers; --no-save leaves package.json alone.
+npm install --no-save @google-cloud/bigquery @google-cloud/storage
+```
+
+Use Application Default Credentials (workload identity,
+`gcloud auth application-default login`, or `GOOGLE_APPLICATION_CREDENTIALS`).
+The script never reads, writes or prints credentials, and it redacts the
+PostgreSQL URL and bearer tokens from anything it prints. If a peer package is
+missing it prints the install command and exits with status 2.
+
+| Variable                                                             | Required                 | Meaning                                                                                                                                                              |
+| -------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REPORTING_LEDGER_PG_URL`                                            | yes                      | PostgreSQL the ledger runs on. The role must be able to create and drop schemas.                                                                                     |
+| `GCP_BQ_PROJECT`                                                     | unless `--skip-bigquery` | Destination project for the temporary dataset.                                                                                                                       |
+| `GCP_BQ_LOCATION`                                                    | no (`US`)                | Dataset and job location.                                                                                                                                            |
+| `GCP_CLIENT_PROJECT`                                                 | no                       | The BigQuery client's default project (billing project for queries and DDL). Set it different from `GCP_BQ_PROJECT` to exercise the cross-project path.             |
+| `GCP_DATASET_PREFIX`                                                 | no (`adcp_sink_validation_`) | Dataset name prefix.                                                                                                                                     |
+| `GCS_BUCKET`                                                         | unless `--skip-gcs`      | Bucket under test. Its policy must satisfy the row-provider probe.                                                                                                   |
+| `GCS_PREFIX`                                                         | no (`adcp-reporting-validation`) | A prefix you own for the test; a unique run folder is created beneath it.                                                                                    |
+| `KEEP=1`                                                             | no                       | Keep the dataset, objects and schemas, and print how to remove them.                                                                                                 |
+| `ADCP_SDK_ROOT`                                                      | no                       | Another built checkout whose `dist/` is tested (see below).                                                                                                          |
+| `--yes` or `CONFIRM=1`                                               | yes                      | Acknowledge the preflight; without it nothing is created and the exit status is 2.                                                                                   |
+| `--skip-bigquery`, `--skip-gcs` (or `SKIP_BIGQUERY=1`, `SKIP_GCS=1`) | no                       | Skip a section.                                                                                                                                                      |
+
+The preflight prints the identity ADC resolves to, the projects, location,
+bucket, prefix and dataset name before anything is created.
+
+### Required IAM
+
+- **Destination project** (or the dataset, once it exists): BigQuery Data
+  Editor (`roles/bigquery.dataEditor`; it includes `bigquery.datasets.create`
+  and table create and read) and BigQuery Job User (`roles/bigquery.jobUser`;
+  load jobs are created here). The creator of a dataset owns it, which covers
+  the forced delete in cleanup; if your organization strips that, grant
+  `roles/bigquery.dataOwner` instead. If reading job metadata is denied, add
+  `roles/bigquery.resourceViewer` (`bigquery.jobs.get`).
+- **Client project**, when it differs: BigQuery Job User, because the DDL and
+  verification queries run as jobs there.
+- **GCS**: Storage Object Admin (`roles/storage.objectAdmin`) on the test
+  prefix, with an IAM condition such as
+  `resource.name.startsWith("projects/_/buckets/BUCKET/objects/PREFIX/")`, plus
+  `storage.buckets.get` for the probe (for example
+  `roles/storage.legacyBucketReader`, or a custom role holding only
+  `storage.buckets.get`). Object Admin alone does not include
+  `storage.buckets.get`.
+
+### Running it
+
+Against current `main`:
+
+```bash
+git checkout main && git pull && npm ci && npm run build
+npm install --no-save @google-cloud/bigquery @google-cloud/storage
+export REPORTING_LEDGER_PG_URL=postgres://...   # a scratch database
+export GCP_BQ_PROJECT=dest-project GCP_CLIENT_PROJECT=billing-project GCP_BQ_LOCATION=US
+export GCS_BUCKET=my-test-bucket GCS_PREFIX=adcp-reporting-validation
+npm run validate:reporting-gcp -- --yes
+```
+
+Against a pull request branch (replace `<n>` with its number), keep running the script from
+`main` and point it at a second built checkout, so a branch cut before this
+script existed still works:
+
+```bash
+git fetch origin pull/<n>/head:pr-<n>
+git worktree add ../adcp-client-pr-<n> pr-<n>
+(cd ../adcp-client-pr-<n> && npm ci && npm run build)
+ADCP_SDK_ROOT=../adcp-client-pr-<n> npm run validate:reporting-gcp -- --yes
+```
+
+The same environment applies. The run ends with a `PASS`, `FAIL` and `INFO`
+report and a markdown block (project and bucket names masked) to paste into
+the PR. The exit status is 0 with no `FAIL`, 1 with any `FAIL`, and 2 for a
+configuration problem or a missing `--yes`. Results of the overlap probes are
+`INFO` on purpose: on `main` expect the stale-run probe to report duplicates,
+and on a branch with the plan fence expect it to report none.
+
+`test/lib/reporting-gcp-validation-pg.test.js` drives the script's core against
+in-memory BigQuery and Storage doubles and a real PostgreSQL, so the logic,
+reporting and cleanup safety stay covered without credentials. It proves nothing
+about real BigQuery or GCS behavior.
+
+### The Python SDK's equivalent
+
+The Python SDK (`adcp-client-python`, package `adcp`) has the same GCS row
+provider and the same conformance runner: `create_gcs_reporting_row_object_provider_v1`
+in `adcp.reporting.ledger.row_storage_gcs` and
+`run_reporting_row_object_provider_conformance_v1` in
+`adcp.reporting.ledger.row_storage_object`, with the same bucket policy rules.
+Install `pip install 'adcp[reporting-gcs]'`, then run the conformance against the
+same bucket and prefix as above (it writes and deletes only
+`$GCS_PREFIX/conformance/<uuid>.jsonl`):
+
+```bash
+python - <<'PY'
+import asyncio, os
+from google.cloud import storage
+from adcp.reporting.ledger.row_storage_gcs import create_gcs_reporting_row_object_provider_v1
+from adcp.reporting.ledger.row_storage_object import run_reporting_row_object_provider_conformance_v1
+
+async def main():
+    provider = create_gcs_reporting_row_object_provider_v1(storage=storage.Client())
+    passed = await run_reporting_row_object_provider_conformance_v1(
+        provider,
+        location={"bucket": os.environ["GCS_BUCKET"]},
+        prefix=os.environ.get("GCS_PREFIX", "adcp-reporting-validation"),
+    )
+    print("PASS", passed)
+
+asyncio.run(main())
+PY
+```
+
+Python has no BigQuery warehouse sink. A live JavaScript to Python interop run
+against GCS is not possible with the existing interop test: the Python test
+(`tests/conformance/reporting/test_reporting_row_storage_interop_pg.py`) and its
+JavaScript driver (`tests/interop/reporting_row_storage_js_driver.cjs`) both
+hard-code the filesystem provider and a directory bucket root, and the
+cross-SDK row-storage fixtures replay on a filesystem too. Running it on GCS
+would need both drivers changed to build an object binding with
+`provider: 'gcs'` and `location: { bucket }` (same prefix, deployment namespace
+and binding definition on both sides). The optional live GCS controls in
+`scripts/reporting-interop/GCS.md` exercise the Managed Delivery evidence
+readers, not row storage.

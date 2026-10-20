@@ -53,7 +53,7 @@ Your domain (e.g., agent.example.com)
         -> /.well-known/jwks.json      # JSON Web Key Set with public keys
 ```
 
-`@adcp/sdk` provides `BrandJsonJwksResolver` which handles this entire chain automatically, with caching and refresh.
+`@adcp/sdk` provides `ResolvedAgentJwksResolver` which handles this entire chain automatically, with caching and refresh.
 
 ## Step 1: Generate a Signing Key
 
@@ -214,6 +214,12 @@ const signingFetch = buildAgentSigningFetch({
 });
 ```
 
+### Diagnosing a seller's rejection of a signed request
+
+For SDK client calls over A2A or MCP, a signed HTTP 401 with a `Signature` challenge (or no challenge) produces an `AuthenticationRequiredError` with `requestSigned: true` and `status: 401`. Its `code` remains `AUTHENTICATION_REQUIRED` for compatibility; `signatureErrorCode` carries a recognized seller `request_signature_*` code, and the message includes the protocol's repair hint. Check the public discovery chain, `brand_json_url` → `agents[]` → `jwks_uri`, when the seller cannot resolve your key. Explicit Bearer or Basic gateway challenges retain their existing authentication recovery. For client-credentials agents, a bare 401 still permits one token refresh; a persistent signed rejection keeps its diagnostics. Other signed bare 401s bypass unsigned authentication probes and interactive OAuth recovery, so gateways requiring those flows should send an explicit Bearer challenge.
+
+`error.responseBody` contains a bounded, redacted seller diagnostic when capture succeeds. It is non-enumerable and excluded from JSON error reports. Custom header values are conservatively treated as credentials; short values can mask matching diagnostic text. Treat it as untrusted operator diagnostic text; do not feed it to automated prompts or use it as recovery instructions. Failed `TaskResult` values preserve this error under `result.errorInstance`, so the diagnostic is available as `result.errorInstance.responseBody` after narrowing to `AuthenticationRequiredError`. Conformance raw capture uses the same bounded, redacted diagnostic rather than the original response bytes for these failures. Low-level signing fetch presets continue to return the original HTTP `Response`.
+
 ## Step 3.5: Production Key Storage — KMS / HSM / Vault
 
 Holding a private JWK in process memory is fine for development and testing but it's not where you want production signing keys to live. A process compromise leaks the signing key, and the only remedy is rotation across every counterparty that's cached your public key (within their TTL). The AdCP spec recommends storing keys in a managed key store (HSM or KMS); the SDK supports this directly via the `SigningProvider` interface.
@@ -354,7 +360,7 @@ For local dev / non-KMS testing, `--key-file <jwk-path>` accepts an in-process J
 
 ```typescript
 import { createExpressVerifier, StaticJwksResolver } from '@adcp/sdk/signing';
-import { mcpToolNameResolver } from '@adcp/sdk/server';
+import { adcpOperationResolver } from '@adcp/sdk/server';
 
 // Raw-body capture MUST be mounted ahead of the verifier — express.json()
 // would otherwise consume the stream and the verifier would have no bytes to
@@ -372,7 +378,7 @@ app.post(
       required_for: ['create_media_buy', 'update_media_buy'],
     },
     jwks: new StaticJwksResolver(buyerPublicKeys),
-    resolveOperation: mcpToolNameResolver,
+    resolveOperation: adcpOperationResolver,
   }),
   handler
 );
@@ -408,13 +414,27 @@ app.use(createExpressVerifier({
   capability: { ... },
   jwks,
   replayStore,                                                  // <-- shared across instances
-  resolveOperation: mcpToolNameResolver,
+  resolveOperation: adcpOperationResolver,
 }));
 ```
 
 The schema uses one table with `(keyid, scope, nonce)` as the primary key, indexes on `expires_at` and `(keyid, scope, expires_at)`, and a table-specific guarded-insert function. Each insert attempt is one round trip to that function, which tries a transaction-scoped advisory lock and handles the replay/cap/insert decision atomically. Busy scopes use bounded client-side retry between queries, so pooled connections remain available to unrelated scopes. Rerun `getReplayStoreMigration()` before deploying an SDK upgrade so the function stays current; the migration is idempotent. The sweeper exists because Postgres has no native row-level TTL — it's a `DELETE FROM replay_cache WHERE expires_at <= now()` you call on a schedule. Other backends (Redis, KeyDB, anything supporting atomic insert-if-absent with TTL) can implement the `ReplayStore` interface the same way.
 
 On successful verification, `req.verifiedSigner` contains `{ keyid, agent_url?, verified_at }`. On failure, the middleware returns `401` with `WWW-Authenticate: Signature error="<code>"`.
+
+### Operation resolution: MCP and A2A
+
+`required_for`, `supported_for`, and `warn_for` match the operation resolved from the request, not the JSON-RPC method (adcp#7945). `adcpOperationResolver` (from `@adcp/sdk/server`) implements the rule for both transports:
+
+| Request | Resolved operation |
+|---|---|
+| MCP `tools/call` | `params.name` |
+| A2A `SendMessage`, `SendStreamingMessage`, `message/send`, `message/stream` | `skill` of the Message's sole DataPart |
+| Any other JSON-RPC method (`tasks/*`, `CancelTask`, `initialize`) | none; matched by `protocol_methods_*` only |
+
+A body that does not resolve to exactly one operation returns the distinguished `UNRESOLVABLE_OPERATION`, and the verifier rejects it with `request_body_malformed` before it reads any signature header or capability list, signed or not. That covers zero or several DataParts, FileParts, a Part with two content members, a `skill` that is not a non-empty string, duplicate keys (after JSON string decoding), case variants of a recognized member name (`Skill`, `Parts`), and batches. Never treat an unresolvable body as "an operation that is not in `required_for`": a resolver that returns `undefined` for an A2A message (as `mcpToolNameResolver` does) leaves `required_for` unenforced over A2A.
+
+`createAdcpServer({ signedRequests })` and `createA2AAdapter` use this resolver for you. When you compose authenticators by hand, `requireAuthenticatedOrSigned` defaults to it, rejects unresolvable bodies, and also runs the verifier's unsigned-branch checks: `protocolMethodsRequiredFor`, and the webhook-authentication rule, which a valid bearer does not satisfy.
 
 ### Composing with bearer auth
 
@@ -427,20 +447,20 @@ import {
   verifyApiKey,
   verifySignatureAsAuthenticator,
   requireAuthenticatedOrSigned,
-  mcpToolNameResolver,
+  adcpOperationResolver,
 } from '@adcp/sdk/server';
-import { BrandJsonJwksResolver } from '@adcp/sdk/signing/server';
+import { ResolvedAgentJwksResolver } from '@adcp/sdk/signing/server';
 
 serve(createAgent, {
   authenticate: requireAuthenticatedOrSigned({
     signature: verifySignatureAsAuthenticator({
       capability: { supported: true, required_for: ['create_media_buy'], covers_content_digest: 'either' },
-      jwks: new BrandJsonJwksResolver(),
-      resolveOperation: mcpToolNameResolver,
+      jwks: new ResolvedAgentJwksResolver(expectedBuyerAgentUrl, 'mcp'),
+      resolveOperation: adcpOperationResolver,
     }),
     fallback: verifyApiKey({ keys: { 'sk_live_abc': { principal: 'acct_42' } } }),
     requiredFor: ['create_media_buy', 'update_media_buy'],
-    resolveOperation: mcpToolNameResolver,
+    resolveOperation: adcpOperationResolver,
   }),
 });
 ```
@@ -453,7 +473,8 @@ Set `requiredFor` to the AdCP operations you want to gate behind signatures — 
 |---|---|
 | `StaticJwksResolver` | Fixed set of known buyer keys. Good for dev/testing. |
 | `HttpsJwksResolver` | Fetches JWKS from a URL with caching and refresh. |
-| `BrandJsonJwksResolver` | Full discovery chain: brand.json -> jwks_uri -> JWKS. Production recommended. |
+| `ResolvedAgentJwksResolver` | Capability-bound discovery from an expected agent URL. Production recommended. |
+| `BrandJsonJwksResolver` | Confirms an operator mapping against capabilities; accepts an explicit `agentUrl` or infers a unique onboarding URL from existing configuration. |
 
 ## Step 5: Verify Inbound Webhooks (Buyer / Orchestrator)
 
@@ -462,16 +483,18 @@ When sellers send webhooks, verify the signature to confirm authenticity:
 ```typescript
 import {
   verifyWebhookSignature,
-  BrandJsonJwksResolver,
+  ResolvedAgentJwksResolver,
   InMemoryReplayStore,
+  InMemoryRevocationStore,
 } from '@adcp/sdk/signing/server';
 
-const jwks = new BrandJsonJwksResolver();
+const jwks = new ResolvedAgentJwksResolver(expectedSellerAgentUrl, 'mcp', { legacyWebhookFallback: true });
 const replayStore = new InMemoryReplayStore();
+const revocationStore = new InMemoryRevocationStore();
 
 app.post('/webhook', async (req, res) => {
   try {
-    await verifyWebhookSignature(req, { jwks, replayStore });
+    await verifyWebhookSignature(req, { jwks, replayStore, revocationStore });
   } catch (err) {
     return res.status(401).json({ error: 'invalid webhook signature' });
   }
@@ -479,6 +502,31 @@ app.post('/webhook', async (req, res) => {
   // Process the verified webhook...
 });
 ```
+
+Webhook-v1 uses unpadded Base64URL for `Signature` throughout AdCP 3.x,
+including 3.2. Its URL canonicalization follows AdCP 3.2 independently of
+that encoding. The 3.2 request-signing migration to padded standard Base64
+does not change the webhook-v1 profile. Python senders should use
+`adcp.signing.webhook_signer.sign_webhook` rather than a generic
+`sign_request` call with `signing_profile_version="3.2"` and the webhook tag.
+See the [protocol's binary-value encoding rules](https://github.com/adcontextprotocol/adcp/blob/v3.2.5/docs/building/by-layer/L1/security.mdx#adcp-rfc-9421-profile).
+
+When a known peer uses a generic RFC 9421 signer that emits standard padded
+Base64, configure that receiver route explicitly:
+
+```typescript
+await verifyWebhookSignature(req, {
+  jwks,
+  replayStore,
+  revocationStore,
+  signatureEncoding: 'rfc8941-base64',
+});
+```
+
+`createWebhookVerifier` accepts the same option. Each mode strictly parses
+its configured encoding; neither retries the other encoding. Select this
+option from trusted integration configuration, independently of incoming
+headers or webhook payloads.
 
 ## Step 6: Sign Outbound Webhooks (Seller)
 

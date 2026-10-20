@@ -1,6 +1,8 @@
 // Test helpers for AdCP client library
 // Provides pre-configured test agents for examples and quick testing
 
+export { assertPendingWebFlowStoreRoundTrip, type PendingWebFlowStoreRoundTripOptions } from './pending-web-flow-store';
+
 export {
   // Test agents (with auth)
   testAgent,
@@ -246,7 +248,12 @@ export { runAgainstLocalAgent } from './local-agent-runner';
 export type { LocalAgentRunResult, PerStoryboardOverride, RunAgainstLocalAgentOptions } from './local-agent-runner';
 
 // External schema bundles for hosted compliance/certification runs.
-export { registerExternalSchemaRoot, unregisterExternalSchemaRoot, withExternalSchemaRoot } from '../validation';
+export {
+  registerExternalSchemaRoot,
+  unregisterExternalSchemaRoot,
+  withExternalSchemaRoot,
+  withServedReleaseSchemaRoots,
+} from '../validation';
 
 // Storyboard-driven testing
 export {
@@ -404,4 +411,11 @@ export {
   // probe is runner-native, so its task name ships as a constant rather than a
   // magic string operators have to copy (adcp-client#2940).
   MCP_SESSION_PROBE_TASK,
+} from './storyboard';
+
+export { resolveCreativeBuildProbe, validateCreativeBuildProbeSpec } from './storyboard';
+export type {
+  CreativeBuildProbeSpec,
+  CreativeBuildProbeInputFixture,
+  CreativeBuildProbeResolution,
 } from './storyboard';

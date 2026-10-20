@@ -1,3 +1,4 @@
+import { SerializeError, serializeInnerList, serializeItem, type Item } from 'structured-headers';
 import { RequestSignatureError } from './errors';
 
 export interface RequestLike {
@@ -43,8 +44,6 @@ const DEFAULT_PARAM_ORDER: ReadonlyArray<keyof SignatureParams> = [
   'alg',
   'tag',
 ];
-
-const STRING_PARAMS = new Set<keyof SignatureParams>(['nonce', 'keyid', 'alg', 'tag']);
 
 const SUPPORTED_DERIVED = new Set(['@method', '@target-uri', '@authority', '@status']);
 
@@ -178,15 +177,23 @@ export function buildResponseSignatureBase(
   return lines.join('\n');
 }
 
+/**
+ * Serialize the `@signature-params` inner list (RFC 9421 §2.3) with the
+ * structured-field serializer, in the canonical AdCP parameter order.
+ */
 export function formatSignatureParams(components: ReadonlyArray<string>, params: SignatureParams): string {
-  const componentList = components.map(formatComponentIdentifier).join(' ');
-  const paramPairs: string[] = [];
+  const parameters = new Map<string, string | number>();
   for (const key of DEFAULT_PARAM_ORDER) {
     const raw = params[key];
-    if (raw === undefined) continue;
-    paramPairs.push(STRING_PARAMS.has(key) ? `${key}="${raw}"` : `${key}=${raw}`);
+    if (raw !== undefined) parameters.set(key, raw);
   }
-  return `(${componentList});${paramPairs.join(';')}`;
+  try {
+    return serializeInnerList([components.map(componentItem), parameters]);
+  } catch (error) {
+    if (!(error instanceof SerializeError)) throw error;
+    // A value that cannot form an RFC 8941 field (e.g. a non-ASCII keyid) is a caller error.
+    throw new TypeError(`Signature parameters are not RFC 8941 serializable: ${error.message}`);
+  }
 }
 
 function parseComponentIdentifier(component: string): { bare: string; requestBound: boolean } {
@@ -206,9 +213,13 @@ function parseComponentIdentifier(component: string): { bare: string; requestBou
   };
 }
 
-function formatComponentIdentifier(component: string): string {
+function componentItem(component: string): Item {
   const { bare, requestBound } = parseComponentIdentifier(component);
-  return `"${bare}"${requestBound ? ';req' : ''}`;
+  return [bare, new Map(requestBound ? [['req', true]] : [])];
+}
+
+function formatComponentIdentifier(component: string): string {
+  return serializeItem(componentItem(component));
 }
 
 function resolveResponseComponentValue(
@@ -362,6 +373,8 @@ function decodeUnreservedPercentEncoding(input: string): string {
  * non-transitional produce different A-labels for the same input, which
  * would open a signer/verifier canonicalization differential. Accepts
  * both absolute (`scheme://…`) and scheme-relative (`//…`) URL shapes.
+ * The transport taxonomy classifies the received URI as malformed. Diagnostic
+ * step 1 is SDK-local parsing, not the checklist's signature-header parser.
  */
 export function rejectNonAsciiHost(rawUrl: string): void {
   const authorityMatch = rawUrl.match(/^(?:[a-z][a-z0-9+.\-]*:)?\/\/([^/?#]*)/i);
@@ -370,7 +383,7 @@ export function rejectNonAsciiHost(rawUrl: string): void {
   for (let i = 0; i < authority.length; i++) {
     if (authority.charCodeAt(i) > 0x7f) {
       throw new RequestSignatureError(
-        'request_signature_header_malformed',
+        'request_target_uri_malformed',
         1,
         'URL authority contains non-ASCII bytes; use the A-label (Punycode) form'
       );

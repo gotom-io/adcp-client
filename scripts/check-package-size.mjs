@@ -17,7 +17,100 @@ import { assertPublishProtocolArtifacts } from './check-publish-protocol-artifac
 // enough compressor variance for supported Node/npm versions without allowing
 // the old 48 MB artifact shape to return. The packed limit is decimal because
 // npm reports published package size in MB and issue #2579 set a 20 MB target.
-const MAX_PACKED_TARBALL_BYTES = 20_000_000;
+// Canonical agent resolution adds three dual-format module/declaration sets
+// and one migration guide (+13 files). The measured tarball is 20,004,504
+// bytes; allow 25 KB above the existing 20 MB target for these artifacts and
+// compressor variance. Restoring age-provenance declarations adds about 5 KB
+// compressed (20,022,298 bytes on main versus 20,027,281 with the fix), without
+// adding published files. Allow that growth while retaining the same margin;
+// schema-sync skill snapshots are excluded and all other budgets stay fixed.
+// Bounded validation diagnostics add two internal module/declaration sets and
+// enlarge the shared dispatcher bundles. The measured tarball is 20,032,303
+// bytes; allow 10 KB for this change and compressor variance.
+// AgentOAuthClientCredentialsSchema publishes auth/oauth/client-credentials-schema
+// as CJS + ESM + both declaration flavours (four artifacts, 3,354 unpacked bytes).
+// The measured tarball is 20,040,986 bytes; allow 5 KB for these artifacts and
+// compressor variance. File-count, unpacked, and schema budgets stay fixed.
+// The optional GCS write fence adds three dual-format module/declaration sets
+// and one guide. CI measured 20,060,226 compressed bytes; preserve 10 KB of
+// compressor margin for that additive surface. Other size budgets stay fixed.
+// The complete GCS adapter/private-reader surface adds six internal module sets
+// and a guide; the first measured combined artifact is 20,079,662 bytes.
+// Allow 35 KB above that candidate for final documentation and compressor variance.
+// Operation resolution over A2A (GHSA-frxv-c96c-4vqw) adds the shared
+// signing/operation-resolution module, the A2A gate in the adapter, and the
+// grader's A2A vector module (about 42 KB compressed on top of the GCS surface). The measured combined
+// tarball is 20,121,361 bytes; allow 14 KB for compressor variance.
+// AdCP 3.2.3 adds 33 canonical A2A operation-resolution vectors. The measured
+// tarball is about 20,146,000 bytes; preserve 14 KB of compressor margin for this
+// signed compliance corpus. Unpacked, schema, and declaration budgets stay fixed.
+// Reliable Reporting row storage (paged exact reads, the row-storage migration
+// and the verified PostgreSQL chunk engine) adds three internal dual-format
+// module sets. The measured paged-read artifact is 20,160,752 bytes; allow 40 KB
+// for the following row-storage modules and compressor variance.
+// Object-storage row bindings add the provider port, key rendering, filesystem
+// provider and conformance runner; the measured artifact is 20,205,763 bytes.
+// Allow 55 KB for row retention, host reads and the cloud object providers.
+// Shared discovery and per-call MCP context add two dual-format module sets
+// and an adoption guide. With the reporting host/cloud modules on main, the
+// measured combined artifact is 20,287,031 bytes; allow 23 KB for compressor
+// variance. Unpacked, schema and declaration budgets remain unchanged.
+// The BigQuery warehouse sink completes Stage 1 reporting row storage; the
+// measured combined artifact is 20,313,297 bytes. Allow 22 KB for compressor
+// variance and the operations runbook.
+// Core-only ledger maintenance, the not-found error mapping and the 15.7.0
+// changelog measure 20,335,129 bytes packed; allow 25 KB for compressor variance.
+// Snapshot compaction and its key-template guard measure 20,360,760 bytes packed;
+// allow 25 KB for compressor variance.
+// Canonical creative selector projection, private seller-origin cache evidence,
+// and its delivery guide measure 20,364,177 bytes in the combined CI artifact
+// on both Node floors. Preserve the existing 25 KB compressor margin; unpacked,
+// file-count, bundled-schema, and declaration budgets stay fixed.
+// AdCP 3.2.4 replaces the primary signed compliance corpus and adds 22
+// request-signing vectors. Its unreadable-revision validators and health
+// projection measured 20,403,623 bytes in CI before the managed-delivery router.
+// The router adds one dual-format module set. The combined signed 3.2.4
+// artifact measures 20,419,639 bytes locally; preserve the existing 25 KB
+// compressor margin, rounded up to the next 10 KB. Other byte budgets stay fixed.
+// Reporting row-storage field alignment (AdCP names, the source-timezone period date,
+// provider stat and the migration guide) measured 20,450,821 bytes in CI on both Node
+// floors. Allow 30 KB above that for compressor variance; other byte budgets stay fixed.
+// Experimental identity 3.3 adds ten runtime/declaration module sets and a
+// CLI command. The measured tarball is 20,579,706 bytes; allow 40 KB for
+// documentation and compressor variance. Other byte budgets stay fixed.
+// Account sync contracts and keyed persistence add four dual-format runtime/
+// declaration module sets and a packaged storyboard. CI measured 20,623,608
+// bytes before packaging the storyboard; preserve about 25 KB of compressor
+// margin for this additive surface. All other byte budgets stay fixed.
+// The identity 3.3 follow-ups (#3249, #3250, #3252, #3258: layered Web Bot
+// Auth verification, interop support, trust and grant semantics) measure
+// 20,660,761 bytes for the full stack; allow about 40 KB for compressor
+// variance. Other byte budgets stay fixed.
+// The orphaned row-object collector and provider `list` (four providers, the
+// conformance check, maintenance wiring and the operations runbook) measure
+// 20,702,804 bytes packed; allow about 37 KB for compressor variance. Other byte
+// budgets stay fixed.
+// The Reliable Reporting storage split moved the PostgreSQL store, row storage, managed delivery, notification
+// activity and the cloud providers (24 modules, 96 files) into @adcp/reporting-storage, which has its own budget in
+// packages/reporting-storage/scripts/check-package.mjs. The SDK keeps three new modules (receipts, offering
+// validation, scheduler support) and gains a migration guide. The measured tarball is 20,318,824 bytes; allow
+// about 40 KB for compressor variance.
+// Replacing both compliance corpora with signed AdCP 3.2.5 / 3.1.29 on the
+// current main base measures 20,365,246 bytes packed and 111,595,107 unpacked
+// across 6,556 files. Preserve about 40 KB of compressor margin. The previous
+// corpora are replaced; no duplicate compliance roots or archives are packaged.
+// The property-list reference probe adds one internal dual-format runtime/
+// declaration module set (+4 files) and expands runner evidence handling.
+// The measured tarball is 20,422,982 bytes; allow about 27 KB for compressor
+// variance. Unpacked, schema, and declaration byte budgets stay fixed.
+// With the creative build probe, the combined beta.8 package measures
+// 20,439,714 bytes across 6,578 files. This fits the existing byte cap;
+// retain both probes' additive file allowances and every other guard.
+// The 4.0 compatibility validation and refreshed registry declarations measure
+// 20,452,069 bytes packed in CI. Allow about 28 KB of compressor variance for
+// this additive surface; all unpacked, file-count, schema and declaration
+// budgets stay fixed.
+const MAX_PACKED_TARBALL_BYTES = 20_480_000;
 const MAX_UNPACKED_PACKAGE_BYTES = 120 * 1024 * 1024;
 // AdCP 3.2.0-beta.10 adds the account-change schema family. The seller reporting
 // ledger adds ten public module artifacts. AdCP 3.2.0-rc.2 replaced the preview
@@ -102,8 +195,84 @@ const MAX_UNPACKED_PACKAGE_BYTES = 120 * 1024 * 1024;
 // AdCP 3.2.1 GA replaces the rc.7 bundle: 27 request-signing profile vectors,
 // six media-buy storyboards, the hosted-grader test kit, and five new schemas
 // (execution requirements, outcome-target cost-per, reporting delivery offering id) (+39).
+// Signed-request rejection diagnostics add one internal dual-format module
+// with both declaration flavours (+4 files); byte budgets stay fixed.
+// Buyer provisioning and discovery authorization add five runtime/declaration
+// module sets (+20 files) and one first-call guide (+1); byte budgets stay fixed.
+// Opt-in strict account references add one internal dual-format
+// runtime/declaration module for once-per-process deprecation warnings
+// (+4 files); byte budgets stay fixed.
+// The 14.0-to-14.1 upgrade checklist adds one packaged Markdown guide (+1);
+// every byte budget stays fixed.
+// Storage-independent wholesale mirrors add one module set and one buyer guide (+5 files).
+// Shared JSONPath translation and bounded validation diagnostics add two
+// internal module/declaration sets (+8 files).
+// Operation resolution over A2A and the grader's A2A vector module add two
+// internal dual-format runtime/declaration module sets (+8 files).
 const MAX_PACKED_FILE_COUNT =
-  6_135 + 34 + 4 + 10 + 4 + 4 + 4 + 9 + 16 + 4 + 1 + 5 + 8 + 4 + 4 + 11 + 4 + 13 + 6 + 4 + 39;
+  6_135 +
+  34 +
+  4 +
+  10 +
+  4 +
+  4 +
+  4 +
+  9 +
+  16 +
+  4 +
+  1 +
+  5 +
+  8 +
+  4 +
+  4 +
+  11 +
+  4 +
+  13 +
+  6 +
+  4 +
+  39 +
+  4 +
+  21 +
+  4 +
+  13 +
+  1 +
+  5 +
+  8 +
+  8 +
+  13 + // GCS write-fence runtime/declaration modules and adoption guide.
+  29 + // GCS adapter, reader, validation, fence split, errors, I/O modules and guide.
+  33 + // AdCP 3.2.3 canonical A2A vectors; the measured package contains 6,457 files.
+  8 + // Reporting row encoding and revision-metadata helper modules (two dual-format sets).
+  4 + // Reporting row-storage migration module (one dual-format set).
+  4 + // Verified reporting row-storage engine (one dual-format set).
+  8 + // Reporting row-storage errors and object-provider modules (two dual-format sets).
+  4 + // Reporting host change-feed module (one dual-format set).
+  8 + // GCS row-object provider and shared cloud-provider I/O modules (two dual-format sets).
+  9 + // Shared discovery and per-call MCP context modules (two dual-format sets) and adoption guide.
+  4 + // `reporting/s3` row-object provider subpath (one dual-format set).
+  4 + // `reporting/azure` row-object provider subpath (one dual-format set).
+  4 + // `reporting/bigquery` warehouse sink subpath (one dual-format set).
+  8 + // Pending OAuth flow serialization and store conformance (two dual-format sets).
+  8 + // Browser schemas entry and shared get-products validator (two dual-format runtime/declaration sets).
+  4 + // Local creative-schema reference inspection (one dual-format runtime/declaration set).
+  4 + // Managed-delivery adapter router (`reporting/ledger/managed-router`, one dual-format set).
+  1 + // Reporting row-storage field-alignment migration guide.
+  22 + // AdCP 3.2.4 signed request-signing compliance vectors; no new runtime module sets.
+  1 + // Agent identity origin/resolver migration guide.
+  41 + // Experimental identity 3.3: ten dual-format module sets and one CLI file.
+  17 + // Account sync/keyed-store modules (four dual-format sets) and example storyboard.
+  1 + // Reliable Reporting stability policy guide.
+  4 + // Identity 3.3 generated-type bridge (`identity-3.3/generated-compat`, one dual-format set).
+  4 + // Shared consent-macro recognition (one dual-format runtime/declaration set).
+  4 + // Reporting page-size helper (`reporting/pagination`, one dual-format runtime/declaration set).
+  12 + // Reporting receipts, offering validation and scheduler support modules (three dual-format sets).
+  1 - // Reliable Reporting storage migration guide.
+  96 - // 24 storage modules (96 files) now ship in @adcp/reporting-storage.
+  1 + // The integrated reporting-service example README now ships with @adcp/reporting-storage.
+  2 + // The maintained bundle replacement adds the hosted-grader kit and compact macro-bearing URL schema.
+  13 + // Property-list identifier, server, and certification modules (three dual-format sets) and adoption guide.
+  4 + // Property-list reference probe (one dual-format runtime/declaration module set).
+  5; // Creative build probe: one dual-format runtime/declaration module (+4) and one guide (+1).
 const MAX_BUNDLED_SCHEMA_BYTES = 1280 * 1024;
 const MAX_CJS_SCHEMA_DECLARATION_BYTES = 45 * 1024 * 1024;
 const MAX_ESM_SCHEMA_FACADE_BYTES = 1024;
@@ -158,7 +327,10 @@ export function checkPackageSize(repoRoot) {
   }
 
   if (packageInfo.size > MAX_PACKED_TARBALL_BYTES) {
-    throw new Error(`packed tarball is ${mib(packageInfo.size)} MiB; budget is ${mib(MAX_PACKED_TARBALL_BYTES)} MiB`);
+    throw new Error(
+      `packed tarball is ${packageInfo.size} bytes (${mib(packageInfo.size)} MiB); ` +
+        `budget is ${MAX_PACKED_TARBALL_BYTES} bytes (${mib(MAX_PACKED_TARBALL_BYTES)} MiB)`
+    );
   }
   if (packageInfo.unpackedSize > MAX_UNPACKED_PACKAGE_BYTES) {
     throw new Error(
@@ -170,6 +342,12 @@ export function checkPackageSize(repoRoot) {
   const sourceMaps = packageInfo.files.filter(file => file.path.endsWith('.map'));
   if (sourceMaps.length > 0) {
     throw new Error(`packed package contains ${sourceMaps.length} source map files`);
+  }
+  const skillSnapshots = packageInfo.files.filter(
+    file => file.path.startsWith('skills/') && file.path.split('/').some(part => part.endsWith('.previous'))
+  );
+  if (skillSnapshots.length > 0) {
+    throw new Error(`packed package contains ${skillSnapshots.length} schema-sync skill snapshot files`);
   }
   const rawBundledSchemas = packageInfo.files.filter(
     file => file.path.includes('/schemas-data/') && file.path.includes('/bundled/') && file.path.endsWith('.json')

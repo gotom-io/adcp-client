@@ -208,84 +208,6 @@ async function withHonestEstablishedSeller(version, run) {
   }
 }
 
-async function withHonestV25Seller(run) {
-  const version = 'v2.5';
-  const calls = [];
-  const mutations = [];
-  const replays = new Map();
-  const product = createTestProduct({
-    format_ids: [{ agent_url: 'https://creative.adcontextprotocol.org', id: 'display_300x250' }],
-  });
-  const server = new McpServer({ name: 'honest-v2.5-seller', version: '1.0.0' });
-  const register = (tool, handler) => {
-    server.registerTool(tool, { inputSchema: PASSTHROUGH_INPUT }, async args => {
-      assertSchema('request', tool, args, version);
-      calls.push({ tool, args: structuredClone(args) });
-      return handler(args);
-    });
-  };
-  const mutate = (tool, args, build) => {
-    const key = `${tool}:${args.buyer_ref ?? args.media_buy_id}`;
-    const fingerprint = JSON.stringify(args);
-    const replay = replays.get(key);
-    if (replay) {
-      if (replay.fingerprint === fingerprint) return toolResult(tool, replay.data, version);
-      return {
-        isError: true,
-        content: [{ type: 'text', text: 'buyer_ref reused with changed payload' }],
-        structuredContent: {
-          errors: [{ code: 'invalid_request', message: 'buyer_ref reused with changed payload' }],
-        },
-      };
-    }
-    const data = build();
-    replays.set(key, { fingerprint, data });
-    mutations.push({ tool, key, args: structuredClone(args) });
-    return toolResult(tool, data, version);
-  };
-
-  register('get_products', () => toolResult('get_products', { products: [product] }, version));
-  register('create_media_buy', args =>
-    mutate('create_media_buy', args, () => ({
-      media_buy_id: 'v25-media-buy-1',
-      buyer_ref: args.buyer_ref ?? args.media_buy_id,
-      packages: [],
-    }))
-  );
-  register('update_media_buy', args =>
-    mutate('update_media_buy', args, () => ({
-      media_buy_id: 'v25-media-buy-1',
-      buyer_ref: args.buyer_ref ?? args.media_buy_id,
-      affected_packages: [],
-    }))
-  );
-  register('get_media_buy_delivery', () =>
-    toolResult(
-      'get_media_buy_delivery',
-      {
-        reporting_period: { start: START, end: END },
-        currency: 'USD',
-        media_buy_deliveries: [],
-      },
-      version
-    )
-  );
-
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const mcp = new Client({ name: 'compact-buyer-for-v2.5', version: '1.0.0' });
-  await Promise.all([mcp.connect(clientTransport), server.connect(serverTransport)]);
-  const buyer = AgentClient.fromMCPClient(mcp, {
-    adcpVersion: '3.2.1',
-    allowV2: true,
-    validation: { requests: 'strict', responses: 'strict' },
-  });
-  try {
-    await run({ buyer, calls, mutations, product });
-  } finally {
-    await Promise.allSettled([mcp.close(), server.close()]);
-  }
-}
-
 async function withHonestEstablishedProposalState(state, run) {
   const version = '3.1.18';
   const server = new McpServer({ name: `honest-proposal-${state}`, version: '1.0.0' });
@@ -336,83 +258,6 @@ async function withHonestEstablishedProposalState(state, run) {
     await Promise.allSettled([mcp.close(), server.close()]);
   }
 }
-
-test('3.2 compact facade preserves the honest v2.5 direct subset and types unavailable capabilities', async () => {
-  await withHonestV25Seller(async ({ buyer, calls, mutations, product }) => {
-    const lifecycle = await buyer.negotiateMediaBuyLifecycle({
-      principalScope: 'release-gate-buyer',
-      legacyPurchaseSellerSessionScope: 'release-gate-v25-seller-session',
-      allowedLosses: ['feed_version_not_atomic', 'pricing_version_not_atomic', 'revision_not_atomic'],
-    });
-    assert.equal(lifecycle.negotiated_version, '2.5');
-    assert.equal(lifecycle.lifecycle, 'established');
-    const listed = await lifecycle.listProducts({ brand: BRAND });
-    assert.equal(listed.success, true, JSON.stringify(listed));
-    assert.equal(listed.data.products[0].product_id, product.product_id);
-
-    const intent = {
-      idempotency_key: 'v25-direct-release-gate-0001',
-      account: ACCOUNT,
-      brand: BRAND,
-      feed_version: 'v25-unversioned-feed',
-      purchases: [{ product_id: product.product_id, pricing_option_id: 'po-1', budget: 1000 }],
-      start_time: START,
-      end_time: END,
-    };
-    const first = await lifecycle.buyProducts(intent);
-    const replay = await lifecycle.buyProducts(intent);
-    assert.equal(first.success, true, JSON.stringify(first));
-    assert.equal(replay.success, true, JSON.stringify(replay));
-    assert.equal(mutations.filter(call => call.tool === 'create_media_buy').length, 1);
-
-    const paused = await lifecycle.controlMediaBuy({
-      idempotency_key: 'v25-pause-release-gate-0001',
-      account: ACCOUNT,
-      media_buy_id: 'v25-media-buy-1',
-      revision: 1,
-      paused: true,
-    });
-    assert.equal(paused.success, true, JSON.stringify(paused));
-    assert.deepEqual(paused.compatibility.losses, ['revision_not_atomic']);
-    await assert.rejects(
-      lifecycle.getMediaBuyDelivery({
-        account: ACCOUNT,
-        media_buy_ids: ['v25-media-buy-1'],
-        start_date: '2027-01-01',
-        end_date: '2027-01-02',
-      }),
-      error => error.code === 'UNSUPPORTED_FEATURE' && error.feature === 'media_buy_delivery_readback'
-    );
-
-    const proposals = await lifecycle.requestProposals({
-      account: ACCOUNT,
-      brand: BRAND,
-      brief: 'test',
-    });
-    assert.equal(proposals.success, true, JSON.stringify(proposals));
-    assert.equal(proposals.data.outcome, 'products_available');
-    assert.equal(proposals.data.products[0].product_id, product.product_id);
-    assert.equal(proposals.data.purchase_continuation.kind, 'legacy_create');
-
-    for (const operation of [
-      () => lifecycle.listProducts({ brand: BRAND, max_results: 1 }),
-      () => lifecycle.getMediaBuys({ account: ACCOUNT }),
-      () =>
-        lifecycle.controlMediaBuy({
-          account: ACCOUNT,
-          media_buy_id: 'v25-media-buy-1',
-          revision: 1,
-          canceled: true,
-        }),
-    ]) {
-      await assert.rejects(operation(), error => error.code === 'UNSUPPORTED_FEATURE');
-    }
-    assert.equal(calls[0].tool, 'get_products');
-    assert.equal(calls[0].args.buying_mode, undefined);
-    assert.equal(calls.find(call => call.tool === 'create_media_buy').args.idempotency_key, undefined);
-    assert.equal(calls.find(call => call.tool === 'create_media_buy').args.buyer_ref, intent.idempotency_key);
-  });
-});
 
 for (const state of ['submitted', 'input-required']) {
   test(`established proposal projection preserves honest ${state} wire state without fabricating an outcome`, async () => {
@@ -589,8 +434,19 @@ for (const version of ['3.0.25', '3.1.18', '3.2.1']) {
       assert.equal(createWire.packages[0].impressions, 10_000);
       assert.equal(createWire.packages[0].pacing, 'even');
       assert.deepEqual(createWire.packages[0].targeting_overlay, {});
-      if (version.startsWith('3.0')) assert.equal(createWire.packages[0].format_option_refs, undefined);
-      else assert.deepEqual(createWire.packages[0].format_option_refs, purchase.format_option_refs);
+      // The seller's product declares only legacy format_ids, so it has no
+      // format_options[] entry for the SDK-minted option id. A canonical write
+      // addresses that option by its direct format_kind + params selector.
+      assert.equal(createWire.packages[0].format_option_refs, undefined);
+      if (!version.startsWith('3.0')) {
+        const [option] = listed.data.products[0].format_options;
+        assert.equal(createWire.packages[0].format_kind, option.format_kind);
+        assert.deepEqual(createWire.packages[0].params, option.params);
+      } else {
+        // This 3.0 intent selects no format; keep the wire selector absent.
+        assert.equal(createWire.packages[0].format_ids, undefined);
+        assert.equal(createWire.packages[0].format_kind, undefined);
+      }
     });
   });
 
@@ -714,6 +570,7 @@ test('the same compact-first buyer facade projects established direct and propos
     format_ids: [{ agent_url: 'https://creative.adcontextprotocol.org', id: 'display_300x250' }],
   });
   const adcp = createAdcpServer({
+    resolveAccount: ref => (ref ? { account_id: ref.account_id ?? JSON.stringify(ref), status: 'active' } : undefined),
     name: 'a2a-established-release-gate',
     version: '1.0.0',
     adcpVersion: '3.1.18',
@@ -1069,6 +926,7 @@ test('the compact-first buyer uses the native 3.2 lifecycle discovered over offi
     };
   };
   const adcp = createAdcpServer({
+    resolveAccount: ref => (ref ? { account_id: ref.account_id ?? JSON.stringify(ref), status: 'active' } : undefined),
     name: 'a2a-compact-release-gate',
     version: '1.0.0',
     adcpVersion: '3.2.1',

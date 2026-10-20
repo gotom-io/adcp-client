@@ -1,3 +1,4 @@
+import { VersionUnsupportedError } from '../errors';
 // Unified Protocol Interface for AdCP
 export {
   callMCPTool,
@@ -25,10 +26,10 @@ export async function closeConnections(protocol: 'mcp' | 'a2a' = 'mcp'): Promise
   }
 }
 
-/** Close only the current runner's MCP scope; fall back to legacy global cleanup. */
+/** Close the current MCP scope. Without an active MCP scope, leave other callers' sessions open. */
 export async function closeScopedConnections(protocol: 'mcp' | 'a2a' = 'mcp'): Promise<void> {
   if (protocol === 'mcp') {
-    if (!(await closeCurrentMCPConnectionScope())) await closeMCPConnections();
+    await closeCurrentMCPConnectionScope();
   } else {
     closeA2AConnections();
   }
@@ -38,6 +39,7 @@ export { withMCPConnectionScope };
 export type { MCPCallOptions, MCPConnectionResult } from './mcp';
 export { callA2ATool, createA2AClientFromCardUrl } from './a2a';
 export { DEFAULT_REQUEST_TIMEOUT_MS } from './abort';
+export { DEFAULT_MAX_RESPONSE_BYTES, SSE_CUMULATIVE_BUDGET_MULTIPLIER } from './responseSizeLimit';
 export {
   callMCPToolWithTasks,
   getMCPTaskStatus,
@@ -63,6 +65,7 @@ import {
 import { hasValidatedMcpAuthorizationRequirements } from '../auth/oauth/authorization-required';
 import { getNonInteractiveOAuthProvider } from '../auth/oauth/provider-cache';
 import { AuthenticationCredentialsRejectedError, is401Error } from '../errors';
+import { getSignedRequestRejection } from './signedRequestRejection';
 import { isLikelyPrivateUrl } from '../net';
 import { validateAgentUrl } from '../validation';
 import { withSpan } from '../observability/tracing';
@@ -86,7 +89,13 @@ export {
   withTransportDiagnostics,
   wrapFetchWithTransportDiagnostics,
 } from './transportDiagnostics';
-export type { TransportActivity, TransportActivityContext, TransportActivityHandler } from './transportDiagnostics';
+export type {
+  TransportActivity,
+  TransportActivityContext,
+  TransportActivityHandler,
+  TransportActivityType,
+  TransportResponseOutcome,
+} from './transportDiagnostics';
 
 export type VersionEnvelopeMode = 'auto' | 'none' | 'major-only';
 
@@ -159,13 +168,13 @@ export function bundleSupportsAdcpVersionField(bundleKey: string): boolean {
  * are explicitly NOT valid wire values per the envelope schema's own
  * normalization rule.
  *
- * Returns `{}` for v2 callers (predates the major-version field entirely).
+ * Rejects retired AdCP 2 dispatch requests.
  */
 function buildVersionEnvelope(
   adcpVersion: string | undefined,
   serverVersion: 'v2' | 'v3' | undefined
 ): Record<string, unknown> {
-  if (serverVersion === 'v2') return {};
+  if (serverVersion === 'v2') throw new VersionUnsupportedError('request', 'version', 'v2');
   const wireMajor = resolveWireMajor(adcpVersion);
   const bundleKey = resolveBundleKey(adcpVersion ?? ADCP_VERSION);
   if (!bundleSupportsAdcpVersionField(bundleKey)) {
@@ -180,35 +189,13 @@ function buildVersionEnvelope(
   return { adcp_major_version: wireMajor, adcp_version: wireValue };
 }
 
-let hasWarnedAboutV2PushNotificationSecret = false;
-
-/**
- * Warn once when an async webhook registration is suppressed for a v2 seller.
- *
- * v2.5's `push-notification-config.json` requires `authentication`, and unlike
- * 3.x it has no RFC 9421 selector semantics — so omitting the block produces a
- * schema-invalid request rather than choosing a signing mode. Without a
- * configured secret there is no honest value to send, and the previous
- * behaviour (a hardcoded placeholder credential) told the seller the channel
- * was authenticated by a constant published in this package.
- */
-function warnV2PushNotificationNeedsSecret(): void {
-  if (hasWarnedAboutV2PushNotificationSecret) return;
-  hasWarnedAboutV2PushNotificationSecret = true;
-  console.warn(
-    '[adcp] Suppressing push_notification_config for a v2 seller: AdCP 2.5 requires an ' +
-      '`authentication` block and no `webhookSecret` is configured. Set `webhookSecret` to register ' +
-      'async task-status webhooks with this agent, or move the agent to an AdCP 3.x pin, where the ' +
-      'RFC 9421 webhook profile needs no shared secret.'
-  );
-}
-
 function buildVersionEnvelopeForMode(
   mode: VersionEnvelopeMode,
   adcpVersion: string | undefined,
   serverVersion: 'v2' | 'v3' | undefined
 ): Record<string, unknown> {
-  if (mode === 'none' || serverVersion === 'v2') return {};
+  if (serverVersion === 'v2') throw new VersionUnsupportedError('request', 'version', 'v2');
+  if (mode === 'none') return {};
   if (mode === 'major-only') return { adcp_major_version: resolveWireMajor(adcpVersion) };
   return buildVersionEnvelope(adcpVersion, serverVersion);
 }
@@ -244,36 +231,71 @@ export function applyVersionEnvelope(
 export interface TransportOptions {
   /**
    * Maximum response body size (in octets) the SDK will read before aborting
-   * with `ResponseTooLargeError`. When unset, the SDK does not impose a cap —
-   * matches the underlying MCP / A2A transport defaults.
+   * with `ResponseTooLargeError`.
    *
-   * Set this when crawling **untrusted** agents (registries, federated
-   * discovery layers, monitoring tools) to prevent a hostile vendor from
-   * buffering a large reply before any application-layer schema validation
-   * runs. Counted across response chunks; pre-cancels when `Content-Length`
-   * exceeds the cap. Applies to A2A agent-card discovery
-   * (`/.well-known/agent.json`) on the same call as well.
+   * **Defaults to 4 MiB** (`DEFAULT_MAX_RESPONSE_BYTES`). Agent responses are
+   * untrusted input, so the cap is on by default on every MCP and A2A call
+   * path — tool calls, endpoint discovery, `tools/list`, and A2A agent-card
+   * lookup (`/.well-known/agent.json`). Counted across response chunks as
+   * they arrive; pre-cancels when `Content-Length` already exceeds the cap.
    *
-   * Per-call override (`TaskOptions.transport.maxResponseBytes`) beats the
-   * value set on the client constructor (`SingleAgentClientConfig.transport`).
+   * Raise it for an agent that legitimately publishes a large catalog; lower
+   * it when crawling **untrusted** agents (registries, federated discovery
+   * layers, monitoring tools). Set it to exactly `0` to opt out of
+   * enforcement entirely — an explicit opt-out, never the default. `Infinity`
+   * and negative values are *not* opt-outs: they fall back to the 4 MiB
+   * default, because they almost always arrive from a misparsed env var or a
+   * budget subtraction rather than an intention. Use `0`.
+   *
+   * Per-call `transport` **replaces** the client constructor's `transport`
+   * object rather than merging field by field
+   * (`TaskOptions.transport` ?? `SingleAgentClientConfig.transport`), so a
+   * per-call object that omits `maxResponseBytes` gets the default back, not
+   * the constructor's value. Repeat the field when you override the object.
+   *
+   * Cached MCP connections are keyed on the cap, so varying it per call opens
+   * a separate connection (and MCP session) per distinct value against the
+   * same agent. That is deliberate — a connection established under one
+   * policy must not serve a call that configured another — but it means
+   * raising the cap for one tool is not free. Prefer a single client-level
+   * value where you can, or pin the session explicitly with
+   * `withMCPConnectionScope` when continuity matters.
    *
    * @remarks
-   * **Safe to set on all calls.** SSE responses (`text/event-stream`) are
-   * passed through unchanged — a single tool call legitimately emits N status
-   * frames + a final result, bounded by protocol-level framing rather than
-   * cumulative byte counts. The cap applies to one-shot JSON responses
-   * (`get_adcp_capabilities`, agent-card lookup, tool result payloads on
-   * non-streaming transports) where the body is bounded by definition.
+   * **SSE is covered too.** `text/event-stream` responses used to be exempt,
+   * which let any peer opt itself out of the cap by changing one response
+   * header. They now carry two bounds: no single event frame may exceed
+   * `maxResponseBytes` (the memory bound — an SSE consumer buffers one frame
+   * at a time), and the cumulative event-stream octets read during one call
+   * may not exceed `maxResponseBytes * 2`
+   * (`SSE_CUMULATIVE_BUDGET_MULTIPLIER`, the liveness bound that stops an
+   * endless drip of individually legal frames). Both failures raise the same
+   * `ResponseTooLargeError`; nothing is silently truncated.
+   *
+   * A long-lived `GET` event-stream — MCP's standalone notification listener,
+   * the legacy SSE transport — outlives the call that opened it, so it meters
+   * its cumulative allowance per *connection* instead of per call. That makes
+   * the cumulative number a memory bound there, not a liveness bound: a peer
+   * that keeps tripping it gets a reconnect cycle at a bounded cost per
+   * cycle. Cached connections are keyed on the cap in effect, so a listener
+   * is only ever reused by calls that configured the same policy as the call
+   * that opened it.
    *
    * @remarks
-   * **Hostile-peer note:** A peer can opt itself out of this cap by responding
-   * with `Content-Type: text/event-stream`. SSE is bypassed because cumulative
-   * event-frame bytes are unbounded by spec — MCP and A2A both stream tool
-   * responses this way. The MCP/A2A SDKs consume SSE incrementally and frame
-   * termination bounds memory in practice, so this is not a memory-bomb risk
-   * for well-formed transports. Adopters relying on `maxResponseBytes` as a
-   * hostile-server defense should treat it as best-effort for non-SSE
-   * responses only.
+   * **Compression and streaming failures.** The byte counter runs downstream
+   * of the runtime's content-decoder, so it measures decompressed octets: a
+   * small gzip blob that inflates to gigabytes still trips the cap after
+   * `maxResponseBytes` of output. The `Content-Length` pre-check, by
+   * contrast, sees the compressed length and is therefore only a fast path,
+   * not the guarantee.
+   *
+   * On a streaming transport the cap errors the response body. Some
+   * transports classify that as a stream disconnect and retry rather than
+   * propagating it, so the call would otherwise run out its deadline: the SDK
+   * records the violation and, if the call then fails, raises
+   * `ResponseTooLargeError` with the transport's own error as `cause` instead
+   * of the timeout. A buyer never gets a timeout for what is really an
+   * over-cap response.
    *
    * @remarks
    * Future hardening knobs (DNS-rebind defense, scheme allow-list, request
@@ -445,7 +467,7 @@ export interface PreparedProtocolToolCall {
   args: Record<string, unknown>;
   /** Native A2A TaskPushNotificationConfig retained independently of AdCP registration. */
   pushNotificationConfig?: PushNotificationConfig;
-  /** Stable operation ID generated for a beta.5 application webhook registration. */
+  /** Stable operation ID generated for an AdCP 3.1+ application webhook registration. */
   operationId?: string;
 }
 
@@ -481,8 +503,7 @@ export function prepareProtocolToolCall(
   applyPublishedSchemaCompatibility(options.toolName, argsWithVersion, args);
   const effectiveBundle =
     typeof argsWithVersion.adcp_version === 'string' ? resolveBundleKey(argsWithVersion.adcp_version) : undefined;
-  const usesApplicationRegistration =
-    options.serverVersion !== 'v2' && isAdcpVersionAtLeast(effectiveBundle, '3.2.0-beta.5');
+  const usesApplicationRegistration = isAdcpVersionAtLeast(effectiveBundle, '3.1.0');
 
   let pushNotificationConfig: PushNotificationConfig | undefined;
   let applicationPushNotificationConfig: PushNotificationConfig | undefined;
@@ -497,8 +518,6 @@ export function prepareProtocolToolCall(
           credentials: options.webhookSecret,
         },
       };
-    } else if (options.serverVersion === 'v2') {
-      warnV2PushNotificationNeedsSecret();
     } else {
       pushNotificationConfig = {
         url: options.webhookUrl,
@@ -513,14 +532,14 @@ export function prepareProtocolToolCall(
         operation_id: operationId,
       };
     } else if (agent.protocol === 'mcp' && !agent._inProcessMcpClient) {
-      // Preserve the pre-beta.5 MCP wire shape for explicitly negotiated
+      // Preserve the pre-3.1 MCP wire shape for explicitly negotiated
       // older bundles. A2A used only its native configuration on those lines.
       applicationPushNotificationConfig = pushNotificationConfig;
     }
   }
 
   return {
-    // AdCP 3.2 task-webhook registration is application-layer data on every
+    // AdCP 3.1+ task-webhook registration is application-layer data on every
     // transport. A2A's native TaskPushNotificationConfig is a distinct
     // transport feature and must not replace this argument.
     args: applicationPushNotificationConfig
@@ -739,7 +758,14 @@ export class ProtocolClient {
                   // something out-of-band. Force a fresh exchange and retry once
                   // before surfacing the error. Bounded (single retry) so we don't
                   // loop if the credentials are genuinely wrong.
-                  if (agent.oauth_client_credentials && is401Error(err)) {
+                  // A bare 401 is ambiguous when a bearer is present. Keep
+                  // the existing single refresh; explicit Signature failures
+                  // cannot be repaired by exchanging an OAuth token.
+                  if (
+                    agent.oauth_client_credentials &&
+                    is401Error(err) &&
+                    getSignedRequestRejection(err)?.challenge?.scheme !== 'signature'
+                  ) {
                     const ccStorage = getAgentStorage(agent);
                     const allowPrivateIp = transport?.allowPrivateIp ?? isLikelyPrivateUrl(agent.agent_uri);
                     await ensureClientCredentialsTokens(agent, {
@@ -771,6 +797,13 @@ export class ProtocolClient {
                         }
                       );
                     } catch (retryErr) {
+                      // Reconnecting can fail on an unsigned initialize before
+                      // the signed tool retry. Keep the original seller reason
+                      // when that authentication failure has no signed evidence.
+                      const rejection =
+                        getSignedRequestRejection(retryErr) ??
+                        (is401Error(retryErr) ? getSignedRequestRejection(err) : undefined);
+                      if (rejection) throw rejection;
                       await rethrowAsNeedsAuthorization(
                         retryErr,
                         agent.agent_uri,
@@ -815,7 +848,14 @@ export class ProtocolClient {
                   // MCP path above. Kept symmetric so A2A CC agents aren't a
                   // second-class experience — including the NeedsAuthorizationError
                   // rewrap on a retry that still 401s.
-                  if (agent.oauth_client_credentials && is401Error(err)) {
+                  // A bare 401 is ambiguous when a bearer is present. Keep
+                  // the existing single refresh; explicit Signature failures
+                  // cannot be repaired by exchanging an OAuth token.
+                  if (
+                    agent.oauth_client_credentials &&
+                    is401Error(err) &&
+                    getSignedRequestRejection(err)?.challenge?.scheme !== 'signature'
+                  ) {
                     const ccStorage = getAgentStorage(agent);
                     const allowPrivateIp = transport?.allowPrivateIp ?? isLikelyPrivateUrl(agent.agent_uri);
                     await ensureClientCredentialsTokens(agent, {
@@ -844,6 +884,10 @@ export class ProtocolClient {
                         transport?.legacyCompat
                       );
                     } catch (retryErr) {
+                      const rejection =
+                        getSignedRequestRejection(retryErr) ??
+                        (is401Error(retryErr) ? getSignedRequestRejection(err) : undefined);
+                      if (rejection) throw rejection;
                       await rethrowAsNeedsAuthorization(
                         retryErr,
                         agent.agent_uri,
@@ -892,6 +936,8 @@ async function rethrowAsNeedsAuthorization(
   configuredAllowPrivateIp?: boolean,
   recoveryMode: AuthorizationRecoveryMode = 'discover'
 ): Promise<void> {
+  const signedRejection = getSignedRequestRejection(err);
+  if (signedRejection) throw signedRejection;
   if (err instanceof NeedsAuthorizationError) throw err;
   if (!is401Error(err)) return;
   if (recoveryMode === 'static') {

@@ -1,6 +1,10 @@
 # Seller Reporting Ledger
 
-`@adcp/sdk/reporting/ledger` turns a conforming reporting source into durable seller-side Reliable Reporting Core. It is separate from the buyer-side `reconcileReporting` API.
+Reliable Reporting Core turns a conforming reporting source into durable seller-side reporting. It is separate from the buyer-side `reconcileReporting` API.
+
+Two packages make it up. `@adcp/sdk` holds the protocol layer: the `ReportingLedgerStore` interface, the protocol handlers, the producer, `createReliableReportingService` and row encoding (`@adcp/sdk/reporting/ledger`, `@adcp/sdk/reporting/service`). [`@adcp/reporting-storage`](https://github.com/adcontextprotocol/adcp-client/blob/main/packages/reporting-storage/README.md) holds the storage behind it: the PostgreSQL ledger store and migrations, row storage and its GCS, S3 and Azure providers, managed delivery, notification activity, the BigQuery sink and the production composition. Install both (`npm install @adcp/sdk@beta @adcp/reporting-storage@beta pg` while SDK 16 is in beta). Moving from the pre-split `@adcp/sdk/reporting/*` imports? See [Reliable Reporting storage moved to `@adcp/reporting-storage`](../migration-reporting-storage-package.md).
+
+> **Stability:** `@adcp/reporting-storage` is pre-1.0 and every export of it is experimental: breaking changes ship in its minor releases. Pin it with `~`. The store, transaction, lease and row-read interfaces in `@adcp/sdk/reporting/ledger` that it implements are `@experimental` too. See the [Reliable Reporting stability policy](REPORTING-STABILITY.md).
 
 ## Recommended: install the lifecycle service
 
@@ -11,7 +15,7 @@ producer, handlers, and decisioning-platform account resolver.
 
 ```ts
 import { Pool } from 'pg';
-import { PostgresReportingLedgerStore } from '@adcp/sdk/reporting/ledger';
+import { PostgresReportingLedgerStore } from '@adcp/reporting-storage';
 import { createReliableReportingService } from '@adcp/sdk/reporting/service';
 import { createAdcpServerFromPlatform } from '@adcp/sdk/server';
 
@@ -51,7 +55,7 @@ const reporting = createReliableReportingService({
   },
 });
 
-await pool.query(reporting.setup.migrations[0]);
+for (const sql of reporting.setup.migrations) await pool.query(sql);
 const installedPlatform = reporting.install(platform);
 const server = createAdcpServerFromPlatform(installedPlatform, serverOptions);
 
@@ -84,7 +88,7 @@ still use an `accountIds` roster. Production setup requires
 `activity.tenantScopeForAccount`; when an offering uses `consumer_receipt`, it
 also requires a trusted `obligatedConsumers` callback so lifecycle health can
 become reconciled only after every obligated consumer has accepted.
-See the [integrated seller example](../../examples/reliable-reporting-service/README.md#integrated-seller-production-service)
+See the [integrated seller example](https://github.com/adcontextprotocol/adcp-client/blob/main/packages/reporting-storage/examples/reliable-reporting-service/README.md#integrated-seller-production-service)
 for the full option shape.
 
 Install a buyer declaration after the account and its media-buy scope have
@@ -133,6 +137,8 @@ import {
   PostgresReportingLedgerStore,
   REPORTING_LEDGER_MIGRATION,
   sweepExpiredReportingLedgerState,
+} from '@adcp/reporting-storage';
+import {
   createReportingDeliveryHandler,
   createReportingProducer,
   createReportingStatusHandler,
@@ -160,7 +166,7 @@ const getMediaBuyDelivery = createReportingDeliveryHandler(store);
 await sweepExpiredReportingLedgerState(pool);
 ```
 
-Pass `getReportingStatus` and `getMediaBuyDelivery` directly to the matching `createAdcpServer` slots. The delivery helper serves only exact `reporting_revision_id` reads and returns the row payload bound by the ledger revision. Advertise `media_buy.reporting_delivery` in `experimental_features` together with a `media_buy.reporting_delivery` capability whose Reliable Reporting version is `1.0` only after both handlers are wired. Configure account resolution on the server: both handlers require the framework-resolved, caller-scoped account identity and never trust a request-body identity as an authorization boundary. If two callers can name the same upstream account, the resolver must issue distinct internal account IDs for their ledger namespaces. Install immutable delivery-configuration generations through `producer.installConfiguration`, call `planObligations()` after period close, and run `runWorker()` from a durable scheduler. Multiple workers are safe: PostgreSQL claims use `SKIP LOCKED`, expiring leases, and fencing generations.
+Pass `getReportingStatus` and `getMediaBuyDelivery` directly to the matching `createAdcpServer` slots. The delivery helper serves only exact `reporting_revision_id` reads and returns the row payload bound by the ledger revision. Both handlers take `pagination.max_results` as AdCP defines it, from `core/pagination-request.json`: an integer from 1 to 100, 50 when omitted. Any other value (and a `pagination` that is not an object or a `cursor` that is not a string) is refused with `VALIDATION_ERROR` (`field: 'pagination.max_results'`, `'pagination'` or `'pagination.cursor'`) before the ledger is read, so the same request behaves the same on every seller; page with `pagination.cursor`. The buyer-side walkers ask for the schema maximum, 100. Advertise `media_buy.reporting_delivery` in `experimental_features` together with a `media_buy.reporting_delivery` capability whose Reliable Reporting version is `1.0` only after both handlers are wired. Configure account resolution on the server: both handlers require the framework-resolved, caller-scoped account identity and never trust a request-body identity as an authorization boundary. If two callers can name the same upstream account, the resolver must issue distinct internal account IDs for their ledger namespaces. Install immutable delivery-configuration generations through `producer.installConfiguration`, call `planObligations()` after period close, and run `runWorker()` from a durable scheduler. Multiple workers are safe: PostgreSQL claims use `SKIP LOCKED`, expiring leases, and fencing generations.
 
 The planner supports fixed millisecond schedules and an explicit source-calendar
 day schedule. For the latter, set the existing schedule identity fields to
@@ -233,6 +239,14 @@ empty revision association. A deployment with per-tenant workers should pass
 the resolved `account_id` to both `planObligations()` and `runWorker()`;
 omitting it intentionally runs a deployment-wide worker.
 
+### Already running your own ledger tables?
+
+Do not dual-write, and do not migrate data. Cut over at a period boundary: the
+SDK ledger produces and serves new periods, and your old tables become
+read-only behind the optional `legacyRevisionReader`, which answers exact
+`get_media_buy_delivery` reads only for revisions the SDK ledger does not hold.
+See [Cutting over to the SDK reporting ledger](REPORTING-LEDGER-CUTOVER.md).
+
 ### Migrating an existing manual lifecycle
 
 Keep the same `PostgresReportingLedgerStore` and run the same
@@ -272,6 +286,872 @@ Official configurations also pin a `finalityPolicy` (`policyId` plus `source_fin
 
 Every revision stores its rows together with an RFC 8785 JCS SHA-256 binding and exact decimal control totals for requested numeric metrics. A revision number and obligation are immutable. Official revisions are terminal; later source corrections are immutable adjustments bound to the official revision, never superseding revisions. Status snapshots omit row payloads, are capped at 8 MiB, expire after 15 minutes, and keep cursor pages stable over the flat obligation/revision/adjustment union. A periods response returns an opaque `changes_checkpoint`; echo that value verbatim as `changes_after` rather than supplying a timestamp. Account-scoped write/snapshot locks make those checkpoints gap-free for SDK store writes. The default table set is deployment-wide; use a dedicated database/schema and acknowledge that boundary explicitly. `sourceScope` must contain opaque routing identities only—never credentials or bearer tokens—because it is retained with the obligation. Retained resource locations are held to the same rule, and at the seam that persists them rather than only in the worker's pre-flight, because a caller driving `settleMaterialization` directly would otherwise store a presigned location that `get_reporting_status` then publishes. Query and fragment are refused on the raw string rather than on a successful parse, because a relative path carrying a presigning query never parsed as a URL at all; userinfo is refused as a colon-separated pair before the `@`, which is the credential shape, plus any `http(s)` userinfo at all. A blanket `@` rule would refuse `abfss://container@account.dfs.core.windows.net/...` and a Snowflake stage reference, neither of which carries a secret.
 
+## Row storage
+
+By default every revision document carries its rows inline. At pulse cadence
+that keeps bulk report bytes in the transactional database. Opt in to row
+storage to keep only the revision header in the ledger document and store
+rows as verified canonical JSONL chunks (the shared SDK persistence layout,
+adcontextprotocol/adcp#7996):
+
+```ts
+import { REPORTING_ROW_STORAGE_MIGRATION } from '@adcp/reporting-storage';
+
+await pool.query(REPORTING_ROW_STORAGE_MIGRATION); // after REPORTING_LEDGER_MIGRATION; PostgreSQL 13+
+const store = new PostgresReportingLedgerStore(pool, {
+  acknowledgeIsolatedDatabase: true,
+  rowStorage: true,
+});
+await store.readyRowStorage();
+```
+
+`createPostgresReliableReportingProductionService` accepts the same
+`rowStorage` option and adds the migration to `setup.migrations`.
+
+- Rows are split into 500-row segments and chunks of at most 10,000 rows or
+  8 MiB. Chunk, segment and manifest digests are committed with the revision,
+  and every read is verified before rows are released. Delivery pages read only
+  the segments they need.
+- A revision whose rows are byte-identical to a live row set in the same
+  obligation is stored as a header-only revision. It gets a new identity,
+  freshness and binding, and references the existing chunks
+  (`rows_shared_from_row_set_id`), so an unchanged pulse uploads nothing.
+- Revisions written before you enable row storage keep their inline rows.
+  Reads handle both forms whether or not the option is set.
+- Missing or corrupt rows inside the retention window make
+  `get_media_buy_delivery` fail with `SERVICE_UNAVAILABLE` rather than reporting
+  the revision as absent; expired rows read like an unknown revision.
+- An exact `get_media_buy_delivery` read of an unknown, unauthorized, expired or
+  compacted revision, or with a tampered `pagination.cursor`, returns the same
+  nondisclosing `REFERENCE_NOT_FOUND` with `field: "reporting_revision_id"`
+  (not transient, so buyers do not retry), so a response never reveals whether a
+  revision exists for another account.
+- Managed Delivery claims hydrate PostgreSQL-stored rows automatically.
+
+To move existing inline rows into row storage, run the resumable migration in
+bounded batches. A revision whose rows do not reproduce its committed binding is
+reported in `quarantined` and left untouched:
+
+```ts
+let cursor: string | undefined;
+do {
+  const batch = await store.migrateInlineRows({ limit: 100, cursor });
+  if (batch.quarantined.length) console.warn('unverifiable inline rows', batch.quarantined);
+  cursor = batch.cursor;
+} while (cursor);
+```
+
+Removing rows from ledger documents frees space only after `VACUUM FULL` or an
+online repack of `adcp_reporting_revisions` and `adcp_reporting_adjustments`.
+
+### Stored field names
+
+Stored values use AdCP's names and bounds: a chunk's `object_ref` and
+`native_version_ref` (1 to 1024 characters each, enforced by `CHECK`
+constraints), `size_bytes` (the stored object's size after compression, as in
+the AdCP file manifest), and `canonical_size_bytes` (the uncompressed canonical
+bytes that the chunk digests cover; a row set's `content_size_bytes` is the
+byte count of the content its `content_sha256` covers). A row set records `format` (`jsonl`) and
+`algorithm` (`adcp_jcs_rows_v1`). Neither token feeds a digest. Installed
+databases upgrade in place when you re-apply `REPORTING_ROW_STORAGE_MIGRATION`;
+see [Breaking: reporting row storage field alignment](../migration-reporting-row-storage-alignment.md)
+for the old names, the API renames and the re-sync option.
+
+### Object storage bindings
+
+Rows can live in object storage instead of PostgreSQL. A binding is defined in
+host code, which makes the configuration the allowlist: the database records
+which binding each revision used and its identity digest, but it can never
+point reads or writes at a destination the host did not configure.
+
+```ts
+import {
+  PostgresReportingLedgerStore,
+  createFilesystemReportingRowObjectProviderV1,
+} from '@adcp/reporting-storage';
+
+const store = new PostgresReportingLedgerStore(pool, {
+  acknowledgeIsolatedDatabase: true,
+  rowStorage: {
+    deploymentNamespace: 'prod-us',
+    bindings: {
+      inline: { kind: 'postgres' },
+      reports: {
+        kind: 'object',
+        provider: 'filesystem', // or a cloud provider registered below
+        location: { root: 'reports' },
+        prefix: 'adcp-rows',
+        compression: 'gzip',
+      },
+    },
+    providers: {
+      filesystem: createFilesystemReportingRowObjectProviderV1({ roots: { reports: '/var/lib/adcp/rows' } }),
+    },
+    selectRowBinding: ({ content_size_bytes }) => (content_size_bytes < 256 * 1024 ? 'inline' : 'reports'),
+  },
+});
+await store.readyRowStorage();
+```
+
+- Each chunk is one object, written create-only. If an object already exists at
+  a planned key, it is adopted only when its bytes decode to the exact chunk;
+  otherwise the commit fails with `CONTENT_CONFLICT`.
+- Keys always start with `{prefix}/{namespace_key}/` and use a hashed account
+  segment, never a raw account ID. Override `keyTemplate` with the placeholders
+  in `REPORTING_ROW_KEY_PLACEHOLDERS`; templates must include
+  `{content_sha256}`, `{chunk_index}` and `{revision_key}`. `{revision_key}` is
+  required on every writable binding, so each row set writes its own object
+  keys (it hashes the row-set ID, so two uploads never name the same key). The store refuses a
+  template without it when it is configured and again in `readyRowStorage`,
+  with `INVALID_INPUT`.
+  `{period_date}` renders AdCP's `YYYY-MM-DD`: the calendar date of the period
+  start in the period's `source_timezone`, never UTC (a period starting
+  `2026-10-02T07:00:00Z` in `America/Los_Angeles` is `2026-10-02`; one starting
+  `2026-10-01T15:00:00Z` in `Asia/Tokyo` is also `2026-10-02`). It is one path
+  segment, so the default layout is
+  `{prefix}/{namespace_key}/{account_key}/2026-10-02/{finality}/...`, not
+  `2026/10/02/`. A missing, unknown or non-IANA timezone fails the write with
+  `INVALID_INPUT` rather than guessing a date. The rendered key must stay within
+  AdCP's 1024-character `object_ref` bound.
+- Rows written under an older template without `{revision_key}` stay readable:
+  every read uses the chunk's recorded `object_ref`, never a re-rendered key.
+  Changing a template needs a new binding ID, and the old definition must stay
+  configured while revisions reference it. Mark that old definition
+  `readOnly: true` to keep it configured without `{revision_key}`: it is
+  exempt from the requirement, never selected for new writes, and still used
+  for reads and retirement. A read-only binding is still registered and
+  probed by `readyRowStorage`, so keep its location reachable (and keep
+  enforcing `readOnly` in every process that shares the database: it is not
+  stored).
+- Header-only revisions share their predecessor's chunks within an obligation,
+  and chunk rows written under an older template can name one object from
+  several row sets. Every delete path (period retirement, compaction and the
+  intent sweep) therefore skips an object while a live row set outside the
+  operation still references the same binding, key and native version, or an
+  open write intent created it. (With unique keys, a create-only write only
+  finds an existing object when a writer retries the same row set.) The check
+  and delete run under the per-object lock described below. The reference check and the delete run in one
+  transaction under a per-object advisory lock, and a commit that adopts an
+  existing object takes the same lock, proves the object is still there and
+  holds the lock until its chunk rows commit. A delete that wins the lock makes the adopting
+  commit fail with `STATE_UNAVAILABLE` (the writer re-uploads once its intent
+  lapses); a commit that wins is seen by the delete, which skips. A skipped
+  object is deleted by the retirement, compaction or sweep of the last row set
+  that referenced it, so it is not leaked.
+- An upload runs only while the obligation lease still covers
+  `writeDeadlineMilliseconds` plus five seconds. A fenced write intent records
+  every object the upload created, and the ledger commit closes the intent in
+  the same transaction. Objects of an upload that never committed are left for
+  the intent sweep.
+- Every read verifies the stored bytes against the recorded physical digest
+  before decompressing, then verifies segments, chunks and the revision binding.
+- Keep a retired binding configured while revisions still reference it.
+- The filesystem provider identifies each write by inode, birth time, mtime
+  and size, stamping a random sub-millisecond mtime on every write. It needs a
+  filesystem with sub-second mtime and, ideally, birth time (ext4, XFS, APFS,
+  NTFS). On a coarse filesystem (FAT, some NFS mounts, ext3), a reused inode
+  re-created with identical bytes in the same second gets the same version,
+  so a delayed delete could remove the replacement. The conformance check
+  `write-unique-version` fails on such filesystems. That failure means the
+  filesystem is wrong, not the code.
+- Custom providers implement `ReportingRowObjectProviderV1`. Run
+  `runReportingRowObjectProviderConformanceV1(provider, { location, prefix })`
+  against a dedicated test prefix before using one. Provider calls take and
+  return AdCP's names: `objectRef` (the decoded, destination-relative object
+  key) and `nativeVersionRef` (the decoded provider-native version), each 1 to
+  1024 characters. Implement the optional `stat({ objectRef, nativeVersionRef })`,
+  which returns `{ sizeBytes }` for that exact version or `null` when it is
+  absent, without reading the body. The commit transaction uses it to prove an
+  adopted object is unchanged (native versions are write-unique, so the same
+  version at the recorded size is the same bytes) instead of downloading it
+  while holding the account and object locks. A provider without `stat` falls
+  back to reading the whole object there. All bundled providers implement it.
+  Also implement the optional `list({ prefix, pageToken, pageSize })`, which
+  returns `{ objects: [{ objectRef, nativeVersionRef, sizeBytes, createdAt }],
+  nextPageToken? }`: every stored version under the prefix once, in a stable
+  order (on a versioned store, noncurrent versions too, never delete markers),
+  with the version exactly as `putIfAbsent` recorded it and the time it was
+  written. The orphan collector needs it; a binding whose provider has no `list`
+  is reported as unsupported there. The conformance suite checks it (`list`) when
+  present. All bundled providers implement it.
+
+#### Cloud providers
+
+Cloud providers wrap official clients that the host constructs with its own
+credentials. A binding's `location` holds only non-secret coordinates, and its
+optional `credentialRef` names one of the clients you injected; an unknown
+reference fails `UNSAFE_BINDING`. Provider errors surface only as stable
+`ReportingRowStoreError` codes. Row buckets are separate from Managed Delivery
+buckets.
+
+**Google Cloud Storage** (`@adcp/reporting-storage/gcs`, optional peer
+`@google-cloud/storage`):
+
+```ts
+import { Storage } from '@google-cloud/storage';
+import { createGcsReportingRowObjectProviderV1 } from '@adcp/reporting-storage/gcs';
+
+const gcs = createGcsReportingRowObjectProviderV1({
+  storage: new Storage(), // keyless credentials (workload identity / ADC)
+  clients: { 'tenant-eu': euStorage }, // optional, selected by credentialRef
+});
+// binding: { kind: 'object', provider: 'gcs', location: { bucket: 'acme-adcp-rows' }, prefix: 'adcp-rows' }
+// providers: { gcs }
+```
+
+- Writes are single-request uploads with `ifGenerationMatch: 0` and a declared
+  MD5, without `Content-Encoding`. The recorded native version is the object
+  generation; reads and deletes pin it, and reads never transcode.
+- The probe requires uniform bucket-level access and enforced public access
+  prevention. Versioning, soft delete and retention policies are allowed. A
+  lifecycle `Delete` rule that can match live objects under the binding prefix
+  (no `matchesPrefix`, or a prefix that overlaps it) is refused; rules limited
+  to noncurrent versions (`isLive: false`, `numNewerVersions`,
+  `daysSinceNoncurrentTime`, `noncurrentTimeBefore`) are allowed. Keep
+  retention-driven deletion in the ledger's pruning, not in bucket lifecycle.
+- The client needs `storage.buckets.get` for the probe plus object create, get
+  and delete on the bucket.
+
+**Amazon S3 and S3-compatible stores** (`@adcp/reporting-storage/s3`, optional peer
+`@aws-sdk/client-s3`):
+
+```ts
+import { S3Client } from '@aws-sdk/client-s3';
+import { createS3ReportingRowObjectProviderV1 } from '@adcp/reporting-storage/s3';
+
+const s3 = createS3ReportingRowObjectProviderV1({
+  client: new S3Client({ region: 'us-east-1' }), // default credential chain
+});
+// binding: { kind: 'object', provider: 's3', location: { bucket: 'acme-adcp-rows', region: 'us-east-1' }, prefix: 'adcp-rows' }
+// providers: { s3 }
+```
+
+- Endpoint, region, credentials and path style come only from the client you
+  inject; `location` accepts just `bucket` and an optional `region`, which the
+  probe checks against the client.
+- **Bucket versioning is required.** Writes use `PutObject` with
+  `If-None-Match: *` (a 409 is retried once). The recorded native version is
+  the write-unique `VersionId`; reads pin it with `VersionId`, and deletes
+  confirm the exact version with `HeadObject`, then delete by `VersionId`.
+  Deletes must be fenced to one write, and an ETag identifies content, not a
+  write: a delayed delete (for example an intent sweep removing an abandoned
+  upload) pinned to an ETag would also remove a replacement object later
+  re-created with identical bytes at the same key. The probe therefore refuses
+  any bucket whose `GetBucketVersioning` status is not `Enabled` (suspended or
+  unversioned), and `putIfAbsent` refuses a result with no `VersionId`.
+  Deleting a specific `VersionId` permanently removes that version without
+  leaving a delete marker, so retention still frees storage; noncurrent-version
+  lifecycle rules are not needed for rows this provider deletes.
+- S3-compatible stores may ignore `If-None-Match`, so the probe writes a probe
+  key under the binding prefix twice and requires the second write to fail with
+  412, then deletes it. It also refuses missing or inaccessible buckets, a
+  bucket policy reported as public, and enabled lifecycle `Expiration` rules
+  that can match the prefix. The probe cannot verify Block Public Access on
+  every store, so keep row buckets private.
+- The client needs `s3:ListBucket` (HeadBucket),
+  `s3:GetLifecycleConfiguration`, `s3:GetBucketVersioning`, object put/get,
+  `s3:GetObjectVersion` and `s3:DeleteObjectVersion`.
+  `s3:GetBucketPolicyStatus` is optional. For stores without flexible
+  checksums, construct the client with `requestChecksumCalculation: 'WHEN_REQUIRED'`.
+
+**Azure Blob Storage** (`@adcp/reporting-storage/azure`, optional peer
+`@azure/storage-blob`):
+
+```ts
+import { DefaultAzureCredential } from '@azure/identity';
+import { BlobServiceClient } from '@azure/storage-blob';
+import { createAzureBlobReportingRowObjectProviderV1 } from '@adcp/reporting-storage/azure';
+
+const azure = createAzureBlobReportingRowObjectProviderV1({
+  client: new BlobServiceClient('https://acmerows.blob.core.windows.net', new DefaultAzureCredential()),
+});
+// binding: { kind: 'object', provider: 'azure_blob', location: { account: 'acmerows', container: 'adcp-rows' }, prefix: 'adcp-rows' }
+// providers: { azure_blob: azure }
+```
+
+- `location` names the storage `account` and `container`; the selected client
+  must belong to that account. The endpoint and credentials come only from
+  the client.
+- **Blob versioning is required** on the storage account. Writes are
+  block-blob uploads with `If-None-Match: *`. A 409 `BlobAlreadyExists` or 412
+  adopts the existing blob. The recorded native version is the write-unique
+  `versionId`; reads and deletes pin it, and only count a response that echoes
+  that exact version. ETags are content-derived, so they cannot fence a delayed
+  delete away from an identical re-upload at the same key. The probe's
+  create-only write must return a `versionId` (otherwise `UNSAFE_BINDING`), and
+  `putIfAbsent` refuses a result without one. Deleting a specific version
+  permanently removes it, so retention still frees storage. Azurite does not
+  implement blob versioning and cannot back this provider. Metadata names are
+  stored as C# identifiers (`adcp_intent`).
+- The probe refuses missing or inaccessible containers and containers with
+  anonymous access. Like S3, it proves create-only writes empirically with a
+  probe blob under the prefix. Lifecycle management policies are account-level
+  and are not visible to the data-plane client, so make sure none can delete
+  blobs under the binding prefix.
+- The client needs read, write and delete on blobs in the container (for
+  example `Storage Blob Data Contributor`), plus permission to delete
+  versions.
+
+### Retention
+
+Retention is period-aligned and opt-in. A period becomes eligible once both its
+end and its latest publication are older than `max(statusRetentionDays,
+recordRetentionDays)`, no worker holds its lease, and no Managed Delivery
+materialization still references it. Superseded snapshots stay readable for the
+whole window, as the protocol requires.
+
+When the change feed is installed, retention also waits for registered feed
+consumers. A period is held while any live consumer (one whose cursor was saved
+within `maxFeedHoldDays`, default 7) has not yet passed that period's change
+rows, in the consumer's own feed order. This is the same rule `pruneChanges`
+uses, so a warehouse sink that is briefly down does not lose revisions it has
+not loaded. A held period is simply not retired on this pass. A consumer silent
+for longer than `maxFeedHoldDays` stops holding, so a dead consumer cannot block
+retention forever; it has then fallen behind retention (see the warehouse sink
+below). Pass `maxFeedHoldDays` to `retireExpiredPeriods`; the production service
+passes `changeFeed.maxFeedHoldDays` for you so retention and feed pruning agree.
+
+```ts
+await store.retireExpiredPeriods({ statusRetentionDays: 30, recordRetentionDays: 45, limit: 100 });
+await store.sweepRowWriteIntents({ limit: 100 }); // abandoned object uploads
+```
+
+Retirement runs in three resumable phases. First it records a `retiring`
+tombstone and marks the period's rows as expired. Then it deletes external row
+objects at their recorded versions. Finally it deletes the period's rows and
+ledger records together. The tombstone keeps the final revision ID and digest,
+and planners never re-create a retired period. `ledger_retained_from` advances
+because the retired obligations no longer exist.
+
+A period whose deletes fail (a removed binding, a permanent provider error)
+stays `retiring` and is retried with backoff rather than on every pass. The
+tombstone records `attempts`, `next_attempt_at` and `last_failure`; the wait
+starts at one minute, doubles per failure and is capped at six hours. Periods
+still backing off are skipped. Ready retries go ahead of fresh periods for up to
+half of each pass (rounded up) and only fill slots fresh periods leave empty, so
+a retry backlog still drains at full speed when nothing else is eligible and a
+few stuck periods cannot stop others from retiring (each leaves the head of the
+queue for its backoff after one failed attempt). The result reports `failed` and `failures` for this pass,
+`deferred` for periods backing off, and `stuck` (up to 20, with `attempts` and
+`cause`) for periods that have failed five or more times. The maintenance helper
+passes `stuck` and `deferred` to `onError`. Re-apply `REPORTING_LEDGER_MIGRATION`
+before upgrading; it adds the three tombstone columns idempotently.
+
+`sweepRowWriteIntents` backs off the same way (`sweep_attempts`, `next_sweep_at`,
+added idempotently by `REPORTING_ROW_STORAGE_MIGRATION`) and takes intents that
+never failed first. An intent with objects to delete through a binding this host
+does not configure is left untouched, since a host that configures it can finish
+the sweep. The result counts `swept`, `objectsDeleted`, `failed` (this pass),
+`skippedUnconfigured`, `deferred` and `overdue`; the last three describe what is
+still waiting after the pass. `overdue` counts intents expired for longer than
+`overdueAfterSeconds` (default 24 hours): no host is sweeping them and their
+objects are leaking, so check that some host configures every binding you have
+used.
+
+`createPostgresReliableReportingProductionService` accepts
+`retention: { enabled: true, recordRetentionDays?, limit? }`. Its scheduler
+always sweeps abandoned row uploads and expired cursor snapshots and
+checkpoints, and retires periods when retention is enabled.
+
+### Compacting superseded snapshots (opt-in)
+
+> **Do not enable this in production before the next eligible AdCP minor after
+> November 20, 2026.** Until then the published protocol still describes
+> superseded snapshots as preserved. The option is off by default, and
+> retaining the whole chain, as the ledger does by default, stays conformant.
+
+[adcontextprotocol/adcp#8100](https://github.com/adcontextprotocol/adcp/pull/8100)
+separates the two things `status_retention_days` covers. **Metadata** for every
+revision stays queryable for the whole window. **Content** (the rows) is owed
+only for the revisions a buyer is likely to read, so a seller that publishes a
+snapshot every 15 minutes need not keep thousands of full snapshots per period.
+
+The window runs from the revision's `created_at`. Once a later revision names it
+in `supersedes_reporting_revision_id`, it runs from that successor's
+`created_at` instead. Within its window the seller must keep content readable
+by exact read when the revision is:
+
+- (a) the current, unsuperseded revision of its slice, which includes every
+  official revision;
+- (b) the revision the current revision supersedes;
+- (c) a superseded snapshot inside its recovery grace, `max(automated recovery
+  window, one hour)` after its successor's `created_at`;
+- (d) named, for the requesting caller, by that caller's own reporting receipt
+  in any status, or by its current consumer status statement with status
+  `received`, `unreadable` or `content_mismatch`.
+
+Any other superseded snapshot may be compacted to metadata only. An exact read
+of a compacted revision returns the same nondisclosing `REFERENCE_NOT_FOUND` as
+an unknown ID. A revision in (a) to (d) whose content cannot be served is
+`SERVICE_UNAVAILABLE` (`REVISION_UNREADABLE`), never not-found.
+
+```ts
+// Core-only service
+createReliableReportingService({
+  // ...
+  maintenance: reportingLedgerMaintenance({ compaction: { enabled: true, limit: 100 } }),
+});
+
+// Production service
+await createPostgresReliableReportingProductionService({
+  // ...
+  compaction: { enabled: true, limit: 100 },
+});
+
+// Or call the store directly
+await store.compactSupersededSnapshots({
+  statusRetentionDays: 30,
+  automatedRecoveryWindowSeconds: 3600,
+  limit: 100,
+});
+```
+
+Both options take `{ enabled: true; limit?: number }` (default `limit` 100 per
+pass) and reuse the service's `statusRetentionDays` and
+`automatedRecoveryWindowSeconds`. The maintenance task is named
+`snapshot compaction`.
+
+A snapshot is compacted only when all of these hold:
+
+- A later revision supersedes it, and it is not the revision the current
+  revision supersedes. Current and official revisions are never compacted.
+- Its recovery grace has passed: `max(automatedRecoveryWindowSeconds, 3600)`
+  seconds since its successor's `created_at`.
+- No caller is owed it. The check spans every caller: a receipt in any status
+  (current or superseded), or a current `received`, `unreadable` or
+  `content_mismatch` consumer status statement, from any caller keeps the
+  revision while its window (`statusRetentionDays` from its successor's
+  `created_at`) is open. After that window nothing is owed any more.
+- The obligation holds no live worker lease, no Managed Delivery
+  materialization of that revision is still `pending`, and no live change-feed
+  consumer (updated within `maxFeedHoldDays`) has yet to pass that revision's
+  change row. This is the same hold retirement applies, narrowed to the
+  revision.
+- It has rows. A revision with no rows has nothing to reclaim.
+
+Compaction drops row content only. The revision header, its manifest and every
+metadata listing stay, and `listRevisionMetadata` and the status views keep
+listing it. `listRevisions`, which hydrates rows, omits compacted revisions.
+The `revision` view of `get_reporting_status` for a compacted revision answers
+as an unavailable lookup, like an exact read.
+
+It uses the same three resumable phases as retirement. Under the account lock it
+re-checks eligibility and marks the row set `pruning` (reads answer as expired;
+no new revision can share its chunks). It then deletes external objects at their
+recorded versions through the fenced delete path, skipping any object a row set
+that is not being pruned still references. Finally it deletes the chunk
+manifest and any PostgreSQL chunk body nothing else uses, and marks the row set
+`pruned`. A crash after the first phase leaves a `pruning` row set that the next
+pass finishes. Chunks shared by byte-identical revisions survive until the last
+revision referencing them is compacted.
+
+Compaction records no change-feed row: the revision's metadata did not change,
+and a sink still catching up holds the revision back (above).
+
+Every writable object row binding's `keyTemplate` must include
+`{revision_key}` (the default template does), so two uploads never name the
+same object. Deletes skip objects another row set still references (see
+[Object storage](#object-storage-bindings)), which still matters for header-only
+revisions that share chunks within an obligation and for rows written under an
+older template, so compaction does not depend on key uniqueness alone. A
+`readOnly` binding for older rows is exempt: it never takes commits, so nothing
+can adopt through it. The SDK fails closed when the store is configured, and
+`createReliableReportingService`, `createPostgresReliableReportingProductionService`
+and `compactSupersededSnapshots` re-check before compacting.
+
+### Core-only setup with row storage, change feed and retention
+
+You do not need the production service (managed delivery, notifications and
+activity) to keep a ledger tidy. Build the store with the options you want and
+give `createReliableReportingService` a `maintenance` option built by
+`reportingLedgerMaintenance` from `@adcp/reporting-storage`. The production
+service does the same work automatically; the two share one implementation, so
+partial-failure reporting, the `maxFeedHoldDays` that retention honours, per-task
+limits and abort handling are identical.
+
+```ts
+import {
+  PostgresReportingLedgerStore,
+  REPORTING_LEDGER_MIGRATION,
+  REPORTING_ROW_STORAGE_MIGRATION,
+  REPORTING_LEDGER_CHANGES_MIGRATION,
+  reportingLedgerMaintenance,
+} from '@adcp/reporting-storage';
+import { createReliableReportingService } from '@adcp/sdk/reporting/service';
+
+// Apply the three migrations, then:
+const store = new PostgresReportingLedgerStore(pool, {
+  acknowledgeIsolatedDatabase: true,
+  rowStorage, // verified chunked rows in your object store
+  changeFeed: true, // host reads and consumer cursors
+});
+await store.readyRowStorage();
+
+const reporting = createReliableReportingService({
+  store,
+  statusRetentionDays: 90, // the commitment advertised to buyers; retention uses it
+  // ...adapters, contact, resolveSource, resolveCurrency, resolveCoverage
+  maintenance: reportingLedgerMaintenance({
+    intervalMilliseconds: 300_000, // default: at most one pass per 5 minutes
+    retention: { enabled: true, recordRetentionDays: 120, limit: 100 },
+    changeFeed: { changeRetentionDays: 30, maxFeedHoldDays: 7 },
+  }),
+});
+
+reporting.start({ intervalMilliseconds: 60_000, deploymentWide: true, onError });
+```
+
+`reporting.start()` runs maintenance on its first pass and then at most once per
+`maintenance.intervalMilliseconds`, after the tenant cycles, never on every
+cycle. A task that throws, or that resolves with `failed` items, goes to the
+scheduler's `onError` (or `logger.warn`) and never stops the loop; partial
+failures arrive as `ReportingMaintenancePartialFailureError`.
+
+If you run your own scheduler instead, call `reporting.runMaintenance({ signal })`.
+It returns one result per task and reports failures in the result rather than
+throwing:
+
+```ts
+for (const result of await reporting.runMaintenance()) {
+  if (result.status === 'failed') log.error(result.task, result.error);
+  else if (result.partialFailure) log.warn(result.partialFailure.message);
+}
+```
+
+Tasks, in order:
+
+| Task                  | Runs                                              | What it does                                                         |
+| --------------------- | ------------------------------------------------- | -------------------------------------------------------------------- |
+| `snapshot sweep`      | always                                            | Deletes expired cursor snapshots and checkpoints (1,000 per pass).   |
+| `row upload sweep`    | always                                            | Resolves abandoned object uploads (100 per pass); no-op without row storage. |
+| `change-feed pruning` | when `maintenance.changeFeed` is set              | `pruneChanges` with `changeRetentionDays` and `maxFeedHoldDays`.     |
+| `retention`           | when `maintenance.retention.enabled` is `true`    | `retireExpiredPeriods` with the service's `statusRetentionDays` and the feed's `maxFeedHoldDays`. |
+| `snapshot compaction` | when `maintenance.compaction.enabled` is `true`   | `compactSupersededSnapshots` with the service's `statusRetentionDays` and `automatedRecoveryWindowSeconds` (see [Compacting superseded snapshots](#compacting-superseded-snapshots-opt-in)). |
+| `orphan object collection` | when `maintenance.orphanCollection.enabled` is `true` | `collectOrphanedRowObjects`: lists each object binding under `{prefix}/{namespace_key}/` and deletes old objects nothing names. Opt-in, rate-limited and resumable; see [Orphaned object collection](REPORTING-OPERATIONS.md#adopting-row-storage-retention-and-the-change-feed). |
+
+Notes:
+
+- The service's `maintenance` option takes a factory, not an options object:
+  the SDK does not know what maintenance a store needs, so it calls the factory
+  once at construction with the store and the retention and recovery-window
+  commitments it advertises. `reportingLedgerMaintenance(options)` is the
+  PostgreSQL one. It requires a `PostgresReportingLedgerStore` (or a store with the
+  same `retireExpiredPeriods`, `pruneChanges` and `sweepRowWriteIntents`
+  methods, plus `collectOrphanedRowObjects` when `orphanCollection` is set) and
+  fails at construction otherwise. `maintenance.changeFeed` also
+  requires `changeFeed: true` on the store, since pruning is otherwise a silent
+  no-op.
+- Retention takes `statusRetentionDays` from the service, so it can never retire
+  a period earlier than the retention you advertise. `recordRetentionDays` may
+  only lengthen it.
+- The snapshot sweep uses `store.sweepExpiredState()`. A custom store without
+  that method skips the task rather than failing.
+- Run it on every replica or on one: each task is bounded, resumable and safe
+  to run concurrently.
+- Enable `retention` last (see the adoption checklist in the
+  [operations guide](REPORTING-OPERATIONS.md#adopting-row-storage-retention-and-the-change-feed)).
+  Retirement cannot be undone.
+
+### Host reads: current revisions and the change feed
+
+In-process consumers such as pacing, alerts and warehouse loaders read from the
+ledger, never from a warehouse copy.
+
+```ts
+import { REPORTING_LEDGER_CHANGES_MIGRATION } from '@adcp/reporting-storage';
+
+await pool.query(REPORTING_LEDGER_CHANGES_MIGRATION); // PostgreSQL 13+
+const store = new PostgresReportingLedgerStore(pool, { acknowledgeIsolatedDatabase: true, changeFeed: true });
+
+const current = await store.getCurrentRevision({ account_id, reporting_obligation_id });
+const { revisions, cursor: next } = await store.listCurrentRevisions({
+  account_id,
+  period_start_from: '2026-10-01T00:00:00Z',
+  period_start_to: '2026-10-08T00:00:00Z',
+});
+
+let cursor = await loadCursor();
+const page = await store.changesAfter({ account_id, cursor, kinds: ['revision'] });
+// ...apply page.records...
+await store.saveFeedConsumerCursor('pacing', page.cursor); // holds back pruning
+```
+
+- The current revision is the official revision if one exists, otherwise the
+  highest-numbered snapshot. An official revision is terminal, so this is always
+  one index lookup.
+- `changesAfter` lists committed obligation, revision, adjustment and retirement
+  changes. Every feed, account-scoped or deployment-wide (omit `account_id`),
+  orders by `(xid, seq)` and returns only changes whose transaction precedes
+  every transaction still in flight (`xid` below the reading snapshot's
+  `xmin`), so a slow commit is never skipped. The order does not depend on the
+  account lock, on the order a writer drew `seq` in, or on which lock key a
+  writer took: a change with a lower `seq` and a higher `xid` that commits late
+  is simply returned on a later page, after the cursor. The cost is that any
+  older open transaction on the cluster, including an idle one in another
+  database, holds every feed back until it ends; keep transactions short. An
+  empty page therefore means either caught up or held back, so poll again rather
+  than treating it as the end of the feed. The account scan is served by the
+  `(account_id, xid, seq)` index that `REPORTING_LEDGER_CHANGES_MIGRATION`
+  creates.
+- **A ledger database has exactly one writer SDK.** The store writes each change
+  row under the account advisory lock. The feed no longer needs that lock for
+  its order, but a second SDK is still unsupported: it can write rows the first
+  SDK's lifecycle, retention and idempotency logic does not know about. Give
+  another SDK (for example a Python deployment) its own database. `pruneChanges`
+  only deletes changes older than `changeRetentionDays`, far longer than any
+  transaction should stay open, and consumer holds compare against cursors the
+  feed itself returned, so neither adds an ordering assumption.
+- **Upgrading from account cursors that carry only `seq`.** Account feeds used
+  to order by `seq` and cut each page before the first in-flight change. An old
+  account cursor is `{ seq }` with no `xid`. `changesAfter` accepts it and maps
+  it to the position `(xid, seq)` where `xid` is the smaller of the oldest `xid`
+  among the account's changes after that `seq` and the reading snapshot's `xmin`.
+  Every change after the old `seq` has an `xid` at or above both (a change that
+  has not committed yet belongs to a transaction at or above `xmin`), so nothing
+  is skipped. The cost is that changes the consumer already read can be returned
+  again: those with a lower `seq` and a higher `xid`, and, when a long
+  transaction was open at that moment, every change committed since it began.
+  Treat redelivery as normal, as for any at-least-once consumer. The returned cursor is in the new
+  format, even on an empty page. A legacy cursor fails with `CURSOR_EXPIRED` if
+  any change with a higher `seq` was pruned (`adcp_reporting_change_account_horizon.pruned_through_seq`
+  still records the highest pruned `seq` for this check). A consumer row saved
+  before the upgrade has a NULL `cursor_xid` and holds retention by `seq` until
+  the consumer saves its next cursor; `saveFeedConsumerCursor` given a legacy
+  cursor maps it the same way. Re-apply `REPORTING_LEDGER_CHANGES_MIGRATION`
+  before starting the new binary: it adds the account horizon's `xid` columns,
+  replaces the consumer table's check constraint, and creates the new index. On
+  a large changes table, create the index first with `CREATE INDEX CONCURRENTLY
+  IF NOT EXISTS adcp_reporting_changes_account_xid ON adcp_reporting_changes
+  (account_id, xid, seq)`, because a plain `CREATE INDEX` blocks appends while it
+  builds; the migration then skips it. The older
+  `adcp_reporting_changes_account (account_id, seq)` index is left in place and
+  serves the legacy-cursor mapping; drop it once no legacy cursor remains.
+- **Do not run the old and new SDK's change-feed maintenance together.** An older
+  host's `pruneChanges`, `retireExpiredPeriods` and compaction hold an account
+  consumer's changes by `seq` alone and record only `pruned_through_seq`, so
+  against a consumer that holds new-format cursors they can prune a change the
+  consumer has not read and never advance the horizon the new reader checks.
+  Stop the older hosts' maintenance (or the hosts) before the new binary reads
+  the feed. Rolling back is not supported once a consumer has saved a new-format
+  account cursor: the older SDK rejects it, so reset those consumers.
+- `pruneChanges` deletes changes older than `changeRetentionDays` (default 30)
+  that every consumer updated within `maxFeedHoldDays` (default 7) has passed.
+  An older cursor throws `ReportingChangeCursorExpiredError`; resynchronize from
+  `listCurrentRevisions`.
+- A read with no cursor can throw `ReportingChangeCursorExpiredError` too. `changesAfter`
+  re-reads the retention horizon after the page, so a prune that commits during
+  a consumer's first read rejects that page instead of returning one that skips
+  the pruned changes. Host startup code must handle `CURSOR_EXPIRED` on a first
+  read the same way as on a saved cursor: retry (the new read starts at the later
+  horizon) or resynchronize from `listCurrentRevisions`. Match on
+  `error.code === 'CURSOR_EXPIRED'` rather than `instanceof`, which fails when
+  the store and your code load through different module formats (CJS and ESM).
+- Consumer checkpoints are forward-only. `saveFeedConsumerCursor(name, cursor)`
+  ignores a cursor behind the saved one in the same feed scope, so a delayed or
+  stale acknowledgment cannot pull the retention hold backward. It resolves
+  `true` when the checkpoint was written and `false` when it was ignored (an
+  equal position also resolves `false` with `{ refreshUnchanged: false }`). To
+  rewind a consumer on purpose, for example to replay changes, pass
+  `{ rewind: true }`; the saved position and retention hold move back to that
+  cursor (the write always applies, and the cursor is not checked against the
+  retention horizon, so it must still be inside the retained history). Without it a rewound
+  consumer would keep its old, newer hold, pruning could remove exactly what it
+  is about to read, and its next read would throw `CURSOR_EXPIRED`.
+  `removeFeedConsumer(name)` unregisters a consumer so it stops holding back
+  pruning; it resolves `true` when a registration was removed.
+- Period retention honours the same hold: `retireExpiredPeriods` does not retire
+  a period while a live consumer has not read its changes. A consumer that
+  stays silent past `maxFeedHoldDays` stops holding, and its unread changes can
+  then point at revisions whose period was retired.
+- The production service accepts `changeFeed: true | { changeRetentionDays,
+  maxFeedHoldDays }` and prunes the feed on its scheduler.
+
+### BigQuery warehouse sink
+
+`@adcp/reporting-storage/bigquery` loads committed revisions into your own BigQuery
+tables for analysts. The warehouse copy is derived and non-authoritative. It
+is never read for serving or verification, so its table names, columns,
+partitioning and retention are yours.
+
+```ts
+import { BigQuery } from '@google-cloud/bigquery';
+import {
+  REPORTING_WAREHOUSE_SINK_MIGRATION,
+  createBigQueryReportingWarehouseSinkV1,
+} from '@adcp/reporting-storage/bigquery';
+
+await pool.query(REPORTING_WAREHOUSE_SINK_MIGRATION); // after REPORTING_LEDGER_CHANGES_MIGRATION
+const bigquery = new BigQuery({ projectId: 'analytics-prod' }); // ADC / workload identity
+const sink = createBigQueryReportingWarehouseSinkV1({
+  store, // PostgresReportingLedgerStore with changeFeed: true
+  db: pool,
+  bigquery,
+  name: 'warehouse',
+  projectId: 'analytics-prod',
+  datasetId: 'reporting',
+  rowsTableId: 'media_buy_delivery_rows',
+  revisionsTableId: 'media_buy_delivery_revisions',
+  location: 'US',
+  mapRow: row => ({ media_buy_id: row.media_buy_id, impressions: row.impressions, spend: row.spend }),
+});
+await bigquery.query({ query: sink.defaultTablesSql }); // or create your own tables
+await bigquery.query({ query: sink.currentRowsViewSql });
+setInterval(() => {
+  void sink.runOnce().catch(error => console.error('Warehouse run failed', error));
+}, 15 * 60_000);
+```
+
+- Each run follows the change feed and reads every revision's rows through the
+  store's verified reader. It loads rows first and revision metadata second,
+  in one load job per table per tick. The sink always adds
+  `reporting_revision_id`, `reporting_obligation_id`, `account_id`,
+  `revision_number`, `finality`, `period_date` and `ordinal` to your mapped
+  columns. `period_date` is a `DATE`: the calendar date of the period start in
+  the period's `source_timezone`, as `YYYY-MM-DD` (an SDK column derived from
+  AdCP's `period`), not the UTC date unless that is the source timezone. A
+  period starting `2026-10-02T07:00:00Z` in `America/Los_Angeles` is
+  `2026-10-02`; one starting `2026-10-01T15:00:00Z` in `Asia/Tokyo` is also
+  `2026-10-02`. It is the start's date only, not a coverage range: a period
+  that crosses local midnight or spans several days is one `period_date`, so
+  `PARTITION BY period_date` holds source-local days and a UTC "yesterday"
+  filter can straddle partitions. The sink computes it with the same helper
+  that renders `{period_date}` in object keys. It fails the batch rather than
+  load a guessed date when a revision's period or timezone is missing or
+  invalid. The batch stays retained, so the sink stops until that revision's
+  period is repaired (or the runtime's timezone data is upgraded); reset with
+  `discardRetainedPlan` restarts from the beginning, so empty the tables first.
+- Batches are planned durably before loading, and job IDs derive from the
+  change-feed range. Before every submission the sink looks that job ID up in
+  the destination project and location: a job that finished cleanly counts as
+  loaded, a job that is pending or running is waited for (never uploaded
+  again), and only a missing job (404) is uploaded. A crash or timeout between a
+  load and the cursor commit therefore replays the same batch under the same
+  job ID without a second upload. An upload an earlier run abandoned at its
+  deadline is still running in the same process (the official client cannot
+  abort it), so the next run waits for it, within its own deadline, rather than
+  starting another, however long ago it started (that age includes the gap
+  between runs). If that wait outlasts the run's deadline it counts as a timeout
+  and the deadline grows. Only an upload still pending after 6 hours, the
+  largest deadline, is abandoned and replaced; BigQuery refuses a duplicate job
+  ID, so a replacement can never load the batch twice. A job that finished with
+  an error is retried under a new attempt for that table only. Deadline and
+  timeout errors name the table (`rows` or `revisions`, and its ID), the
+  deadline in force and that table's timeout count, never a file path or
+  credential.
+- `projectId` scopes both load submission and replay status checks. When it is
+  omitted, both use the BigQuery client's default project. Each replica must
+  be able to read the BigQuery jobs submitted by the other replicas. Set
+  `location` for any dataset outside the US and EU multi-regions: BigQuery
+  answers a job lookup without the right location with 404, and the sink then
+  cannot find the jobs it created.
+- `loadTimeoutMilliseconds` (default 10 minutes) is the base deadline for one
+  run's work on one load: uploading the file, or waiting for a job that is still
+  running. It bounds a run, not the job. BigQuery does not stop a load when the
+  client gives up (a cancel is accepted and the job finishes anyway), and it
+  refuses a resubmitted job ID only after the whole file is uploaded again, so
+  the sink never cancels and never relies on that refusal. When the deadline
+  passes, the run rejects with the plan retained and nothing advanced: the job
+  ID, the attempt and the cursor stay as they were, and the next run looks the
+  job up by its ID again. A job whose upload outlasted a deadline is created in
+  the background and is picked up by the next run with no second upload. Each
+  such timeout doubles that table's deadline for later runs (up to 6 hours).
+  The growth is kept with the plan in `planned_rows_timeouts` and
+  `planned_revisions_timeouts` (so it survives restarts and applies to every
+  replica, and clears when the batch commits), so an upload slower than the
+  deadline eventually gets enough time. Set the deadline above your slowest
+  expected load to avoid the extra runs. Only a job BigQuery reports as
+  finished with an error advances the attempt. A status check that times out
+  is bounded by the base deadline and does not grow it. Re-run
+  `REPORTING_WAREHOUSE_SINK_MIGRATION` after upgrading: it adds the two timeout
+  columns (a sink table without them rejects with a message saying so).
+  BigQuery's server-side `jobTimeoutMs` is not used: for a local-file load the
+  official client builds `configuration.load` from the load options and cannot
+  set job-level fields, and BigQuery silently drops `labels` and `jobTimeoutMs`
+  found inside `configuration.load`. (Staging the file in GCS and submitting
+  the load with `bigquery.createJob` can set both; the sink does not stage
+  files.) For the same reason the `labels` option has no effect (it warns once per process and
+  is deprecated). To attribute load cost, query
+  `` `region-<location>`.INFORMATION_SCHEMA.JOBS_BY_PROJECT `` (needs
+  `bigquery.jobs.listAll`; about 180 days of history), filtering on
+  `STARTS_WITH(job_id, 'adcp_rr_')` or on `destination_table`, and summing
+  `total_slot_ms` or `total_bytes_billed`.
+- Overlapping runs atomically claim one durable batch. Replays use that
+  batch's job IDs; attempts and cursor commits compare the full saved plan.
+  A stale run rejects without replacing another batch or rewinding either
+  the warehouse cursor or its feed checkpoint. Catch the rejection and retry
+  `runOnce()` on the next tick. Empty-feed cursor initialization uses the
+  same claim and commit rules. Replicas sharing a sink name must use the same
+  ledger database, feed scope, destination, location and row mapping. Use a new
+  name when that configuration changes. Independent ledgers loading into the
+  same BigQuery project must use distinct sink names, even if their destination
+  tables differ. An idle tick drains non-revision changes through the
+  same fenced checkpoint. An idle tick also recovers a failed acknowledgment
+  without refreshing an unchanged checkpoint. Failed loads and idle ticks
+  behind the deployment feed's transaction fence can still age out after
+  `maxFeedHoldDays`.
+- Feed reads recheck the retention horizon before returning a page. If pruning
+  overtakes the starting position during a read, `runOnce()` rejects with
+  `ReportingChangeCursorExpiredError` before committing the page.
+  The non-revision fallback preserves the first read's cursor, including on
+  initial startup. If retention overtakes the initial read, the sink records
+  that starting cursor before rejecting, so later ticks and restarted workers
+  continue to report the gap. This does not acknowledge the missing changes or
+  renew their retention hold. Resynchronize from current revisions before resuming.
+- A brand-new sink can hit that rejection from a harmless startup race: pruning
+  commits during its very first read, after the changes it lost were already
+  past retention and held by nobody. Every later tick then rejects with
+  `CURSOR_EXPIRED` because the sink keeps reporting that gap. Clear it with
+  `await sink.reset()`, which resets the sink to start from the oldest retained
+  change and unregisters its feed consumer (stop every worker with that sink
+  name first; do not edit `adcp_reporting_warehouse_sinks` by hand). `reset()`
+  refuses while a batch plan is retained, because that batch's BigQuery load
+  jobs may have succeeded; reconcile the plan against BigQuery, then call
+  `reset({ discardRetainedPlan: true })`. It does not touch the warehouse: a sink
+  that already loaded history reloads the retained revisions, so empty the
+  destination tables first (after stopping every worker and letting in-flight
+  uploads and jobs finish, since the sink never cancels a load) or use a new
+  sink name against new tables. Every
+  reset starts a new job ID generation, so reloaded batches submit fresh BigQuery
+  jobs instead of matching the finished jobs of the earlier history. Nothing holds
+  change retention between `reset()` and the first committed batch. If `reset()`
+  rejects after clearing the sink (it could not unregister the consumer), call
+  it again before restarting workers. Re-run `REPORTING_WAREHOUSE_SINK_MIGRATION`
+  after upgrading: it adds the `reset_generation` column.
+- Upgrading from 15.9.0: stop every 15.9.0 sink worker before starting newer
+  ones, then re-apply `REPORTING_WAREHOUSE_SINK_MIGRATION`. A 15.9.0 worker
+  cancels a load at its deadline, so one running beside a newer worker on the
+  same sink can cancel a job the newer worker is waiting on. The job then ends
+  `DONE` with an error and the attempt advances. Rows do not duplicate, but
+  convergence slows. Also set `location` to the dataset's location: without it
+  a replay lookup of a load job returns 404 for datasets outside the US and EU
+  multi-regions, and the sink uploads again, gets a 409, and fails with a
+  "check projectId and location" error. The sink warns once per process when
+  `location` is unset.
+- Stop old sink workers before relying on these overlap guarantees. If an
+  earlier overlapping run left a plan whose starting cursor differs from the
+  committed cursor, the sink rejects it before loading. Reconcile the retained
+  plan, its BigQuery jobs and warehouse rows before repairing the checkpoint.
+  Do not discard the plan automatically: its load jobs may have succeeded.
+- Query `current_rows`, not the raw rows table. Pacing snapshots are
+  cumulative, so summing across revisions double-counts. The view keeps each
+  obligation's current revision.
+- The sink registers as a change-feed consumer, so `pruneChanges` keeps changes
+  it has not loaded yet, and `retireExpiredPeriods` keeps the periods it has not
+  loaded yet, in both cases only while its cursor was saved within
+  `maxFeedHoldDays`. Superseded snapshots are the intraday pacing curve, and the
+  warehouse may keep them as long as you like.
+- `runOnce()` resolves with `{ idle, revisions, rows, missing }`. `idle` means
+  no revision changes were selected for this batch; an idle tick can still advance
+  past non-revision feed changes without submitting load jobs. `missing`
+  lists revision IDs the feed announced that were retired before the batch ran.
+  A non-empty `missing` means the sink fell behind retention (it was down longer
+  than `maxFeedHoldDays` plus the retention window): the warehouse lacks those
+  revisions. Backfill them from another source or accept the gap. The cursor
+  still advances so the sink is not stuck. After a crash and replay of a planned
+  batch, a listed revision may already have been loaded by the first attempt.
+- The sink uses only `dataset().table().load()`, `job().getMetadata()` and
+  `query()` from the official client you construct. It adds no dependency.
+
 ## Managed Delivery and Reconciled Billing
 
 Core remains the default and has no destination, external-resource, or receipt dependency. To opt into the higher tiers, apply `REPORTING_MANAGED_DELIVERY_MIGRATION` **after** `REPORTING_LEDGER_MIGRATION`, explicitly construct the Core store with `managedDelivery: true`, create a `PostgresReportingManagedDeliveryStore`, and pass both stores with a destination adapter to `createReportingManagedDeliveryRuntime`. The async factory proves the stores share one authority and validates the RC3 tier wiring before returning it. It advertises `managed_delivery` only when an immutable binding, delivery, bounded resource reading, generation-fenced revocation, and at least one verification profile are installed. The advertised automated recovery window must be at least the widest installed managed Core configuration recovery window. It advertises `reconciled_billing` and `receipt_task` only when an authenticated consumer resolver and canonical-digest verification are also installed.
@@ -279,9 +1159,13 @@ Core remains the default and has no destination, external-resource, or receipt d
 ```ts
 import {
   PostgresReportingLedgerStore,
+} from '@adcp/reporting-storage';
+import {
   PostgresReportingManagedDeliveryStore,
   REPORTING_MANAGED_DELIVERY_MIGRATION,
   createReportingManagedDeliveryRuntime,
+} from '@adcp/reporting-storage/managed';
+import {
   reportingManagedDeliveryBindingV1,
 } from '@adcp/sdk/reporting/ledger';
 
@@ -296,6 +1180,9 @@ await managedStore.authorizeDestination({
   destination_ref: destinationRef,
   generation: 1,
   authorized_at: new Date().toISOString(),
+  // The delivery contract this generation serves, recorded once and immutable.
+  pattern: 'file_transfer',
+  transport: 'gcs',
 });
 await managedStore.installBinding(
   reportingManagedDeliveryBindingV1({
@@ -332,6 +1219,56 @@ const reportingDelivery = managed.reportingDeliveryCapabilities;
 await managed.runWorker({ maxIterations: 100 });
 ```
 
+### Pattern and transport on a destination authorization
+
+A destination has exactly one delivery pattern, and a change to its delivery contract mints a new `destination_ref` generation, so the pattern and transport are fixed for an authorization generation. Pass `pattern` (`file_transfer`, `dataset_share`, `warehouse_materialization`) and `transport` (the same lowercase token the offering's `method.transport` uses, such as `gcs` or `s3`) to `authorizeDestination()` when you create the generation. The store records them in `pattern`/`transport` columns and returns them on the authorization that `claimRevocation()` hands to `adapter.revoke()`, so a revocation can be routed to the transport that holds the provider grant instead of being guessed or fanned out.
+
+- Both are optional, and `transport` requires `pattern`. A generation recorded without them stays valid and revocable; it is simply unroutable by transport.
+- They are immutable. Replaying `authorizeDestination()` for the current generation may omit them but cannot state different values, and it cannot add them to a generation recorded without. Change the contract by minting a new generation.
+- `installBinding()` rejects a binding whose `method` or `transport` differs from what its generation recorded, so one generation can never be delivered through one transport and revoked through another.
+- Upgrading: `REPORTING_MANAGED_DELIVERY_MIGRATION` is additive (`ADD COLUMN IF NOT EXISTS`) and safe to re-run. The run that adds the columns backfills each existing generation from the bindings that reference it, but only where every such binding names the same method and the same transport. A generation whose bindings disagree, name no transport, or do not exist is left NULL, and the migration raises a `NOTICE` with how many. Later runs do nothing, so a NULL generation is never re-decided by a binding that arrived afterwards. `managedStore.listDestinationAuthorizationsWithoutContract()` lists the NULL generations with a `reason` (`no_binding`, `binding_without_transport`, `bindings_disagree`, `not_recorded`) so you can see which still need handling.
+
+### Multi-transport delivery with the router
+
+A seller often delivers one feed through several transports: one buyer takes files in a GCS bucket, another in S3. A runtime takes one adapter, so install a router that is itself a `ReportingManagedDeliveryAdapterV1` and dispatches to one adapter per `(pattern, transport)`. The router is pure dispatch with no state of its own, so the store and worker keep every fence they provide today: leases, the authorization-generation check, settlement, the retry and attempt cap, and revocation SLA accounting, per materialization and whichever route served it.
+
+```ts
+import {
+  createReportingManagedDeliveryAdapterRouterV1,
+  createReportingManagedDeliveryRuntime,
+} from '@adcp/reporting-storage/managed';
+
+const adapter = createReportingManagedDeliveryAdapterRouterV1({
+  routes: [
+    { id: 'gcs', match: { pattern: 'file_transfer', transport: 'gcs' }, adapter: gcsAdapter },
+    { id: 's3', match: { pattern: 'file_transfer', transport: 's3' }, adapter: s3Adapter },
+  ],
+  // Optional. Only for bindings and authorizations recorded before a transport was.
+  legacyDefault: 'gcs',
+});
+
+const managed = await createReportingManagedDeliveryRuntime({ /* ... */ adapter });
+// or: createPostgresReliableReportingProductionService({ /* ... */ managedDelivery: { adapter, /* ... */ } })
+```
+
+How a route is chosen:
+
+- `deliver()` and `read()` select from the immutable binding alone: `binding.method` (the pattern) and `binding.transport`. They never look at request input, materialization state or the resource.
+- `revoke()` selects from the `pattern` and `transport` recorded on the destination authorization generation (see above). It calls exactly one adapter and never fans out.
+- Anything that cannot be routed throws a typed `ReportingManagedDeliveryRoutingErrorV1` (`code`: `REPORTING_ROUTE_NOT_FOUND`, `REPORTING_ROUTE_TRANSPORT_REQUIRED`, `REPORTING_ROUTE_CONTRACT_UNRECORDED`, `REPORTING_ROUTE_VERIFICATION_UNSUPPORTED`) before any adapter is called. A failed delivery is an ordinary failed attempt and counts toward the attempt cap. A failed revocation is released for retry and counted as overdue once it outlives `authorization_revocation_seconds`, so an unroutable grant is visible, not silent.
+- A binding with no `transport`, and an authorization with no recorded pattern/transport, go to `legacyDefault` if you configured one (and, for a pattern that is stated, only if it is that route's pattern); otherwise they fail as above. A recorded transport with no route never falls back to `legacyDefault`: the router will not guess which provider holds the grant.
+
+Construction throws if route ids repeat, if two routes match the same `(pattern, transport)`, if a route adapter does not declare `revocationFencesDeliveryGenerations: true`, or if a route has an empty `verificationProfiles`. The router's own `verificationProfiles` is the union of its routes' and exists only for compatibility; it never admits a binding.
+
+Admission happens at install and at startup, not at first delivery:
+
+- `createReportingManagedDeliveryRuntime` registers the router's `admitBinding` with the store (`setBindingAdmission`), so `installBinding` refuses a binding whose pattern/transport has no route, or whose `verification_profile` is not one of that route's `verificationProfiles`, before it writes anything. The refusal is the router's own typed error. A runtime whose adapter provides `admitBinding` refuses a store that cannot enforce it. Single adapters define no such hook and behave exactly as before.
+- At runtime construction every advertised managed offering's `method` (pattern and transport) must have a route, and a consumer-receipt offering needs a route that supports `canonical_digest`. Bindings installed before you adopted the router are not re-checked at startup; they fail at delivery with the typed error unless `legacyDefault` takes them.
+
+Optional adapter probe: an adapter may define `probe({ signal })`, which must not mutate provider state. The router probes every route that defines one, concurrently and each within `probeTimeoutMilliseconds` (default 10 seconds; it must be below the runtime's 30 second probe deadline so a hung route is still named), and the runtime calls it before it adopts any durable policy. A failure stops startup with an error naming the failing route id (`Managed Delivery adapter probe failed for route "s3"`); the provider's own message stays on `cause` and out of the message. Offerings are not withdrawn dynamically: fix the route or remove it, then restart.
+
+Observability: when the adapter is a router, `runWorker()` results also carry per-route counts keyed by route id: `deliveriesByRoute`, `deliveryFailuresByRoute`, `revocationsByRoute`, `revocationFailuresByRoute` and `overdueByRoute`. Work no route could take is counted under `UNROUTED_REPORTING_ROUTE_KEY_V1` (`'~unrouted'`, which no route id can equal). The counts carry route ids only, never credentials, locations or provider messages. A single-adapter runtime's result shape is unchanged.
+
 Deployment-wide materialization planning is durably round-robin. The PostgreSQL
 store advances an agent-wide cursor before processing its bounded account page
 and gives every selected account a first-pass share before unused capacity
@@ -357,7 +1294,7 @@ Managed-only changes are lifecycle candidates in their own right. A settlement, 
 
 `MAX_MATERIALIZATIONS_PER_ACCOUNT` and `MAX_RECEIPTS_PER_CONSUMER` are lifetime counts by default. Because managed evidence is immutable, a long-lived account eventually reaches them and then stops planning materializations and refuses every receipt with no way back. Construct the store with `new PostgresReportingManagedDeliveryStore(pool, { evidenceRetentionDays })` to make the caps active-scope: only evidence recorded inside that window counts against them, and `pruneExpiredEvidence({ account_id, limit })` deletes what has fallen outside it — never anything still inside the window, never a `pending` or leased materialization, and never a receipt batch inside its own replay retention. Retention has a floor: at least the 30-day receipt replay retention, and at least the strongest durable status or resource-retention horizon registered for the database. Adoption and binding installation exclusively lock the migration-created policy sentinel before account/binding locks; settlement, revocation claim, and pruning hold shared locks on it through their writes. A stronger promise therefore cannot land between a weaker check and its write, while unrelated hot-path readers remain concurrent. Pruning genuinely does its selection before taking the account lock, and asks which receipts a live replay row still names by expanding those rows once rather than posing a containment question per candidate — a shape no index could serve, which held the lock long enough to fail concurrent Core writes with 55P03. Because that selection is unlocked it is a proposal rather than a verdict: every victim is revalidated under the account lock against current live replay rows, surviving receipts and unexpired resources before it is deleted, so a replay that commits in the gap keeps the receipt it promised to reproduce. The revalidation is narrowed to the candidates' own consumers and keys, so the lock still holds no per-candidate scan. The registry lock is held to commit inside the transaction that acts on it, and a precondition such as the installed-window check runs inside that same transaction so a refusal rolls the write back rather than leaving a durable promise nobody validated, so an install cannot read an empty registry while a narrower promise is being registered, and a prune cannot approve a horizon another replica is about to widen. Pruning deletes and tombstones in one statement against one frozen cutoff, so a moving boundary can never leave a deleted row without its permanent identity. Successive prunes demote the tombstones they supersede, so a subject has exactly one tombstone still claiming to be its leaf and a chain pruned twice resolves the same way every time. Re-presenting a pruned receipt byte-identically answers `unchanged` with the instant the tombstone kept, resolves that receipt's own tombstone before any rule about its subject — so an exact re-presentation is not refused as new content for a settled subject — replays the same answer under the same idempotency key by rehydrating from the tombstone when the body is gone, counts as already-resolved for the batch's duplicate-subject rule, and never recreates the row: recreating it restarted the retention clock, undid the storage the prune reclaimed, and moved the published `received_at` to a moment the consumer never filed anything at. A pruned receipt ID can never bind different content, a subject whose accepted leaf expired can never reopen — the read projection consults tombstones, not just live rows — and materialization attempt history survives as a compact terminal record, so a revision that exhausted its attempts or already succeeded does not restart at attempt 1 once its rows age out. Both conclusions — the acceptance and the fact a delivery succeeded — are folded into the live, filtered and lifecycle projections alike. Counters describe exactly the records the response emits, never more and never less, so a buyer recomputing the association cannot see `ASSOCIATED_HISTORY_INCOMPLETE`; retention therefore refuses to prune an acceptance while the resource it accepts is still readable, which is what keeps a `complete` period from having nothing to show for itself. An acceptance carries the consumer that gave it, so one consumer's pruned acceptance never settles the obligation on another's behalf — including the anonymous fail-safe consumer, which owns no acceptances at all. Pruning also removes the expired replay row before the receipts it names, keeps any receipt a surviving replay row still references — a later batch can name an earlier receipt — and keeps any materialization whose resource is still readable or that a retained receipt names as its evidence. An adjustment receipt names no materialization — it names the revision it corrects — so the readable-resource hold matches on that revision as well, or a period whose revision resource was still readable lost the adjustment acceptance behind its own `complete`. Run it from the same scheduler that runs the worker. Lifecycle receipt reads are driven from the obligation's own subjects into a `(subject_id, receipt_kind, recorded_at)` index rather than asking the global receipt table which of its rows belong to an obligation — a question that supplies neither account nor consumer, so every due obligation re-scanned the whole receipt history. The managed state digest, the obligated-consumer roster read and the permanent delivery tombstones do the same — consumer statuses carry an `obligation_id` index and materialization tombstones an `(obligation_id, reached_success, reached_success_at)` one — because that digest is read inside the apply transaction while it holds the account lock: a scan there is a scan with the lock held, which pushed concurrent Core writes past their lock timeout and failed them with 55P03.
 
-The managed tables are additive and do not alter the Core tables. This is the schema boundary coordinated with #2943: that work owns transactional reporting notification/activity intent and the existing webhook delivery/credential plane. Managed Delivery does not create a second webhook sender, outbox, credential store, or subscriber model. Apply both feature migrations after the Core migration in either order; each owns separate tables and both reuse the Core authority.
+The managed tables are additive and do not alter the Core tables. This is the schema boundary coordinated with the reporting notification work: that work owns transactional reporting notification/activity intent and the existing webhook delivery/credential plane. Managed Delivery does not create a second webhook sender, outbox, credential store, or subscriber model. Apply both feature migrations after the Core migration in either order; each owns separate tables and both reuse the Core authority.
 
 ## Transactional reporting notifications and account activity
 
@@ -379,12 +1316,14 @@ only for health changes:
 ```ts
 import { createPostgresPersistentNotificationRuntime } from '@adcp/sdk/server';
 import {
-  createPostgresReportingNotificationActivityRuntime,
-  createPostgresReportingNotificationAttemptCheckpoint,
   PostgresReportingLedgerStore,
   REPORTING_LEDGER_FINALITY_WRITER_FENCE_MIGRATION,
   REPORTING_LEDGER_MIGRATION,
-} from '@adcp/sdk/reporting/ledger';
+} from '@adcp/reporting-storage';
+import {
+  createPostgresReportingNotificationActivityRuntime,
+  createPostgresReportingNotificationAttemptCheckpoint,
+} from '@adcp/reporting-storage/notifications';
 
 // Build the durable pre-POST checkpoint first. The notification runtime needs
 // it, and the activity runtime verifies it targets the same durable store —
@@ -876,7 +1815,7 @@ reconciliation and fails closed if both are supplied, preventing double fire;
 the port's pending rows, rather than `listPendingTransitions()`, own retry.
 
 The activity table is deliberately separate from Core revision and obligation
-rows. Managed Delivery/Reconciled Billing work in #2944 can add immutable
+rows. Managed Delivery/Reconciled Billing work can add immutable
 materialization and receipt tables without changing this transition identity,
 queue schema, or migration ordering.
 
@@ -890,7 +1829,7 @@ In AdCP 3.2, `next_expected_at` has two deliberately different summary meanings.
 
 ## Consumer status ingest
 
-The SDK is pinned to AdCP 3.2.1 and exposes `sync_reporting_status` from the ledger subpath. Its request, response, consumer-status, obligation, issue, delivery-capabilities, and reporting-status types come from the published 3.2.1 schema bundle.
+The SDK is pinned to AdCP 3.2.5 and exposes `sync_reporting_status` from the ledger subpath. Its request, response, consumer-status, obligation, issue, delivery-capabilities, and reporting-status types come from the published 3.2.5 schema bundle.
 
 ```ts
 const syncReportingStatus = createSyncReportingStatusHandler(store, {

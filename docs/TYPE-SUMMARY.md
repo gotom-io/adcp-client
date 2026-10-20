@@ -1,7 +1,7 @@
 # AdCP Type Summary
 
-> Generated at: 2026-10-01
-> @adcp/sdk v14.0.0
+> Generated at: 2026-10-19
+> @adcp/sdk v16.0.0
 
 Curated reference of the types that matter for using the AdCP client. For full generated types see `src/lib/types/tools.generated.ts` and `src/lib/types/core.generated.ts`.
 
@@ -49,6 +49,11 @@ interface A2ALegacyCompatOptions {
 }
 
 interface TransportOptions {
+  // Defaults to 4 MiB (DEFAULT_MAX_RESPONSE_BYTES); only 0 opts out
+  // (Infinity / negatives fall back to the default).
+  // SSE is bounded per event plus `maxResponseBytes * 2` cumulative per call.
+  // Over-cap responses throw ResponseTooLargeError; nothing is truncated.
+  // A per-call `transport` replaces this object; it does not merge.
   maxResponseBytes?: number;
   trustedFetchFn?: typeof fetch;
   allowPrivateIp?: boolean;
@@ -56,7 +61,41 @@ interface TransportOptions {
   legacyCompat?: A2ALegacyCompatOptions; // A2A only
 }
 
+// Selected transport observer fields; correlate all events by transportRequestId.
+type TransportActivityType = 'request_started' | 'response_received' | 'response_completed' | 'request_failed';
+type TransportResponseOutcome = 'ended' | 'errored' | 'aborted' | 'cancelled';
+interface TransportActivity {
+  type: TransportActivityType;
+  transportRequestId: string;
+  durationMs?: number; // response_received: time to headers; response_completed: total time
+  streaming?: boolean; // Uncaptured body: terminal observation follows consumption or abort
+  outcome?: TransportResponseOutcome; // response_completed only
+  bytes?: number; // Bytes forwarded before the terminal outcome; no stream payload retained
+}
+
+// Share discovery across request-local clients using an application-owned authorization identity.
+interface AgentDiscoveryCacheConfig {
+  cache: AgentDiscoveryCache; // get / set / delete; synchronous or asynchronous
+  authIdentity: string; // Trusted principal and authorization scope; never a token
+  ttlMs?: number; // Default: five minutes; maximum: 24 hours
+}
+const discoveryCache = createInMemoryAgentDiscoveryCache({ maxEntries: 256 });
+const client = new SingleAgentClient(agentConfig, {
+  discoveryCache: { cache: discoveryCache, authIdentity: 'tenant:buyer-scope', ttlMs: 300_000 },
+});
+// Public from @adcp/sdk, @adcp/sdk/client, and @adcp/sdk/advanced.
+await withMCPConnectionScope(async () => { await client.getCapabilities(); /* ...tool calls... */ });
+// closeScopedConnections() can close the current workflow early.
+interface AgentDiscoverySeed {
+  capabilities: AdcpCapabilities; // Authoritative evidence, never synthetic
+  toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  endpoint?: { agentUri: string; mcpEra?: 'legacy' | 'modern' }; // Same origin, no URL userinfo
+}
+// client.primeDiscoveryCache(seed): Promise<boolean>; also available on AgentClient.
+// client.invalidateDiscoveryCache(): Promise<void>; refresh after a seller change.
+
 interface TaskOptions {
+  skipStatusHandlers?: boolean; // Skip inline completion handlers, including continuations
   timeout?: number;             // Absolute whole-task deadline
   signal?: AbortSignal;         // Caller cancellation
   // Direct A2A mutation route, bound to authenticated principal + account scope.
@@ -2861,9 +2900,23 @@ interface InlineReportingAvailabilityEvidenceV1 {
 
 ## Seller Reporting Ledger
 
-Ledger symbols import from `@adcp/sdk/reporting/ledger`; `createPostgresPersistentNotificationRuntime` is a server symbol and imports from `@adcp/sdk/server`.
+The ledger interface, handlers and producer import from `@adcp/sdk/reporting/ledger`. The PostgreSQL store, its migrations, row storage and maintenance import from `@adcp/reporting-storage`, managed delivery from `@adcp/reporting-storage/managed` and notification activity from `@adcp/reporting-storage/notifications` (install `@adcp/reporting-storage` next to `@adcp/sdk`; it is pre-1.0 and every export is experimental). `createPostgresPersistentNotificationRuntime` is a server symbol and imports from `@adcp/sdk/server`.
 
 ```typescript
+import { Pool } from 'pg';
+import { createPostgresPersistentNotificationRuntime } from '@adcp/sdk/server';
+import {
+  createReportingDeliveryHandler,
+  createReportingProducer,
+  createReportingStatusHandler,
+  createSyncReportingStatusHandler,
+} from '@adcp/sdk/reporting/ledger';
+import { PostgresReportingLedgerStore, REPORTING_LEDGER_MIGRATION } from '@adcp/reporting-storage';
+import {
+  createPostgresReportingNotificationActivityRuntime,
+  createPostgresReportingNotificationAttemptCheckpoint,
+} from '@adcp/reporting-storage/notifications';
+
 // Build the notification path first: the store must be constructed with the
 // activity port, or lifecycle transitions record no activity and notify nobody.
 const attemptCheckpoint = createPostgresReportingNotificationAttemptCheckpoint({
@@ -2926,6 +2979,9 @@ The store freezes configuration lineage and period-end denominators, retains imm
 Import from `@adcp/sdk/reporting/service`. This is the adapter-first lifecycle owner over the source and ledger primitives; it does not introduce another store or transport.
 
 ```typescript
+import { createReliableReportingService } from '@adcp/sdk/reporting/service';
+import { PostgresReportingLedgerStore, reportingLedgerMaintenance } from '@adcp/reporting-storage';
+
 interface ReliableReportingAdapterV1 {
   readonly sourceOffering: ReportingSourceOfferingV1;
   readonly deliveryOffering: ReportingDeliveryOffering;
@@ -2948,9 +3004,10 @@ const reporting = createReliableReportingService({
   resolveCurrency: account => currency,
   resolveCoverage: account => ({ constituents }), // authorized media-buy/package denominator
   resolveConsumerId, // optional; controls consumer-status handler/capability
+  maintenance: reportingLedgerMaintenance({ retention: { enabled: true } }), // optional factory from @adcp/reporting-storage
 });
 
-await pool.query(reporting.setup.migrations[0]);
+for (const sql of reporting.setup.migrations) await pool.query(sql);
 const installedPlatform = reporting.install(platform);
 await reporting.installConfiguration(configuration, { account: ctx.account });
 await reporting.runCycle({ accountId }); // tenant-partitioned
@@ -2960,7 +3017,7 @@ await reporting.stop();
 
 Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free `sourceScope`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply `account`, `sourceScope`, `sourceTimezone`, `contract`, `currency`, `constituents`, or `mediaBuyIds`; `mediaBuyIds` is derived from `resolveCoverage`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires `platform.accounts.upsert`, which owns the advertised `sync_accounts` configuration path.
 
-For complete seller production assembly, use async `createPostgresReliableReportingProductionService` from `@adcp/sdk/reporting/service`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply `activity.tenantScopeForAccount`; Reconciled Billing offerings also require a trusted `obligatedConsumers` roster. Its scheduler and `recoverOnce` require explicit `deploymentWide: true` because recovery scans the whole namespace. See `docs/guides/REPORTING-LEDGER.md` and `docs/guides/REPORTING-OPERATIONS.md`.
+For complete seller production assembly, use async `createPostgresReliableReportingProductionService` from `@adcp/reporting-storage/service`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply `activity.tenantScopeForAccount`; Reconciled Billing offerings also require a trusted `obligatedConsumers` roster. Its scheduler and `recoverOnce` require explicit `deploymentWide: true` because recovery scans the whole namespace. See `docs/guides/REPORTING-LEDGER.md` and `docs/guides/REPORTING-OPERATIONS.md`.
 
 Buyer production processes use `createPostgresReportingConsumerRuntimeV1` with `createReliableReportingConsumerV1` from the package root. Verify webhook signatures before passing authenticated hints, preserve seller/principal scope, and configure `evaluateAdjustment` to authorize integrity-valid post-official corrections; the default defers them. See `docs/guides/REPORTING-RECONCILIATION.md`.
 

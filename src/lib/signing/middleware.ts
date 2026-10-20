@@ -4,6 +4,7 @@ import { RequestSignatureError } from './errors';
 import { InMemoryReplayStore } from './replay';
 import { InMemoryRevocationStore } from './revocation';
 import { verifyRequestSignature, type VerifyRequestOptions } from './verifier';
+import type { ResolvedOperation } from './operation-resolution';
 import type { VerifiedSigner } from './types';
 
 declare module 'http' {
@@ -67,6 +68,13 @@ export interface ExpressMiddlewareOptions extends Omit<
    * the verifier will then treat the request as "not in any required_for"
    * and accept unsigned traffic rather than rejecting.
    *
+   * Return {@link UNRESOLVABLE_OPERATION} for a body that does not resolve to
+   * exactly one operation; the verifier then rejects it with
+   * `request_body_malformed`, signed or not. `resolveRequestOperation` (and
+   * `adcpOperationResolver` from `@adcp/sdk/server`) implements the MCP and A2A
+   * rules, including that fail-closed result, and is what `createAdcpServer`
+   * auto-wires.
+   *
    * SECURITY: a `resolveOperation` that always returns `undefined` — for
    * example, a routing helper that silently fails to match — disables
    * `required_for` enforcement globally. Unsigned requests on signed-only
@@ -75,7 +83,7 @@ export interface ExpressMiddlewareOptions extends Omit<
    * asserting `resolveOperation(req)` is non-undefined for sample signed
    * requests is the simplest guard.
    */
-  resolveOperation: (req: ExpressLike) => string | undefined;
+  resolveOperation: (req: ExpressLike) => ResolvedOperation;
   /**
    * Override how the request's full URL is reconstructed. Use when the server
    * sits behind a TLS-terminating or path-rewriting load balancer, since
@@ -99,6 +107,26 @@ export function createExpressVerifier(options: ExpressMiddlewareOptions) {
     res: { status: (code: number) => { set: (k: string, v: string) => { json: (body: unknown) => void } } },
     next: NextFn
   ): Promise<void> {
+    // Profile selection (AdCP 3.3 R2): a message carrying Signature-Agent or
+    // the web-bot-auth tag is verified under Web Bot Auth only, never under
+    // RFC 9421. This middleware does not implement Web Bot Auth, so it refuses
+    // the request the way the server integrations do when the profile is not
+    // configured: 403 without an Accept-Signature challenge.
+    // Loaded lazily so the RFC 9421 middleware keeps Web Bot Auth out of the
+    // focused client's eager module graph.
+    const { selectSignatureProfile, WebBotAuthError } = require('./web-bot-auth') as typeof import('./web-bot-auth');
+    if (selectSignatureProfile({ headers: req.headers }) === 'web-bot-auth') {
+      const refused = new WebBotAuthError(403, 'profile_disabled');
+      res
+        .status(refused.status)
+        .set('Cache-Control', 'no-store')
+        .json({
+          ...refused.body,
+          message:
+            'Web Bot Auth is not configured on this endpoint; use createAdcpServer signedRequests.webBotAuth or verifySignatureAsAuthenticator({ webBotAuth })',
+        });
+      return;
+    }
     try {
       const url = options.getUrl ? options.getUrl(req) : defaultUrl(req);
       const body = resolveRawBody(req);
@@ -119,6 +147,7 @@ export function createExpressVerifier(options: ExpressMiddlewareOptions) {
           keyid: result.keyid,
           agent_url: result.agent_url,
           verified_at: result.verified_at,
+          ...(result.operatorRecord !== undefined && { operatorRecord: result.operatorRecord }),
         };
       }
       next();

@@ -1,6 +1,7 @@
 import { ADCPError } from '../errors';
 import type { RequestSigningErrorCode } from '../types/core.generated';
-export { RequestSigningErrorCodeMetadata } from '../types/enums.generated';
+import { RequestSigningErrorCodeMetadata } from '../types/enums.generated';
+export { RequestSigningErrorCodeMetadata };
 
 /** Canonical rc.6 request-signing transport vocabulary. */
 export type RequestSignatureErrorCode = RequestSigningErrorCode;
@@ -8,11 +9,19 @@ export type RequestSignatureErrorCode = RequestSigningErrorCode;
 export class RequestSignatureError extends ADCPError {
   readonly code: RequestSignatureErrorCode;
   readonly failedStep: number;
+  readonly recovery: 'transient' | 'correctable' | 'terminal';
 
-  constructor(code: RequestSignatureErrorCode, failedStep: number, message: string, details?: unknown) {
+  constructor(
+    code: RequestSignatureErrorCode,
+    failedStep: number,
+    message: string,
+    details?: unknown,
+    recovery?: 'transient' | 'correctable' | 'terminal'
+  ) {
     super(message, details);
     this.code = code;
     this.failedStep = failedStep;
+    this.recovery = recovery ?? RequestSigningErrorCodeMetadata[code].recovery;
   }
 }
 
@@ -62,11 +71,20 @@ export type WebhookSignatureErrorCode =
 export class WebhookSignatureError extends ADCPError {
   readonly code: WebhookSignatureErrorCode;
   readonly failedStep: number;
+  /** Local retry signal; the wire error code stays in the webhook vocabulary. */
+  readonly retryable: boolean;
 
-  constructor(code: WebhookSignatureErrorCode, failedStep: number, message: string, details?: unknown) {
+  constructor(
+    code: WebhookSignatureErrorCode,
+    failedStep: number,
+    message: string,
+    details?: unknown,
+    retryable = false
+  ) {
     super(message, details);
     this.code = code;
     this.failedStep = failedStep;
+    this.retryable = retryable;
   }
 }
 

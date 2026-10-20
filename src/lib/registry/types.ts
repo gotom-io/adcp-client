@@ -252,14 +252,34 @@ type RegistryResolveIdentifiersRequest = NonNullable<
   operations['resolveIdentifiers']['requestBody']
 >['content']['application/json'];
 
-/** Request body for POST /api/registry/resolve. `mode` defaults to `resolve` server-side. */
-export type ResolveIdentifiersRequest = Omit<RegistryResolveIdentifiersRequest, 'mode'> & {
+/** Request body for POST /api/registry/resolve. Mode and sandbox use the registry's defaults when omitted. */
+export type ResolveIdentifiersRequest = Omit<RegistryResolveIdentifiersRequest, 'mode' | 'sandbox'> & {
   mode?: RegistryResolveIdentifiersRequest['mode'];
+  sandbox?: RegistryResolveIdentifiersRequest['sandbox'];
 };
 
 /** Response from POST /api/registry/resolve (200) */
 export type ResolveIdentifiersResponse =
   operations['resolveIdentifiers']['responses']['200']['content']['application/json'];
+
+export interface ResolveIdentifiersAllOptions {
+  /** Per-request identifier cap, from 1 through the registry limit of 10,000. */
+  batchSize?: number;
+  /** UTF-8 JSON request cap including provenance and envelope. Default: 1 MiB. */
+  maxRequestBytes?: number;
+  /** Maximum simultaneous requests. Default: 2. */
+  concurrency?: number;
+  /** Retries for HTTP 429 only. Other failures are returned without retrying contributions. Default: 3. */
+  maxRetries?: number;
+  /** Maximum server-requested retry delay. Default: 60 seconds; longer rate limits return errors without early retries. */
+  maxRetryDelayMs?: number;
+}
+
+/** One outcome per input, in input order (including duplicates). */
+export type ResolveIdentifierOutcome = {
+  index: number;
+  identifier: ResolveIdentifiersRequest['identifiers'][number];
+} & ({ success: true; result: ResolveIdentifiersResponse['resolved'][number] } | { success: false; error: Error });
 
 /** Request body for POST /api/registry/catalog/disputes */
 export type FileCatalogDisputeRequest = NonNullable<

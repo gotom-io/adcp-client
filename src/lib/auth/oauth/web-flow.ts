@@ -50,7 +50,15 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import type { AgentConfig, OAuthConfigStorage } from './types';
-import { DEFAULT_CLIENT_METADATA, fromMCPClientInfo, fromMCPTokens, OAuthError, toMCPClientInfo } from './types';
+import {
+  DEFAULT_CLIENT_METADATA,
+  fromMCPClientInfo,
+  fromMCPTokens,
+  OAuthError,
+  toMCPClientInfo,
+  assertOAuthCredentialIssuer,
+  assertOAuthServerIssuer,
+} from './types';
 import { validateOAuthResourceUrl } from './resource-url';
 import { ssrfSafeFetch } from '../../net/ssrf-fetch';
 
@@ -88,6 +96,8 @@ export interface PendingWebFlow {
   resourceOverrideSnapshot?: string | null;
   scope?: string;
   authorizationServerUrl: string;
+  /** Validated AS issuer frozen at start. Legacy rows without it cannot spend credentials. */
+  authorizationServerIssuer?: string;
   /** Persist as JSON (e.g. Postgres `jsonb`); contents are MCP SDK-typed. */
   clientInformation: OAuthClientInformation;
   createdAt: Date;
@@ -385,6 +395,9 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
   if (!asMetadata) {
     throw new OAuthError(`No OAuth metadata at ${asUrl.toString()}`, 'no_authorization_server_metadata', agent.id);
   }
+  assertOAuthServerIssuer(asMetadata, asUrl.toString());
+  const authorizationServerIssuer = asUrl.toString();
+  assertSavedCredentialIssuers(agent, authorizationServerIssuer);
 
   const resource = resourceOverride
     ? new URL(resourceOverride)
@@ -408,6 +421,7 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
     clientMetadata: baseClientMetadata,
     fetchFn: guardedFetch,
     allowConfidentialClient,
+    issuer: authorizationServerIssuer,
   });
 
   const state = (generateState ?? defaultGenerateState)();
@@ -437,6 +451,7 @@ export async function startWebOAuthFlow(opts: StartWebFlowOptions): Promise<Star
     resourceOverrideSnapshot: agent.oauth_resource ?? null,
     scope,
     authorizationServerUrl: asUrl.toString(),
+    authorizationServerIssuer,
     clientInformation,
     createdAt: now,
     expiresAt,
@@ -484,7 +499,7 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
   }
 
   const flow = await pendingFlowStore.consume(state);
-  if (!flow || flow.expiresAt.getTime() < Date.now()) {
+  if (!flow || flow.expiresAt.getTime() <= Date.now()) {
     throw new InvalidOrExpiredFlowError(state);
   }
 
@@ -499,6 +514,20 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
   const asMetadata = await discoverAuthorizationServerMetadata(flow.authorizationServerUrl, {
     fetchFn: guardedFetch,
   });
+  assertOAuthServerIssuer(asMetadata, flow.authorizationServerUrl);
+  assertFrozenIssuer(flow);
+  assertOAuthCredentialIssuer(
+    flow.clientInformation,
+    flow.authorizationServerIssuer,
+    !!flow.clientInformation.client_secret
+  );
+
+  // A clear or replacement during metadata discovery must also refuse before
+  // spending the frozen client secret. Atomic adapter CAS remains separate.
+  if (agentStorage) {
+    agentForPersistence = await agentStorage.loadAgent(flow.agentId);
+    assertAgentUnchangedForFlow(agentForPersistence, flow);
+  }
 
   let tokens: OAuthTokens;
   try {
@@ -511,6 +540,8 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
       resource: flow.resource ? new URL(flow.resource) : undefined,
       fetchFn: guardedFetch,
     });
+    // The response's issuer extension is untrusted; stamp from the frozen flow.
+    tokens = { ...tokens, issuer: flow.authorizationServerIssuer };
   } catch (err) {
     throw wrapTokenExchangeError(err);
   }
@@ -529,7 +560,8 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
     } else if (flow.resourceOverrideAction === 'clear') {
       delete agentForPersistence.oauth_resource;
     }
-    delete agentForPersistence.oauth_code_verifier;
+    agentForPersistence.oauth_code_verifier = undefined;
+    agentForPersistence.oauth_discovery_state = undefined;
     await agentStorage.saveAgent(agentForPersistence);
     persisted = true;
   }
@@ -543,6 +575,24 @@ export async function completeWebOAuthFlow(opts: CompleteWebFlowOptions): Promis
   };
 }
 
+function assertSavedCredentialIssuers(agent: AgentConfig, issuer: string): void {
+  if (agent.oauth_tokens) assertOAuthCredentialIssuer(agent.oauth_tokens, issuer, !!agent.oauth_tokens.refresh_token);
+  if (agent.oauth_client) assertOAuthCredentialIssuer(agent.oauth_client, issuer, !!agent.oauth_client.client_secret);
+}
+
+function assertFrozenIssuer(
+  flow: PendingWebFlow
+): asserts flow is PendingWebFlow & { authorizationServerIssuer: string } {
+  if (!flow.authorizationServerIssuer) {
+    throw new OAuthError(
+      'Pending OAuth flow lacks a validated authorization-server issuer. Start a new owner sign-in.',
+      'oauth_issuer_required',
+      flow.agentId
+    );
+  }
+  assertOAuthServerIssuer({ issuer: flow.authorizationServerIssuer }, flow.authorizationServerUrl);
+}
+
 function assertAgentUnchangedForFlow(
   agent: AgentConfig | undefined,
   flow: PendingWebFlow
@@ -553,6 +603,13 @@ function assertAgentUnchangedForFlow(
   if (agent.agent_uri !== flow.agentUrl) {
     throw new AgentChangedDuringFlowError(flow.agentId);
   }
+  if (!agent.oauth_client) throw new AgentChangedDuringFlowError(flow.agentId);
+  const currentClient = toMCPClientInfo(agent.oauth_client);
+  for (const key of ['client_id', 'client_secret', 'client_secret_expires_at', 'issuer'] as const) {
+    if (currentClient[key] !== flow.clientInformation[key]) throw new AgentChangedDuringFlowError(flow.agentId);
+  }
+  assertFrozenIssuer(flow);
+  assertSavedCredentialIssuers(agent, flow.authorizationServerIssuer);
   if (
     Object.prototype.hasOwnProperty.call(flow, 'resourceOverrideSnapshot') &&
     (agent.oauth_resource ?? null) !== flow.resourceOverrideSnapshot
@@ -620,7 +677,7 @@ export class InMemoryPendingFlowStore implements PendingWebFlowStore {
     const flow = this.flows.get(state);
     if (!flow) return null;
     this.flows.delete(state);
-    if (flow.expiresAt.getTime() < Date.now()) return null;
+    if (flow.expiresAt.getTime() <= Date.now()) return null;
     return flow;
   }
 
@@ -628,7 +685,7 @@ export class InMemoryPendingFlowStore implements PendingWebFlowStore {
     const now = Date.now();
     let removed = 0;
     for (const [state, flow] of this.flows) {
-      if (flow.expiresAt.getTime() < now) {
+      if (flow.expiresAt.getTime() <= now) {
         this.flows.delete(state);
         removed++;
       }
@@ -779,8 +836,9 @@ async function resolveClientInformation(args: {
   clientMetadata: OAuthClientMetadata;
   fetchFn?: typeof fetch;
   allowConfidentialClient: boolean;
+  issuer: string;
 }): Promise<OAuthClientInformation> {
-  const { agent, agentStorage, asUrl, asMetadata, clientMetadata, fetchFn, allowConfidentialClient } = args;
+  const { agent, agentStorage, asUrl, asMetadata, clientMetadata, fetchFn, allowConfidentialClient, issuer } = args;
 
   if (agent.oauth_client) {
     return toMCPClientInfo(agent.oauth_client);
@@ -794,11 +852,12 @@ async function resolveClientInformation(args: {
     );
   }
 
-  const registered: OAuthClientInformationFull = await registerClient(asUrl.toString(), {
+  const response: OAuthClientInformationFull = await registerClient(asUrl.toString(), {
     metadata: asMetadata,
     clientMetadata,
     fetchFn,
   });
+  const registered: OAuthClientInformationFull = { ...response, issuer };
 
   if (registered.client_secret && !allowConfidentialClient) {
     throw new ConfidentialClientNotAllowedError(agent.id);
@@ -808,7 +867,10 @@ async function resolveClientInformation(args: {
     // Load fresh and save fresh so two concurrent /start calls for the
     // same agentId do not trample each other's `oauth_client` via a
     // shared in-memory reference.
-    const fresh = (await agentStorage.loadAgent(agent.id)) ?? agent;
+    const fresh = await agentStorage.loadAgent(agent.id);
+    if (!fresh) throw new AgentVanishedDuringFlowError(agent.id);
+    if (fresh.agent_uri !== agent.agent_uri || fresh.oauth_client) throw new AgentChangedDuringFlowError(agent.id);
+    assertSavedCredentialIssuers(fresh, issuer);
     fresh.oauth_client = fromMCPClientInfo(registered);
     await agentStorage.saveAgent(fresh);
   }

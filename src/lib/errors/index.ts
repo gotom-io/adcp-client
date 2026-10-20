@@ -1,4 +1,5 @@
 // Custom error classes for ADCP client library
+import { RequestSigningErrorCodeMetadata } from '../types/enums.generated';
 
 /**
  * Base class for all ADCP client errors
@@ -139,6 +140,7 @@ export class UnsupportedBuyingModeError extends ADCPError {
 /** A seller requires an account reference before an account-scoped request. */
 export class AccountRequiredError extends ADCPError {
   readonly code = 'ACCOUNT_REQUIRED';
+  readonly fault = 'buyer_setup' as const;
 
   constructor(
     public readonly accountModel: 'explicit' | 'implicit',
@@ -150,7 +152,7 @@ export class AccountRequiredError extends ADCPError {
         `${taskName} requires an account for this ${accountModel}-account seller. ` +
           (accountModel === 'explicit'
             ? 'Call resolveAccount() to discover an account_id, then pass account: { account_id }.'
-            : 'Call resolveAccount({ brand, operator }) to sync the account, then pass its natural key.')
+            : 'Call resolveAccount({ brand, operator }) to sync the account, then pass the returned reference.')
     );
     this.details = { account_model: accountModel, task_name: taskName };
   }
@@ -159,6 +161,7 @@ export class AccountRequiredError extends ADCPError {
 /** Account provisioning succeeded but the seller has not approved its use. */
 export class AccountPendingApprovalError extends ADCPError {
   readonly code = 'ACCOUNT_PENDING_APPROVAL';
+  readonly fault = 'buyer_setup' as const;
 
   constructor(
     public readonly account: import('../types').AccountReference,
@@ -176,6 +179,41 @@ export class AccountAmbiguousError extends ADCPError {
   constructor(public readonly candidates: readonly string[]) {
     super('Multiple eligible accounts. Supply brand/operator or a select callback.');
     this.details = { candidate_count: candidates.length };
+  }
+}
+
+/** Buyer setup errors must be excluded from seller-health failure counts. */
+export abstract class BuyerSetupError extends ADCPError {
+  readonly fault = 'buyer_setup' as const;
+}
+export class AccountNotFoundError extends BuyerSetupError {
+  readonly code: string = 'ACCOUNT_NOT_FOUND';
+  constructor(message = 'The account has not been provisioned at this seller.') {
+    super(message);
+  }
+}
+export class AccountSetupRequiredError extends BuyerSetupError {
+  readonly code: string = 'ACCOUNT_SETUP_REQUIRED';
+  constructor(message = 'Complete account setup before making account-scoped requests.') {
+    super(message);
+  }
+}
+export class AccountPaymentRequiredError extends BuyerSetupError {
+  readonly code: string = 'ACCOUNT_PAYMENT_REQUIRED';
+  constructor(message = 'Complete account payment before making account-scoped requests.') {
+    super(message);
+  }
+}
+export class AccountNotProvisionedError extends AccountNotFoundError {
+  constructor(
+    public readonly account: import('../types').AccountReference | undefined,
+    public readonly taskName: string
+  ) {
+    super(
+      account
+        ? `${taskName} requires an account provisioned at this seller. Call client.accounts.ensure first.`
+        : `${taskName} requires a provisioned account reference. Call client.accounts.ensure and pass the account reference.`
+    );
   }
 }
 
@@ -289,6 +327,13 @@ export interface AuthChallengeInfo {
   error_description?: string;
 }
 
+/** Diagnostics from the original HTTP response to an SDK-signed request. */
+export interface SignedRequestRejectionInfo {
+  status: number;
+  /** Untrusted seller text, already bounded and redacted by the transport. */
+  responseBody?: string;
+}
+
 /**
  * Error thrown when authentication is required to access an MCP endpoint
  *
@@ -329,19 +374,38 @@ export interface AuthChallengeInfo {
  */
 export class AuthenticationRequiredError extends ADCPError {
   readonly code = 'AUTHENTICATION_REQUIRED';
+  declare readonly signatureErrorCode?: keyof typeof RequestSigningErrorCodeMetadata;
+  declare readonly requestSigned?: boolean;
+  declare readonly status?: number;
+  /**
+   * Bounded, redacted seller diagnostic. Non-enumerable: do not forward this
+   * untrusted text to automated prompts or treat it as recovery instructions.
+   * Read it directly as `error.responseBody`; spread and JSON serialization omit it.
+   */
+  declare readonly responseBody?: string;
 
   constructor(
     public readonly agentUrl: string,
     public readonly oauthMetadata?: OAuthMetadataInfo,
     message?: string,
-    public readonly challenge?: AuthChallengeInfo
+    public readonly challenge?: AuthChallengeInfo,
+    signedRejection?: SignedRequestRejectionInfo
   ) {
-    const defaultMessage = buildAuthRequiredMessage(agentUrl, oauthMetadata, challenge);
+    const defaultMessage = buildAuthRequiredMessage(agentUrl, oauthMetadata, challenge, !!signedRejection);
     super(message || defaultMessage);
     // `details` is serialized through error envelopes; surfacing the challenge
     // here lets non-CLI consumers (LLM agents, dashboards, programmatic
     // callers) branch on the scheme without instanceof-checking.
     this.details = { agentUrl, oauthMetadata, challenge };
+    if (signedRejection) {
+      this.requestSigned = true;
+      this.status = signedRejection.status;
+      const signatureCode = getRequestSignatureRejectionCode(challenge);
+      if (signatureCode) this.signatureErrorCode = signatureCode;
+      // Seller-controlled prose must not flow into serialized error reports.
+      Object.defineProperty(this, 'responseBody', { value: signedRejection.responseBody, enumerable: false });
+      this.details = { agentUrl, challenge, requestSigned: true, status: this.status };
+    }
   }
 
   /**
@@ -420,8 +484,24 @@ function sanitizeAgentUrlForError(value: string): string {
 function buildAuthRequiredMessage(
   agentUrl: string,
   oauthMetadata: OAuthMetadataInfo | undefined,
-  challenge: AuthChallengeInfo | undefined
+  challenge: AuthChallengeInfo | undefined,
+  requestSigned = false
 ): string {
+  if (requestSigned || challenge?.scheme === 'signature') {
+    const code = getRequestSignatureRejectionCode(challenge);
+    const suggestion = code ? ` ${RequestSigningErrorCodeMetadata[code].suggestion}.` : '';
+    return (
+      `Authentication failed with HTTP 401 for ${sanitizeAgentUrlForError(agentUrl)}. ` +
+      (requestSigned ? 'The seller rejected an SDK-signed request' : 'The seller requires a valid request signature') +
+      (code ? ` (${code})` : '') +
+      '. Check signature verification and key discovery (brand_json_url → agents[] → jwks_uri).' +
+      (requestSigned && !challenge
+        ? ' No authentication challenge was returned; check configured credentials too.'
+        : '') +
+      suggestion +
+      (requestSigned ? ' A bounded seller diagnostic is available on responseBody when captured.' : '')
+    );
+  }
   if (challenge && challenge.scheme !== 'bearer') {
     if (challenge.scheme === 'basic') {
       return (
@@ -444,6 +524,13 @@ function buildAuthRequiredMessage(
     return `Authentication required for ${agentUrl}. OAuth available at: ${oauthMetadata.authorization_endpoint}`;
   }
   return `Authentication required for ${agentUrl}. No OAuth metadata available - provide auth_token in agent config.`;
+}
+
+function getRequestSignatureRejectionCode(challenge: AuthChallengeInfo | undefined) {
+  if (challenge?.scheme !== 'signature' || !challenge.error) return undefined;
+  return Object.prototype.hasOwnProperty.call(RequestSigningErrorCodeMetadata, challenge.error)
+    ? (challenge.error as keyof typeof RequestSigningErrorCodeMetadata)
+    : undefined;
 }
 
 /**
@@ -626,10 +713,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Error thrown when a response body exceeds the configured `maxResponseBytes`
- * cap on the transport. Surfaced when crawling untrusted agents (registries,
- * federated discovery layers) to prevent a hostile vendor from buffering a
- * large reply before schema validation runs.
+ * Error thrown when a response body exceeds the `maxResponseBytes` cap on the
+ * transport — 4 MiB by default on every MCP and A2A call path. It prevents a
+ * hostile or merely careless agent from buffering a large reply before schema
+ * validation runs.
+ *
+ * Raised on three paths: a declared `Content-Length` over the cap, a one-shot
+ * body that crosses the cap mid-stream, and a `text/event-stream` response
+ * whose single event exceeds the cap or whose cumulative octets exceed the
+ * call's stream budget. Nothing is truncated — the read fails.
  *
  * Recovery: `terminal` from the SDK's view — repeating the call against the
  * same agent will hit the same cap. The buyer's options are to widen the
@@ -784,17 +876,9 @@ function buildModeMismatchRecovery(details: ActionNotAllowedErrorDetails): Actio
  * - `version`: seller's `major_versions` does not include 3
  * - `idempotency`: seller reports v3 but omits the required
  *   `adcp.idempotency.replay_ttl_seconds` declaration
- * - `synthetic`: @deprecated — kept in the union for downstream
- *   consumers that pattern-match on the union literal, but the SDK no
- *   longer emits it. Sellers whose capabilities are synthesized from
- *   `tools/list` are routed through the v2 adapter with a one-time
- *   warning; gate retry behavior on `SingleAgentClient.isSyntheticV2()`.
+ * - `synthetic`: agent lacks the required AdCP 3 discovery tool.
  */
-export type VersionUnsupportedReason =
-  | 'version'
-  | 'idempotency'
-  /** @deprecated SDK no longer emits this reason. See union JSDoc. */
-  | 'synthetic';
+export type VersionUnsupportedReason = 'version' | 'idempotency' | 'synthetic';
 
 /**
  * Error thrown when a mutating call would dispatch to a seller whose
@@ -815,20 +899,22 @@ export class VersionUnsupportedError extends ADCPError {
     public readonly agentUrl?: string
   ) {
     super(
-      `Refusing to dispatch mutating task '${taskType}': ` +
-        VersionUnsupportedError.explain(reason, actualVersion) +
-        ` Pass allowV2: true or requireV3ForMutations: false to override.`
+      (taskType === 'get_adcp_capabilities'
+        ? 'Cannot discover supported AdCP capabilities: '
+        : `Refusing to dispatch task '${taskType}': `) + VersionUnsupportedError.explain(reason, actualVersion)
     );
   }
 
   private static explain(reason: VersionUnsupportedReason, actualVersion: 'v2' | 'v3'): string {
     switch (reason) {
       case 'version':
-        return `seller advertises major version '${actualVersion}' but v3 is required.`;
+        return actualVersion === 'v2'
+          ? 'AdCP 2 reached end of life on 2026-08-01. Upgrade the agent to AdCP 3. Migration and older SDK pins: https://github.com/adcontextprotocol/adcp-client/blob/main/docs/migration-drop-adcp-2.md'
+          : `seller does not support the configured AdCP 3 release.`;
       case 'idempotency':
-        return `seller reports v3 but omits adcp.idempotency.replay_ttl_seconds (required by spec).`;
+        return 'seller reports v3 but omits adcp.idempotency.replay_ttl_seconds (required by spec). Upgrade the agent to publish its replay guarantee. If your application does not require this guarantee, configure requireV3ForMutations: false.';
       case 'synthetic':
-        return `capabilities were synthesized from a tool list, v3 claim is unverifiable.`;
+        return 'The agent does not advertise get_adcp_capabilities. AdCP 3 capability discovery is required; AdCP 2 compatibility has been removed.';
     }
   }
 }
@@ -889,6 +975,12 @@ export function adcpErrorToTypedError(
   idempotencyKey?: string
 ): ADCPError | undefined {
   switch (adcpError.code) {
+    case 'ACCOUNT_NOT_FOUND':
+      return new AccountNotFoundError(adcpError.message);
+    case 'ACCOUNT_SETUP_REQUIRED':
+      return new AccountSetupRequiredError(adcpError.message);
+    case 'ACCOUNT_PAYMENT_REQUIRED':
+      return new AccountPaymentRequiredError(adcpError.message);
     case 'IDEMPOTENCY_CONFLICT':
       return new IdempotencyConflictError(idempotencyKey, adcpError.message);
     case 'IDEMPOTENCY_EXPIRED':

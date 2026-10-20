@@ -82,6 +82,12 @@ function isRuntimeSchemaDirectory(name: string): boolean {
  * with a useful field name from `resolveAdcpVersion`.
  */
 export function resolveBundleKey(version: string): string {
+  if (/^v?2(?:\.|$)/.test(version)) {
+    throw new ConfigurationError(
+      'AdCP 2 reached end of life on 2026-08-01; only AdCP 3 schema bundles are supported.',
+      'adcpVersion'
+    );
+  }
   // Bare 'MAJOR.MINOR' (no patch).
   const minorOnly = version.match(/^(\d+)\.(\d+)$/);
   if (minorOnly) return `${minorOnly[1]}.${minorOnly[2]}`;
@@ -246,6 +252,27 @@ export function toReleasePrecisionWire(bundleKeyOrVersion: string): string {
  * surface the error; the construction-time fence in `resolveAdcpVersion`
  * catches most cross-major mistakes before this point.
  */
+const identity33Scope = new AsyncLocalStorage<boolean>();
+/** @internal Draft schema resolution is scoped to an explicitly configured instance. */
+export function isIdentity33SchemaScope(): boolean {
+  return identity33Scope.getStore() === true;
+}
+export function withIdentity33SchemaScope<T>(fn: () => T, enabled = true): T {
+  return identity33Scope.run(enabled, fn);
+}
+export function bindIdentity33SchemaScope<T extends object>(instance: T): T {
+  return new Proxy(instance, {
+    get(target, property, receiver) {
+      const value = withIdentity33SchemaScope(() => Reflect.get(target, property, receiver));
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      if (descriptor && !descriptor.configurable && 'value' in descriptor && !descriptor.writable) return value;
+      return typeof value === 'function'
+        ? (...args: unknown[]) => withIdentity33SchemaScope(() => value.apply(target, args))
+        : value;
+    },
+  });
+}
+
 function resolveSchemaRoot(version: string): string {
   const key = resolveBundleKey(version);
   const scopedRoot = scopedExternalSchemaRoots.getStore()?.get(key);
@@ -254,6 +281,7 @@ function resolveSchemaRoot(version: string): string {
   const externalRoot = externalSchemaRoots.get(key);
   if (externalRoot && existsSync(externalRoot)) return externalRoot;
 
+  if (isIdentity33SchemaScope() && key === '3.3') return resolveSchemaRoot(ADCP_VERSION);
   const distCandidate = path.join(__dirname, '..', 'schemas-data', key);
   if (existsSync(distCandidate)) return distCandidate;
 
@@ -647,6 +675,7 @@ export function withExternalSchemaRoot<T>(version: string, root: string | undefi
  */
 export function isExternalSchemaRootActive(version: string): boolean {
   const key = resolveBundleKey(version);
+  if (isIdentity33SchemaScope() && key === '3.3') return true;
   const scopedRoot = scopedExternalSchemaRoots.getStore()?.get(key);
   if (scopedRoot && existsSync(scopedRoot)) return true;
   const registeredRoot = externalSchemaRoots.get(key);
@@ -1127,7 +1156,7 @@ export function getSchemaValidatorByRef(
   });
   addFormats(ajv);
   for (const keyword of keywords ?? []) ajv.addKeyword(keyword);
-  const rawSchema = loadJson(file);
+  const rawSchema = identity33ReferenceSchema(loadJson(file), version);
   const dependencySchemas: LoadedSchema[] = [];
   const registeredIds = new Map<string, LoadedSchema>();
   for (const schemaFile of walkJsonFiles(root)) {
@@ -1138,7 +1167,7 @@ export function getSchemaValidatorByRef(
       continue;
     }
     if (schemaFile === file) continue;
-    const schema = loadJson(schemaFile);
+    const schema = identity33ReferenceSchema(loadJson(schemaFile), version);
     if ((keywords || allErrors) && typeof schema.$id === 'string') {
       const previous = schema.$id === rawSchema.$id ? rawSchema : registeredIds.get(schema.$id);
       // Bundles intentionally mirror async-response refs. Identical copies
@@ -1291,6 +1320,22 @@ export function getRegisteredSchemaIds(version: string = ADCP_VERSION): readonly
   return [...new Set([...Object.keys(registry ?? {}), ...Object.keys(bundledRegistry ?? {})])];
 }
 
+/** Keep new invalidation reasons isolated to explicitly enabled draft references. */
+function identity33ReferenceSchema(schema: LoadedSchema, version: string): LoadedSchema {
+  if (!isIdentity33SchemaScope() || resolveBundleKey(version) !== '3.3') return schema;
+  const clone = structuredClone(schema);
+  const pending: unknown[] = [clone];
+  while (pending.length) {
+    const node = pending.pop();
+    if (!node || typeof node !== 'object') continue;
+    const object = node as Record<string, unknown>;
+    if (Array.isArray(object.enum) && object.enum.includes('destination_state_changed'))
+      object.enum = [...object.enum, 'relationship_changed', 'relationship_expiring'];
+    for (const value of Object.values(object)) if (typeof value === 'object') pending.push(value);
+  }
+  return clone;
+}
+
 /** Suffix used in the suffix table — exported for testing. */
 export { SCHEMA_FILENAME_SUFFIX };
 
@@ -1307,6 +1352,232 @@ export function hasSchemaBundle(version: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * A caller-supplied schema root for a release an agent may echo in a
+ * `get_adcp_capabilities` response. `aliases` is the validated alias set
+ * (computed once per process per `version`/`root` pair).
+ */
+interface ServedReleaseSchemaRoot {
+  readonly version: string;
+  readonly root: string;
+  readonly aliases: ReadonlySet<string>;
+}
+
+const servedReleaseSchemaRootScope = new AsyncLocalStorage<readonly ServedReleaseSchemaRoot[]>();
+/**
+ * Validated alias sets for served-release roots, keyed by `version\0root`.
+ * Checking a root walks every schema file in it (about a second for a full
+ * release), so a hosted caller that passes the same roots on every run pays
+ * that once per process. Roots are treated as immutable artifacts, and
+ * neither this memo nor the compiled validators for a root are evicted, so
+ * pass stable root paths rather than a fresh extraction per run.
+ */
+const servedReleaseRootAliases = new Map<string, ReadonlySet<string>>();
+
+/**
+ * Run `fn` with schema roots for the releases an agent may echo in its
+ * `get_adcp_capabilities` response.
+ *
+ * Keys are AdCP versions in any form the SDK accepts for a pin (`'3.2'`,
+ * `'3.2.5'`, `'3.3.0-beta.1'`); values are schema-data roots in the same
+ * shape as `schemaRoot` (a directory holding `bundled/`, e.g. a hosted
+ * `dist/schemas/3.2.5`). Each root is checked against its key the same way
+ * `withExternalSchemaRoot` checks one, and a malformed map throws before `fn`
+ * runs.
+ *
+ * The roots are consulted only when validating a `get_adcp_capabilities`
+ * response against the release the agent echoed (see
+ * {@link resolveServedValidationVersion}): discovery's capability notices,
+ * `getAdcpCapabilities()` response validation and storyboard
+ * `response_schema` checks on that task. They are not activated for any other
+ * task, so every other response, storyboard selection and grading stay on the
+ * pin. A supplied root takes precedence over an external root registered for
+ * the same release and over the SDK's bundled schemas for it.
+ *
+ * Scoped to the current async execution chain; nested calls add to the
+ * enclosing scope, with the innermost entry for a release winning.
+ * `comply()` and `runStoryboard()` accept the same map as
+ * `servedReleaseSchemaRoots` and call this for you.
+ */
+export function withServedReleaseSchemaRoots<T>(roots: Readonly<Record<string, string>> | undefined, fn: () => T): T {
+  if (roots === undefined) return fn();
+  if (roots === null || typeof roots !== 'object' || Array.isArray(roots)) {
+    throw new TypeError('servedReleaseSchemaRoots must be an object mapping AdCP versions to schema roots');
+  }
+  const entries: ServedReleaseSchemaRoot[] = [];
+  for (const [version, root] of Object.entries(roots)) {
+    resolveBundleKey(version);
+    if (typeof root !== 'string' || root.length === 0) {
+      throw new TypeError(`servedReleaseSchemaRoots["${version}"] must be a non-empty schema root path`);
+    }
+    const memoKey = `${version}\0${root}`;
+    let aliases = servedReleaseRootAliases.get(memoKey);
+    if (!aliases) {
+      if (!hasSchemaRootShape(root)) {
+        throw new Error(`Served-release AdCP schema root for version "${version}" not found or empty at ${root}`);
+      }
+      aliases = assertSchemaRootMatchesVersion(version, root);
+      servedReleaseRootAliases.set(memoKey, aliases);
+    }
+    const conflict = entries.find(entry => entry.root !== root && [...aliases].some(alias => entry.aliases.has(alias)));
+    if (conflict) {
+      throw new Error(
+        `servedReleaseSchemaRoots["${version}"] and servedReleaseSchemaRoots["${conflict.version}"] name the same ` +
+          `release with different schema roots (${root}, ${conflict.root})`
+      );
+    }
+    entries.push({ version, root, aliases });
+  }
+  if (entries.length === 0) return fn();
+  const parent = servedReleaseSchemaRootScope.getStore() ?? [];
+  return servedReleaseSchemaRootScope.run([...entries, ...parent], fn);
+}
+
+function findServedReleaseSchemaRoot(release: string): ServedReleaseSchemaRoot | undefined {
+  const entries = servedReleaseSchemaRootScope.getStore();
+  if (!entries?.length) return undefined;
+  let key: string;
+  try {
+    key = resolveBundleKey(release);
+  } catch {
+    return undefined;
+  }
+  return entries.find(entry => entry.aliases.has(key) || entry.aliases.has(release));
+}
+
+/** Major of an echoed release-precision `adcp_version` (`core/version-envelope.json` wire pattern). */
+const SERVED_RELEASE_MAJOR = /^(\d+)\.\d+(?:-[a-zA-Z0-9.-]+)?$/;
+/** Major of a numeric pin: `'3.0'`, `'3.0.25'`, `'3.1-beta'`, `'3.1.0-beta.1'`. */
+const NUMERIC_PIN_MAJOR = /^(\d+)\.\d+/;
+
+/** Whether the response's own `adcp.supported_versions` lists `release`. */
+function listsSupportedRelease(response: object, release: string): boolean {
+  const adcp = (response as { adcp?: unknown }).adcp;
+  if (adcp === null || typeof adcp !== 'object') return false;
+  const supported = (adcp as { supported_versions?: unknown }).supported_versions;
+  if (!Array.isArray(supported)) return false;
+  return supported.some(entry => {
+    if (typeof entry !== 'string') return false;
+    if (entry === release) return true;
+    try {
+      return toReleasePrecisionWire(entry) === release;
+    } catch {
+      return false;
+    }
+  });
+}
+
+interface ServedValidationSelection {
+  /** Version to validate against: the echoed release, or the pin. */
+  version: string;
+  /** Caller-supplied root for the echoed release, when one applies. */
+  served?: ServedReleaseSchemaRoot;
+}
+
+function selectServedValidationVersion(response: unknown, pinnedVersion: string): ServedValidationSelection {
+  const pin: ServedValidationSelection = { version: pinnedVersion };
+  const pinMajor = NUMERIC_PIN_MAJOR.exec(pinnedVersion)?.[1];
+  // Legacy aliases ('v2.5', 'v3') have their own adapter paths; leave them alone.
+  if (pinMajor === undefined) return pin;
+  if (response === null || typeof response !== 'object') return pin;
+
+  const echoed = (response as { adcp_version?: unknown }).adcp_version;
+  if (typeof echoed !== 'string') return pin;
+  const echoMajor = SERVED_RELEASE_MAJOR.exec(echoed)?.[1];
+  if (echoMajor === undefined || echoMajor !== pinMajor) return pin;
+
+  let pinnedRelease: string;
+  try {
+    pinnedRelease = toReleasePrecisionWire(pinnedVersion);
+  } catch {
+    return pin;
+  }
+  // The pinned release itself: keep the exact pin so a patch-precise pin and
+  // any external root bound to it still apply.
+  if (echoed === pinnedRelease) return pin;
+  // An agent may only serve a release it advertises.
+  if (!listsSupportedRelease(response, echoed)) return pin;
+
+  const served = findServedReleaseSchemaRoot(echoed);
+  if (served) return { version: echoed, served };
+  // Covers an external root registered (or scoped) for the echo and the
+  // SDK's bundled schemas.
+  return hasSchemaBundle(echoed) ? { version: echoed } : pin;
+}
+
+/**
+ * Select the AdCP release a `get_adcp_capabilities` response is validated
+ * against.
+ *
+ * The versioning spec (`docs/reference/versioning.mdx`, "Server echoes") says
+ * the seller echoes the release it actually served in `adcp_version`, and
+ * buyers SHOULD validate against that release's schema, not their pin; with
+ * no echo, against the pin. This matters most under a 3.0 pin: the 3.0
+ * bundle has no `adcp_version` request field, so the SDK sends only
+ * `adcp_major_version: 3` and the seller serves (and echoes) its highest 3.x
+ * release.
+ *
+ * Returns the echoed `adcp_version` when all of these hold, otherwise
+ * `pinnedVersion`:
+ * - it is a release-precision string in the same major as the pin;
+ * - the response's own `adcp.supported_versions` lists it;
+ * - a schema root for it is available: one supplied through
+ *   {@link withServedReleaseSchemaRoots} (`servedReleaseSchemaRoots` on
+ *   `comply()` / `runStoryboard()`), an external root registered or scoped
+ *   for it, or the SDK's bundled schemas.
+ *
+ * This holds whether or not an external schema root is active for the pin.
+ * Hosted compliance always runs with one, and the capabilities response is
+ * negotiated before any pin applies, so the pin's root must not override the
+ * release the agent actually served.
+ *
+ * Validation stays strict either way: an echo from another major, a malformed
+ * or unlisted echo, or one with no schema available falls back to the pin
+ * rather than skipping validation. When the echo names the pinned release
+ * itself, the exact pin is returned so a patch-precise pin (and any external
+ * schema root bound to it) still applies. An echo older than the pin (pin
+ * 3.2, served 3.0) is validated against the older release; that is the spec's
+ * downshift rule, not a loosening bug.
+ *
+ * Callers apply this to `get_adcp_capabilities` only. Use
+ * {@link withServedValidationVersion} to also activate a supplied root.
+ *
+ * @internal — not part of the public API surface; may change without a major bump.
+ */
+export function resolveServedValidationVersion(response: unknown, pinnedVersion: string): string {
+  try {
+    return selectServedValidationVersion(response, pinnedVersion).version;
+  } catch {
+    return pinnedVersion;
+  }
+}
+
+/**
+ * Run `fn` with the release {@link resolveServedValidationVersion} selects.
+ * When that release has a root supplied through
+ * {@link withServedReleaseSchemaRoots}, the root is active for the duration
+ * of `fn` only, so it never leaks into validation of any other response.
+ *
+ * @internal — not part of the public API surface; may change without a major bump.
+ */
+export function withServedValidationVersion<T>(
+  response: unknown,
+  pinnedVersion: string,
+  fn: (version: string) => T
+): T {
+  let selection: ServedValidationSelection;
+  try {
+    selection = selectServedValidationVersion(response, pinnedVersion);
+  } catch {
+    selection = { version: pinnedVersion };
+  }
+  const { version, served } = selection;
+  if (!served) return fn(version);
+  const next = new Map(scopedExternalSchemaRoots.getStore());
+  for (const alias of served.aliases) next.set(alias, served.root);
+  return scopedExternalSchemaRoots.run(next, () => fn(version));
 }
 
 const mcpToolSchemaCache = new Map<string, Readonly<Record<string, unknown>> | null>();

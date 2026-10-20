@@ -1527,194 +1527,6 @@ test('SingleAgentClient discovers the current MCP endpoint before resuming persi
   }
 });
 
-test('restart resume preserves v2 wire identity and re-enters canonical policy and handler finalization', async () => {
-  const originalCallTool = ProtocolClient.callTool;
-  const storage = new MemoryStorage({ autoCleanup: false });
-  const v2Agent = {
-    id: 'v2-canonical-resume-agent',
-    name: 'V2 canonical resume agent',
-    agent_uri: 'https://seller.example/.well-known/agent-card.json',
-    protocol: 'a2a',
-  };
-  const canonicalAgent = { ...v2Agent, agent_uri: 'https://seller.example/a2a' };
-  const legacyDisplayRef = {
-    agent_url: 'https://formats.seller.example/mcp',
-    id: 'seller_display_300x250',
-  };
-  const projectionCatalog = (formatOptionId, publisherDomain) => ({
-    source: 'configured',
-    publisher_domain: publisherDomain,
-    formats: [
-      {
-        format_kind: 'display_tag',
-        format_option_id: formatOptionId,
-        params: { width: 300, height: 250 },
-        v1_format_ref: [legacyDisplayRef],
-      },
-    ],
-  });
-  const statusResults = [];
-  let calls = 0;
-  ProtocolClient.callTool = async (_resolvedAgent, taskName, params, options) => {
-    calls += 1;
-    assert.equal(taskName, 'get_products');
-    assert.equal(options.serverVersion, 'v2');
-    if (calls === 1) {
-      return {
-        result: {
-          kind: 'task',
-          id: 'seller-v2-task',
-          contextId: 'seller-v2-context',
-          status: {
-            state: 'input-required',
-            message: {
-              kind: 'message',
-              messageId: 'seller-v2-question',
-              role: 'agent',
-              parts: [{ kind: 'data', data: { question: 'Approve catalog?', field: 'approval' } }],
-            },
-          },
-          artifacts: [],
-        },
-      };
-    }
-    assert.deepEqual(params, { input: { approved: true } });
-    return {
-      result: {
-        kind: 'task',
-        id: 'seller-v2-task',
-        contextId: 'seller-v2-context',
-        status: { state: 'completed' },
-        artifacts: [
-          {
-            artifactId: 'get-products-result',
-            parts: [
-              {
-                kind: 'data',
-                data: {
-                  success: true,
-                  products: [
-                    {
-                      product_id: 'kept-product',
-                      name: 'Kept product',
-                      description: 'Has a transactable price',
-                      publisher_properties: [{ publisher_domain: 'seller.example', selection_type: 'all' }],
-                      format_ids: [legacyDisplayRef],
-                      delivery_type: 'guaranteed',
-                      delivery_measurement: { provider: 'first-party' },
-                      pricing_options: [
-                        {
-                          pricing_option_id: 'po-cpm',
-                          pricing_model: 'cpm',
-                          rate: 5,
-                          currency: 'USD',
-                          is_fixed: true,
-                        },
-                      ],
-                      reporting_capabilities: {
-                        available_reporting_frequencies: ['daily'],
-                        expected_delay_minutes: 60,
-                        timezone: 'UTC',
-                        supports_webhooks: false,
-                        available_metrics: ['impressions'],
-                        date_range_support: 'date_range',
-                      },
-                    },
-                  ],
-                },
-              },
-            ],
-          },
-        ],
-      },
-    };
-  };
-
-  const config = {
-    deferredStorage: storage,
-    validateFeatures: false,
-    validation: { requests: 'off', responses: 'strict', rejectProductsWithoutPricingOptions: true },
-    handlers: {
-      onGetProductsStatusChange: data => statusResults.push(data),
-    },
-    projectionCatalogs: [projectionCatalog('configured-display', 'configured.example')],
-  };
-
-  try {
-    const first = new SingleAgentClient(v2Agent, config);
-    first.ensureEndpointDiscovered = async () => canonicalAgent;
-    first.detectServerVersion = async () => 'v2';
-    first.getEarlyResultForUnsupportedFeatures = async () => null;
-    const perCallProjectionCatalogs = [projectionCatalog('per-call-display', 'per-call.example')];
-    const paused = await first.getProducts(
-      {
-        buying_mode: 'brief',
-        brief: 'Find display inventory',
-        account: { account_id: 'account-1' },
-      },
-      async () => ({
-        defer: true,
-        token: testDurableToken('v2-canonical-resume-token'),
-      }),
-      { projectionCatalogs: perCallProjectionCatalogs }
-    );
-    assert.equal(paused.status, 'deferred');
-    assert.equal(statusResults.length, 0);
-    perCallProjectionCatalogs[0].publisher_domain = 'mutated-after-dispatch.example';
-    const persisted = await storage.get(paused.deferred.token);
-    assert.equal(persisted.clientContext.projectionCatalogs[0].publisher_domain, 'per-call.example');
-
-    const restarted = new SingleAgentClient(v2Agent, config);
-    restarted.ensureCanonicalUrlResolved = async () => canonicalAgent;
-    const resumed = await restarted.resumeDeferredTask(paused.deferred.token, { approved: true });
-
-    assert.equal(resumed.status, 'completed');
-    assert.ok(Array.isArray(resumed.data?.products), JSON.stringify(resumed));
-    assert.equal(resumed.data.products.length, 1);
-    assert.equal(resumed.data.products[0].product_id, 'kept-product');
-    assert.equal(resumed.data.products[0].format_ids, undefined);
-    assert.equal(resumed.data.products[0].format_options[0].format_kind, 'display_tag');
-    assert.equal(resumed.data.products[0].format_options[0].format_option_id, 'per-call-display');
-    assert.equal(resumed.data.products[0].format_options[0].publisher_domain, 'per-call.example');
-    assert.equal(statusResults.length, 1);
-    assert.equal(statusResults[0].products[0].format_ids, undefined);
-
-    const selectedOption = resumed.data.products[0].format_options[0];
-    let capturedPurchase;
-    restarted.getCapabilities = async () => ({ features: { canonicalCreatives: false } });
-    restarted.executeAndHandle = async (_taskName, _handlerName, wireParams) => {
-      capturedPurchase = wireParams;
-      return { success: true, status: 'completed', data: { media_buy_id: 'mb-after-resume', packages: [] } };
-    };
-    await restarted.createMediaBuy({
-      account: { account_id: 'account-1' },
-      brand: { domain: 'buyer.example' },
-      start_time: 'asap',
-      end_time: '2027-12-31T00:00:00Z',
-      packages: [
-        {
-          buyer_ref: 'pkg-after-resume',
-          product_id: resumed.data.products[0].product_id,
-          pricing_option_id: 'po-cpm',
-          budget: 1000,
-          format_option_refs: [
-            {
-              scope: selectedOption.publisher_domain ? 'publisher' : 'product',
-              ...(selectedOption.publisher_domain && { publisher_domain: selectedOption.publisher_domain }),
-              format_option_id: selectedOption.format_option_id,
-            },
-          ],
-        },
-      ],
-    });
-    assert.equal(capturedPurchase.packages[0].format_option_refs, undefined);
-    assert.deepEqual(capturedPurchase.packages[0].format_ids, [legacyDisplayRef]);
-  } finally {
-    ProtocolClient.callTool = originalCallTool;
-    storage.destroy();
-  }
-});
-
 test('durable clients reject non-serializable per-call projection converters before dispatch', async () => {
   const storage = new MemoryStorage({ autoCleanup: false });
   try {
@@ -1748,26 +1560,88 @@ test('durable clients reject authenticated property-list verification before sel
       validateFeatures: false,
       validation: { requests: 'off', responses: 'off' },
     });
-    await assert.rejects(
-      client.getProducts({
-        buying_mode: 'brief',
-        brief: 'Find private inventory',
-        property_list: {
-          agent_url: 'https://property-lists.example/mcp',
-          list_id: 'private-list',
-          auth_token: 'private-list-secret',
-        },
-      }),
-      error => {
-        assert.match(error.message, /cannot persist property_list\.auth_token/);
-        assert.doesNotMatch(error.message, /private-list-secret/);
-        return true;
-      }
-    );
+    const reference = {
+      agent_url: 'https://property-lists.example/mcp',
+      list_id: 'private-list',
+      auth_token: 'private-list-secret',
+    };
+    const tokenlessReference = { agent_url: reference.agent_url, list_id: reference.list_id };
+    for (const location of [
+      { property_list: reference },
+      { filters: { property_list: reference } },
+      { property_list: reference, filters: { property_list: tokenlessReference } },
+      { property_list: tokenlessReference, filters: { property_list: reference } },
+      { property_list: reference, filters: { property_list: null } },
+      { property_list: { auth_token: reference.auth_token }, filters: { property_list: tokenlessReference } },
+      { property_list: tokenlessReference, filters: { property_list: { auth_token: reference.auth_token } } },
+      {
+        property_list: { auth_token: { value: reference.auth_token } },
+        filters: { property_list: tokenlessReference },
+      },
+      { property_list: tokenlessReference, filters: { property_list: { auth_token: 12345 } } },
+    ]) {
+      await assert.rejects(
+        client.getProducts({ buying_mode: 'brief', brief: 'Find private inventory', ...location }),
+        error => {
+          assert.match(error.message, /cannot persist property_list\.auth_token/);
+          assert.doesNotMatch(error.message, /private-list-secret/);
+          return true;
+        }
+      );
+    }
     assert.equal(protocolCalls, 0);
+    assert.equal(storage.getStats().totalItems, 0, 'rejected references must not create durable records');
   } finally {
     ProtocolClient.callTool = originalCallTool;
     storage.destroy();
+  }
+});
+
+test('durable property-list credential rejection preserves explicit enforcement opt-outs', async () => {
+  const originalCallTool = ProtocolClient.callTool;
+  ProtocolClient.callTool = async (_agent, taskName) => {
+    assert.equal(taskName, 'get_products');
+    return {
+      result: {
+        kind: 'task',
+        id: 'opted-out-property-list',
+        status: { state: 'completed' },
+        artifacts: [
+          {
+            artifactId: 'products',
+            parts: [{ kind: 'data', data: { status: 'completed', products: [], cache_scope: 'public' } }],
+          },
+        ],
+      },
+    };
+  };
+  try {
+    for (const productPropertyPolicy of [false, { enforceRequestPropertyList: false }]) {
+      const storage = new MemoryStorage({ autoCleanup: false });
+      try {
+        const client = new SingleAgentClient(agent, {
+          deferredStorage: storage,
+          validateFeatures: false,
+          validation: { requests: 'off', responses: 'off', productPropertyPolicy },
+        });
+        client.validateTaskFeatures = async () => undefined;
+        client.getEarlyResultForUnsupportedFeatures = async () => null;
+        client.ensureEndpointDiscovered = async () => agent;
+        client.detectServerVersion = async () => 'v3';
+        const tokenlessReference = { agent_url: 'https://property-lists.example/mcp', list_id: 'private-list' };
+        const result = await client.getProducts({
+          buying_mode: 'brief',
+          brief: 'Find inventory',
+          property_list: { ...tokenlessReference, auth_token: 'explicitly-opted-out-token' },
+          filters: { property_list: tokenlessReference },
+        });
+        assert.equal(result.success, true);
+      } finally {
+        storage.destroy();
+      }
+    }
+  } finally {
+    ProtocolClient.callTool = originalCallTool;
   }
 });
 
@@ -1852,123 +1726,6 @@ test('durable property-list requests own nested input before asynchronous prefli
     const paused = await pending;
     assert.equal(paused.status, 'deferred');
     assert.doesNotMatch(JSON.stringify(await storage.get(paused.deferred.token)), /late-caller-secret/);
-  } finally {
-    ProtocolClient.callTool = originalCallTool;
-    storage.destroy();
-  }
-});
-
-test('resumed v2 submitted continuations keep v2 polling semantics', async () => {
-  const originalCallTool = ProtocolClient.callTool;
-  const storage = new MemoryStorage({ autoCleanup: false });
-  const token = testDurableToken('v2-resumed-submitted-token');
-  const now = Date.now();
-  await storeDeferredState(
-    storage,
-    token,
-    {
-      continuationVersion: 'v2-submitted-version',
-      taskId: 'client-v2-submitted-correlation',
-      contextId: 'seller-v2-submitted-context',
-      a2aTaskId: 'seller-v2-submitted-a2a-task',
-      serverVersion: 'v2',
-      agentId: agent.id,
-      taskName: 'get_products',
-      params: { buying_mode: 'brief', brief: 'Display' },
-      messages: [],
-      clientContext: {
-        kind: 'single-agent',
-        taskType: 'get_products',
-        handlerName: 'onGetProductsStatusChange',
-        canonical: true,
-        productPolicyRequest: { account: { account_id: 'account-submitted' } },
-      },
-      createdAt: now,
-      expiresAt: now + 60_000,
-    },
-    60
-  );
-  let calls = 0;
-  ProtocolClient.callTool = async (_resolvedAgent, taskName, _params, options) => {
-    calls += 1;
-    assert.equal(options.serverVersion, 'v2');
-    if (calls === 1) {
-      assert.equal(taskName, 'get_products');
-      return { status: 'submitted', task_id: 'seller-v2-work-handle' };
-    }
-    assert.equal(taskName, 'tasks/get');
-    return {
-      task_id: 'seller-v2-work-handle',
-      task_type: 'get_products',
-      status: 'completed',
-      result: {
-        success: true,
-        products: [
-          {
-            product_id: 'submitted-product',
-            name: 'Submitted product',
-            description: 'Legacy product completed through polling',
-            format_ids: [{ agent_url: 'https://creative.adcontextprotocol.org/', id: 'display_300x250_image' }],
-            pricing_options: [
-              { pricing_option_id: 'submitted-price', pricing_model: 'cpm', currency: 'USD', fixed_price: 5 },
-            ],
-            forecast: {
-              generated_at: '2026-08-23T22:00:00+02:00',
-              valid_until: { $date: '2026-08-24T02:30:00+02:30' },
-            },
-          },
-        ],
-      },
-      created_at: now,
-      updated_at: now,
-    };
-  };
-
-  try {
-    const restarted = new SingleAgentClient(agent, {
-      deferredStorage: storage,
-      validateFeatures: false,
-      validation: { requests: 'off', responses: 'off' },
-    });
-    restarted.ensureCanonicalUrlResolved = async () => ({ ...agent, agent_uri: 'https://seller.example/a2a' });
-    const submitted = await restarted.resumeDeferredTask(token, { approved: true });
-    assert.equal(submitted.status, 'submitted');
-    const completed = await submitted.submitted.waitForCompletion(0);
-    assert.equal(completed.status, 'completed');
-    assert.equal(completed.data.products[0].forecast.generated_at, '2026-08-23T20:00:00Z');
-    assert.equal(completed.data.products[0].forecast.valid_until, '2026-08-24T00:00:00Z');
-    const selected = completed.data.products[0].format_options[0];
-    let capturedPurchase;
-    restarted.getCapabilities = async () => ({ features: { canonicalCreatives: false } });
-    restarted.executeAndHandle = async (_taskName, _handlerName, wireParams) => {
-      capturedPurchase = wireParams;
-      return { success: true, status: 'completed', data: { media_buy_id: 'submitted-follow-on', packages: [] } };
-    };
-    await restarted.createMediaBuy({
-      account: { account_id: 'account-submitted' },
-      brand: { domain: 'buyer.example' },
-      start_time: 'asap',
-      end_time: '2027-12-31T00:00:00Z',
-      packages: [
-        {
-          product_id: 'submitted-product',
-          pricing_option_id: 'submitted-price',
-          budget: 1000,
-          format_option_refs: [
-            {
-              scope: selected.publisher_domain ? 'publisher' : 'product',
-              ...(selected.publisher_domain && { publisher_domain: selected.publisher_domain }),
-              format_option_id: selected.format_option_id,
-            },
-          ],
-        },
-      ],
-    });
-    assert.equal(capturedPurchase.packages[0].format_option_refs, undefined);
-    assert.deepEqual(capturedPurchase.packages[0].format_ids, [
-      { agent_url: 'https://creative.adcontextprotocol.org/', id: 'display_300x250_image' },
-    ]);
-    assert.equal(calls, 2);
   } finally {
     ProtocolClient.callTool = originalCallTool;
     storage.destroy();
@@ -3448,6 +3205,91 @@ test('failed completion handler retains the checkpoint and retries finalization 
     storage.destroy();
   }
 });
+
+for (const mode of ['skip', 'isolate']) {
+  test(`${mode} completion handler failures finalize durable results and replay without redispatch`, async () => {
+    const originalCallTool = ProtocolClient.callTool;
+    const storage = new MemoryStorage({ autoCleanup: false });
+    const operationId = `${mode}-handler-operation`;
+    const token = testDurableToken(`${mode}-handler-token`);
+    const sellerWorkId = `${mode}-handler-seller-task`;
+    const now = Date.now();
+    await storeDeferredState(
+      storage,
+      token,
+      {
+        continuationVersion: `${mode}-handler-version`,
+        taskId: operationId,
+        a2aTaskId: `${mode}-handler-a2a-task`,
+        serverVersion: 'v3',
+        agentId: agent.id,
+        taskName: 'create_media_buy',
+        params: {},
+        messages: [],
+        clientContext: {
+          kind: 'single-agent',
+          taskType: 'create_media_buy',
+          handlerName: 'onCreateMediaBuyStatusChange',
+          canonical: false,
+          productPolicyRequest: {},
+          ...(mode === 'skip' && { skipStatusHandlers: true }),
+        },
+        settlementOperationId: operationId,
+        settlementServerTaskId: sellerWorkId,
+        createdAt: now,
+        expiresAt: now + 60_000,
+      },
+      60
+    );
+    let protocolCalls = 0;
+    let handlerCalls = 0;
+    let observerCalls = 0;
+    ProtocolClient.callTool = async () => {
+      protocolCalls += 1;
+      return { status: 'completed', task_id: sellerWorkId, media_buy_id: `${mode}-handler-buy`, packages: [] };
+    };
+    try {
+      const client = new SingleAgentClient(agent, {
+        deferredStorage: storage,
+        validateFeatures: false,
+        validation: { requests: 'off', responses: 'off' },
+        isolateStatusHandlerErrors: mode === 'isolate',
+        handlers: {
+          onCreateMediaBuyStatusChange: () => {
+            handlerCalls += 1;
+            throw new Error('local post-processing failed');
+          },
+        },
+        onStatusHandlerError: () => {
+          observerCalls += 1;
+        },
+      });
+      client.ensureCanonicalUrlResolved = async () => ({ ...agent, agent_uri: 'https://seller.example/a2a' });
+      client.registerDurableSettlementRecovery(async (_operationId, observation) => ({
+        settled: true,
+        status: 'completed',
+        result: observation.result,
+      }));
+      const completed = await client.resumeDeferredTask(token, { approved: true });
+      assert.equal(completed.status, 'completed');
+      assert.equal(completed.data.media_buy_id, `${mode}-handler-buy`);
+      const stored = await storage.get(token);
+      assert.equal(stored.settlementFinalizedResult.status, 'completed');
+      assert.equal(stored.settlementFinalizationLease, undefined);
+      const replay = await client.resumeDeferredTask(token, { approved: true });
+      assert.deepEqual(replay.data, completed.data);
+      assert.deepEqual(replay.metadata, completed.metadata);
+      assert.deepEqual(replay.debug_logs, completed.debug_logs);
+      assert.deepEqual(replay.conversation, completed.conversation);
+      assert.equal(protocolCalls, 1);
+      assert.equal(handlerCalls, mode === 'skip' ? 0 : 1);
+      assert.equal(observerCalls, mode === 'skip' ? 0 : 1);
+    } finally {
+      ProtocolClient.callTool = originalCallTool;
+      storage.destroy();
+    }
+  });
+}
 
 test('an active terminal checkpoint lease excludes concurrent clients', async () => {
   const storage = new MemoryStorage({ autoCleanup: false });

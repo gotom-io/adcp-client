@@ -304,6 +304,7 @@ export {
   requireSignatureWhenPresent,
   requireAuthenticatedOrSigned,
   mcpToolNameResolver,
+  adcpOperationResolver,
 } from './auth-signature';
 export type {
   VerifySignatureAsAuthenticatorOptions,
@@ -661,6 +662,7 @@ export {
   computeGovernedPayloadHash,
   createGovernanceEnforcementMiddleware,
   verifyGovernanceAuthorization,
+  createGovernanceAgentJwksResolver,
 } from '../governance';
 export type {
   BuildGovernanceExecutionRequestInput,
@@ -677,6 +679,7 @@ export type {
   GovernanceRevocationResolver,
   GovernanceRevocationStatus,
   VerifyGovernanceAuthorizationOptions,
+  GovernanceBuyerIdentity,
 } from '../governance';
 
 export {
@@ -828,6 +831,18 @@ export {
 } from '../adapters/oauth-passthrough-resolver';
 
 export { createRosterAccountStore, type RosterAccountStoreOptions } from '../adapters/roster-account-store';
+export { createKeyedAccountStore, type KeyedAccountStoreOptions } from '../adapters/keyed-account-store';
+export {
+  memoryKeyedAccountBackend,
+  pgKeyedAccountBackend,
+  redisKeyedAccountBackend,
+  getKeyedAccountMigration,
+  type KeyedAccountBackend,
+  type KeyedAccountRecord,
+  type KeyedAccountSnapshot,
+  type PgKeyedAccountBackendOptions,
+  type KeyedAccountRedisClient,
+} from '../adapters/keyed-account-backend';
 
 export {
   createDerivedAccountStore,
@@ -855,3 +870,11 @@ export type {
   SellerActionResolutionOptions,
   SellerActionResolution,
 } from './media-buy-action-resolver';
+export * from '../identifiers';
+export { registerPropertyListTool, sendPropertyListChanged } from './property-lists';
+export type {
+  PropertyListPage,
+  PropertyListToolOptions,
+  PropertyListChangedNotification,
+  SendPropertyListChangedOptions,
+} from './property-lists';

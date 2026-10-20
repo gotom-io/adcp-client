@@ -29,12 +29,14 @@ AdCP operations are **distributed and asynchronous by default**. An agent might:
 ## Installation
 
 ```bash
-npm install @adcp/sdk              # 14.x, AdCP 3.2
+npm install @adcp/sdk              # 16.x, AdCP 3.2
 npm install @adcp/sdk@adcp-3.1     # 13.x, maintained AdCP 3.1 line
 npm install @adcp/sdk@adcp-3.0     # 7.11.x, AdCP 3.0
 ```
 
-Upgrading to SDK 14? Read the [release-bound upgrade worksheet](./docs/migration-14.x-rc-worksheet.md), then use the [13-to-14](./docs/migration-13-to-14.md) or [12-to-14](./docs/migration-12-to-14.md) migration guide. The [prerelease history](./docs/releases/14.0.0-beta.0.md) covers changes made during the 14.0 beta cycle. The npm `latest` tag tracks SDK 14 (AdCP 3.2); SDK 13 stays available on `adcp-3.1` as the maintained AdCP 3.1 line. SDK 14 requires Node.js `^20.19.0 || >=22.12.0`. Older paths: [12-to-13](./docs/migration-12-to-13.md), **[MIGRATION-v8.md](./MIGRATION-v8.md)**, and [8.0-to-8.1](./docs/migration-8.0-to-8.1.md).
+AdCP 2 reached end of life on August 1, 2026. This checkout supports AdCP 3 agents only; review the [AdCP 2 retirement guide](./docs/migration-drop-adcp-2.md) before upgrading an integration that still calls AdCP 2 sellers.
+
+Upgrading to SDK 16? Read the [SDK 16 release notes](./docs/releases/16.0.0.md) and [release-bound upgrade worksheet](./docs/migration-14.x-rc-worksheet.md). The npm `latest` tag tracks SDK 16 (AdCP 3.2); SDK 13 stays available on `adcp-3.1` as the maintained AdCP 3.1 line. SDK 16 requires Node.js `^20.19.0 || >=22.12.0`. Earlier migration guides: [SDK 15 OAuth](./docs/migration-oauth-issuer-bindings.md), [13-to-14](./docs/migration-13-to-14.md), [12-to-14](./docs/migration-12-to-14.md), [12-to-13](./docs/migration-12-to-13.md), **[MIGRATION-v8.md](./MIGRATION-v8.md)**, and [8.0-to-8.1](./docs/migration-8.0-to-8.1.md).
 
 ### Narrow type imports (`@adcp/sdk/types/<tool>`)
 
@@ -57,7 +59,22 @@ Large workspaces should keep the generated schema surface out of the default typ
 | Client, server, signing, and response helpers | `@adcp/sdk`, `@adcp/sdk/client`, `@adcp/sdk/server`, or another focused runtime subpath |
 | One tool's request/response types             | `@adcp/sdk/types/<tool>` such as `@adcp/sdk/types/sync-accounts`                        |
 | Runtime Zod schemas and tool schema maps      | `@adcp/sdk/schemas`                                                                     |
+| Runtime Zod schemas in browser UIs            | `@adcp/sdk/schemas/browser`                                                             |
 | Broad generated protocol type barrel          | `@adcp/sdk/types`                                                                       |
+
+Browser widgets and dashboards can validate AdCP objects with the generated Zod schemas:
+
+```ts
+import {
+  EventSourceHealthSchema,
+  SyncAudiencesResponseSchema,
+  SyncEventSourcesResponseSchema,
+} from '@adcp/sdk/schemas/browser';
+
+const health = EventSourceHealthSchema.parse(rawHealth);
+```
+
+The browser entry also exports `GetProductsRequestSchema` and `LegacyGetProductsRequestSchema`, `BiddingPolicySchema`, `CanonicalBudgetAllocationSchema`, and the strict `SyncCreatives*` validators, with the same validation behavior as the Node entry. It has no Node built-ins in its import graph. JSON Schema loading and tool registration helpers remain available from `@adcp/sdk/schemas`. The generated schemas still initialize together, so importing one schema can retain the full generated module in a browser bundle; per-schema tree-shaking is tracked in [#3178](https://github.com/adcontextprotocol/adcp-client/issues/3178).
 
 ### Focused client runtime (`@adcp/sdk/client/core`)
 
@@ -88,6 +105,7 @@ Start with the persona guide that matches your job:
 - [Build a seller](./docs/guides/SELLER-QUICKSTART-3.2.md)
 - [Call a seller](./docs/guides/BUYER-QUICKSTART-3.2.md)
 - [Adopt the account change feed](./docs/migration-account-change-feed.md)
+- [Upgrade an integration that still uses AdCP 2](./docs/migration-drop-adcp-2.md)
 - [Upgrade from SDK 13](./docs/migration-13-to-14.md)
 - [Add AdCP to an existing platform](./docs/guides/EXISTING-PLATFORM.md)
 - [Run in production](./docs/guides/PRODUCTION-DURABILITY.md)
@@ -587,6 +605,60 @@ app.post(
 
 Full guide covering key generation, JWKS publication, brand.json setup, webhook signing, capability declaration, key rotation, and conformance testing: **[docs/guides/SIGNING-GUIDE.md](./docs/guides/SIGNING-GUIDE.md)**.
 
+### Response Size Cap
+
+Agent responses are untrusted input, so the SDK caps every response body it
+reads. **The default is 4 MiB** (`DEFAULT_MAX_RESPONSE_BYTES`), applied on
+every MCP and A2A call path: tool calls, endpoint discovery, `tools/list`,
+A2A agent-card lookup, and OAuth token exchange. (OAuth metadata discovery
+has its own, tighter 64 KiB cap and does not use this mechanism.)
+
+Bytes are counted as they stream in, a declared `Content-Length` over the cap
+is refused before the body is read, and an oversized response fails with a
+typed `ResponseTooLargeError`. Nothing is silently truncated.
+
+```typescript
+import { ResponseTooLargeError } from '@adcp/sdk';
+
+// Raise the cap for an agent that legitimately publishes a large catalog.
+const client = new ADCPMultiAgentClient(agents, {
+  transport: { maxResponseBytes: 32 * 1024 * 1024 },
+});
+
+// …or per call.
+await client.agent('agent_x').getProducts(params, {
+  transport: { maxResponseBytes: 32 * 1024 * 1024 },
+});
+
+// Opt out entirely — explicit, never the default. Only `0` opts out;
+// `Infinity` and negative values fall back to the 4 MiB default.
+await client.agent('agent_x').getProducts(params, { transport: { maxResponseBytes: 0 } });
+
+try {
+  await client.agent('agent_x').getProducts(params);
+} catch (err) {
+  if (err instanceof ResponseTooLargeError) {
+    console.warn(`agent returned > ${err.limit} bytes from ${err.url}`);
+  }
+}
+```
+
+`text/event-stream` responses are covered too, with two bounds: no single
+event frame may exceed `maxResponseBytes`, and the cumulative event-stream
+octets read during one call may not exceed `maxResponseBytes * 2` (8 MiB by
+default). A peer cannot escape the cap by replying with
+`Content-Type: text/event-stream`.
+
+The counter runs downstream of the runtime's content-decoder, so it measures
+**decompressed** octets: a small gzip blob that inflates to gigabytes still
+trips the cap after `maxResponseBytes` of output. The `Content-Length`
+pre-check sees the compressed length, so it is a fast path rather than the
+guarantee.
+
+A per-call `transport` object **replaces** the client's `transport` rather
+than merging into it — repeat `maxResponseBytes` when you override the object
+for some other reason.
+
 ### Authentication
 
 ```typescript
@@ -738,6 +810,23 @@ Build a registry service that:
 - Provides web UI for browsing properties and agents
 
 Library provides discovery logic - you add persistence layer.
+
+### Property catalog registration and errors
+
+For bulk property catalog registration, use `RegistryClient.resolveIdentifiersAll()`
+in default `resolve` mode (requires an API key and provenance); use `mode: 'lookup'`
+for read-only resolution. It splits by count and request bytes, bounds concurrency,
+honors rate-limit retry delays, and returns per-input outcomes. `saveProperty()`
+updates hosted publisher configuration; `saveProperties()` fans out those updates
+and is intended for one configuration per publisher domain. Both validate
+`publisher_domain` before HTTP. See [the property-list guide](docs/guides/PROPERTY-LISTS.md)
+for identifier validators, mixed app/CTV matching, MCP list serving, signed change
+notifications, and certification.
+
+Registry HTTP errors use `RegistryRequestError` / `isRegistryRequestError` with
+`status`, `method`, `retryAfterMs`, and bounded untrusted `details`. Do not parse
+`error.message` for HTTP status or retry timing. Local identifier validation uses
+`IdentifierValidationError`; bulk resolve failures are available in each outcome.
 
 ### Brand relationship verification
 

@@ -391,6 +391,30 @@ Each `CanonicalFormatLegacyRoute` contains `product_id`, the stable
 resolver to `AgentClient` or `createAdcpServerFromPlatform()` without changing
 the existing resolver callback contract.
 
+Routes built with `legacyRoutesForProduct()` from products returned by
+`getProducts()` also record `seller_declared`. It is `false` when the SDK derived
+the option from a seller's legacy `format_ids`; such a route also carries
+`canonical_selector`, the `format_kind` + `params` that a canonical-wire write
+sends in place of the SDK-minted `format_option_id`, which the seller cannot
+resolve. An `AgentClient` given a resolver rebuilt from these routes applies
+that rewrite in another process, as it does after its own discovery. Routes
+without `seller_declared` leave canonical writes unchanged.
+
+A buyer that stored the seller's raw `get_products` product, and projects it
+again in a process that never ran discovery, can record the same origin by
+passing that stored product: `legacyRoutesForProduct(productId,
+projected.format_options, { sellerProduct: storedProduct })`. An option is then
+seller-declared exactly when the stored product's own `format_options[]` names
+it, which is the rule the SDK applies after its own discovery.
+
+The client reads that origin from the resolver function that
+`canonicalFormatLegacyResolverFromRoutes()` returns. A resolver you build around
+it, for example one that tries the stored routes and then another source, is a
+different function and carries no origin unless you pass it through
+`carryFormatOptionOrigins(composedResolver, routesResolver)`.
+`canonicalFormatLegacyResolverFromCatalogSnapshots(snapshots, fallback)` already
+carries its fallback's origin.
+
 Compatibility consumers that must retain top-level `format_ids[]` while
 publishing URL-free canonical declarations can use the additive projection:
 

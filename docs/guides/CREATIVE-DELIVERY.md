@@ -124,16 +124,112 @@ await agent.syncCreatives(
 The same pure functions are available from the explicit
 `@adcp/sdk/v2/projection` migration subpath for composition outside a client call:
 `projectCreativeForDelivery()`, `projectMediaBuyCreativesForDelivery()`, and
-`projectSyncCreativesForDelivery()`. Capability resolution uses the client's
+`projectSyncCreativesForDelivery()`.
+
+When these helpers emit a legacy `format_id`, they also map assets to the
+definition's `asset_id` keys. Definitions come from the bundled reference
+catalog, or from an optional final `legacyFormatDefinitions` array supplied to
+any of the three helpers. Caller definitions take precedence and must match
+both the format agent URL and ID. No network lookup occurs during projection.
+
+Existing declared asset keys keep their values. Other assets move only to one
+unoccupied slot with the same `asset_type`; URL assets must also match
+`requirements.url_type`, and pixel trackers must match the slot's `event`.
+Custom tracker events also match `custom_event_name`. Definitions containing
+repeatable groups retain all asset keys; projection does not infer group membership.
+Unmatched assets, ambiguous matches, and assets competing for the same slot
+keep their original keys. Unknown definitions leave assets unchanged. Canonical
+delivery retains its asset keys, and projection never mutates the caller's data.
+
+Capability resolution uses the client's
 emitted wire release pin: AdCP 3.2+ is canonical by contract, 3.0 is legacy, and 3.1
 checks the explicit `media_buy.features.canonical_creatives` declaration. A
 3.1 peer without the feature is deliberately
 `unknown` because a 3.1 version claim does not prove the runtime accepts
 canonical creatives. For MCP peers the client then inspects the advertised
 input schema for the current tool only; support advertised by another creative
-tool is never reused. Unknown peers receive a legacy projection only when the
-selected product provides one unambiguous ref. Ambiguous or unavailable mappings throw
-`CreativeFormatProjectionError` before transport.
+tool is never reused.
+
+For a seller proven to serve AdCP 3.1, an otherwise unknown write uses canonical
+delivery when every selected option and creative is covered by the seller's own
+`format_options`. This follows the 3.1 buyer rule to prefer advertised format
+options over dual-emitted legacy IDs. Creative option references and kinds must
+match, including declared slots and dimensions. Sync assignments must all have
+matching selector containers. Explicit legacy capabilities or tool schemas take
+precedence; experimental declarations and options synthesized by the SDK from
+legacy IDs do not establish canonical support. This also works when a 3.2 buyer
+negotiates down to a 3.1 seller.
+
+Supply the selected product or the result of `packageRefsForFormatOptions()` in
+`creativeFormatProjection.selectorContainers`. Include `package_id` when using
+assignments. After serializing a selection, include `product_id` so the same
+client can recover the seller declaration from account-scoped product discovery,
+including product-cache hits. Product evidence applies to that request only.
+The seller remains responsible for full manifest validation.
+
+Canonical fallback requires affirmative evidence from this client's product
+discovery and an advertised `supported_versions` entry proving the seller serves
+3.1. The fallback uses synchronous discovery and successful conditional catalog
+revalidation. A saved product on a fresh client, including one synthesized from
+legacy IDs, cannot establish support by its shape alone. Rediscover the product
+in the current account and authorization scope first. Evidence expires after
+the discovery TTL (five minutes by default); product-cache hits do not extend
+it. Authorization changes and discovery invalidation invalidate the evidence.
+Request-scoped custom transports require explicit capability or tool-schema
+support and do not reuse this inferred product evidence.
+
+Assignment-only sync and updates containing only an existing `package_id` keep
+their existing wire behavior. Pass the matching selectors for this request to
+use the product-based fallback; package IDs alone do not establish support.
+Without assignments, each creative must match every supplied container; use
+assignments or split mixed-format batches when the products accept different kinds.
+
+Without matching product evidence, unknown peers receive a legacy projection
+only when the selected product provides one unambiguous ref. Ambiguous or
+unavailable mappings throw `CreativeFormatProjectionError` before transport.
+
+Schema inspection follows local JSON Pointer `$ref` targets, including `$defs`,
+and retains the complete listed document through shared discovery-cache reuse.
+Unused definitions and annotations do not establish support. External references,
+named anchors, and dynamic references are not resolved; inspection never fetches
+schema URLs. Cycles and traversal limits cannot force a guessed wire mode.
+
+Before building creatives, inspect the tool's wire evidence:
+
+```ts
+const mode = await agent.resolveCreativeFormatWireMode('sync_creatives');
+```
+
+This method is available on `AgentClient` and `SingleAgentClient`, accepts
+`sync_creatives`, `create_media_buy`, or `update_media_buy`, and shares the
+write path's capability discovery, tool-schema fallback, and buyer wire pin.
+This context-free check does not inspect a write's product options, so an
+`unknown` result can still become canonical for a matching 3.1 write as described
+above.
+It reuses fresh cached or primed evidence; cold discovery may make read calls,
+but it sends no mutation. Pass `{ signal, transport }` as the optional second
+argument to use the same cancellation and transport scope as the write.
+
+The result is `canonical`, `legacy`, or `unknown` (`CreativeFormatWireMode`).
+For older peers without matching product evidence, `unknown` means projection
+still requires one unambiguous legacy reference. It does not promise canonical
+support. Conflicting capability/schema evidence or missing release proof with
+a 3.2+ buyer pin throws `CreativeFormatCapabilityError`, as during a write.
+The standalone `resolveCreativeFormatWireMode(capabilities, version)` helper
+only evaluates capability declarations; use the client method when you need
+the tool-schema fallback too.
+
+For a manual projection check, import `projectSyncCreativesForDelivery` from
+`@adcp/sdk/v2/projection`. Matching the write requires the same mode, converter,
+resolver, and selector inputs. Include a selector container for every assigned
+`package_id`, including packages that have no selected format; `syncCreatives()`
+adds those missing containers automatically. Client-configured catalogs and
+cached package routes can also supply projection inputs, so this helper is not
+a dry run of the client's full projection pipeline.
+
+Resolve again after installing new evidence with `primeCapabilities()`, calling
+`SingleAgentClient.refreshCapabilities()`, or changing authorization or
+transport scope. Scoped transports rediscover evidence for each call.
 
 Use `packageRefsForFormatOptions(product, selectedIds)` when authoring package
 selectors. It returns only canonical `format_option_refs`. The SDK carries any
@@ -146,6 +242,16 @@ create/update/get-media-buy completions also learn exact package routes,
 including polling, deferred, and webhook completions. A creative assigned to
 multiple packages downgrades only when every package resolves to the same
 legacy ref set.
+
+For a canonical seller whose product declares only legacy `format_ids`, those
+authored option refs name IDs minted locally by the SDK. After discovering the
+product with the same client, create/update writes send the equivalent
+`format_kind` + `params` selector and sync writes drop undeclared creative pins.
+Product-cache snapshots retain this seller-origin evidence privately. A selection
+that needs multiple direct selectors, or an undeclared custom format that needs
+its schema identity, fails with `ADCP_CREATIVE_FORMAT_PROJECTION_FAILED` before
+dispatch. Seller-declared option refs remain unchanged. Re-run `getProducts()`
+after restarting before writing selections derived from legacy-only products.
 
 After a process restart, re-run product and media-buy reads that carry enough
 selector context or configure the explicit canonical-to-legacy resolver below.

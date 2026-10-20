@@ -16,6 +16,7 @@ import type { SignerKey } from './signer';
 import { containsWebhookAuthentication } from './webhook-auth-detection';
 import { ADCP_VERSION } from '../version';
 import { requestSigningEncodingForVersion } from './content-digest';
+import { resolveRequestOperation } from './operation-resolution';
 export { requestSigningEncodingForVersion } from './content-digest';
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -62,14 +63,6 @@ function describeBody(body: unknown): string {
   return typeof body;
 }
 
-/** A2A JSON-RPC methods that carry an AdCP operation, across A2A 0.3 and 1.0. */
-const A2A_SEND_METHODS: ReadonlySet<string> = new Set([
-  'message/send',
-  'message/stream',
-  'SendMessage',
-  'SendStreamingMessage',
-]);
-
 /**
  * Extract the AdCP operation name from a JSON-RPC request body, if any.
  *
@@ -89,36 +82,12 @@ const A2A_SEND_METHODS: ReadonlySet<string> = new Set([
 export function extractAdcpOperation(body: unknown): string | undefined {
   const text = bodyToUtf8(body);
   if (!text) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (!parsed || typeof parsed !== 'object') return undefined;
-  const rpc = parsed as { method?: unknown; params?: unknown };
-
-  if (rpc.method === 'tools/call') {
-    const params = rpc.params as { name?: unknown } | undefined;
-    return typeof params?.name === 'string' ? params.name : undefined;
-  }
-
-  if (typeof rpc.method === 'string' && A2A_SEND_METHODS.has(rpc.method)) {
-    const params = rpc.params as { message?: { parts?: unknown } } | undefined;
-    const parts = params?.message?.parts;
-    if (!Array.isArray(parts)) return undefined;
-    for (const part of parts) {
-      if (part && typeof part === 'object') {
-        const p = part as { kind?: unknown; data?: { skill?: unknown } };
-        const isDataPart = p.kind === undefined || p.kind === 'data';
-        if (isDataPart && typeof p.data?.skill === 'string') {
-          return p.data.skill;
-        }
-      }
-    }
-  }
-
-  return undefined;
+  // The seller resolves the operation from the SAME rules (sole DataPart for
+  // A2A, `params.name` for MCP), so the buyer never decides whether to sign on
+  // the basis of a different Part than the seller will dispatch. A body the
+  // seller treats as unresolvable has no operation here either.
+  const operation = resolveRequestOperation({ rawBody: text, method: 'POST' });
+  return typeof operation === 'string' ? operation : undefined;
 }
 
 /**
@@ -248,13 +217,41 @@ export function buildAgentSigningFetch(options: BuildAgentSigningFetchOptions): 
   const upstream: FetchLike = explicitUpstream ?? ((input, init) => defaultUpstream()(input, init));
 
   const shouldSign = (_url: string, init: RequestInit | undefined): boolean => {
-    if (carriesWebhookAuthentication(init?.body)) return true;
+    if (carriesWebhookAuthentication(init?.body)) {
+      if (signing.profile === 'web-bot-auth' && !getCapability()?.requestSigning?.profiles?.includes('web-bot-auth'))
+        throw new TypeError('Seller did not advertise the Web Bot Auth request signing profile');
+      return true;
+    }
     const operation = extractAdcpOperation(init?.body);
     const entry = getCapability();
-    return shouldSignOperation(operation, entry?.requestSigning, signing);
+    const sign =
+      signing.profile === 'web-bot-auth' && !!operation && entry?.requestSigning?.profiles?.includes('web-bot-auth')
+        ? true
+        : shouldSignOperation(operation, entry?.requestSigning, signing);
+    if (sign && signing.profile === 'web-bot-auth' && !entry?.requestSigning?.profiles?.includes('web-bot-auth'))
+      throw new TypeError('Seller did not advertise the Web Bot Auth request signing profile');
+    return sign;
   };
 
   const binaryEncoding = requestSigningEncodingForVersion(options.adcpVersion ?? ADCP_VERSION);
+  if (signing.profile === 'web-bot-auth') {
+    const { createWebBotAuthFetch, jwkThumbprint } = require('./web-bot-auth') as typeof import('./web-bot-auth');
+    if (isProviderSigningConfig(signing)) {
+      if (!signing.public_key) throw new TypeError('Web Bot Auth providers require public_key');
+      return createWebBotAuthFetch(
+        upstream,
+        { provider: freezeProviderIdentity(signing.provider), publicKey: signing.public_key },
+        { origin: signing.agent_url, shouldSign }
+      );
+    }
+    if (jwkThumbprint(signing.private_key) !== signing.kid)
+      throw new TypeError('Web Bot Auth kid must be the public JWK thumbprint');
+    return createWebBotAuthFetch(
+      upstream,
+      { privateKey: signing.private_key },
+      { origin: signing.agent_url, shouldSign }
+    );
+  }
   const coverContentDigest: CoverContentDigestPredicate = (_url, _init) => {
     if (binaryEncoding === 'rfc8941-base64') return true;
     const entry = getCapability();

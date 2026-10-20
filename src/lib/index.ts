@@ -1,4 +1,6 @@
 // AdCP Client Library - Main Exports
+export * from './identifiers';
+export type { ResolveIdentifiersAllOptions, ResolveIdentifierOutcome } from './registry';
 // A comprehensive type-safe client library for the AdContext Protocol
 
 // ====== REGISTRY LOOKUPS ======
@@ -281,12 +283,22 @@ export {
   createSingleAgentClient,
   UnsupportedFeatureError,
 } from './core/SingleAgentClient';
+export { createInMemoryAgentDiscoveryCache } from './core/agent-discovery-cache';
 export type {
+  AgentDiscoveryCache,
+  AgentDiscoveryCacheConfig,
+  AgentDiscoveryEntry,
+  InMemoryAgentDiscoveryCache,
+  InMemoryAgentDiscoveryCacheOptions,
+} from './core/agent-discovery-cache';
+export type {
+  AgentDiscoverySeed,
   CapabilityEvidenceScope,
   CapabilityEvidenceSnapshot,
   ClientProductPropertyPolicy,
   CreativeDeliveryTaskOptions,
   SingleAgentClientConfig,
+  StatusHandlerErrorContext,
   SyncCreativesTaskOptions,
   VerifyAndParseWebhookOptions,
   WebhookHandlerAdapter,
@@ -523,6 +535,7 @@ export {
   targetDeclaresLegacyGovernanceAwareness,
   validateGovernancePlan,
   verifyGovernanceAuthorization,
+  createGovernanceAgentJwksResolver,
   REGULATED_HUMAN_REVIEW_CATEGORIES,
   ANNEX_III_POLICY_IDS,
 } from './governance';
@@ -643,6 +656,7 @@ export type {
   PlanBudget,
   ReallocationAutonomy,
   VerifyGovernanceAuthorizationOptions,
+  GovernanceBuyerIdentity,
 } from './governance';
 
 // ====== TASK EVENT TYPES ======
@@ -733,6 +747,11 @@ export {
   AccountRequiredError,
   AccountPendingApprovalError,
   AccountAmbiguousError,
+  BuyerSetupError,
+  AccountNotFoundError,
+  AccountSetupRequiredError,
+  AccountPaymentRequiredError,
+  AccountNotProvisionedError,
   SDK_ERROR_TO_PROTOCOL_ERROR_CODE,
   VersionUnsupportedError,
   IdempotencyConflictError,
@@ -786,6 +805,8 @@ export type {
   BuyerPropertyPolicy,
   NormalizedPolicyDomain,
   ProductPolicyProductLike,
+  ProductPolicyResolvedProperty,
+  ProductPropertyPolicyIdentifier,
   ProductPropertyPolicyDiagnostic,
   ProductPropertyPolicyDiagnosticCode,
   ProductPropertyPolicyDiagnosticSeverity,
@@ -1273,7 +1294,12 @@ export { PlacementPresentationDocumentSchema, PlacementPresentationReferenceSche
 // ====== ERROR CODES ======
 // Standard error code vocabulary for programmatic error handling
 export type { Error as TaskErrorDetail } from './types/core.generated';
-export { STANDARD_ERROR_CODES, isStandardErrorCode, getErrorRecovery } from './types/error-codes';
+export {
+  STANDARD_ERROR_CODES,
+  isStandardErrorCode,
+  getErrorRecovery,
+  DEFAULT_UNKNOWN_ERROR_RECOVERY,
+} from './types/error-codes';
 export type { StandardErrorCode, ErrorRecovery } from './types/error-codes';
 
 // ====== SERVER-SIDE HELPERS ======
@@ -1637,6 +1663,7 @@ export {
   type ExchangeClientCredentialsOptions,
   type EnsureClientCredentialsOptions,
   type AgentOAuthClientCredentials,
+  AgentOAuthClientCredentialsSchema,
 } from './auth/oauth';
 
 // ====== VALIDATION ======
@@ -1654,11 +1681,15 @@ export {
   createA2AClient,
   closeMCPConnections,
   closeOAuthConnections,
+  closeScopedConnections,
+  withMCPConnectionScope,
   bundleSupportsAdcpVersionField,
   BODY_SNIPPET_TIMEOUT_MS,
   OBSERVER_FLUSH_TIMEOUT_MS,
   sanitizeTransportHeaders,
   sanitizeTransportUrl,
+  DEFAULT_MAX_RESPONSE_BYTES,
+  SSE_CUMULATIVE_BUDGET_MULTIPLIER,
 } from './protocols';
 export {
   toReleasePrecisionWire,
@@ -1672,6 +1703,8 @@ export type {
   TransportActivity,
   TransportActivityContext,
   TransportActivityHandler,
+  TransportActivityType,
+  TransportResponseOutcome,
   TransportOptions,
   A2ALegacyCompatOptions,
 } from './protocols';
@@ -1824,10 +1857,8 @@ export { Render, urlRender, htmlRender, bothRender } from './utils/render-builde
 // Use `parameterizedRender({ role })` (or the alias `templateRender`) so
 // format_id parameters carry duration.
 //
-// `FormatRender` below is the grouped namespace (value export). The v3
-// structural interface by the same name is re-exported from
-// `utils/format-renders` further down — TypeScript keeps type and value
-// namespaces separate, so both are available under the single import.
+// `FormatRender` below is the factory namespace. The structural interface
+// is exported separately as `FormatRenderEntry` further down.
 export {
   FormatRender,
   displayRender,
@@ -1864,6 +1895,7 @@ export {
   FormatOptionRefsLookupError,
   CreativeFormatCapabilityError,
   CreativeFormatProjectionError,
+  type CreativeFormatWireMode,
   type LegacyFormatConversionContext,
   type LegacyFormatConverter,
   type LegacyFormatResolutionContext,
@@ -1871,6 +1903,7 @@ export {
   legacyFormatConverterFromCatalogSnapshots,
   canonicalFormatLegacyResolverFromCatalogSnapshots,
   canonicalFormatLegacyResolverFromRoutes,
+  carryFormatOptionOrigins,
   legacyRoutesForProduct,
   projectionAdaptersFromCatalogSnapshots,
   type ProjectionCatalogAdapters,
@@ -1879,6 +1912,7 @@ export {
   type CanonicalFormatLegacyResolver,
   type CanonicalFormatLegacyResolutionContext,
   type CanonicalFormatLegacyRoute,
+  type LegacyRoutesForProductOptions,
   type AdditiveCanonicalProduct,
   type CanonicalOnlyProduct,
   type CanonicalCreativeAsset,
@@ -2009,7 +2043,6 @@ export {
 //   - `ADCP_MAJOR_VERSION` / `COMPATIBLE_ADCP_VERSIONS` in version information
 //   - `SingleAgentClient#requireV3()` / `AgentClient#requireV3()` — runtime gate
 export {
-  buildSyntheticCapabilities,
   buildSyntheticV3Capabilities,
   parseCapabilitiesResponse,
   supportsV3,
@@ -2044,7 +2077,7 @@ export type {
   ToolInfo,
   FeatureName,
 } from './utils/capabilities';
-export type { ResolveAccountOptions, ListedAccount } from './core/account-resolution';
+export type { ResolveAccountOptions, ResolveAccountResult, ListedAccount } from './core/account-resolution';
 
 // Buyer-side creative delivery helpers
 export { inlineCreativesForPackages, inlineCreativesForPackagesLegacy } from './utils/creative-delivery';
@@ -2057,21 +2090,17 @@ export type {
   LegacyInlineCreativePackage,
 } from './utils/creative-delivery';
 
-// Creative assignment adapter (v2 creative_ids ↔ v3 creative_assignments)
+// AdCP 3 creative assignment helpers
 export {
-  adaptPackageRequestForV2,
-  adaptCreateMediaBuyRequestForV2,
-  adaptUpdateMediaBuyRequestForV2,
   normalizePackageResponse,
   normalizeMediaBuyResponse,
-  usesV2CreativeIds,
   usesV3CreativeAssignments,
   getCreativeIds,
   getCreativeAssignments,
 } from './utils/creative-adapter';
 export type { CreativeAssignment } from './utils/creative-adapter';
 
-// Format renders normalizer (v2 dimensions ↔ v3 renders)
+// AdCP 3 format render helpers
 export {
   normalizeFormatRenders,
   normalizeFormatsResponse,
@@ -2079,23 +2108,16 @@ export {
   getPrimaryRender,
   getCompanionRenders,
   isMultiRenderFormat,
-  usesV2Dimensions,
   usesV3Renders,
   getFormatDimensions,
 } from './utils/format-renders';
-// FormatRender (the v3 structural interface) was renamed to FormatRenderEntry
-// so the `FormatRender` name at the barrel becomes the factory namespace
-// exported from `./utils/format-render-builders` above. The deprecated type
-// alias `FormatRender = FormatRenderEntry` still lives in `utils/format-renders`
-// for callers importing the sub-module directly; it's not re-exported here.
 export type { FormatRenderEntry, RenderDimensions } from './utils/format-renders';
 
-// Preview response normalizer (v2 output_id ↔ v3 render_id)
+// AdCP 3 preview render helpers
 export {
   normalizePreviewRender,
   normalizePreview,
   normalizePreviewCreativeResponse,
-  usesV2RenderFields,
   usesV3RenderFields,
   getRenderId,
   getRenderRole,
@@ -2104,6 +2126,7 @@ export {
   getPreviewHtml,
 } from './utils/preview-normalizer';
 export type { PreviewRendererMetadata, PreviewRenderV3 } from './utils/preview-normalizer';
+
 export {
   resolvePreviewAuthority,
   type PlacementPreviewCandidate,
@@ -2165,7 +2188,14 @@ export {
   VERSION_INFO,
 } from './version';
 export type { AdcpVersion } from './version';
-export { listBundledAdcpVersions, resolveAdcpVersion } from './utils/adcp-version-config';
+export {
+  listBundledAdcpVersions,
+  resolveAdcpVersion,
+  isAdcpVersionAtLeast,
+  sellerAdvertises31,
+  shouldOmit31Fields,
+} from './utils/adcp-version-config';
+export { redactSecrets } from './utils/redact-secrets';
 
 // ====== OBSERVABILITY ======
 // OpenTelemetry tracing utilities (no-op if @opentelemetry/api not installed)
@@ -2299,6 +2329,7 @@ export {
   divergenceOffset,
   translateUniversalMacros,
   UnsafeNativeMappingError,
+  MultipleVendorConsentMacrosError,
   compileUniversalMacroTemplate,
 } from './substitution';
 export type {
@@ -2389,3 +2420,15 @@ export type {
   CollectionDistribution,
   DiscoveryCollection,
 } from './discovery/types';
+
+export {
+  BuyerAccountRegistry,
+  type AccountPolicy,
+  type BuyerAccountStorage,
+  type BuyerAccountRegistryOptions,
+  type BuyerAccountDispatch,
+  type BuyerAccountProvisioningDispatch,
+  type EnsureAccountOptions,
+  type ProvisionedAccount,
+} from './core/buyer-account-registry';
+export { createProductCache, ProductCache, type ProductCacheOptions } from './core/product-cache';

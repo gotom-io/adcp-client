@@ -1,6 +1,7 @@
 import { parseDictionary } from 'structured-headers';
 import {
   buildSignatureBase,
+  canonicalAuthority,
   canonicalTargetUri,
   getHeaderValue,
   rejectNonAsciiHost,
@@ -17,7 +18,8 @@ import { RequestSignatureError } from './errors';
 import { AgentResolverError } from './agent-resolver/errors';
 import { parseStrictJson, StrictJsonError } from './agent-resolver/strict-json';
 import { parseSignature, parseSignatureInput, type ParsedSignatureInput } from './parser';
-import { jwkToPublicKey, verifySignature } from './crypto';
+import { jwkToPublicKey, verifySignatureAsync } from './crypto';
+import { isUnresolvableOperation, type UnresolvableOperation } from './operation-resolution';
 import type { JwksResolver } from './jwks';
 import type { ReplayStore } from './replay';
 import type { RevocationStore } from './revocation';
@@ -30,6 +32,7 @@ import {
   REQUEST_SIGNING_TAG,
   type VerifierCapability,
   type VerifyResult,
+  type VerifiedSigner,
 } from './types';
 
 export interface VerifyRequestOptions {
@@ -44,8 +47,13 @@ export interface VerifyRequestOptions {
    * the verifier treats the operation as "not in any required_for list" and
    * returns an unsigned result rather than rejecting — callers in
    * always-verify mode (where every request is signed) can leave this blank.
+   *
+   * Pass {@link UNRESOLVABLE_OPERATION} when the request body does not resolve
+   * to exactly one operation (see `resolveRequestOperation`). The verifier
+   * then rejects with `request_body_malformed` before it looks at any
+   * signature header or capability list, whether or not the request is signed.
    */
-  operation?: string;
+  operation?: string | UnresolvableOperation;
   /**
    * Trusted endpoint release pin; never inferred from request payload data.
    * A 3.2+ pin parses `Signature` and `Content-Digest` strictly as RFC 8941
@@ -64,57 +72,27 @@ export async function verifyRequestSignature(
   request: RequestLike,
   options: VerifyRequestOptions
 ): Promise<VerifyResult> {
-  const now = options.now ? options.now() : Math.floor(Date.now() / 1000);
+  const currentTime = options.now ?? (() => Math.floor(Date.now() / 1000));
+  const now = currentTime();
   const pinnedBinaryEncoding =
     options.adcpVersion !== undefined ? requestSigningEncodingForVersion(options.adcpVersion) : undefined;
   const sigInputHeader = getHeaderValue(request.headers, 'Signature-Input');
   const sigHeader = getHeaderValue(request.headers, 'Signature');
 
+  // Pre-check 0: the request must resolve to exactly one operation. This runs
+  // before the header-pair checks and the `required_for` test, and whether or
+  // not the request is signed — an unresolvable body is never "an operation
+  // that is not in required_for".
+  if (isUnresolvableOperation(options.operation)) throw unresolvableOperationError();
+  const operation = options.operation;
+
   // Pre-check: both headers present or both absent.
   if (!sigInputHeader && !sigHeader) {
-    const operation = options.operation;
     // Precedence is intentionally fail-specific: AdCP tool required_for,
     // raw JSON-RPC protocol methods, then payload-driven webhook-auth
     // elevation. The specific signed-only contract should win before the
     // generic body scan runs.
-    if (operation && options.capability.required_for.includes(operation)) {
-      throw new RequestSignatureError(
-        'request_signature_required',
-        0,
-        `Operation "${operation}" requires a signed request`
-      );
-    }
-    const protocolMethodsRequiredFor = options.capability.protocol_methods_required_for ?? [];
-    if (protocolMethodsRequiredFor.length > 0 && exceedsUnsignedBodyInspectionCap(request.body)) {
-      throw new RequestSignatureError(
-        'request_signature_required',
-        0,
-        'Unsigned request body exceeds the protocol method inspection cap while protocol methods require signing'
-      );
-    }
-    const protocolMethods = jsonRpcProtocolMethods(request.body);
-    const requiredProtocolMethod = protocolMethods.find(method => protocolMethodsRequiredFor.includes(method));
-    if (requiredProtocolMethod) {
-      throw new RequestSignatureError(
-        'request_signature_required',
-        0,
-        `Protocol method "${requiredProtocolMethod}" requires a signed request`
-      );
-    }
-    // Payload-driven elevation: any request carrying webhook receiver
-    // credentials (task, reporting, artifact, or revocation callbacks) MUST
-    // be RFC 9421 signed, regardless of whether the operation appears in
-    // `required_for`
-    // (#webhook-security downgrade-resistance). A bearer-only channel
-    // would otherwise let an attacker who captured a token register or
-    // update webhook credentials and redirect callbacks to a hostile URL.
-    if (carriesWebhookAuthentication(request)) {
-      throw new RequestSignatureError(
-        'request_signature_required',
-        0,
-        'Requests carrying webhook authentication must be RFC 9421 signed'
-      );
-    }
+    assertUnsignedRequestAllowed(request.body, operation, options.capability);
     return { status: 'unsigned', verified_at: now };
   }
   if (!sigInputHeader || !sigHeader) {
@@ -148,7 +126,8 @@ export async function verifyRequestSignature(
   if (!parsedSig) throw parseError;
   const effectiveEncoding = pinnedBinaryEncoding ?? parsedEncoding!;
   const canonicalizationProfile = effectiveEncoding === 'rfc8941-base64' ? '3.2' : 'legacy';
-  if (canonicalizationProfile === 'legacy') rejectNonAsciiHost(request.url);
+  // A received signed authority must already use A-labels in every profile.
+  rejectNonAsciiHost(request.url);
   validateSingleValuedCoveredHeaders(parsedInput.components, request);
 
   // Step 2: required params present.
@@ -186,13 +165,37 @@ export async function verifyRequestSignature(
 
   // Step 7: resolve keyid.
   let jwk;
+  let resolvedAgentUrl: string | undefined;
+  let authorizationValidUntil: number | undefined;
+  let operatorRecord: VerifiedSigner['operatorRecord'];
   try {
-    jwk = await options.jwks.resolve(parsedInput.params.keyid);
+    if (options.jwks.resolveWithMetadata) {
+      const resolution = await options.jwks.resolveWithMetadata(parsedInput.params.keyid);
+      if (resolution.legacyWebhookFallback)
+        throw new AgentResolverError(
+          'request_signature_brand_json_url_missing',
+          'Legacy discovery is limited to webhook verification',
+          {}
+        );
+      jwk = resolution.jwk;
+      resolvedAgentUrl = resolution.agentUrl;
+      operatorRecord = resolution.operatorRecord;
+      authorizationValidUntil = resolution.operatorAuthorizationValidUntil;
+    } else {
+      jwk = await options.jwks.resolve(parsedInput.params.keyid);
+    }
   } catch (err) {
     if (err instanceof AgentResolverError) {
-      throw new RequestSignatureError(err.code, 7, err.message, err.detail);
+      throw new RequestSignatureError(err.code, 7, err.message, err.detail, err.recovery);
     }
     throw err;
+  }
+  if (authorizationValidUntil !== undefined && currentTime() >= authorizationValidUntil) {
+    throw new RequestSignatureError(
+      'request_signature_brand_origin_mismatch',
+      7,
+      'Delegated operator authorization expired before verification'
+    );
   }
   if (!jwk) {
     throw new RequestSignatureError(
@@ -260,6 +263,19 @@ export async function verifyRequestSignature(
     );
   }
 
+  // The profile derives @authority from the as-received Host header, while the
+  // signature base below uses the request URL's authority. Judge a Host header
+  // the URL does not carry here, so a malformed one is refused even when the
+  // signature verifies over the clean URL authority.
+  const receivedHost = getHeaderValue(request.headers, 'Host');
+  if (receivedHost !== undefined) {
+    if (/[\s/?#@\\]/.test(receivedHost)) {
+      throw new RequestSignatureError('request_target_uri_malformed', 10, 'Host header is not a valid authority');
+    }
+    rejectNonAsciiHost(`https://${receivedHost}/`);
+    canonicalAuthority(`https://${receivedHost}/`, '3.2');
+  }
+
   // Step 10: cryptographic verify. Use the received Signature-Input value
   // verbatim as the @signature-params line so a peer emitting params in a
   // different legal order still produces a byte-identical base.
@@ -270,8 +286,9 @@ export async function verifyRequestSignature(
     parsedInput.signatureParamsValue,
     canonicalizationProfile
   );
-  const publicKey = jwkToPublicKey(jwk);
-  const valid = verifySignature(parsedInput.params.alg, publicKey, Buffer.from(base, 'utf8'), parsedSig.bytes);
+  // Validates the JWK (request_signature_key_unknown on malformed keys).
+  jwkToPublicKey(jwk);
+  const valid = await verifySignatureAsync(parsedInput.params.alg, jwk, Buffer.from(base, 'utf8'), parsedSig.bytes);
   if (!valid) {
     throw new RequestSignatureError(
       'request_signature_invalid',
@@ -328,11 +345,21 @@ export async function verifyRequestSignature(
     }
   }
 
+  if (authorizationValidUntil !== undefined && currentTime() >= authorizationValidUntil) {
+    throw new RequestSignatureError(
+      'request_signature_brand_origin_mismatch',
+      7,
+      'Delegated operator authorization expired during verification'
+    );
+  }
+
   // Step 12: commit the (keyid, nonce) into the replay cache now that all
   // prior checks have passed. Floor the TTL at one max-window + skew so a
   // signer minting tiny validity windows can't replay outside the configured
   // replay horizon, and so cross-replica eventual consistency has headroom.
-  const remaining = parsedInput.params.expires - now + CLOCK_SKEW_TOLERANCE_SECONDS;
+  // The window check accepts through `expires + skew` inclusive, so the
+  // nonce must outlive that instant by one second.
+  const remaining = parsedInput.params.expires - now + CLOCK_SKEW_TOLERANCE_SECONDS + 1;
   const ttl = Math.max(remaining, MAX_SIGNATURE_WINDOW_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS);
   const insertResult = await options.replayStore.insert(jwk.kid, replayScope, parsedInput.params.nonce, ttl, now);
   if (insertResult === 'replayed') {
@@ -350,8 +377,22 @@ export async function verifyRequestSignature(
     );
   }
 
-  const agent_url = options.agentUrlForKeyid?.(jwk.kid);
-  return { status: 'verified', keyid: jwk.kid, agent_url, verified_at: now };
+  if (authorizationValidUntil !== undefined && currentTime() >= authorizationValidUntil) {
+    throw new RequestSignatureError(
+      'request_signature_brand_origin_mismatch',
+      7,
+      'Delegated operator authorization expired before acceptance'
+    );
+  }
+
+  const agent_url = resolvedAgentUrl ?? options.agentUrlForKeyid?.(jwk.kid);
+  return {
+    status: 'verified',
+    keyid: jwk.kid,
+    agent_url,
+    verified_at: now,
+    ...(operatorRecord !== undefined && { operatorRecord }),
+  };
 }
 
 function signatureEncodingCandidates(
@@ -368,6 +409,95 @@ function signatureEncodingCandidates(
   // keeps accepting both serializations during a rolling upgrade.
   if (pinned === 'rfc8941-base64' || digestPolicy !== 'either') return [pinned];
   return ['legacy-base64url', 'rfc8941-base64'];
+}
+
+/** The `request_body_malformed` rejection for a body that resolves to no single operation. */
+export function unresolvableOperationError(): RequestSignatureError {
+  return new RequestSignatureError(
+    'request_body_malformed',
+    0,
+    'Request body does not resolve to exactly one AdCP operation'
+  );
+}
+
+/**
+ * Throw `request_signature_required` when an UNSIGNED request must be signed:
+ * its resolved operation is in `capability.required_for`, or its JSON-RPC
+ * method is in `capability.protocol_methods_required_for`, or it carries
+ * webhook authentication. Returns normally when none applies.
+ *
+ * "Unsigned" is the caller's contract: no `Signature` / `Signature-Input`
+ * header. The checks do not consult any fallback credential; a caller that
+ * lets a configured fallback authenticator satisfy `required_for` (the
+ * presence-gated composer) runs the pieces separately.
+ */
+export function assertUnsignedRequestAllowed(
+  body: string | undefined,
+  operation: string | undefined,
+  capability: Pick<VerifierCapability, 'required_for' | 'protocol_methods_required_for'>
+): void {
+  assertUnsignedOperationNotRequired(operation, capability);
+  assertUnsignedProtocolMethodNotRequired(body, capability);
+  assertUnsignedWebhookAuthenticationAbsent(body);
+}
+
+/** `required_for` half of {@link assertUnsignedRequestAllowed}. */
+export function assertUnsignedOperationNotRequired(
+  operation: string | undefined,
+  capability: Pick<VerifierCapability, 'required_for'>
+): void {
+  if (operation && capability.required_for.includes(operation)) {
+    throw new RequestSignatureError(
+      'request_signature_required',
+      0,
+      `Operation "${operation}" requires a signed request`
+    );
+  }
+}
+
+/** `protocol_methods_required_for` half of {@link assertUnsignedRequestAllowed}. */
+export function assertUnsignedProtocolMethodNotRequired(
+  body: string | undefined,
+  capability: Pick<VerifierCapability, 'protocol_methods_required_for'>
+): void {
+  const protocolMethodsRequiredFor = capability.protocol_methods_required_for ?? [];
+  if (protocolMethodsRequiredFor.length === 0) return;
+  if (exceedsUnsignedBodyInspectionCap(body)) {
+    throw new RequestSignatureError(
+      'request_signature_required',
+      0,
+      'Unsigned request body exceeds the protocol method inspection cap while protocol methods require signing'
+    );
+  }
+  const requiredProtocolMethod = jsonRpcProtocolMethods(body).find(method =>
+    protocolMethodsRequiredFor.includes(method)
+  );
+  if (requiredProtocolMethod) {
+    throw new RequestSignatureError(
+      'request_signature_required',
+      0,
+      `Protocol method "${requiredProtocolMethod}" requires a signed request`
+    );
+  }
+}
+
+/**
+ * Payload-driven elevation: any request carrying webhook receiver credentials
+ * (task, reporting, artifact, or revocation callbacks) MUST be RFC 9421
+ * signed, regardless of whether the operation appears in `required_for`
+ * (#webhook-security downgrade-resistance). A bearer-only channel would
+ * otherwise let an attacker who captured a token register or update webhook
+ * credentials and redirect callbacks to a hostile URL. Unlike `required_for`,
+ * a valid fallback credential does not satisfy this.
+ */
+export function assertUnsignedWebhookAuthenticationAbsent(body: string | undefined): void {
+  if (carriesWebhookAuthentication(body)) {
+    throw new RequestSignatureError(
+      'request_signature_required',
+      0,
+      'Requests carrying webhook authentication must be RFC 9421 signed'
+    );
+  }
 }
 
 function contentDigestEncodingCandidates(pinned: SfBinaryEncoding | undefined): readonly SfBinaryEncoding[] {
@@ -647,8 +777,7 @@ function exceedsUnsignedBodyInspectionCap(body: string | undefined): boolean {
  * returns `true` — we can't prove absence of webhook auth within our DoS
  * budget, and oversized unsigned bodies are outside normal AdCP operation.
  */
-function carriesWebhookAuthentication(request: RequestLike): boolean {
-  const body = request.body;
+function carriesWebhookAuthentication(body: string | undefined): boolean {
   if (!body) return false;
   if (exceedsUnsignedBodyInspectionCap(body)) return true;
   let parsed: unknown;

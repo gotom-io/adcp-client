@@ -125,7 +125,7 @@ function assertSafeVersion(value: string, source: string): void {
 
 // Legacy wire aliases. Historical protocol previews are intentionally absent:
 // only the exact current prerelease pin is advertised by buildCompatibleVersions.
-const COMPATIBLE_PREFIX = ['v2.5', 'v2.6', 'v3'] as const;
+const COMPATIBLE_PREFIX = ['v3'] as const;
 
 const PRE_3_1_COMPATIBLE_PREFIX = COMPATIBLE_PREFIX.filter(version => !version.startsWith('3.1.')) as string[];
 
@@ -163,7 +163,7 @@ const MAX_PATCH_ENUMERATION = 500;
  * enumeration entirely.
  */
 const LAST_3_0_GA_PATCH = 25;
-const LAST_3_1_GA_PATCH = 24;
+const LAST_3_1_GA_PATCH = 29;
 /** First published AdCP 3.2 GA patch; 3.2.0 was withdrawn before GA. */
 const FIRST_3_2_GA_PATCH = 1;
 

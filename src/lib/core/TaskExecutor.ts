@@ -1,3 +1,14 @@
+import { VersionUnsupportedError } from '../errors';
+import { deliveryWebhookRegistrationId } from './webhook-registration';
+import { isAdcpVersionAtLeast } from '../utils/adcp-version-config';
+function validateIdentity33Payload(
+  ...args: Parameters<typeof import('../identity-3.3/validation').validateIdentity33Payload>
+): ReturnType<typeof import('../identity-3.3/validation').validateIdentity33Payload> {
+  return (
+    require('../identity-3.3/validation') as typeof import('../identity-3.3/validation')
+  ).validateIdentity33Payload(...args);
+}
+import { buildValidationError } from '../validation/schema-errors';
 // Core task execution engine for ADCP conversation flow
 // Implements PR #78 async patterns: working/submitted/input-required/completed
 
@@ -12,6 +23,7 @@ import {
 import { listMCPTasks } from '../protocols/mcp-tasks';
 import { withPreparedProtocolToolCall } from '../protocols/prepared-call-context';
 import { getAuthToken } from '../auth';
+import { getSignedRequestRejection } from '../protocols/signedRequestRejection';
 import { is401Error, adcpErrorToTypedError, ConfigurationError } from '../errors';
 import type { ADCPError } from '../errors';
 import type { DeferredTaskState, DeferredTaskStorage } from '../storage/interfaces';
@@ -23,6 +35,7 @@ import {
   type ValidationMode,
 } from '../validation/client-hooks';
 import { formatIssues } from '../validation/schema-validator';
+import { withServedValidationVersion } from '../validation/schema-loader';
 import { ADCP_VERSION } from '../version';
 import { unwrapProtocolResponse, isAdcpOperationSuccess } from '../utils/response-unwrapper';
 import { extractAdcpErrorInfo, extractCorrelationId } from '../utils/error-extraction';
@@ -220,6 +233,7 @@ export async function rejectDeferredSettlement(result: TaskResult<any>): Promise
 
 /** Supporting contract for the internal pre-dispatch boundary. */
 export type BeforeProtocolDispatchHookResult<T> =
+  | { action: 'dispatch_ready' }
   | {
       action: 'dispatch_committed';
       /** Require the owning durable coordinator to authorize every seller-input continuation. */
@@ -287,10 +301,13 @@ interface ExternalTaskSettlementInFlight {
 }
 
 /** Hook used by higher-level SDK coordinators at the final dispatch boundary. */
-export type BeforeProtocolDispatchHook<T> = (
+export type BeforeProtocolDispatchHook<T> = ((
   effectiveParams: any,
   context: BeforeProtocolDispatchContext
-) => Promise<BeforeProtocolDispatchHookResult<T>>;
+) => Promise<BeforeProtocolDispatchHookResult<T>>) & {
+  /** @internal A notification-only hook leaves task settlement with the executor. */
+  terminalSettlement?: 'executor';
+};
 
 /** Keeps internal dispatch-boundary failures out of the normal TaskResult error projection. */
 /** @internal */
@@ -321,7 +338,13 @@ type GovernedCredentialScanResult =
 function webhookRegistrationFromPreparedCall(
   _agent: AgentConfig,
   preparedCall: PreparedProtocolToolCall
-): { callbackUrl: string; mode: 'rfc9421' | 'hmac-sha256' } | undefined {
+):
+  | {
+      callbackUrl: string;
+      mode: 'rfc9421' | 'hmac-sha256';
+      signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+    }
+  | undefined {
   const candidate =
     preparedCall.args.push_notification_config &&
     typeof preparedCall.args.push_notification_config === 'object' &&
@@ -335,8 +358,15 @@ function webhookRegistrationFromPreparedCall(
     throw new ConfigurationError('push_notification_config.url must be a string.', 'push_notification_config.url');
   }
 
+  const profile = (candidate as Record<string, unknown>).signing_profile;
   if (!Object.prototype.hasOwnProperty.call(candidate, 'authentication')) {
-    return { callbackUrl: candidate.url, mode: 'rfc9421' };
+    if (profile !== undefined && !['adcp/webhook-signing/v1', 'web-bot-auth'].includes(profile as string))
+      throw new ConfigurationError('Unsupported webhook signing profile', 'signing_profile');
+    return {
+      callbackUrl: candidate.url,
+      mode: 'rfc9421',
+      ...(profile !== undefined && { signingProfile: profile as 'adcp/webhook-signing/v1' | 'web-bot-auth' }),
+    };
   }
   const authentication = candidate.authentication;
   if (!authentication || typeof authentication !== 'object' || Array.isArray(authentication)) {
@@ -620,13 +650,6 @@ function resolveIdempotencyKey(taskName: string, params: any, serverVersion?: 'v
       ? params.idempotency_key
       : undefined;
   if (callerSupplied) return callerSupplied;
-  // v2.5 mutations use buyer_ref as their stable replay identity. Request
-  // adaptation has already derived it from the caller's canonical key. Do
-  // not inject a fresh v3-only idempotency_key after adaptation: that makes
-  // identical retries differ on the wire and can defeat legacy dedupe.
-  if (serverVersion === 'v2') {
-    return params && typeof params === 'object' && typeof params.buyer_ref === 'string' ? params.buyer_ref : undefined;
-  }
   if (requestUsesIdempotency(taskName, params)) return generateIdempotencyKey();
   return undefined;
 }
@@ -969,6 +992,10 @@ export class TaskExecutor {
       agentId?: string;
       /** Webhook secret for legacy HMAC authentication. */
       webhookSecret?: string;
+      experimentalIdentity33?: () => boolean;
+      signedIdentity33Webhooks?: () => boolean;
+      identity33SchemaExperiment?: boolean;
+      webhookSigningProfile?: () => 'adcp/webhook-signing/v1' | 'web-bot-auth' | undefined;
       /** Persist sanitized callback mode provenance before dispatch. */
       onWebhookRegistration?: (registration: {
         agent: AgentConfig;
@@ -976,6 +1003,8 @@ export class TaskExecutor {
         operationId: string;
         callbackUrl: string;
         mode: 'rfc9421' | 'hmac-sha256';
+        signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+        deliveryKind?: 'reporting' | 'artifact';
         delegatedOperatorAuthorization?: TaskOptions['delegatedOperatorAuthorization'];
       }) => void | Promise<void>;
       /** Persist fail-closed routing provenance before a durable mutation claim can run. */
@@ -1161,24 +1190,16 @@ export class TaskExecutor {
    * Throws in strict, logs to `debugLogs` in warn, no-ops in off.
    */
   validateRequest(taskName: string, params: unknown, debugLogs?: any[]): void {
+    if (this.config.experimentalIdentity33?.() && this.requestValidationMode !== 'off') {
+      const outcome = validateIdentity33Payload(taskName, 'request', params, this.config.adcpVersion);
+      if (!outcome.valid) {
+        if (this.requestValidationMode === 'strict') throw buildValidationError(taskName, 'request', outcome.issues);
+        if (debugLogs)
+          this.logDebug(debugLogs, 'warning', `Request validation failed for ${taskName}`, { issues: outcome.issues });
+      }
+      return;
+    }
     validateOutgoingRequest(taskName, params, this.requestValidationMode, debugLogs, this.config.adcpVersion);
-  }
-
-  /**
-   * After `adaptRequestForServerVersion` has rewritten a v3 request into v2
-   * wire format, validate the adapted shape against the cached v2.5 schema
-   * bundle. Always warn-only — adapter bugs shouldn't break user requests,
-   * and the v3 pre-send pass already vouched for the user-facing input.
-   * This pass exists to surface drift between what the adapter emits and
-   * what a v2.5 server expects on the wire (primarily as CI signal via the
-   * adapter-conformance test suite).
-   *
-   * Skips silently for tasks without a v2.5 schema or when the v2.5 bundle
-   * isn't cached. Caller is responsible for gating on `serverVersion === 'v2'`
-   * so v3-targeted traffic doesn't pay the validation cost.
-   */
-  validateAdaptedRequestAgainstV2(taskName: string, adaptedParams: unknown, debugLogs?: any[]): void {
-    validateOutgoingRequest(taskName, adaptedParams, 'warn', debugLogs, 'v2.5');
   }
 
   /**
@@ -1303,6 +1324,7 @@ export class TaskExecutor {
     beforeProtocolDispatch?: BeforeProtocolDispatchHook<T>,
     deferredClientContext?: unknown
   ): Promise<TaskResult<T>> {
+    if (serverVersion === 'v2') throw new VersionUnsupportedError(taskName, 'version', 'v2', agent.agent_uri);
     const effectiveServerVersion = serverVersion ?? 'v3';
     this.lastKnownServerVersion = effectiveServerVersion;
     // Own the request graph before the first awaited activity/governance
@@ -1344,7 +1366,7 @@ export class TaskExecutor {
         ? undefined
         : resolveIdempotencyKey(taskName, params, serverVersion);
     if (idempotencyKey) attachTaskDeadlineIdempotencyKey(options, idempotencyKey);
-    if (serverVersion !== 'v2' && idempotencyKey && params && typeof params === 'object' && !params.idempotency_key) {
+    if (idempotencyKey && params && typeof params === 'object' && !params.idempotency_key) {
       params = { ...params, idempotency_key: idempotencyKey };
     }
 
@@ -1446,6 +1468,24 @@ export class TaskExecutor {
       });
       throwIfAborted(options.signal);
 
+      const callbackProfile =
+        this.config.signedIdentity33Webhooks?.() &&
+        (webhookUrl || params?.reporting_webhook || params?.artifact_webhook || params?.push_notification_config)
+          ? this.config.webhookSigningProfile?.()
+          : undefined;
+      const applyCallbackProfiles = (args: Record<string, any>): void => {
+        if (!callbackProfile || options.preserveGovernedPayload) return;
+        for (const field of ['push_notification_config', 'reporting_webhook', 'artifact_webhook']) {
+          const callback = args[field];
+          if (
+            callback &&
+            typeof callback === 'object' &&
+            callback.authentication === undefined &&
+            callback.signing_profile === undefined
+          )
+            callback.signing_profile = callbackProfile;
+        }
+      };
       // Run governance check if configured for this tool
       const governanceMiddleware = this.governanceMiddleware;
       if (governanceMiddleware) {
@@ -1459,7 +1499,7 @@ export class TaskExecutor {
           ? prepareProtocolToolCall(agent, params, {
               toolName: taskName,
               webhookUrl,
-              webhookSecret: this.config.webhookSecret,
+              webhookSecret: this.config.signedIdentity33Webhooks?.() ? undefined : this.config.webhookSecret,
               operationId: taskId,
               serverVersion: effectiveServerVersion,
               adcpVersion: this.config.adcpVersion,
@@ -1467,6 +1507,7 @@ export class TaskExecutor {
               versionEnvelope,
             }).args
           : params;
+        if (modernGovernance) applyCallbackProfiles(governableParams);
         if (await governanceMiddleware.shouldCheck(taskName, governableParams, targetCapabilities)) {
           const sdkInjectedPushConfig =
             modernGovernance && webhookUrl !== undefined && this.config.webhookSecret !== undefined;
@@ -1534,13 +1575,49 @@ export class TaskExecutor {
       const preparedCall = prepareProtocolToolCall(agent, dispatchParams, {
         toolName: taskName,
         webhookUrl,
-        webhookSecret: this.config.webhookSecret,
+        webhookSecret: this.config.signedIdentity33Webhooks?.() ? undefined : this.config.webhookSecret,
         operationId: taskId,
         serverVersion: effectiveServerVersion,
         adcpVersion: this.config.adcpVersion,
         wireAdcpVersion,
         versionEnvelope,
       });
+      applyCallbackProfiles(preparedCall.args);
+      const signingProfile = options.preserveGovernedPayload ? undefined : callbackProfile;
+      if (
+        signingProfile &&
+        preparedCall.args.push_notification_config &&
+        typeof preparedCall.args.push_notification_config === 'object'
+      ) {
+        const registration = preparedCall.args.push_notification_config as Record<string, unknown>;
+        if (registration.authentication === undefined && registration.signing_profile === undefined)
+          registration.signing_profile = signingProfile;
+      }
+      if (this.config.signedIdentity33Webhooks?.()) {
+        for (const [field, deliveryKind, taskType] of [
+          ['reporting_webhook', 'reporting', 'media_buy_delivery'],
+          ['artifact_webhook', 'artifact', 'artifact_delivery'],
+        ] as const) {
+          const delivery = preparedCall.args[field] as
+            | { url?: unknown; authentication?: unknown; signing_profile?: unknown }
+            | undefined;
+          if (!delivery || typeof delivery.url !== 'string' || delivery.authentication !== undefined) continue;
+          const selected =
+            delivery.signing_profile ?? (options.preserveGovernedPayload ? 'adcp/webhook-signing/v1' : callbackProfile);
+          if (selected !== 'adcp/webhook-signing/v1' && selected !== 'web-bot-auth')
+            throw new Error('Invalid delivery signing profile');
+          if (!options.preserveGovernedPayload) delivery.signing_profile = selected;
+          await this.config.onWebhookRegistration?.({
+            agent,
+            taskType,
+            operationId: deliveryWebhookRegistrationId(deliveryKind, delivery.url),
+            callbackUrl: delivery.url,
+            mode: 'rfc9421',
+            signingProfile: selected,
+            deliveryKind,
+          });
+        }
+      }
       let webhookRegistrationPersisted = false;
       if (webhookUrl && this.config.onWebhookRegistration) {
         const registration = webhookRegistrationFromPreparedCall(agent, preparedCall);
@@ -1565,19 +1642,22 @@ export class TaskExecutor {
       throwIfAborted(options.signal);
       if (beforeProtocolDispatch) {
         let decision: BeforeProtocolDispatchHookResult<T>;
-        dispatchBoundaryOwnsTerminalState = true;
+        const ownsSettlement = beforeProtocolDispatch.terminalSettlement !== 'executor';
+        dispatchBoundaryOwnsTerminalState = ownsSettlement;
         try {
-          this.compactClosedExternalTaskSettlementFences();
-          if (
-            this.liveExternalTaskSettlementCount() + this.settlementCapacityReservations.size >=
-            COMPACTED_TASK_STATE_LIMIT
-          ) {
-            throw new Error('The durable task-settlement capacity is exhausted; no mutation claim was attempted.');
-          }
-          this.settlementCapacityReservations.add(taskId);
-          if (webhookRegistrationPersisted) {
-            await this.config.onDurableSettlementRequired?.(taskId);
-            throwIfAborted(options.signal);
+          if (ownsSettlement) {
+            this.compactClosedExternalTaskSettlementFences();
+            if (
+              this.liveExternalTaskSettlementCount() + this.settlementCapacityReservations.size >=
+              COMPACTED_TASK_STATE_LIMIT
+            ) {
+              throw new Error('The durable task-settlement capacity is exhausted; no mutation claim was attempted.');
+            }
+            this.settlementCapacityReservations.add(taskId);
+            if (webhookRegistrationPersisted) {
+              await this.config.onDurableSettlementRequired?.(taskId);
+              throwIfAborted(options.signal);
+            }
           }
           decision = await beforeProtocolDispatch(preparedCall.args, {
             operationId: taskId,
@@ -1587,6 +1667,7 @@ export class TaskExecutor {
             registerExternalTaskSettlement: handler => this.registerExternalTaskSettlement(taskId, handler),
           });
           if (decision.action === 'dispatch_committed') {
+            if (!ownsSettlement) throw new Error('An executor-settled dispatch hook cannot claim durable settlement.');
             if (
               decision.requireDeferredSettlementResumeAuthorization === true &&
               this.config.deferredStorage !== undefined
@@ -1617,8 +1698,8 @@ export class TaskExecutor {
           }
           return attachMatch(earlyResult);
         }
-        dispatchCommitted = true;
-        dispatchSettlement = decision;
+        dispatchCommitted = decision.action === 'dispatch_committed';
+        dispatchSettlement = decision.action === 'dispatch_committed' ? decision : undefined;
       }
 
       // A claim that completes after the caller deadline must be fenced, not
@@ -1639,7 +1720,7 @@ export class TaskExecutor {
       const callOptions = {
         debugLogs,
         webhookUrl,
-        webhookSecret: this.config.webhookSecret,
+        webhookSecret: this.config.signedIdentity33Webhooks?.() ? undefined : this.config.webhookSecret,
         operationId: taskId,
         serverVersion: effectiveServerVersion,
         session: { contextId: options.contextId, taskId: options.taskId },
@@ -4108,6 +4189,9 @@ export class TaskExecutor {
     if (!state) {
       throw new Error('Deferred task not found.');
     }
+    if (state.serverVersion === 'v2') {
+      throw new VersionUnsupportedError(state.taskName, 'version', 'v2');
+    }
     if (state.expiresAt <= Date.now()) {
       throw new Error('Deferred task expired.');
     }
@@ -5765,7 +5849,7 @@ export class TaskExecutor {
       status: 'failed' as const,
       error: error.message || String(error),
       adcpError: adcpErrorInfo,
-      errorInstance: this.buildErrorInstance(taskId, adcpErrorInfo),
+      errorInstance: getSignedRequestRejection(error) ?? this.buildErrorInstance(taskId, adcpErrorInfo),
       correlationId,
       metadata: this.buildMetadata({
         taskId,
@@ -5964,10 +6048,9 @@ export class TaskExecutor {
   /**
    * Normalize response data for schema validation
    *
-   * Converts v2-style responses to v3 format before validation.
-   * This ensures validation passes for both v2 and v3 server responses.
+   * Normalizes established AdCP 3 product fields before validation.
    */
-  private normalizeResponseForValidation(response: any, taskName: string, legacyWire = false): any {
+  private normalizeResponseForValidation(response: any, taskName: string): any {
     if (!response) return response;
 
     // Strip underscore-prefixed client-side annotations (`_message` is added
@@ -5981,14 +6064,8 @@ export class TaskExecutor {
         if (!k.startsWith('_')) stripped[k] = v;
       }
     } else {
-      return taskName === 'get_products' && !legacyWire ? normalizeGetProductsResponse(response) : response;
+      return taskName === 'get_products' ? normalizeGetProductsResponse(response) : response;
     }
-
-    // Validate v2.5 against the exact response that crossed the wire. Public
-    // canonicalization happens later in SingleAgentClient; applying it here
-    // would compare canonical `fixed_price`/`format_options` fields to the
-    // legacy schema that correctly requires `rate`/`is_fixed`/`format_ids`.
-    if (legacyWire) return stripped;
 
     switch (taskName) {
       case 'get_products':
@@ -6014,55 +6091,29 @@ export class TaskExecutor {
     const logViolations = this.config.logSchemaViolations !== false;
 
     try {
-      // Validate against the version the agent actually spoke. Without
-      // this, v2.5 sellers (e.g. Wonderstruck) return valid v2.5-shaped
-      // responses and the SDK rejects them as malformed v3 — surfaces as
-      // `pricing_options must NOT have fewer than 1 items` and similar
-      // shape mismatches that don't exist in v2.5. The v3 → v2 path is
-      // Normal dispatch uses lastKnownServerVersion; restart recovery passes
-      // the persisted continuation version explicitly so concurrent or fresh
-      // executors cannot validate the seller's response against another wire.
-      const validationVersion =
-        (serverVersion ?? this.lastKnownServerVersion) === 'v2'
-          ? 'v2.5'
-          : (this.responseAdcpVersionForValidation() ?? this.config.adcpVersion ?? ADCP_VERSION);
-      const normalizedResponse = this.normalizeResponseForValidation(response, taskName, validationVersion === 'v2.5');
-      // TaskExecutor owns the user-facing log entry below. Passing debugLogs
-      // into the lower-level hook would emit a second, unversioned duplicate.
-      const outcome = validateIncomingResponse(taskName, normalizedResponse, mode, undefined, validationVersion);
-      if (outcome.valid) return { valid: true, errors: [] };
-
-      const errorStrings = outcome.issues.map(i => `${i.pointer}: ${i.message}`);
-
-      if (logViolations) {
-        debugLogs.push({
-          timestamp: new Date().toISOString(),
-          type: mode === 'strict' ? 'error' : 'warning',
-          message: `Schema validation ${mode === 'strict' ? 'failed' : 'warning'} for ${taskName}: ${formatIssues(
-            outcome.issues
-          )}`,
-          errors: errorStrings,
-          issues: outcome.issues,
-          schemaVariant: outcome.variant,
-          schemaVersion: validationVersion,
-          mode,
-        });
+      const pinnedValidationVersion =
+        this.responseAdcpVersionForValidation() ?? this.config.adcpVersion ?? ADCP_VERSION;
+      // Capabilities are negotiated before any pin applies: a 3.0 pin (or a
+      // major-only envelope) is served the seller's highest release in the
+      // major, echoed in `adcp_version`. Validate against that release, as the
+      // versioning spec requires ("Server echoes"), when it is same-major,
+      // listed in the response's `supported_versions` and has a schema root;
+      // otherwise against the pin. This holds even when an external schema
+      // root is active for the pin. Only the validator's version changes; the
+      // unwrapper keeps `effectiveResponseAdcpVersion()`.
+      if (taskName === 'get_adcp_capabilities') {
+        return withServedValidationVersion(response, pinnedValidationVersion, validationVersion =>
+          this.validateResponseSchemaAgainst(response, taskName, debugLogs, mode, logViolations, validationVersion)
+        );
       }
-
-      if (mode === 'warn') {
-        if (logViolations) {
-          console.warn(
-            `Schema validation failed for ${taskName} against AdCP ${validationVersion} (non-blocking):`,
-            errorStrings
-          );
-        }
-        return { valid: true, errors: [] };
-      }
-
-      if (logViolations) {
-        console.error(`Schema validation failed for ${taskName} against AdCP ${validationVersion}:`, errorStrings);
-      }
-      return { valid: false, errors: errorStrings };
+      return this.validateResponseSchemaAgainst(
+        response,
+        taskName,
+        debugLogs,
+        mode,
+        logViolations,
+        pinnedValidationVersion
+      );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'unknown error';
       console.error('Error during schema validation:', errorMessage);
@@ -6073,13 +6124,67 @@ export class TaskExecutor {
     }
   }
 
+  private validateResponseSchemaAgainst(
+    response: any,
+    taskName: string,
+    debugLogs: any[],
+    mode: ValidationMode,
+    logViolations: boolean,
+    validationVersion: string
+  ): { valid: boolean; errors: string[] } {
+    const normalizedResponse = this.normalizeResponseForValidation(response, taskName);
+    // TaskExecutor owns the user-facing log entry below. Passing debugLogs
+    // into the lower-level hook would emit a second, unversioned duplicate.
+    const outcome =
+      (this.config.experimentalIdentity33?.() ||
+        (this.config.identity33SchemaExperiment &&
+          normalizedResponse &&
+          typeof normalizedResponse === 'object' &&
+          isAdcpVersionAtLeast((normalizedResponse as { adcp_version?: string }).adcp_version, '3.3'))) &&
+      mode !== 'off'
+        ? validateIdentity33Payload(taskName, 'response', normalizedResponse, validationVersion)
+        : validateIncomingResponse(taskName, normalizedResponse, mode, undefined, validationVersion);
+    if (outcome.valid) return { valid: true, errors: [] };
+
+    const errorStrings = outcome.issues.map(i => `${i.pointer}: ${i.message}`);
+
+    if (logViolations) {
+      debugLogs.push({
+        timestamp: new Date().toISOString(),
+        type: mode === 'strict' ? 'error' : 'warning',
+        message: `Schema validation ${mode === 'strict' ? 'failed' : 'warning'} for ${taskName}: ${formatIssues(
+          outcome.issues
+        )}`,
+        errors: errorStrings,
+        issues: outcome.issues,
+        schemaVariant: outcome.variant,
+        schemaVersion: validationVersion,
+        mode,
+      });
+    }
+
+    if (mode === 'warn') {
+      if (logViolations) {
+        console.warn(
+          `Schema validation failed for ${taskName} against AdCP ${validationVersion} (non-blocking):`,
+          errorStrings
+        );
+      }
+      return { valid: true, errors: [] };
+    }
+
+    if (logViolations) {
+      console.error(`Schema validation failed for ${taskName} against AdCP ${validationVersion}:`, errorStrings);
+    }
+    return { valid: false, errors: errorStrings };
+  }
+
   private responseAdcpVersionForValidation(): string | undefined {
     if (this.config.versionEnvelope === 'major-only') return '3.0';
     return undefined;
   }
 
   private effectiveResponseAdcpVersion(serverVersion?: 'v2' | 'v3'): string {
-    if ((serverVersion ?? this.lastKnownServerVersion) === 'v2') return 'v2.5';
     return this.responseAdcpVersionForValidation() ?? this.config.adcpVersion ?? ADCP_VERSION;
   }
 

@@ -7,6 +7,7 @@ import { DEFAULT_UNKNOWN_ERROR_RECOVERY, getErrorRecovery, type ErrorRecovery } 
 import { validateSyncReportingStatusEnvelope } from '../../validation/sync-reporting-status-envelope';
 import { ADCP_MAJOR_VERSION, ADCP_VERSION, toReleasePrecisionVersion } from '../../version';
 import { isWellFormedUnicodeString } from '../../utils/well-formed-unicode';
+import { jsonPointerToJsonPathLite } from '../../utils/pointer-utils';
 import {
   reportingLedgerConfigurationMatchesScope,
   reportingLedgerEffectivePeriod,
@@ -25,8 +26,7 @@ import {
 import {
   REPORTING_CONSUMER_STATUS_ERROR_FIELD_MAX_BYTES,
   REPORTING_CONSUMER_STATUS_ERROR_MESSAGE_MAX_BYTES,
-  ReportingConsumerStatusConflictError,
-  ReportingLedgerSnapshotUnavailableError,
+  isReportingLedgerErrorNamed,
   type ReportingConsumerStatusLedgerStore,
   type ReportingLedgerRevisionMetadataV1,
   type ReportingLedgerStore,
@@ -238,7 +238,7 @@ export function createSyncReportingStatusHandler<TContext = unknown>(
         });
         if (replay) return completed(replay);
       } catch (error) {
-        if (!(error instanceof ReportingConsumerStatusConflictError)) throw error;
+        if (!isReportingLedgerErrorNamed(error, 'ReportingConsumerStatusConflictError')) throw error;
         return failed(statusIds, 'IDEMPOTENCY_CONFLICT', 'Reporting status idempotency conflict');
       }
       const now = (options.now ?? (() => new Date()))();
@@ -305,7 +305,7 @@ export function createSyncReportingStatusHandler<TContext = unknown>(
         });
         return completed(results);
       } catch (error) {
-        const conflict = error instanceof ReportingConsumerStatusConflictError;
+        const conflict = isReportingLedgerErrorNamed(error, 'ReportingConsumerStatusConflictError');
         if (!conflict && !(error instanceof ReportingStatusValidationError)) throw error;
         return failed(
           statusIds,
@@ -415,7 +415,7 @@ async function validateStatus(
     try {
       page = await store.readSnapshotPage(status.seller_ledger_snapshot_id, accountId, undefined, 1);
     } catch (error) {
-      if (!(error instanceof ReportingLedgerSnapshotUnavailableError)) throw error;
+      if (!isReportingLedgerErrorNamed(error, 'ReportingLedgerSnapshotUnavailableError')) throw error;
       throw new ReportingStatusValidationError('snapshot provenance unavailable');
     }
     const scope = reportingLedgerEffectivePeriod(page.snapshot.query, page.snapshot.ledgerAsOf);
@@ -750,29 +750,11 @@ function wireValidationDiagnostic(
   }
   if (!pointer.startsWith('/')) return { field: pointer };
   const field = jsonPointerToJsonPathLite(pointer);
-  if (!field) return {};
+  if (!field || Buffer.byteLength(field, 'utf8') > REPORTING_CONSUMER_STATUS_ERROR_FIELD_MAX_BYTES) return {};
   return {
     field,
     ...(keyword ? { issues: [{ pointer, message, keyword }] } : {}),
   };
-}
-
-function jsonPointerToJsonPathLite(pointer: string): string | undefined {
-  if (!pointer.startsWith('/')) return undefined;
-  if (pointer === '/') return '$';
-  let field = '';
-  for (const encoded of pointer.slice(1).split('/')) {
-    const segment = encoded.replace(/~1/g, '/').replace(/~0/g, '~');
-    if (/^(0|[1-9][0-9]*)$/.test(segment)) {
-      if (!field) return undefined;
-      field += `[${segment}]`;
-    } else if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(segment)) {
-      field += field ? `.${segment}` : segment;
-    } else {
-      field += `${field ? '' : '$'}[${JSON.stringify(segment)}]`;
-    }
-  }
-  return Buffer.byteLength(field, 'utf8') <= REPORTING_CONSUMER_STATUS_ERROR_FIELD_MAX_BYTES ? field : undefined;
 }
 
 function zodIssueKeyword(

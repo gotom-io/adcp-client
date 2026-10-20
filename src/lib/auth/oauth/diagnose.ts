@@ -15,7 +15,8 @@
  */
 import { ssrfSafeFetch, decodeBodyAsJsonOrText, SsrfRefusedError } from '../../net';
 import type { AgentConfig } from './types';
-import { decodeAccessTokenClaims, parseWWWAuthenticate, validateTokenAudience } from './diagnostics';
+import { assertOAuthCredentialIssuer, assertOAuthServerIssuer, OAuthError } from './types';
+import { decodeAccessTokenClaims, parseWWWAuthenticate, validateDecodedTokenAudience } from './diagnostics';
 import type { DecodedAccessToken } from './diagnostics';
 
 /**
@@ -154,7 +155,7 @@ export async function runAuthDiagnosis(
   const currentDecoded = currentToken ? decodeAccessTokenClaims(currentToken) : null;
   steps.push({
     name: 'decode_current_token',
-    decodedToken: currentDecoded,
+    decodedToken: includeTokens ? currentDecoded : redactDecodedTokenSignature(currentDecoded),
     notes: currentToken
       ? currentDecoded
         ? [`Decoded JWT with claims: ${Object.keys(currentDecoded.claims).join(', ')}`]
@@ -168,6 +169,18 @@ export async function runAuthDiagnosis(
   if (!options.skipRefresh && agent.oauth_tokens?.refresh_token) {
     const tokenEndpoint = extractTokenEndpoint(asCapture);
     const clientId = agent.oauth_client?.client_id;
+    let issuerError: string | undefined;
+    if (tokenEndpoint && clientId) {
+      try {
+        const issuer = new URL(extractIssuer(prmCapture) ?? '').toString();
+        assertOAuthServerIssuer(asCapture.body as { issuer?: unknown } | undefined, issuer);
+        assertOAuthCredentialIssuer(agent.oauth_tokens, issuer, true);
+        assertOAuthCredentialIssuer(agent.oauth_client!, issuer, !!agent.oauth_client?.client_secret);
+      } catch (error) {
+        issuerError =
+          error instanceof OAuthError ? error.message : 'Authorization-server issuer could not be validated';
+      }
+    }
     // Always request the agent URL as the resource indicator, even if PRM
     // advertises something different — a well-behaved client sends what it
     // actually wants to talk to, and using PRM.resource here would cause H2
@@ -183,6 +196,8 @@ export async function runAuthDiagnosis(
         name: 'token_refresh_attempt',
         error: 'No saved oauth_client.client_id — cannot attempt refresh without it',
       });
+    } else if (issuerError) {
+      steps.push({ name: 'token_refresh_attempt', error: issuerError });
     } else {
       const refreshCapture = await attemptTokenRefresh({
         tokenEndpoint,
@@ -210,7 +225,7 @@ export async function runAuthDiagnosis(
       if (refreshedAccessToken) {
         steps.push({
           name: 'decode_refreshed_token',
-          decodedToken: refreshedDecoded,
+          decodedToken: includeTokens ? refreshedDecoded : redactDecodedTokenSignature(refreshedDecoded),
           notes: refreshedDecoded
             ? [`Decoded refreshed JWT with claims: ${Object.keys(refreshedDecoded.claims).join(', ')}`]
             : ['Refreshed access_token is opaque (not a JWT)'],
@@ -610,7 +625,7 @@ function rankH2(
     ];
     return base;
   }
-  const result = validateTokenAudience(jwtFromDecoded(refreshedDecoded), agentUrl);
+  const result = validateDecodedTokenAudience(refreshedDecoded, agentUrl);
   if (result.ok) {
     base.verdict = 'ruled_out';
     base.summary = 'Refreshed token `aud` claim matches the expected resource — AS honors RFC 8707 `resource`';
@@ -698,7 +713,7 @@ function rankH5(
   const expected = prmResource ?? agentUrl;
   const prmDiffersFromAgent =
     prmResource !== undefined && normalizeForCompare(prmResource) !== normalizeForCompare(agentUrl);
-  const result = validateTokenAudience(jwtFromDecoded(currentDecoded), expected);
+  const result = validateDecodedTokenAudience(currentDecoded, expected);
   if (result.ok) {
     base.verdict = 'ruled_out';
     base.summary = `Saved token \`aud\` matches expected resource (${expected})`;
@@ -736,7 +751,7 @@ function rankH6(agentUrl: string, currentDecoded: DecodedAccessToken | null, too
     base.summary = `tool_call returned HTTP ${toolStep.http.status} — agent did not accept the token blindly`;
     return base;
   }
-  const audResult = validateTokenAudience(jwtFromDecoded(currentDecoded), agentUrl);
+  const audResult = validateDecodedTokenAudience(currentDecoded, agentUrl);
   if (audResult.ok) {
     base.verdict = 'ruled_out';
     base.summary = 'Token `aud` matches agent URL and tool_call succeeded — cannot distinguish from correct behavior';
@@ -833,6 +848,17 @@ const TOKEN_MATERIAL_FIELDS = new Set(['access_token', 'refresh_token', 'id_toke
  * the original length (useful for "wrong length" diagnostics) without leaking
  * the secret. Set `includeTokens: true` on {@link DiagnoseOptions} to skip.
  */
+/**
+ * Replace the raw signature segment of a decoded token with a length marker.
+ * The report also carries the decoded header and claims, and for issuers that
+ * serialize those as compact JSON the three parts reassemble into the working
+ * token. Set `includeTokens: true` on {@link DiagnoseOptions} to keep it.
+ */
+function redactDecodedTokenSignature(decoded: DecodedAccessToken | null): DecodedAccessToken | null {
+  if (!decoded) return decoded;
+  return { ...decoded, signature: `<redacted length=${decoded.signature.length}>` };
+}
+
 function redactTokenMaterial(capture: HttpCapture): HttpCapture {
   if (!capture.body || typeof capture.body !== 'object' || Array.isArray(capture.body)) return capture;
   const body = capture.body as Record<string, unknown>;
@@ -894,26 +920,6 @@ function isDefaultPort(scheme: string, port: string): boolean {
   if (scheme === 'https:' && port === '443') return true;
   if (scheme === 'http:' && port === '80') return true;
   return false;
-}
-
-function jwtFromDecoded(_decoded: DecodedAccessToken): string {
-  // validateTokenAudience re-decodes from a JWT string, so we round-trip.
-  // Since we already decoded this, we can't reconstruct the original signature,
-  // but the validator only cares about the claims segment — so we synthesize a
-  // three-segment token with the original claims and dummy header/signature.
-  const h = base64url(JSON.stringify(_decoded.header));
-  const c = base64url(JSON.stringify(_decoded.claims));
-  return `${h}.${c}.${_decoded.signature || 'sig'}`;
-}
-
-function base64url(input: string): string {
-  // `base64` output has at most 2 trailing `=` characters; the bounded form
-  // `={0,2}$` avoids the polynomial-regex flag CodeQL raises on `=+$`.
-  return Buffer.from(input)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/={0,2}$/, '');
 }
 
 function formatError(err: unknown): string {

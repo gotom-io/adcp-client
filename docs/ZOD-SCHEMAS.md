@@ -20,6 +20,28 @@ if (result.success) {
 }
 ```
 
+### Browser / UI bundles
+
+Browser widgets, dashboards, and forms should import runtime validators from `@adcp/sdk/schemas/browser`:
+
+```typescript
+import { EventSourceHealthSchema } from '@adcp/sdk/schemas/browser';
+
+const health = EventSourceHealthSchema.parse(rawHealth);
+```
+
+This entry has no Node built-ins in its import graph and shares the Node entry's portable validators, including canonical and legacy get-products selectors. Named ESM imports let bundlers remove unused validators while preserving the selected schema's dependencies. JSON Schema loading and tool registration helpers are available from `@adcp/sdk/schemas`.
+
+`npm run test:schemas-browser` bundles a single `EventSourceHealthSchema` import with esbuild (`platform: 'browser'`, `format: 'iife'`, `target: 'es2022'`, `minify: true`). The standalone bundle includes Zod and ajv-formats, with no external dependencies. Measurements for esbuild 0.28.2 and Zod 4.4.3:
+
+| Measure | Before tree-shaking | With pure schema initializers | CI maximum |
+| --- | ---: | ---: | ---: |
+| Minified bundle | 1,539,250 B | 336,182 B | 375,000 B |
+| Gzipped bundle | 265,418 B | 67,420 B | 75,000 B |
+| Generated validators retained | 1,203,529 B | 744 B | 2,048 B |
+
+The total-size limits leave roughly 11% headroom for dependency changes. The separate generated-code limit catches unrelated validators being retained even if dependencies become smaller. The check also verifies that product, media-buy, and reporting-obligation validators disappear and that the bundled schema still validates without Node globals. Existing tests exercise all exports through ESM and CommonJS, declaration paths, and portable cross-field validation.
+
 ## Why Zod Schemas?
 
 - ✅ **Runtime validation** - Catch data issues at runtime, not just compile time
@@ -40,6 +62,25 @@ if (result.success) {
 - And all other AdCP tasks...
 
 ## Common Use Cases
+
+### OAuth Client Credentials Configuration
+
+`AgentOAuthClientCredentialsSchema` validates SDK configuration accepted by an API. It is available from `@adcp/sdk`, `@adcp/sdk/auth`, and `@adcp/sdk/schemas`.
+
+```typescript
+import { AgentOAuthClientCredentialsSchema } from '@adcp/sdk/schemas';
+
+const credentials = AgentOAuthClientCredentialsSchema.parse({
+  token_endpoint: 'https://auth.example.com/oauth/token',
+  client_id: 'client-id',
+  client_secret: '$ENV:ADCP_CLIENT_SECRET',
+  scope: 'adcp',
+  resource: ['https://agent.example.com'],
+  auth_method: 'basic',
+});
+```
+
+The schema requires a valid `token_endpoint` URL and non-empty `client_id` and `client_secret` strings. Optional fields are `scope`, `resource` (a string or string array), `audience`, and `auth_method` (`'basic'` or `'body'`). Parsing preserves `$ENV:VAR_NAME` references and leaves omitted fields unset. Token exchange resolves secrets and enforces HTTPS, URL userinfo, and private-address restrictions; this schema validates the configuration shape.
 
 ### API Request Validation
 
@@ -112,7 +153,7 @@ const authority = resolvePreviewAuthority({
 ```typescript
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
-import { CreateMediaBuyRequestSchema } from '@adcp/sdk/schemas';
+import { CreateMediaBuyRequestSchema } from '@adcp/sdk/schemas/browser';
 
 function MediaBuyForm() {
   const { register, handleSubmit } = useForm({

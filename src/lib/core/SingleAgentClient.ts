@@ -1,3 +1,15 @@
+import { normalizeGetProductsResponse } from '../utils/pricing-adapter';
+import { normalizeMediaBuyResponse } from '../utils/creative-adapter';
+import { normalizeFormatsResponse } from '../utils/format-renders';
+import {
+  isIdentity33SchemaScope,
+  withIdentity33SchemaScope,
+  bindIdentity33SchemaScope,
+} from '../validation/schema-loader';
+function loadWebBotAuth(): typeof import('../signing/web-bot-auth') {
+  return require('../signing/web-bot-auth') as typeof import('../signing/web-bot-auth');
+}
+import { canonicalAgentOrigin } from '../signing/agent-resolver/canonicalize';
 import {
   annotateProductsSupplyPaths,
   type ListProductsResponseWithSupplyPath,
@@ -5,7 +17,9 @@ import {
 } from '../supply-path/products';
 // Main ADCP Client - Type-safe conversation-aware client for AdCP agents
 
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, scryptSync } from 'node:crypto';
+const SKIP_PRODUCT_CACHE = Symbol('adcp.skipProductCache');
+const SKIP_ACCOUNT_REGISTRY_OBSERVATION = Symbol('adcp.skipAccountRegistryObservation');
 import type { AccountReference, AgentConfig } from '../types';
 import { ADCP_ENVELOPE_FIELDS } from '../types/adcp';
 import { parseAdcpMajorVersion, toReleasePrecisionVersion, type AdcpVersion } from '../version';
@@ -129,6 +143,8 @@ import {
 import { withTaskDeadline } from './task-deadline';
 import { createMCPRequestHeaders } from '../auth';
 import { isAbortOrTimeoutError } from '../protocols/abort';
+import { getSignedRequestRejection } from '../protocols/signedRequestRejection';
+import { withAmbientIdentityHeaders } from '../protocols/mcp-call-context';
 import { ProtocolClient, normalizeTransportOptions } from '../protocols';
 import {
   AuthenticationCredentialsRejectedError,
@@ -173,6 +189,7 @@ import {
   canonicalDelegatedOperatorAuthorization,
   InMemoryWebhookRegistrationStore,
   parseWebhookRegistration,
+  deliveryWebhookRegistrationId,
   sameWebhookRegistration,
   WebhookRegistrationIntegrityError,
   type WebhookRegistration,
@@ -229,9 +246,16 @@ function presentedStaticTransportCredential(
 }
 
 // v3.0 compatibility utilities
-import type { AdcpCapabilities, AdcpMajorVersion, ToolInfo, FeatureName } from '../utils/capabilities';
+import type { AdcpCapabilities, ToolInfo, FeatureName } from '../utils/capabilities';
 import {
-  buildSyntheticCapabilities,
+  agentDiscoveryCacheKey,
+  MAX_AGENT_DISCOVERY_TTL_MS,
+  resolveAgentDiscoveryTtlMs,
+  validateAgentDiscoveryCacheConfig,
+  type AgentDiscoveryCacheConfig,
+  type AgentDiscoveryEntry,
+} from './agent-discovery-cache';
+import {
   buildSyntheticV3Capabilities,
   augmentCapabilitiesFromTools,
   looksLikeV3Capabilities,
@@ -242,18 +266,35 @@ import {
   assertValidIdempotencyReplayTtlSeconds,
   supportsBuyingMode,
 } from '../utils/capabilities';
-import { AccountPendingApprovalError, AccountRequiredError, UnsupportedBuyingModeError } from '../errors';
-import { sameCountrySet, selectListedAccount, type ResolveAccountOptions } from './account-resolution';
+import {
+  AccountPendingApprovalError,
+  AccountRequiredError,
+  AccountNotProvisionedError,
+  AccountNotFoundError,
+  AccountSetupRequiredError,
+  AccountPaymentRequiredError,
+  UnsupportedBuyingModeError,
+} from '../errors';
+import { BuyerAccountRegistry, type AccountPolicy, type BuyerAccountStorage } from './buyer-account-registry';
+import type { ProductCache } from './product-cache';
+import {
+  sameCountrySet,
+  selectListedAccount,
+  type ResolveAccountOptions,
+  type ResolveAccountResult,
+} from './account-resolution';
 
 import { normalizeRequestParams } from '../utils/request-normalizer';
 import { globalAsyncLocalStorage } from '../utils/global-async-local-storage';
 import { validateUserAgent } from '../utils/validate-user-agent';
 import { resolveWebhookUrl, selectWebhookTemplate } from './webhook-url';
-import { getV25Adapter } from '../adapters/legacy/v2-5';
 import {
   ProductPropertyPolicyError,
   validateProductsAgainstPropertyPolicy,
+  isSupportedPropertyIdentifierType,
+  normalizeDomainForPropertyPolicy,
   type BuyerPropertyPolicy,
+  type ProductPolicyResolvedProperty,
   type ProductPolicyProductLike,
   type ProductPropertyPolicyDiagnostic,
   type ProductPropertyPolicyMode,
@@ -263,9 +304,11 @@ import { resolvePropertyList, type ResolveListOptions } from '../server/targetin
 import {
   CreativeFormatCapabilityError,
   CreativeFormatProjectionError,
+  canUseProductOptionsForCreativeWire,
   projectMediaBuyCreativesForDelivery,
   projectCreativeForDelivery,
   projectSyncCreativesForDelivery,
+  projectUndeclaredFormatOptionSelectors,
   resolveCreativeFormatWireMode,
   stripLegacyCreativeIdentity,
   type CanonicalCreateMediaBuyInput,
@@ -282,8 +325,16 @@ import {
   type CreativeFormatWireMode,
   type CreativeFormatSelectorContainer,
   type SyncCreativeFormatProjection,
+  type UndeclaredFormatOptionSelector,
 } from '../v2/projection/creative-delivery';
 import type { LegacyFormatConverter } from '../v2/projection/v1-to-v2';
+import {
+  formatOptionOriginFromRoutes,
+  sameFormatOptionRef,
+  sellerDeclaredFormatOptionRefs,
+  undeclaredFormatOptionSelector,
+  type FormatOptionOrigin,
+} from '../v2/projection/legacy-routes';
 import {
   legacyFormatConverterFromCatalogSnapshots,
   type ProjectionCatalogSnapshot,
@@ -292,6 +343,13 @@ import type { CanonicalFormatLegacyResolutionContext, CanonicalFormatLegacyResol
 import { toCanonicalOnlyResponse } from '../v2/projection/augment-response';
 import {
   legacyFormatRefsForDeclaration,
+  isSynthesizedFormatOption,
+  selectedFormatOptions,
+  rememberSellerFormatEvidence,
+  sellerFormatEvidence,
+  type SellerFormatEvidence,
+  rememberSellerDeclaredFormatOption,
+  sellerDeclaredFormatOption,
   structuredCloneWithLegacyCreativeMetadata,
 } from '../v2/projection/legacy-metadata';
 import { isProjectionProductInput, type V1FormatId, type V1Product } from '../v2/projection/types';
@@ -303,6 +361,9 @@ type CapabilityProbeRequestOptions = Pick<
   'signal' | 'transport' | 'disableWebhook' | 'delegatedOperatorAuthorization'
 >;
 type ToolSchemaMap = Map<string, Record<string, unknown>>;
+// Complete documents share the property map's scope and lifetime, without
+// changing the property-map contract used by adaptive request filtering.
+const toolInputSchemasByProperties = new WeakMap<ToolSchemaMap, ToolSchemaMap>();
 type CapabilityDiscoveryContext = {
   toolSchemas?: ToolSchemaMap;
   capabilities?: AdcpCapabilities;
@@ -372,33 +433,6 @@ function selectA2AJsonRpcUrl(agentCard: any, protocolVersion: string, configured
     );
   }
   return resolved.toString();
-}
-
-function creativeSchemaSupport(value: unknown, depth = 0): CreativeFormatWireMode {
-  if (depth > 24 || value === null || typeof value !== 'object') return 'unknown';
-  if (Array.isArray(value)) {
-    let legacy = false;
-    for (const item of value) {
-      const support = creativeSchemaSupport(item, depth + 1);
-      if (support === 'canonical') return support;
-      if (support === 'legacy') legacy = true;
-    }
-    return legacy ? 'legacy' : 'unknown';
-  }
-  const object = value as Record<string, unknown>;
-  const properties = object.properties;
-  if (properties !== null && typeof properties === 'object' && !Array.isArray(properties)) {
-    const keys = properties as Record<string, unknown>;
-    if ('creative_id' in keys && 'format_kind' in keys) return 'canonical';
-    if ('creative_id' in keys && 'format_id' in keys) return 'legacy';
-  }
-  let legacy = false;
-  for (const child of Object.values(object)) {
-    const support = creativeSchemaSupport(child, depth + 1);
-    if (support === 'canonical') return support;
-    if (support === 'legacy') legacy = true;
-  }
-  return legacy ? 'legacy' : 'unknown';
 }
 
 function hasMediaBuyCreativeFormatData(request: unknown): boolean {
@@ -526,6 +560,10 @@ type CanonicalLegacyRoute =
       productId: string;
       optionRef: CanonicalLegacyOptionRef;
       refs: readonly V1FormatId[];
+      /** Seller-authored declaration, retained for request-local 3.1 wire selection. */
+      declaration?: Readonly<Record<string, unknown>>;
+      /** Present when the seller's own product did not declare this option. */
+      undeclaredSelector?: UndeclaredFormatOptionSelector;
     }
   | {
       kind: 'package';
@@ -533,6 +571,95 @@ type CanonicalLegacyRoute =
       packageId: string;
       refs: readonly V1FormatId[];
     };
+
+/** Match routing identity/slots and known dimensions; the seller still validates its full creative contract. */
+function creativeMatchesProductOption(
+  creative: Record<string, unknown>,
+  declaration: Readonly<Record<string, unknown>>
+): boolean {
+  const params = isPlainRecord(declaration.params) ? declaration.params : {};
+  const assets = isPlainRecord(creative.assets) ? creative.assets : {};
+  const slots = Array.isArray(params.slots) ? params.slots : [];
+  if (
+    !slots.every(slot => {
+      if (!isPlainRecord(slot) || typeof slot.asset_group_id !== 'string') return false;
+      const value = assets[slot.asset_group_id];
+      const entries = value === undefined ? [] : Array.isArray(value) ? value : [value];
+      const minimum = Math.max(typeof slot.min === 'number' ? slot.min : 0, slot.required === true ? 1 : 0);
+      if (entries.length < minimum || (typeof slot.max === 'number' && entries.length > slot.max)) return false;
+      return entries.every(
+        asset => isPlainRecord(asset) && (typeof slot.asset_type !== 'string' || asset.asset_type === slot.asset_type)
+      );
+    })
+  )
+    return false;
+  const formatParams = isPlainRecord(creative.format_parameters) ? creative.format_parameters : {};
+  const kind = String(creative.format_kind);
+  const mediaType = kind.startsWith('image')
+    ? 'image'
+    : kind.startsWith('video')
+      ? 'video'
+      : kind.startsWith('audio')
+        ? 'audio'
+        : kind === 'html5'
+          ? 'html'
+          : undefined;
+  const assetTypes =
+    mediaType === 'video'
+      ? ['video', 'vast']
+      : mediaType === 'audio'
+        ? ['audio', 'vast', 'daast']
+        : mediaType === 'html'
+          ? ['html', 'zip']
+          : mediaType
+            ? [mediaType]
+            : ['image', 'video', 'audio', 'html', 'zip', 'vast', 'daast'];
+  const requiredMediaSlots = slots.filter(
+    slot =>
+      isPlainRecord(slot) &&
+      (slot.required === true || (typeof slot.min === 'number' && slot.min > 0)) &&
+      assetTypes.includes(String(slot.asset_type))
+  );
+  const preferredGroups = mediaType ? [`${mediaType}_main`, mediaType, kind, ...assetTypes] : [];
+  const primaryGroup =
+    (requiredMediaSlots.length === 1 ? String(requiredMediaSlots[0].asset_group_id) : undefined) ??
+    preferredGroups.find(group => assets[group] !== undefined);
+  const sourceAssets = primaryGroup ? [assets[primaryGroup]] : Object.values(assets);
+  const dimensionalAssets = sourceAssets
+    .flatMap(value => (Array.isArray(value) ? value : [value]))
+    .filter(
+      (value): value is Record<string, unknown> => isPlainRecord(value) && assetTypes.includes(String(value.asset_type))
+    );
+  // Ambiguous multi-asset inputs must all agree; object key order never chooses a rendition.
+  return (dimensionalAssets.length > 0 ? dimensionalAssets : [{}]).every(asset => {
+    const actual = { ...asset, ...formatParams };
+    for (const key of ['width', 'height'] as const) {
+      if (typeof params[key] === 'number' && actual[key] !== params[key]) return false;
+      const min = params[`min_${key}`];
+      const max = params[`max_${key}`];
+      if (typeof min === 'number' && (typeof actual[key] !== 'number' || actual[key] < min)) return false;
+      if (typeof max === 'number' && (typeof actual[key] !== 'number' || actual[key] > max)) return false;
+    }
+    if (
+      Array.isArray(params.sizes) &&
+      !params.sizes.some(size => isPlainRecord(size) && size.width === actual.width && size.height === actual.height)
+    )
+      return false;
+    const duration = actual.duration_ms ?? actual.duration_ms_exact;
+    const exact = params.duration_ms_exact ?? params.duration_ms;
+    if (typeof exact === 'number' && duration !== exact) return false;
+    if (typeof exact !== 'number' && Array.isArray(params.duration_ms_range)) {
+      const [min, max] = params.duration_ms_range;
+      if (
+        typeof duration !== 'number' ||
+        (typeof min === 'number' && duration < min) ||
+        (typeof max === 'number' && duration > max)
+      )
+        return false;
+    }
+    return true;
+  });
+}
 
 interface CanonicalPackageRouteSelectorSnapshot {
   readonly package_id?: string;
@@ -558,6 +685,14 @@ interface DeferredClientFinalizationContext {
   readonly routingSnapshot?: CanonicalCreativeRoutingSnapshot;
   readonly optionTaskId?: string;
   readonly optionContextId?: string;
+  readonly skipStatusHandlers?: boolean;
+  readonly accountRegistry?: {
+    scope: string;
+    refs?: AccountReference[];
+    dryRun?: boolean;
+    knownOnly?: boolean;
+    observationEpoch?: number;
+  };
 }
 
 function isDeferredClientFinalizationContext(value: unknown): value is DeferredClientFinalizationContext {
@@ -573,7 +708,8 @@ function isDeferredClientFinalizationContext(value: unknown): value is DeferredC
     (context.serverVersion === undefined || context.serverVersion === 'v2' || context.serverVersion === 'v3') &&
     (context.serverVersionSynthetic === undefined || typeof context.serverVersionSynthetic === 'boolean') &&
     (context.projectionCatalogs === undefined || Array.isArray(context.projectionCatalogs)) &&
-    (context.handlerName === undefined || typeof context.handlerName === 'string')
+    (context.handlerName === undefined || typeof context.handlerName === 'string') &&
+    (context.skipStatusHandlers === undefined || typeof context.skipStatusHandlers === 'boolean')
   );
 }
 
@@ -1139,6 +1275,17 @@ type NormalizedWebhookPayload = {
 };
 
 export interface ClientProductPropertyPolicy extends BuyerPropertyPolicy {
+  /** Resolve a complete publisher catalog for app/CTV selector matching. Failures follow unknownSelectorBehavior. */
+  resolvePublisherProperties?: (
+    publisherDomain: string,
+    options?: { signal?: AbortSignal }
+  ) => Promise<readonly ProductPolicyResolvedProperty[] | undefined>;
+  /** Maximum distinct catalog lookups per response. Overflow follows unknownSelectorBehavior. Default: 100. */
+  maxPublisherLookups?: number;
+  /** Per-catalog timeout. The hook receives an abort signal. Default: 10 seconds. */
+  publisherLookupTimeoutMs?: number;
+  /** Total catalog-lookup budget per response. Unfinished lookups stay unknown. Default: 10 seconds. */
+  publisherLookupBudgetMs?: number;
   /**
    * Enforcement mode for completed `get_products` responses.
    *
@@ -1148,8 +1295,8 @@ export interface ClientProductPropertyPolicy extends BuyerPropertyPolicy {
    */
   mode?: ProductPropertyPolicyMode;
   /**
-   * When true, a `get_products` request carrying `property_list` is resolved
-   * and used as an allow-list for the returned products. Defaults to true.
+   * Resolve `filters.property_list` (AdCP 3.2) or deprecated `property_list`
+   * as an allow-list. Conflicting references fail closed. Defaults to true.
    */
   enforceRequestPropertyList?: boolean;
   /**
@@ -1188,6 +1335,25 @@ export type WebhookParseErrorCode =
   | 'webhook_verification_unavailable';
 
 export interface WebhookVerificationConfig {
+  webBotAuth?: {
+    directory: import('../signing/web-bot-auth').SignatureDirectoryResolver;
+    /**
+     * Seller origin revocation, checked after verification. A revoked key is
+     * refused; unknown status is retryable; a seller that serves no list is
+     * accepted (webhooks do not spend). Usually an `OriginRevocationResolver`.
+     */
+    revocation?: {
+      status(origin: string, keyid: string): Promise<import('../identity-3.3/revocation').OriginRevocationStatus>;
+    };
+    /** @deprecated Use `revocation`. Conservative: a seller that serves no list is refused. */
+    isRevoked?: (origin: string, keyid: string) => Promise<boolean>;
+  };
+  /** Applicable pins from persisted media-buy records. Reuse refresh callbacks bound to the seller/publisher/tenant across deliveries to share their cooldown. Never use webhook payload fields. */
+  publisherPins?: (
+    registration: Readonly<WebhookRegistration>
+  ) => Promise<readonly import('../signing/publisher-pins').PublisherSigningKeyPin[]>;
+  /** Local diagnostics for request_signature_* discovery causes. */
+  onKeyResolutionError?: (error: unknown) => void;
   /** Deterministic/custom key source. Defaults to resolveAgent brand.json discovery. */
   jwks?: JwksResolver;
   /** Shared nonce replay store. Defaults to one process-local store per client. */
@@ -1324,10 +1490,49 @@ const DURABLE_SETTLEMENT_TERMINAL_STATUSES = new Set<import('./ConversationTypes
 // normalizeWebhookPayload), so its omission is non-fatal for dispatch.
 const MCP_WEBHOOK_REQUIRED_FIELDS = ['idempotency_key', 'task_id', 'task_type', 'status', 'timestamp'] as const;
 
+/** Context for an isolated inline completion status-handler failure. */
+export interface StatusHandlerErrorContext {
+  handlerName: keyof AsyncHandlerConfig;
+  metadata: WebhookMetadata;
+}
+
 /**
  * Configuration for SingleAgentClient (and multi-agent client)
  */
 export interface SingleAgentClientConfig extends ConversationConfig {
+  /** Enable pinned draft identity schemas and positively negotiated 3.3 webhook rules. */
+  experimentalIdentity33?: boolean;
+  webhookSigningProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
+  /** Default off disables provisioning gates; auto/strict use the provisioning registry. */
+  accountPolicy?: AccountPolicy;
+  /** Auto selects seller IDs only with stable_account_id or an AdCP 4+ wire contract. Natural-key preserves legacy implicit references. */
+  accountReferenceMode?: 'auto' | 'natural-key';
+  accountStorage?: BuyerAccountStorage;
+  accountRegistryMaxEntries?: number;
+  accountRegistryOptions?: Pick<
+    import('./buyer-account-registry').BuyerAccountRegistryOptions,
+    'onDispatchStart' | 'onResult'
+  >;
+  /** Trusted stable caller identity for durable registry partitioning. Default is credential fingerprint. */
+  accountRegistryScope?: string;
+  productCache?: ProductCache;
+  /**
+   * Share endpoint discovery, the `tools/list` schema map and
+   * `get_adcp_capabilities` across client instances. Opt-in: nothing is shared
+   * unless a cache and a caller-owned `authIdentity` are supplied.
+   *
+   * Entries are keyed by agent URL, `authIdentity`, the pinned AdCP version, the
+   * non-correlation request headers (tenant/routing headers included), the
+   * signing identity and the transport policy (`allowPrivateIp`,
+   * `maxResponseBytes`), and expire after `ttlMs`. Synthetic capabilities
+   * (a seller whose capabilities call failed or that has no
+   * `get_adcp_capabilities`) are never shared, and calls that use a scoped
+   * `trustedFetchFn` bypass the cache entirely.
+   * See `docs/guides/DISCOVERY-CACHE-AND-SESSION-REUSE.md`.
+   */
+  discoveryCache?: AgentDiscoveryCacheConfig;
+  /** @internal Allow local discovery reuse while the compliance runner owns this exact transport. */
+  _reuseConfiguredDiscovery?: () => boolean;
   /** Durable storage for restart-safe A2A human continuations. */
   deferredStorage?: DeferredTaskStorage;
   /** Resolve current trusted agent configuration for a persisted continuation. */
@@ -1391,8 +1596,21 @@ export interface SingleAgentClientConfig extends ConversationConfig {
    * For at-least-once webhook delivery, set `handlers.webhookDedup` to
    * drop duplicate retries by `idempotency_key`. See
    * `docs/guides/PUSH-NOTIFICATION-CONFIG.md#deduplication`.
+   * For per-call skipping and inline error isolation, see
+   * `docs/guides/PUSH-NOTIFICATION-CONFIG.md#inline-completion-handlers`.
    */
   handlers?: AsyncHandlerConfig;
+  /**
+   * Return successful completed results even if an inline status handler throws.
+   * Defaults to false, preserving handler rejection and durable finalization retry.
+   * Does not change webhook error handling or cancellation behavior.
+   */
+  isolateStatusHandlerErrors?: boolean;
+  /**
+   * Reports inline status-handler errors when isolateStatusHandlerErrors is true.
+   * Errors thrown by this observer are recorded as warnings and do not reject the task.
+   */
+  onStatusHandlerError?: (error: unknown, context: StatusHandlerErrorContext) => void | Promise<void>;
   /** Select legacy HMAC-SHA256 push verification. Omit to use RFC 9421. */
   webhookSecret?: string;
   /** Durable provenance for outbound push registrations. Defaults to process-local memory. */
@@ -1443,35 +1661,8 @@ export interface SingleAgentClientConfig extends ConversationConfig {
    * @default true
    */
   validateFeatures?: boolean;
-  /**
-   * Gate mutating-task dispatch on the seller's declared major version.
-   * When the seller returns an authoritative `get_adcp_capabilities`
-   * response, the guard requires:
-   *   1. `major_versions` includes 3
-   *   2. `adcp.idempotency.replay_ttl_seconds` is declared (spec-required)
-   *
-   * Sellers whose capabilities are synthesized from `tools/list` (no
-   * authoritative `get_adcp_capabilities` response) route through the
-   * v2 adapter with a one-time warning — a compliant v3 seller would
-   * declare itself, so absence of a declaration is read as v2. Adopters
-   * who need a hard "definitely-v3" gate should validate
-   * `(await client.getCapabilities())._synthetic === false` directly.
-   *
-   * Throws `VersionUnsupportedError` before the request is sent when
-   * the guard rejects. Bypass with `allowV2` or — process-wide as a
-   * fallback — `ADCP_ALLOW_V2=1`.
-   *
-   * @default false
-   */
+  /** Require release compatibility and the declared idempotency replay TTL before mutations. */
   requireV3ForMutations?: boolean;
-  /**
-   * Per-client bypass for the v3 guard. When `true`, the guard is off
-   * regardless of the `ADCP_ALLOW_V2` env var. When `undefined`, the env
-   * var is consulted as a fallback. Set explicitly in multi-tenant
-   * deployments so one tenant's override can't silently disable safety
-   * for another.
-   */
-  allowV2?: boolean;
   /**
    * Runtime schema validation options
    */
@@ -1568,9 +1759,11 @@ export interface SingleAgentClientConfig extends ConversationConfig {
    * Transport-level safeguards. Applies to every call this client dispatches
    * unless overridden at call time.
    *
-   * Set `maxResponseBytes` when crawling untrusted agents (registries,
-   * federated discovery layers) to prevent a hostile vendor from buffering
-   * a large reply before any application-layer schema validation runs. Set
+   * `maxResponseBytes` defaults to 4 MiB on every call; raise it for an agent
+   * that legitimately publishes a large catalog, lower it when crawling
+   * untrusted agents (registries, federated discovery layers), or set it to
+   * exactly `0` to opt out of the cap entirely. A per-call `transport`
+   * replaces this object wholesale rather than merging into it. Set
    * `requestTimeoutMs` to override the default 60s cap on A2A agent-card
    * discovery; use `0` to disable the SDK-imposed discovery timeout.
    */
@@ -1599,14 +1792,87 @@ export interface CapabilityEvidenceSnapshot {
   toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
 }
 
+/** Capability evidence to pre-seed into a shared `discoveryCache`. */
+export interface AgentDiscoverySeed {
+  /** Authoritative capabilities (never synthetic). */
+  capabilities: AdcpCapabilities;
+  /** `tools/list` input-schema properties keyed by tool name; optional when capabilities carry discoveredTools. */
+  toolSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  /**
+   * The MCP endpoint serving this agent, to skip endpoint probing. Must be a
+   * credential-free URL on the configured agent's origin, without query or fragment.
+   */
+  endpoint?: { agentUri: string; mcpEra?: 'legacy' | 'modern' };
+}
+
+// Per shared cache and key: the latest invalidation in this process. `epoch`
+// (unique, never reused) lets an older in-flight discovery or local evidence
+// notice it was dropped; `at` is a tombstone, so an entry observed before it is
+// a miss even when the backend delete failed or is still queued. Bounded: records
+// older than any entry could live, and the oldest beyond the cap, are forgotten,
+// but only into a per-cache floor (the largest forgotten epoch and time) that
+// every key inherits: held epochs and entries older than a forgotten invalidation
+// then miss, so forgetting can only cost a rediscovery, never resurrect stale
+// evidence. Best effort across processes: a distributed backend is not made atomic.
+interface SharedInvalidation {
+  epoch: number;
+  at: number;
+}
+const sharedInvalidations = new WeakMap<object, Map<string, SharedInvalidation>>();
+const sharedInvalidationFloors = new WeakMap<object, SharedInvalidation>();
+let sharedInvalidationCounter = 0;
+const MAX_SHARED_INVALIDATION_RECORDS = 1024;
+
+// Per shared cache and key: in-process queue of backend mutations. Bounded so a
+// backend that never answers cannot make the queues grow without limit.
+interface SharedMutationQueue {
+  tail: Promise<void>;
+  pending: number;
+  /** Latest queued delete that has not started; a newer invalidation joins it. */
+  waitingDelete?: { promise: Promise<unknown>; started: boolean };
+}
+const sharedMutationChains = new WeakMap<object, Map<string, SharedMutationQueue>>();
+const MAX_PENDING_SHARED_MUTATIONS_PER_KEY = 16;
+const MAX_SHARED_MUTATION_KEYS = 1024;
+
+// In-process singleflight of live discovery per shared cache and key.
+const sharedDiscoveryFlights = new WeakMap<object, Map<string, Promise<void>>>();
+const MAX_SHARED_DISCOVERY_WAITS = 3;
+// Backend deadline for each shared-cache get/set/delete.
+const SHARED_DISCOVERY_CACHE_TIMEOUT_MS = 2_000;
+// Tolerated disagreement between hosts' clocks when judging an entry's age.
+const SHARED_DISCOVERY_CLOCK_SKEW_MS = 5_000;
+
+// Seller errors that say the capabilities, version or tool surface we cached have changed.
+const CAPABILITY_STALE_ERROR_CODES: ReadonlySet<string> = new Set([
+  'VERSION_UNSUPPORTED',
+  'UNSUPPORTED_FEATURE',
+  'FEATURE_UNSUPPORTED',
+  'TOOL_NOT_FOUND',
+  'METHOD_NOT_FOUND',
+  'UNKNOWN_TOOL',
+]);
+
+/** A plain `{ toolName: { ...inputSchema.properties } }` record; arrays are rejected at both levels. */
+function isToolSchemaRecord(value: unknown): value is Record<string, Record<string, unknown>> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every(
+      properties => typeof properties === 'object' && properties !== null && !Array.isArray(properties)
+    )
+  );
+}
+
 function isCapabilityEvidence(value: unknown): value is AdcpCapabilities {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const candidate = value as Partial<AdcpCapabilities>;
   return (
-    (candidate.version === 'v2' || candidate.version === 'v3') &&
+    candidate.version === 'v3' &&
     Array.isArray(candidate.majorVersions) &&
-    candidate.majorVersions.length > 0 &&
-    candidate.majorVersions.every(version => version === 2 || version === 3) &&
+    candidate.majorVersions.includes(3) &&
+    candidate.majorVersions.every(version => Number.isSafeInteger(version) && version > 0) &&
     Array.isArray(candidate.protocols) &&
     candidate.protocols.every(protocol => typeof protocol === 'string') &&
     typeof candidate.features === 'object' &&
@@ -1616,64 +1882,6 @@ function isCapabilityEvidence(value: unknown): value is AdcpCapabilities {
     candidate.extensions.every(extension => typeof extension === 'string') &&
     typeof candidate._synthetic === 'boolean'
   );
-}
-
-/**
- * Internal single-agent client implementation
- *
- * This is an internal implementation detail used by AgentClient and ADCPMultiAgentClient.
- * External users should use AdCPClient (alias for ADCPMultiAgentClient) instead.
- *
- * Key features:
- * - 🔒 Full type safety for all ADCP tasks
- * - 💬 Conversation management with context preservation
- * - 🔄 Input handler pattern for clarifications
- * - ⏱️ Timeout and retry support
- * - 🐛 Debug logging and observability
- * - 🎯 Works with both MCP and A2A protocols
- */
-/**
- * Does a JS runtime value's type plausibly match a JSON Schema's declared
- * shape? Used by the v2 adapter aliasing path to avoid moving a string
- * into a slot the agent's tool schema declared as an object (e.g.,
- * Wonderstruck's `brand: BrandReference` slot vs our adapter's
- * `brand_manifest: 'https://...'` URL string).
- *
- * Recurses into `anyOf` / `oneOf`: the move is safe iff at least one
- * variant accepts the value's runtime type. `$ref` we can't introspect
- * locally — return true and let the seller's own validation catch.
- *
- * The empty schema `{}` is treated as "doesn't accept this type" so
- * Pydantic-generated tool schemas with `anyOf: [{}, {type: null}]` —
- * which technically allow anything but in practice mask a stricter
- * Pydantic union — don't pull the buyer into the broken alias.
- */
-function valueMatchesSchemaType(value: unknown, propSchema: unknown): boolean {
-  if (!propSchema || typeof propSchema !== 'object') return false;
-  const schema = propSchema as { type?: unknown; oneOf?: unknown; anyOf?: unknown; $ref?: unknown };
-  if (schema.$ref) return true;
-
-  const valueType: string = Array.isArray(value)
-    ? 'array'
-    : value === null
-      ? 'null'
-      : typeof value === 'object'
-        ? 'object'
-        : typeof value;
-
-  // anyOf / oneOf: any variant matching = safe.
-  for (const key of ['anyOf', 'oneOf'] as const) {
-    const variants = (schema as { [k: string]: unknown })[key];
-    if (Array.isArray(variants)) {
-      return variants.some(v => valueMatchesSchemaType(value, v));
-    }
-  }
-
-  const declared = schema.type;
-  if (declared === undefined) return false;
-  if (typeof declared === 'string') return declared === valueType;
-  if (Array.isArray(declared)) return declared.includes(valueType);
-  return false;
 }
 
 function productHasPricingOptions(product: unknown): boolean {
@@ -1689,7 +1897,14 @@ function productIdForPricingDiagnostics(product: unknown): string | undefined {
 }
 
 function propertyListReferenceFromRequest(params: Record<string, unknown>): PropertyListReference | undefined {
-  const value = params.property_list;
+  const filters = params.filters;
+  const nested =
+    filters &&
+    typeof filters === 'object' &&
+    !Array.isArray(filters) &&
+    Object.hasOwn(filters, 'property_list') &&
+    (filters as Record<string, unknown>).property_list !== undefined;
+  const value = nested ? (filters as Record<string, unknown>).property_list : params.property_list;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const ref = value as Partial<PropertyListReference>;
   if (typeof ref.agent_url !== 'string' || typeof ref.list_id !== 'string') return undefined;
@@ -1703,10 +1918,41 @@ function propertyListReferenceFromRequest(params: Record<string, unknown>): Prop
 function productPolicyRequestSnapshot(requestParams: Record<string, unknown>): Readonly<Record<string, unknown>> {
   const account = canonicalAccountRoutingSnapshot(requestParams.account);
   const propertyList = propertyListReferenceFromRequest(requestParams);
+  const referenceError = propertyListReferenceError(requestParams);
   return Object.freeze({
     ...(account ? { account } : {}),
     ...(propertyList ? { property_list: Object.freeze(propertyList) } : {}),
+    ...(referenceError ? { property_list_error: referenceError } : {}),
   });
+}
+
+function propertyListReferenceError(params: Record<string, unknown>): string | undefined {
+  if (typeof params.property_list_error === 'string') return params.property_list_error;
+  const filters = params.filters;
+  if (params.property_list !== undefined && !propertyListReferenceFromRequest({ property_list: params.property_list }))
+    return 'property_list_invalid_reference';
+  if (
+    !filters ||
+    typeof filters !== 'object' ||
+    Array.isArray(filters) ||
+    !Object.hasOwn(filters, 'property_list') ||
+    (filters as Record<string, unknown>).property_list === undefined
+  )
+    return undefined;
+  const nested = propertyListReferenceFromRequest(params);
+  if (!nested) return 'property_list_invalid_reference';
+  if (params.property_list !== undefined) {
+    const legacy = propertyListReferenceFromRequest({ property_list: params.property_list });
+    if (
+      !legacy ||
+      nested.agent_url !== legacy.agent_url ||
+      nested.list_id !== legacy.list_id ||
+      nested.auth_token !== legacy.auth_token
+    ) {
+      return 'property_list_conflicting_references';
+    }
+  }
+  return undefined;
 }
 
 function hasProductPropertyPolicyRules(policy: BuyerPropertyPolicy): boolean {
@@ -1722,19 +1968,11 @@ function hasProductPropertyPolicyRules(policy: BuyerPropertyPolicy): boolean {
   );
 }
 
-function comparablePropertyIdentifiers(
-  identifiers: readonly { type: string; value: string }[]
-): Array<{ type: string; value: string }> {
-  return identifiers
-    .filter(identifier => identifier.type === 'domain' || identifier.type === 'subdomain')
-    .map(identifier => ({ type: identifier.type, value: identifier.value }));
-}
-
 function unsupportedPropertyIdentifiers(
   identifiers: readonly { type: string; value: string }[]
 ): Array<{ type: string }> {
   return identifiers
-    .filter(identifier => identifier.type !== 'domain' && identifier.type !== 'subdomain')
+    .filter(identifier => !isSupportedPropertyIdentifierType(identifier.type))
     .map(identifier => ({ type: identifier.type }));
 }
 
@@ -1759,30 +1997,331 @@ function propertyListResolutionErrorCode(err: unknown): string {
 }
 
 export class SingleAgentClient {
-  private executor: TaskExecutor;
+  private _accounts?: BuyerAccountRegistry;
+  private accountRegistryExplicitlyAccessed = false;
+  private initialOAuthGrantMaterial?: string;
+  private accountCredentialMaterial?: string;
+  private accountCredentialScope?: string;
+
+  private credentialScope(material: string): string {
+    if (this.accountCredentialMaterial !== material) {
+      this.accountCredentialScope = scryptSync(material, 'adcp-sdk/account-registry-scope/v1', 32).toString('hex');
+      this.accountCredentialMaterial = material;
+    }
+    return this.accountCredentialScope!;
+  }
+
+  private accountScope(): string {
+    const agent = this.normalizedAgent ?? this.agent;
+    const cc = agent.oauth_client_credentials;
+    if (!cc && agent.oauth_tokens && !this.initialOAuthGrantMaterial)
+      this.initialOAuthGrantMaterial = JSON.stringify(agent.oauth_tokens);
+    const oauthIdentity = cc
+      ? { client_id: cc.client_id, token_endpoint: cc.token_endpoint, scope: cc.scope, resource: cc.resource }
+      : this.initialOAuthGrantMaterial;
+    const signing = agent.request_signing;
+    const signingIdentity = signing
+      ? signing.kind === 'provider'
+        ? {
+            keyid: signing.provider.keyid,
+            algorithm: signing.provider.algorithm,
+            fingerprint: signing.provider.fingerprint,
+            purpose: signing.provider.adcpUse,
+          }
+        : { keyid: signing.kid, algorithm: signing.alg, key: signing.private_key }
+      : undefined;
+    const credential =
+      this.config.accountRegistryScope ??
+      this.credentialScope(
+        JSON.stringify({
+          token: agent.auth_token,
+          oauth: oauthIdentity,
+          oauthClient: agent.oauth_client?.client_id,
+          oauthResource: agent.oauth_resource,
+          headers: agent.headers,
+          signing: signingIdentity,
+        })
+      );
+    return JSON.stringify([this.agent.agent_uri, this.agent.protocol, credential]);
+  }
+
+  get accounts(): BuyerAccountRegistry {
+    this.accountRegistryExplicitlyAccessed = true;
+    return this.getAccountRegistry();
+  }
+
+  private getAccountRegistry(): BuyerAccountRegistry {
+    return (this._accounts ??= new BuyerAccountRegistry(
+      () => this.accountScope(),
+      async (account, options, taskOptions, dispatch) => {
+        const caps = await this.getCapabilities(taskOptions);
+        const supported = caps.account?.supportedBilling ?? [];
+        const billing =
+          options.billing ?? caps.account?.defaultBilling ?? (supported.length === 1 ? supported[0] : undefined);
+        if (!billing || (supported.length && !supported.includes(billing))) {
+          throw new AccountRequiredError(
+            'implicit',
+            'sync_accounts',
+            'Choose a supported billing party before provisioning.'
+          );
+        }
+        return this.syncAccounts(
+          {
+            ...(dispatch && { idempotency_key: dispatch.idempotencyKey }),
+            accounts: [
+              {
+                ...account,
+                billing,
+                ...(options.paymentTerms !== undefined && { payment_terms: options.paymentTerms }),
+                ...(options.billingEntity !== undefined && { billing_entity: options.billingEntity }),
+              },
+            ],
+          } as MutatingRequestInput<SyncAccountsRequest>,
+          undefined,
+          { ...taskOptions, [SKIP_ACCOUNT_REGISTRY_OBSERVATION]: true } as TaskOptions,
+          dispatch
+        );
+      },
+      this.config.accountStorage,
+      async (accountId, options) => {
+        const rows: ListAccountsResponse['accounts'] = [];
+        const cursors = new Set<string>();
+        let cursor: string | undefined;
+        for (let page = 0; page < 100; page++) {
+          const result = await this.listAccounts(
+            { account: { account_id: accountId }, ...(cursor && { pagination: { cursor } }) },
+            undefined,
+            { ...options, [SKIP_ACCOUNT_REGISTRY_OBSERVATION]: true } as TaskOptions
+          );
+          if (!result.success || result.status !== 'completed' || !result.data || !('accounts' in result.data))
+            throw new Error('Account status reconciliation failed.');
+          rows.push(...result.data.accounts);
+          if (rows.some(row => row.account_id === accountId) || !result.data.pagination?.has_more)
+            return rows.filter(row => row.account_id === accountId);
+          const next = result.data.pagination.cursor;
+          if (!next || cursors.has(next)) break;
+          cursors.add(next);
+          cursor = next;
+        }
+        throw new Error('Account status reconciliation could not complete pagination.');
+      },
+      {
+        ...this.config.accountRegistryOptions,
+        provisionOwnsDispatchBoundary: true,
+        maxEntries: this.config.accountRegistryMaxEntries,
+        evictAtCapacity: () => !this.accountRegistryOptedIn(),
+        normalizeOptions: async (options, taskOptions) => {
+          if (options.billing) return options;
+          const caps = await this.getCapabilities(taskOptions);
+          const supported = caps.account?.supportedBilling ?? [];
+          const billing = caps.account?.defaultBilling ?? (supported.length === 1 ? supported[0] : undefined);
+          return { ...options, ...(billing && { billing }) };
+        },
+      }
+    ));
+  }
+
+  /**
+   * The memoized registry backs `resolveAccount()` only when the caller opts
+   * in with an account policy or registry configuration. Otherwise
+   * `resolveAccount()` keeps the SDK 14.0 sync-on-every-call behavior.
+   */
+  private accountRegistryOptedIn(): boolean {
+    return (
+      (this.config.accountPolicy ?? 'off') !== 'off' ||
+      this.config.accountStorage !== undefined ||
+      this.config.accountRegistryScope !== undefined ||
+      this.config.accountRegistryMaxEntries !== undefined ||
+      this.config.accountRegistryOptions !== undefined
+    );
+  }
+
+  private accountRegistryContext(
+    task: string,
+    params: any,
+    options?: TaskOptions
+  ): DeferredClientFinalizationContext['accountRegistry'] {
+    const knownOnly =
+      !this.accountRegistryExplicitlyAccessed &&
+      (this.config.accountPolicy ?? 'off') === 'off' &&
+      !this.config.accountStorage;
+    if (knownOnly && !this._accounts) return undefined;
+    if (
+      (options as TaskOptions & { [SKIP_ACCOUNT_REGISTRY_OBSERVATION]?: boolean })?.[SKIP_ACCOUNT_REGISTRY_OBSERVATION]
+    )
+      return undefined;
+    if (task !== 'sync_accounts' && task !== 'list_accounts') return undefined;
+    return {
+      scope: this.accountScope(),
+      ...(knownOnly && { knownOnly: true }),
+      observationEpoch: this.getAccountRegistry().captureObservation(),
+      ...(task === 'list_accounts' && params.account && { refs: [params.account] }),
+      ...(task === 'sync_accounts' && {
+        refs: Array.isArray(params.accounts)
+          ? params.accounts.flatMap((value: unknown) => {
+              const ref = canonicalAccountRoutingSnapshot(value);
+              return ref ? [ref as AccountReference] : [];
+            })
+          : [],
+        dryRun: params.dry_run === true,
+      }),
+    };
+  }
+
+  private usesStableAccountIds(capabilities: AdcpCapabilities): boolean {
+    if (capabilities._synthetic) return false;
+    return (
+      capabilities.account?.stableAccountId === true ||
+      (isAdcpVersionAtLeast(this.config.wireAdcpVersion ?? this.resolvedAdcpVersion, '4.0.0') &&
+        (isAdcpVersionAtLeast(capabilities.servedVersion, '4.0.0') ||
+          (!capabilities.servedVersion &&
+            capabilities.supportedVersions?.some(version => isAdcpVersionAtLeast(version, '4.0.0')) === true)))
+    );
+  }
+
+  private accountWireReference(
+    account: AccountReference,
+    accountId: string | undefined,
+    capabilities: AdcpCapabilities
+  ): AccountReference {
+    if (
+      'account_id' in account ||
+      this.config.accountReferenceMode === 'natural-key' ||
+      !this.usesStableAccountIds(capabilities)
+    )
+      return account;
+    if (!accountId)
+      throw new AccountSetupRequiredError(
+        'The seller declares stable account IDs but did not return an account_id. Reconcile with syncAccounts.'
+      );
+    return { account_id: accountId };
+  }
+
+  private async applyAccountPolicy(task: string, params: any, options?: TaskOptions): Promise<any> {
+    const policy = this.config.accountPolicy ?? 'off';
+    const ref =
+      params?.account ?? (typeof params?.account_id === 'string' ? { account_id: params.account_id } : undefined);
+    if (
+      options?.skipAccountValidation ||
+      options?.preserveGovernedPayload ||
+      task === 'list_accounts' ||
+      task === 'sync_accounts'
+    )
+      return params;
+    if (!ref) {
+      if (
+        policy === 'strict' &&
+        ['get_products', 'list_products'].includes(task) &&
+        this.usesStableAccountIds(await this.getCapabilities(options))
+      )
+        throw new AccountNotProvisionedError(undefined, task);
+      return params;
+    }
+    if (policy === 'off' && !this._accounts) return params;
+    if (
+      typeof ref !== 'object' ||
+      ref === null ||
+      (!('account_id' in ref) && (typeof ref.brand?.domain !== 'string' || typeof ref.operator !== 'string'))
+    )
+      return params; // Let normal request validation report malformed references.
+    const registry = this.getAccountRegistry();
+    let known = await registry.get(ref);
+    let capabilities: AdcpCapabilities | undefined;
+    if (
+      known &&
+      !['unknown', 'provisioning', 'failed_provisioning'].includes(known.status) &&
+      !('account_id' in ref) &&
+      this.config.accountReferenceMode !== 'natural-key'
+    ) {
+      const scope = this.accountScope();
+      capabilities = await this.getCapabilities(options);
+      if (scope !== this.accountScope()) throw new AccountNotProvisionedError(ref, task);
+      // Capability discovery may await transport I/O. Recheck status and binding
+      // so a concurrent repair or explicit sync cannot inject an obsolete ID.
+      known = await registry.get(ref);
+      if (scope !== this.accountScope()) throw new AccountNotProvisionedError(ref, task);
+    }
+    if (known && !['unknown', 'provisioning', 'failed_provisioning'].includes(known.status)) {
+      const commitsSpend = [
+        'create_media_buy',
+        'buy_products',
+        'accept_proposal',
+        'activate_signal',
+        'acquire_rights',
+      ].includes(task);
+      // Payment-required accounts can still manage creatives for existing buys.
+      const allowedStatuses = task === 'sync_creatives' ? ['active', 'payment_required'] : ['active'];
+      if (policy !== 'off' && (commitsSpend || task === 'sync_creatives') && !allowedStatuses.includes(known.status)) {
+        if (known.status === 'pending_approval') throw new AccountPendingApprovalError(ref, known.account_id);
+        if (known.status === 'payment_required') throw new AccountPaymentRequiredError();
+        throw new AccountSetupRequiredError(
+          `Account status is ${known.status}. Refresh it with client.accounts.applyStatusChange or complete seller setup.`
+        );
+      }
+      if (capabilities) {
+        const account = this.accountWireReference(ref, known.account_id, capabilities);
+        if (account !== ref) return { ...params, account };
+      }
+      return params;
+    }
+    if (policy === 'off') return params;
+    if (
+      policy === 'strict' ||
+      ![
+        'get_products',
+        'list_products',
+        'get_signals',
+        'request_proposals',
+        'refine_proposals',
+        'decline_proposals',
+      ].includes(task)
+    ) {
+      throw new AccountNotProvisionedError(ref, task);
+    }
+    const caps = await this.getCapabilities(options);
+    if (
+      caps._synthetic ||
+      (['get_products', 'list_products'].includes(task) && caps.account?.requiredForProducts) ||
+      params.push_notification_config ||
+      !schemaAllowsTopLevelField(task, 'brand')
+    ) {
+      throw new AccountNotProvisionedError(ref, task);
+    }
+    if (!('brand' in ref)) throw new AccountNotProvisionedError(ref, task);
+    const { account, ...publicRequest } = params;
+    return { ...publicRequest, brand: params.brand ?? ref.brand };
+  }
+
+  private executor!: TaskExecutor;
   private asyncHandler?: AsyncHandler;
-  private normalizedAgent: InternalAgentConfig;
+  private normalizedAgent!: InternalAgentConfig;
   private discoveredEndpoint?: string; // Cache discovered MCP endpoint
   private discoveredAgent?: AgentConfig; // Stable post-discovery config for protocol/provider caches
   private discoveredMcpEra?: 'legacy' | 'modern';
   private discoveredMcpEraAt = 0;
   private canonicalBaseUrl?: string; // Cache canonical base URL (from agent card or stripped /mcp)
   private cachedCapabilities?: AdcpCapabilities; // Cache detected server capabilities
+  private runAgentInfo?: Awaited<ReturnType<SingleAgentClient['getAgentInfo']>>;
   private cachedToolSchemas?: Map<string, Record<string, unknown>>; // inputSchema.properties per tool name
   private primedCapabilitiesExpiresAt?: number; // Freshness bound for application-owned evidence only
   private capabilityEvidenceScopeKey = randomUUID();
   private capabilityEvidenceAuthMaterial?: string;
-  private _v2WarningFired = false; // Gate: emit the v2-sunset warning once per client instance
+  private capabilitiesFromSharedCache = false; // Installed from config.discoveryCache rather than discovered live
+  private discoveryEpoch = 0; // bumped by invalidation so an older in-flight discovery cannot re-install what was dropped
+  private discoveredEndpointKey?: string; // discoveryCache key the local endpoint was obtained under
+  private discoveredEndpointEpoch?: number; // shared invalidation epoch of that key when the endpoint was obtained
+  private discoveredEndpointExpiresAt?: number; // freshness bound for that endpoint (shared-cache mode only)
+  private sharedEvidenceEpoch?: number; // shared invalidation epoch of that key when the evidence was obtained
+  private sharedEvidenceKey?: string; // discoveryCache key the local capability cache was obtained under
   private _syntheticV3WarningFired = false; // Gate: emit the synthetic-v3 warning once per client instance
-  private _syntheticV2WarningFired = false; // Gate: emit the synthetic-v2 warning once per client instance
   private readonly productPolicyRequestParamsByTask = new Map<string, ProductPolicyRequestState>();
   private readonly canonicalCreativeTaskAssociations = new Map<string, CanonicalCreativeTaskAssociation>();
   private readonly previewCreativeHandlersByTask = new Map<string, 'canonical' | 'legacy'>();
   private readonly canonicalLegacyRoutes = new Map<string, CanonicalLegacyRoute>();
-  private readonly resolvedAdcpVersion: string;
-  private readonly webhookRegistrationStore: WebhookRegistrationStore;
-  private readonly webhookReplayStore: ReplayStore;
-  private readonly webhookRevocationStore: RevocationStore;
+  private readonly resolvedAdcpVersion!: string;
+  private readonly webhookRegistrationStore!: WebhookRegistrationStore;
+  private readonly webhookReplayStore!: ReplayStore;
+  private readonly webhookRevocationStore!: RevocationStore;
   private readonly webhookJwksResolvers = new Map<string, JwksResolver>();
   private readonly durableSettlementRecoverers = new Set<
     (
@@ -1812,6 +2351,11 @@ export class SingleAgentClient {
     private agent: AgentConfig,
     private config: SingleAgentClientConfig = {}
   ) {
+    if ((config.experimentalIdentity33 === true) !== isIdentity33SchemaScope())
+      return withIdentity33SchemaScope(() => {
+        const instance = Reflect.construct(SingleAgentClient, [agent, config], new.target) as SingleAgentClient;
+        return config.experimentalIdentity33 ? bindIdentity33SchemaScope(instance) : instance;
+      }, config.experimentalIdentity33 === true);
     // Own the nested trust-boundary object at construction. Normalization
     // historically returns the input object unchanged for the preferred
     // `trustedFetchFn` spelling, so clone first while retaining function identity.
@@ -1831,10 +2375,13 @@ export class SingleAgentClient {
       ...(configuredWebhookVerification !== undefined && { webhookVerification: configuredWebhookVerification }),
     };
     config = this.config;
+    validateAgentDiscoveryCacheConfig(config.discoveryCache);
     // Validate the configured adcpVersion at construction time. Throws
     // ConfigurationError if the pin's major differs from ADCP_MAJOR_VERSION
     // — cross-major support lands in Stage 3 of the multi-version refactor.
-    this.resolvedAdcpVersion = resolveAdcpVersion(config.adcpVersion);
+    this.resolvedAdcpVersion = resolveAdcpVersion(
+      config.adcpVersion ?? (config.experimentalIdentity33 ? '3.3' : undefined)
+    );
     this.webhookRegistrationStore = config.webhookRegistrationStore ?? new InMemoryWebhookRegistrationStore();
     this.webhookReplayStore = config.webhookVerification?.replayStore ?? new InMemoryReplayStore();
     this.webhookRevocationStore = config.webhookVerification?.revocationStore ?? new InMemoryRevocationStore();
@@ -1854,6 +2401,9 @@ export class SingleAgentClient {
 
     // Normalize agent URL for MCP protocol
     this.normalizedAgent = this.normalizeAgentConfig(this.agent);
+    // Pin this client's configured OAuth grant, retaining caller isolation across automatic token refreshes.
+    if (this.normalizedAgent.oauth_tokens && !this.normalizedAgent.oauth_client_credentials)
+      this.initialOAuthGrantMaterial = JSON.stringify(this.normalizedAgent.oauth_tokens);
     this.capabilityEvidenceAuthMaterial = this.currentCapabilityEvidenceAuthMaterial();
 
     this.executor = new TaskExecutor({
@@ -1899,6 +2449,10 @@ export class SingleAgentClient {
       webhookUrlTemplate: config.webhookUrlTemplate,
       agentId: agent.id,
       webhookSecret: config.webhookSecret,
+      identity33SchemaExperiment: config.experimentalIdentity33,
+      experimentalIdentity33: () => this.config.experimentalIdentity33 === true && this.usesIdentity33Schemas(),
+      signedIdentity33Webhooks: () => this.usesSigned33Webhooks(),
+      webhookSigningProfile: () => this.selectedWebhookSigningProfile(),
       onWebhookRegistration: registration => this.persistWebhookRegistration(registration),
       onDurableSettlementRequired: operationId => this.markWebhookDurableSettlementRequired(operationId),
       externalTaskSettlementRetentionMs: registrationTtl * 1000,
@@ -1932,6 +2486,8 @@ export class SingleAgentClient {
     operationId: string;
     callbackUrl: string;
     mode: WebhookRegistration['mode'];
+    signingProfile?: WebhookRegistration['signingProfile'];
+    deliveryKind?: WebhookRegistration['deliveryKind'];
     delegatedOperatorAuthorization?: DelegatedOperatorAuthorizationContext;
   }): Promise<void> {
     const nowMs = this.config.webhookVerification?.now
@@ -1961,18 +2517,20 @@ export class SingleAgentClient {
     persistedAgentUrl.username = '';
     persistedAgentUrl.password = '';
     persistedAgentUrl.hash = '';
-    const delegatedOperatorAuthorization = this.effectiveDelegatedOperatorAuthorization(
-      args.delegatedOperatorAuthorization
-    );
+    const delegatedOperatorAuthorization = args.deliveryKind
+      ? undefined
+      : this.effectiveDelegatedOperatorAuthorization(args.delegatedOperatorAuthorization);
     const registration: WebhookRegistration = {
       agentId: args.agent.id,
       agentUrl: persistedAgentUrl.toString(),
       protocol: args.agent.protocol,
       operationId: args.operationId,
       taskType: args.taskType,
-      callbackUrl: args.callbackUrl,
+      callbackUrl: args.deliveryKind ? canonicalTargetUri(args.callbackUrl, '3.2') : args.callbackUrl,
       method: 'POST',
       mode: args.mode,
+      ...(args.signingProfile && { signingProfile: args.signingProfile }),
+      ...(args.deliveryKind && { deliveryKind: args.deliveryKind }),
       authorizationContextVersion: 1,
       ...(delegatedOperatorAuthorization !== undefined && { delegatedOperatorAuthorization }),
       ...(previewMode && { previewMode }),
@@ -1981,6 +2539,19 @@ export class SingleAgentClient {
     };
     validateWebhookRegistrationAuthorization(registration);
     try {
+      if (args.deliveryKind) {
+        const previous = await this.webhookRegistrationStore.get(args.agent.id, args.operationId);
+        if (
+          previous &&
+          previous.expiresAt > nowMs &&
+          (previous.signingProfile ?? 'adcp/webhook-signing/v1') !==
+            (registration.signingProfile ?? 'adcp/webhook-signing/v1')
+        )
+          throw new ConfigurationError(
+            `${args.deliveryKind} callback is already registered with ${previous.signingProfile ?? 'adcp/webhook-signing/v1'}. Use a new callback URL or delete its old registration after outstanding deliveries finish.`,
+            `${args.deliveryKind}_webhook.signing_profile`
+          );
+      }
       await this.webhookRegistrationStore.putIfAbsent(registration);
       const persisted = await this.webhookRegistrationStore.get(args.agent.id, args.operationId);
       if (
@@ -1996,6 +2567,12 @@ export class SingleAgentClient {
         );
       }
     } catch (cause) {
+      if (
+        args.deliveryKind &&
+        cause instanceof ConfigurationError &&
+        cause.configField === `${args.deliveryKind}_webhook.signing_profile`
+      )
+        throw cause;
       // RFC 9421 has no safe fallback without seller-pinned provenance. Legacy
       // HMAC remains verifiable from the configured global secret only for the
       // explicit recordless read-only allowlist. Mutation and unknown-task
@@ -2098,6 +2675,7 @@ export class SingleAgentClient {
     } = configuredResolverOptions ?? {};
     const resolver = new ResolvedAgentJwksResolver(registration.agentUrl, registration.protocol, {
       ...resolverOptionsWithoutOperatorContext,
+      legacyWebhookFallback: configuredResolverOptions?.legacyWebhookFallback ?? true,
       ...(delegatedOperatorAuthorization?.brand !== undefined && {
         requiredOperatorBrand: delegatedOperatorAuthorization.brand,
       }),
@@ -2165,8 +2743,19 @@ export class SingleAgentClient {
 
   private assertDurablePropertyListCredentialSupported(taskType: string, requestParams: Record<string, unknown>): void {
     if (!this.config.deferredStorage || taskType !== 'get_products') return;
-    const propertyList = propertyListReferenceFromRequest(requestParams);
-    if (!propertyList?.auth_token) return;
+    // Inspect both raw locations: selection precedence and malformed references must
+    // never hide a credential that would still be serialized in the original request.
+    const filters = requestParams.filters;
+    const references = [
+      requestParams.property_list,
+      filters && typeof filters === 'object' ? (filters as Record<string, unknown>).property_list : undefined,
+    ];
+    const hasCredential = references.some(reference => {
+      if (!reference || typeof reference !== 'object') return false;
+      const token = (reference as Record<string, unknown>).auth_token;
+      return token !== undefined && token !== null && token !== '';
+    });
+    if (!hasCredential) return;
     const policyConfig = this.config.validation?.productPropertyPolicy;
     if (policyConfig === false || policyConfig?.enforceRequestPropertyList === false) return;
     throw new ConfigurationError(
@@ -2210,12 +2799,7 @@ export class SingleAgentClient {
   }
 
   private sameCanonicalOptionRef(left: CanonicalLegacyOptionRef, right: CanonicalLegacyOptionRef): boolean {
-    return (
-      left.scope === right.scope &&
-      left.format_option_id === right.format_option_id &&
-      (left.scope !== 'publisher' ||
-        (right.scope === 'publisher' && left.publisher_domain.toLowerCase() === right.publisher_domain.toLowerCase()))
-    );
+    return sameFormatOptionRef(left, right);
   }
 
   private rememberCanonicalLegacyRoute(key: string, route: CanonicalLegacyRoute): void {
@@ -2250,10 +2834,12 @@ export class SingleAgentClient {
   private rememberCanonicalProductRoutes(
     products: readonly unknown[],
     account: unknown,
-    authoritativeProducts: readonly unknown[] = products
+    authoritativeProducts?: readonly unknown[],
+    evidence?: Omit<SellerFormatEvidence, 'productId'>
   ): void {
-    this.invalidateCanonicalProductRoutes(authoritativeProducts, account);
+    this.invalidateCanonicalProductRoutes(authoritativeProducts ?? products, account);
     const accountScope = this.canonicalAccountScope(account);
+    const declaredOptions = authoritativeProducts ? this.sellerDeclaredFormatOptions(authoritativeProducts) : undefined;
     for (const value of products) {
       if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
       const product = value as Record<string, unknown>;
@@ -2271,16 +2857,108 @@ export class SingleAgentClient {
               }
             : { scope: 'product' as const, format_option_id: option.format_option_id };
         const refs = legacyFormatRefsForDeclaration(option);
-        if (refs.length === 0) continue;
+        // Cached canonical products carry the original seller evidence out of
+        // band; their SDK-minted ids are not new seller declarations.
+        // Keep origin even without legacy refs so fresh seller declarations
+        // can override an older persisted undeclared route.
+        const declared = declaredOptions
+          ? declaredOptions.get(product.product_id)?.some(declaredRef => this.sameCanonicalOptionRef(declaredRef, ref))
+          : sellerDeclaredFormatOption(option);
+        if (declared !== undefined) rememberSellerDeclaredFormatOption(option, declared);
+        if (declared === true && evidence)
+          rememberSellerFormatEvidence(option, { ...evidence, productId: product.product_id });
         this.rememberCanonicalLegacyRoute(this.canonicalLegacyRouteKey(account, product.product_id, ref), {
           kind: 'product',
           accountScope,
           productId: product.product_id,
           optionRef: ref,
           refs,
+          ...(declared === true && sellerFormatEvidence(option)
+            ? { declaration: structuredCloneWithLegacyCreativeMetadata(option) }
+            : {}),
+          ...(declared === false ? { undeclaredSelector: undeclaredFormatOptionSelector(option) } : {}),
         });
       }
     }
+  }
+
+  /**
+   * Option refs each product declared in the seller's own response. A product
+   * absent from the response yields no entry, so its options are treated as
+   * declared rather than guessed undeclared.
+   */
+  private sellerDeclaredFormatOptions(
+    authoritativeProducts: readonly unknown[]
+  ): Map<string, CanonicalLegacyOptionRef[]> {
+    const declared = new Map<string, CanonicalLegacyOptionRef[]>();
+    for (const value of authoritativeProducts) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const product = value as Record<string, unknown>;
+      if (typeof product.product_id !== 'string') continue;
+      declared.set(product.product_id, sellerDeclaredFormatOptionRefs(product));
+    }
+    return declared;
+  }
+
+  /**
+   * What this client's own discovery recorded about an option's origin.
+   * Without a product id, every remembered route for the option must agree
+   * that the seller did not declare it.
+   */
+  private cachedFormatOptionOrigin(
+    account: unknown,
+    ref: CanonicalLegacyOptionRef,
+    productId: string | undefined
+  ): FormatOptionOrigin | undefined {
+    const originOf = (route: Extract<CanonicalLegacyRoute, { kind: 'product' }>): FormatOptionOrigin =>
+      route.undeclaredSelector
+        ? { seller_declared: false, selector: route.undeclaredSelector }
+        : { seller_declared: true };
+    if (productId !== undefined) {
+      const route = this.routeForOption(account, productId, ref);
+      return route?.kind === 'product' ? originOf(route) : undefined;
+    }
+    const accountScope = this.canonicalAccountScope(account);
+    const routes = [...this.canonicalLegacyRoutes.values()].filter(
+      (route): route is Extract<CanonicalLegacyRoute, { kind: 'product' }> =>
+        route.kind === 'product' &&
+        (route.accountScope === accountScope || route.accountScope === 'none') &&
+        this.sameCanonicalOptionRef(route.optionRef, ref)
+    );
+    if (routes.length === 0) return undefined;
+    return originOf(routes.find(route => route.undeclaredSelector === undefined) ?? routes[0]!);
+  }
+
+  /**
+   * The direct selector for an option the seller did not declare, from the
+   * first source that knows the option's origin: the per-call resolver, this
+   * client's discovery, then the configured resolver. Resolvers carry origin
+   * only when built from persisted routes.
+   */
+  private undeclaredSelectorFor(
+    account: unknown,
+    ref: CanonicalLegacyOptionRef,
+    productId: string | undefined,
+    override: CanonicalFormatLegacyResolver | undefined
+  ) {
+    const origin =
+      formatOptionOriginFromRoutes(override, ref, productId) ??
+      this.cachedFormatOptionOrigin(account, ref, productId) ??
+      formatOptionOriginFromRoutes(this.config.canonicalFormatLegacyResolver, ref, productId);
+    return origin && !origin.seller_declared ? origin.selector : undefined;
+  }
+
+  private projectUndeclaredFormatOptions<T>(
+    request: T,
+    operation: 'create_media_buy' | 'update_media_buy' | 'sync_creatives',
+    wireMode: CreativeFormatWireMode,
+    account: unknown,
+    override: CanonicalFormatLegacyResolver | undefined
+  ): T {
+    if (wireMode !== 'canonical') return request;
+    return projectUndeclaredFormatOptionSelectors(request, operation, (ref, productId) =>
+      this.undeclaredSelectorFor(account, ref, productId, override)
+    );
   }
 
   private rememberCanonicalProductRoutesForCompletion(
@@ -2422,7 +3100,7 @@ export class SingleAgentClient {
     const resolved: V1FormatId[] = [];
     for (const ref of optionRefs) {
       const route = this.routeForOption(account, productId, ref);
-      if (!route) return undefined;
+      if (!route || route.refs.length === 0) return undefined;
       resolved.push(...route.refs.map(value => ({ ...value })));
     }
     return resolved;
@@ -2818,28 +3496,64 @@ export class SingleAgentClient {
    */
   private async ensureEndpointDiscovered(options?: ReadRequestOptions): Promise<AgentConfig> {
     throwIfAborted(options?.signal);
+    if (this.config._reuseConfiguredDiscovery?.()) this.synchronizeCapabilityEvidenceAuthorizationScope();
     const needsDiscovery = this.normalizedAgent._needsDiscovery;
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
-    const usesScopedFetch = transport?.trustedFetchFn !== undefined;
+    const usesScopedFetch = this.usesScopedDiscoveryTransport(options);
 
     if (!needsDiscovery) {
       return this.normalizedAgent;
+    }
+
+    // With a shared discoveryCache the local endpoint is only valid for the
+    // policy it was found under and for the freshness bound it was granted.
+    const effectiveEndpointKey =
+      this.config.discoveryCache && !usesScopedFetch && this.discoveredEndpoint
+        ? this.sharedDiscoveryKey(options)
+        : undefined;
+    if (
+      this.config.discoveryCache &&
+      !usesScopedFetch &&
+      this.discoveredEndpoint &&
+      (this.discoveredEndpointKey !== effectiveEndpointKey ||
+        (effectiveEndpointKey !== undefined &&
+          this.discoveredEndpointEpoch !== this.sharedInvalidationEpoch(effectiveEndpointKey)) ||
+        (this.discoveredEndpointExpiresAt ?? 0) <= Date.now())
+    ) {
+      this.discoveredEndpoint = undefined;
+      this.discoveredAgent = undefined;
+      this.discoveredMcpEra = undefined;
     }
 
     // Already discovered? Use cached value
     if (!usesScopedFetch && this.discoveredAgent) {
       return this.discoveredAgent;
     }
+    if (!usesScopedFetch && !this.discoveredEndpoint && this.config.discoveryCache) {
+      await this.adoptSharedEndpoint(options);
+      // Adoption itself is awaited. A peer can invalidate the key after its
+      // final read check but before this continuation uses the derived agent.
+      if (
+        this.discoveredEndpoint &&
+        (this.discoveredEndpointEpoch !== this.sharedInvalidationEpoch(this.sharedDiscoveryKey(options)!) ||
+          (this.discoveredEndpointExpiresAt ?? 0) <= Date.now())
+      ) {
+        this.discoveredEndpoint = undefined;
+        this.discoveredAgent = undefined;
+        this.discoveredMcpEra = undefined;
+      }
+    }
     if (!usesScopedFetch && this.discoveredEndpoint) {
-      this.discoveredAgent = {
+      const adoptedAgent: AgentConfig = {
         ...this.normalizedAgent,
         agent_uri: this.discoveredEndpoint,
       };
+      this.discoveredAgent = adoptedAgent;
       if (this.normalizedAgent.oauth_tokens && !this.normalizedAgent.oauth_client_credentials) {
         const { shareNonInteractiveOAuthProvider } = await import('../auth/oauth/provider-cache');
-        shareNonInteractiveOAuthProvider(this.normalizedAgent, this.discoveredAgent);
+        shareNonInteractiveOAuthProvider(this.normalizedAgent, adoptedAgent);
       }
-      return this.discoveredAgent;
+      return adoptedAgent;
     }
 
     if (this.normalizedAgent.oauth_client_credentials) {
@@ -2853,6 +3567,7 @@ export class SingleAgentClient {
     }
 
     // Perform discovery
+    const endpointEpoch = this.discoveryEpochSnapshot(options);
     const discoveredEndpoint = await this.discoverMCPEndpoint(this.normalizedAgent.agent_uri, options);
 
     if (usesScopedFetch) {
@@ -2864,20 +3579,56 @@ export class SingleAgentClient {
       return discoveredAgent;
     }
 
+    if (endpointEpoch && !this.discoveryEpochIs(endpointEpoch)) {
+      // Invalidated while the probe was in flight: serve this call, keep nothing.
+      return { ...this.normalizedAgent, agent_uri: discoveredEndpoint };
+    }
+
     this.discoveredEndpoint = discoveredEndpoint;
+    if (this.config.discoveryCache) {
+      this.discoveredEndpointKey = this.sharedDiscoveryKey(options);
+      this.discoveredEndpointEpoch = endpointEpoch?.shared;
+      // Publish the complete local state before awaiting the shared write, so a
+      // concurrent call on this instance never sees an endpoint without its bound.
+      this.discoveredEndpointExpiresAt = Date.now() + resolveAgentDiscoveryTtlMs(this.config.discoveryCache.ttlMs);
+      const stored = await this.writeSharedDiscovery(
+        options,
+        {
+          endpoint: {
+            agentUri: discoveredEndpoint,
+            ...(this.discoveredMcpEra && { mcpEra: this.discoveredMcpEra }),
+          },
+        },
+        false,
+        endpointEpoch
+      );
+      if (endpointEpoch && !this.discoveryEpochIs(endpointEpoch)) {
+        if (this.discoveredEndpoint === discoveredEndpoint && this.discoveredEndpointEpoch === endpointEpoch.shared) {
+          this.discoveredEndpoint = undefined;
+          this.discoveredEndpointKey = undefined;
+          this.discoveredEndpointEpoch = undefined;
+          this.discoveredEndpointExpiresAt = undefined;
+          if (this.discoveredAgent?.agent_uri === discoveredEndpoint) this.discoveredAgent = undefined;
+          this.discoveredMcpEra = undefined;
+        }
+        return { ...this.normalizedAgent, agent_uri: discoveredEndpoint };
+      }
+      if (stored && this.discoveredEndpoint === discoveredEndpoint) this.discoveredEndpointExpiresAt = stored.expiresAt;
+    }
 
     // Compute canonical base URL by stripping /mcp suffix
-    this.canonicalBaseUrl = this.computeBaseUrl(this.discoveredEndpoint);
+    this.canonicalBaseUrl = this.computeBaseUrl(discoveredEndpoint);
 
-    this.discoveredAgent = {
+    const discoveredAgent: AgentConfig = {
       ...this.normalizedAgent,
-      agent_uri: this.discoveredEndpoint,
+      agent_uri: discoveredEndpoint,
     };
+    this.discoveredAgent = discoveredAgent;
     if (this.normalizedAgent.oauth_tokens && !this.normalizedAgent.oauth_client_credentials) {
       const { shareNonInteractiveOAuthProvider } = await import('../auth/oauth/provider-cache');
-      shareNonInteractiveOAuthProvider(this.normalizedAgent, this.discoveredAgent);
+      shareNonInteractiveOAuthProvider(this.normalizedAgent, discoveredAgent);
     }
-    return this.discoveredAgent;
+    return discoveredAgent;
   }
 
   /**
@@ -2890,7 +3641,7 @@ export class SingleAgentClient {
     throwIfAborted(options?.signal);
     const needsCanonicalUrl = this.normalizedAgent._needsCanonicalUrl;
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
-    const usesScopedFetch = transport?.trustedFetchFn !== undefined;
+    const usesScopedFetch = this.usesScopedDiscoveryTransport(options);
 
     if (!needsCanonicalUrl) {
       return this.normalizedAgent;
@@ -2915,8 +3666,11 @@ export class SingleAgentClient {
     }
 
     // Fetch agent card to get canonical URL
+    const canonicalEpoch = this.discoveryEpochSnapshot(options);
     const canonicalUrl = await this.fetchA2ACanonicalUrl(this.normalizedAgent.agent_uri, options);
-    if (!usesScopedFetch) this.canonicalBaseUrl = canonicalUrl;
+    if (!usesScopedFetch && (!canonicalEpoch || this.discoveryEpochIs(canonicalEpoch))) {
+      this.canonicalBaseUrl = canonicalUrl;
+    }
 
     return {
       ...this.normalizedAgent,
@@ -3080,7 +3834,9 @@ export class SingleAgentClient {
     const { connectMCPWithFallback } = await import('../protocols/mcp');
     const { probeModernMCPConnection } = await import('../protocols/mcp-modern');
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
-    const usesScopedFetch = transport?.trustedFetchFn !== undefined;
+    const usesScopedFetch = this.usesScopedDiscoveryTransport(options);
+    const endpointEpoch = this.discoveryEpochSnapshot(options);
+    const mayRetain = () => !usesScopedFetch && (!endpointEpoch || this.discoveryEpochIs(endpointEpoch));
 
     const authToken = this.normalizedAgent.oauth_client_credentials
       ? this.normalizedAgent.oauth_tokens?.access_token
@@ -3115,7 +3871,7 @@ export class SingleAgentClient {
           allowPrivateIp: transport?.allowPrivateIp,
         });
         if (modern.connected) {
-          if (!usesScopedFetch) {
+          if (mayRetain()) {
             this.discoveredMcpEra = modern.era;
             this.discoveredMcpEraAt = Date.now();
           }
@@ -3137,12 +3893,14 @@ export class SingleAgentClient {
           }
         );
         await client.close();
-        if (!usesScopedFetch) {
+        if (mayRetain()) {
           this.discoveredMcpEra = 'legacy';
           this.discoveredMcpEraAt = Date.now();
         }
         return { success: true };
       } catch (error: unknown) {
+        const signedRejection = getSignedRequestRejection(error);
+        if (signedRejection) throw signedRejection;
         if (isAbortOrTimeoutError(error)) {
           throw error;
         }
@@ -3374,8 +4132,7 @@ export class SingleAgentClient {
   async verifyAndParseWebhook(options: VerifyAndParseWebhookOptions): Promise<WebhookParseResult> {
     const rawBody = options.rawBody ?? rawBodyFromUnknown(options.body);
     const authHeaders = inspectWebhookAuthenticationHeaders(options.headers, options.signature, options.timestamp);
-    const trustedOperationId =
-      options.operationId && options.operationId !== 'unknown' ? options.operationId : undefined;
+    let trustedOperationId = options.operationId && options.operationId !== 'unknown' ? options.operationId : undefined;
     let registration: Readonly<WebhookRegistration> | undefined;
     if (trustedOperationId) {
       let stored: Readonly<WebhookRegistration> | undefined;
@@ -3420,6 +4177,28 @@ export class SingleAgentClient {
             cause,
           };
         }
+      }
+    }
+    if (
+      !registration &&
+      options.requestUrl &&
+      ['media_buy_delivery', 'artifact_delivery'].includes(options.taskType ?? '')
+    ) {
+      const kind = options.taskType === 'artifact_delivery' ? 'artifact' : 'reporting';
+      const routeId = deliveryWebhookRegistrationId(kind, options.requestUrl);
+      try {
+        const stored = await this.webhookRegistrationStore.get(this.agent.id, routeId);
+        if (stored) {
+          registration = parseWebhookRegistration(stored, { agentId: this.agent.id, operationId: routeId });
+          trustedOperationId = routeId;
+        }
+      } catch (cause) {
+        return {
+          ok: false,
+          code: 'webhook_registration_store_unavailable',
+          message: 'Delivery registration state is unavailable',
+          cause,
+        };
       }
     }
     if (registration) {
@@ -3513,6 +4292,8 @@ export class SingleAgentClient {
       }
     }
     if (registration?.mode === 'rfc9421') {
+      const { verifyWebBotAuth, selectSignatureProfile, WebBotAuthError, WebBotAuthUnavailableError } =
+        loadWebBotAuth();
       const requestMethod = options.requestMethod;
       const requestUrl = options.requestUrl;
       if (rawBody === undefined || !options.headers || !trustedOperationId || !requestMethod || !requestUrl) {
@@ -3526,30 +4307,100 @@ export class SingleAgentClient {
       const normalizedHeaders = normalizeRfc9421WebhookHeaders(options.headers);
       if (!normalizedHeaders.ok) return normalizedHeaders.failure;
       try {
-        const delegatedOperatorAuthorization = this.delegatedOperatorAuthorizationForRegistration(registration);
-        await verifyRfc9421WebhookSignature(
-          {
-            method: requestMethod,
-            url: requestUrl,
-            headers: normalizedHeaders.headers,
-            body: rawBody,
-          },
-          {
-            jwks: this.webhookJwksFor(registration),
-            replayStore: this.webhookReplayStore,
-            revocationStore: this.webhookRevocationStore,
-            ...(this.config.webhookVerification?.now && { now: this.config.webhookVerification.now }),
-            agentUrlForKeyid: () => registration.agentUrl,
-            ...(registration.authorizationContextVersion === 1 && {
-              replayScopeBinding: `delegated-operator:v1:${crypto
-                .createHash('sha256')
-                .update(canonicalDelegatedOperatorAuthorization(delegatedOperatorAuthorization))
-                .digest('base64url')}`,
-            }),
-          }
-        );
+        const actualProfile = selectSignatureProfile({ headers: normalizedHeaders.headers });
+        if (registration.signingProfile === 'web-bot-auth') {
+          if (
+            registration.delegatedOperatorAuthorization ||
+            (await this.config.webhookVerification?.publisherPins?.(registration))
+          )
+            throw new WebBotAuthError(403, 'legacy_webhook_authorization_requires_rfc_profile');
+          const config = this.config.webhookVerification?.webBotAuth;
+          if (!config) throw new WebBotAuthError(403, 'webhook_profile_not_configured');
+          const signers = await verifyWebBotAuth(
+            {
+              method: requestMethod,
+              url: requestUrl,
+              headers: normalizedHeaders.headers,
+              body:
+                typeof rawBody === 'string'
+                  ? rawBody
+                  : // ignoreBOM: Content-Digest covers the exact received bytes.
+                    new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(rawBody),
+            },
+            {
+              directory: config.directory,
+              replayStore: this.webhookReplayStore,
+              ...(config.isRevoked && !config.revocation && { isRevoked: config.isRevoked }),
+              now: this.config.webhookVerification?.now,
+            }
+          );
+          if (signers.length !== 1 || signers[0]!.origin !== canonicalAgentOrigin(registration.agentUrl))
+            throw new WebBotAuthError(403, 'webhook_signer_mismatch');
+          if (config.revocation) {
+            let status;
+            try {
+              status = await config.revocation.status(signers[0]!.origin, signers[0]!.keyid);
+            } catch (error) {
+              throw new WebBotAuthUnavailableError('revocation_persistence_failed', error);
+            }
+            if (status === 'revoked') throw new WebBotAuthError(403, 'key_revoked');
+            if (status === 'unknown') throw new WebBotAuthError(403, 'identity_unverified');
+          } else if (!config.isRevoked) throw new WebBotAuthError(403, 'webhook_revocation_not_configured');
+        } else {
+          if (actualProfile === 'web-bot-auth') throw new WebBotAuthError(403, 'webhook_profile_mismatch');
+          const delegatedOperatorAuthorization = this.delegatedOperatorAuthorizationForRegistration(registration);
+          await verifyRfc9421WebhookSignature(
+            {
+              method: requestMethod,
+              url: requestUrl,
+              headers: normalizedHeaders.headers,
+              body: rawBody,
+            },
+            {
+              jwks: this.webhookJwksFor(registration),
+              publisherPins: await this.config.webhookVerification?.publisherPins?.(registration),
+              onKeyResolutionError: this.config.webhookVerification?.onKeyResolutionError,
+              replayStore: this.webhookReplayStore,
+              revocationStore: this.webhookRevocationStore,
+              ...(this.config.webhookVerification?.now && { now: this.config.webhookVerification.now }),
+              agentUrlForKeyid: () => registration.agentUrl,
+              ...(registration.authorizationContextVersion === 1 && {
+                replayScopeBinding: `delegated-operator:v1:${crypto
+                  .createHash('sha256')
+                  .update(canonicalDelegatedOperatorAuthorization(delegatedOperatorAuthorization))
+                  .digest('base64url')}`,
+              }),
+            }
+          );
+        }
       } catch (cause) {
+        // Discovery failures, unknown revocation status and verifier
+        // infrastructure outages are retryable; signature failures are not.
+        if (cause instanceof WebBotAuthUnavailableError)
+          return { ok: false, code: 'webhook_verification_unavailable', message: cause.message, cause };
+        if (cause instanceof WebBotAuthError)
+          return {
+            ok: false,
+            code: [
+              'directory_unavailable',
+              'directory_fetch_limit',
+              'directory_expired',
+              'identity_unverified',
+              'verification_unavailable',
+            ].includes(cause.reason)
+              ? 'webhook_verification_unavailable'
+              : 'webhook_signature_invalid',
+            message: cause.message,
+            cause,
+          };
         if (cause instanceof WebhookSignatureError) {
+          if (cause.retryable)
+            return {
+              ok: false,
+              code: 'webhook_verification_unavailable',
+              message: 'Seller signing keys could not be resolved for webhook verification.',
+              cause,
+            };
           return { ok: false, code: cause.code, message: cause.message, cause };
         }
         if (
@@ -3637,6 +4488,61 @@ export class SingleAgentClient {
       return parsedPayload;
     }
 
+    if (registration?.deliveryKind) {
+      const loader = require('../validation/schema-loader') as typeof import('../validation/schema-loader');
+      const body = parsedPayload.payload as Record<string, unknown>;
+      const isReport = registration.deliveryKind === 'reporting';
+      const payload = isReport ? body.result : body;
+      const schemaRef = isReport
+        ? 'media-buy/media-buy-delivery-webhook-result.json'
+        : 'content-standards/artifact-webhook-payload.json';
+      const validator = loader.getSchemaValidatorByRef(schemaRef, this.resolvedAdcpVersion);
+      const envelopeValidator = isReport
+        ? loader.getSchemaValidatorByRef('core/mcp-webhook-payload.json', this.resolvedAdcpVersion)
+        : undefined;
+      if (
+        !validator ||
+        !validator(payload) ||
+        (isReport && (!envelopeValidator || !envelopeValidator(body) || body.task_type !== 'media_buy_delivery'))
+      )
+        return {
+          ok: false,
+          code: 'webhook_envelope_invalid',
+          message: 'Authenticated delivery does not match its registered payload kind',
+        };
+      const taskId =
+        isReport && typeof body.task_id === 'string'
+          ? body.task_id
+          : typeof body.media_buy_id === 'string'
+            ? body.media_buy_id
+            : registration.operationId;
+      const operationId =
+        isReport && typeof body.operation_id === 'string' ? body.operation_id : registration.operationId;
+      const status = isReport && isAdcpStatus(body.status) ? body.status : 'completed';
+      return {
+        ok: true,
+        protocol: registration.protocol,
+        envelope: isReport
+          ? (body as unknown as MCPWebhookPayload)
+          : ({
+              ...body,
+              task_type: registration.taskType,
+              operation_id: operationId,
+              task_id: taskId,
+              status,
+              result: payload,
+            } as MCPWebhookPayload),
+        result: payload,
+        metadata: {
+          taskId,
+          taskType: registration.taskType,
+          operationId,
+          status,
+          ...(typeof body.timestamp === 'string' && { timestamp: body.timestamp }),
+          ...(typeof body.idempotency_key === 'string' && { idempotencyKey: body.idempotency_key }),
+        },
+      };
+    }
     const topLevelTaskType =
       isObjectRecord(parsedPayload.payload) && typeof parsedPayload.payload.task_type === 'string'
         ? parsedPayload.payload.task_type
@@ -4547,7 +5453,7 @@ export class SingleAgentClient {
   /**
    * Execute task and call appropriate handler on completion
    *
-   * Automatically adapts requests for v2 servers and normalizes responses.
+   * Adapts requests for maintained AdCP 3 releases and normalizes product responses.
    */
   private async executeAndHandle<T>(
     taskType: string,
@@ -4593,6 +5499,7 @@ export class SingleAgentClient {
     throwIfAborted(options?.signal);
     const canonicalCreativeInvocation =
       CANONICAL_CREATIVE_ACTIVITY_TASKS.has(taskType) || canonicalRequest !== undefined;
+    params = await this.applyAccountPolicy(taskType, params, options);
     // Normalize params for backwards compatibility before validation
     let normalizedParams = options?.preserveGovernedPayload
       ? params
@@ -4645,13 +5552,6 @@ export class SingleAgentClient {
     if (this.config.requireV3ForMutations && requestUsesIdempotency(taskType, normalizedParams)) {
       await this.requireSupportedMajor(taskType, options);
       throwIfAborted(options?.signal);
-    }
-
-    // Check for v3 features used against v2 servers - return empty result if unsupported
-    const earlyResult = await this.getEarlyResultForUnsupportedFeatures<T>(taskType, normalizedParams, options);
-    throwIfAborted(options?.signal);
-    if (earlyResult) {
-      return attachMatch(earlyResult);
     }
 
     const agent = await this.ensureEndpointDiscovered(options);
@@ -4708,17 +5608,8 @@ export class SingleAgentClient {
           capabilityDiscoveryContext.capabilities
         );
 
-    // Symmetric to the pre-adapter v3 pass above: when the adapter
-    // rewrote the request for a v2 server, warn-validate the adapted
-    // shape against the cached v2.5 schema bundle. Drift gets collected
-    // here and merged into result.metadata.debug_logs after executeTask
-    // returns — without that merge the warning would silently drop on
-    // the floor and adapter drift would land in production unnoticed.
-    const v25DriftLogs: any[] = [...adaptDriftLogs];
-    if (webhookDriftLog) v25DriftLogs.push(webhookDriftLog);
-    if (serverVersion === 'v2') {
-      this.executor.validateAdaptedRequestAgainstV2(taskType, adaptedParams, v25DriftLogs);
-    }
+    const adaptationLogs: any[] = [...adaptDriftLogs];
+    if (webhookDriftLog) adaptationLogs.push(webhookDriftLog);
 
     const canonicalInputHandler = this.canonicalCreativeInputHandler(
       taskType,
@@ -4738,10 +5629,14 @@ export class SingleAgentClient {
         serverVersionSynthetic: capabilityDiscoveryContext.capabilities._synthetic,
       }),
       productPolicyRequest: productPolicyRequestSnapshot(normalizedParams),
+      accountRegistry: this.accountRegistryContext(taskType, normalizedParams, effectiveOptions),
       ...(projectionCatalogs !== undefined && { projectionCatalogs }),
       ...(routingSnapshot !== undefined && { routingSnapshot }),
       ...(effectiveOptions?.taskId !== undefined && { optionTaskId: effectiveOptions.taskId }),
       ...(effectiveOptions?.contextId !== undefined && { optionContextId: effectiveOptions.contextId }),
+      ...(effectiveOptions?.skipStatusHandlers !== undefined && {
+        skipStatusHandlers: effectiveOptions.skipStatusHandlers,
+      }),
     };
     let result = await canonicalCreativeExecutionStorage.run(
       {
@@ -4764,14 +5659,15 @@ export class SingleAgentClient {
         )
     );
     throwIfAborted(effectiveOptions?.signal);
+    if (!result.success) await this.invalidateDiscoveryOnCapabilityError(result.adcpError?.code, effectiveOptions);
 
     // Merge collected drift into the executor's debug_logs so adopters
     // reading result.debug_logs see input-schema stripping, post-adapter
-    // v2.5 warnings, and any pre-3.1 webhook-degradation notice alongside
+    // adaptation and pre-3.1 webhook-degradation notices alongside
     // the executor's own logs. On error paths the executor may not surface
     // result.debug_logs at all; logs collected before the failure are
     // dropped, matching the executor's own debug-log behavior.
-    const postAdapterLogs = [...inputSchemaStripLogs, ...v25DriftLogs];
+    const postAdapterLogs = [...inputSchemaStripLogs, ...adaptationLogs];
     if (postAdapterLogs.length > 0) {
       result.debug_logs = [...(result.debug_logs ?? []), ...postAdapterLogs];
     }
@@ -4829,10 +5725,75 @@ export class SingleAgentClient {
       }
     )[DEFERRED_SETTLEMENT_ACK];
     const taskType = context.taskType;
+    if (
+      context.accountRegistry !== undefined &&
+      context.accountRegistry.scope === this.accountScope() &&
+      result.success &&
+      result.status === 'completed' &&
+      result.data &&
+      typeof result.data === 'object' &&
+      'accounts' in result.data &&
+      Array.isArray(result.data.accounts)
+    ) {
+      try {
+        const registry = this.getAccountRegistry();
+        let refs = context.accountRegistry.refs ?? [];
+        let rows: readonly unknown[] = result.data.accounts;
+        if (context.accountRegistry.knownOnly) {
+          refs = (await Promise.all(refs.map(async ref => ((await registry.get(ref)) ? ref : undefined)))).filter(
+            (ref): ref is AccountReference => ref !== undefined
+          );
+          if (taskType === 'list_accounts') {
+            rows = (
+              await Promise.all(
+                result.data.accounts.map(async row => {
+                  const ref = canonicalAccountRoutingSnapshot(row);
+                  if (ref && (await registry.get(ref as AccountReference))) return row;
+                  const natural = canonicalAccountRoutingSnapshot({ ...row, account_id: undefined });
+                  return natural && (await registry.get(natural as AccountReference)) ? row : undefined;
+                })
+              )
+            ).filter(row => row !== undefined);
+          }
+        }
+        if (context.accountRegistry.scope !== this.accountScope()) return result;
+        if (taskType === 'sync_accounts')
+          await registry.observeSync(
+            refs,
+            rows,
+            context.accountRegistry.dryRun,
+            context.accountRegistry.observationEpoch
+          );
+        if (taskType === 'list_accounts') {
+          const ref = refs[0];
+          await registry.observeList(
+            rows,
+            ref &&
+              'account_id' in ref &&
+              (!(result.data as unknown as ListAccountsResponse).pagination?.has_more ||
+                result.data.accounts.some(row => (row as { account_id?: string }).account_id === ref.account_id))
+              ? ref.account_id
+              : undefined,
+            context.accountRegistry.observationEpoch
+          );
+        }
+      } catch {
+        result.debug_logs = [
+          ...(result.debug_logs ?? []),
+          {
+            level: 'warn',
+            timestamp: new Date().toISOString(),
+            message:
+              'Account registry observation failed. The seller operation completed; reconcile with listAccounts before relying on the registry.',
+          },
+        ];
+      }
+    }
     const resumedOptions: TaskOptions = {
       ...(options ?? {}),
       ...(context.optionTaskId !== undefined && { taskId: context.optionTaskId }),
       ...(context.optionContextId !== undefined && { contextId: context.optionContextId }),
+      ...(context.skipStatusHandlers !== undefined && { skipStatusHandlers: context.skipStatusHandlers }),
     };
     const rawDeferredResume = result.deferred?.resume;
     const rawSubmittedWaitForCompletion = result.submitted?.waitForCompletion;
@@ -4840,7 +5801,7 @@ export class SingleAgentClient {
       legacyFormatConverter ?? this.resolveLegacyFormatConverter(undefined, context.projectionCatalogs);
 
     if (result.success && result.data) {
-      result.data = this.normalizeResponseToV3(taskType, result.data) as T;
+      result.data = this.normalizeEstablishedResponse(taskType, result.data) as T;
     }
 
     result = this.wrapProductPolicySubmittedContinuation(
@@ -4939,13 +5900,14 @@ export class SingleAgentClient {
     handlerName: keyof AsyncHandlerConfig,
     options?: TaskOptions
   ): Promise<void> {
-    if (result.status !== 'completed' || !result.success || !this.asyncHandler) return;
+    if (options?.skipStatusHandlers === true || result.status !== 'completed' || !result.success || !this.asyncHandler)
+      return;
     const handler = this.config.handlers?.[handlerName] as
-      | ((data: unknown, metadata: Record<string, unknown>) => void | Promise<void>)
+      | ((data: unknown, metadata: WebhookMetadata) => void | Promise<void>)
       | undefined;
     if (!handler) return;
     throwIfAborted(options?.signal);
-    await handler(result.data, {
+    const metadata: WebhookMetadata = {
       operation_id: options?.contextId || 'sync',
       context_id: options?.contextId,
       task_id: result.metadata.taskId,
@@ -4953,7 +5915,30 @@ export class SingleAgentClient {
       task_type: taskType,
       status: result.status,
       timestamp: new Date().toISOString(),
-    });
+    };
+    try {
+      await handler(result.data, metadata);
+    } catch (error) {
+      if (this.config.isolateStatusHandlerErrors !== true) throw error;
+      throwIfAborted(options?.signal);
+      result.debug_logs = [
+        ...(result.debug_logs ?? []),
+        {
+          level: 'warn',
+          timestamp: new Date().toISOString(),
+          message: 'Inline status handler failed. The seller operation completed; reconcile local post-processing.',
+        },
+      ];
+      try {
+        await this.config.onStatusHandlerError?.(error, { handlerName, metadata });
+      } catch {
+        result.debug_logs.push({
+          level: 'warn',
+          timestamp: new Date().toISOString(),
+          message: 'onStatusHandlerError observer failed. The seller operation completed.',
+        });
+      }
+    }
     throwIfAborted(options?.signal);
   }
 
@@ -4991,7 +5976,7 @@ export class SingleAgentClient {
     transform?: (data: T) => T,
     legacyFormatConverter?: LegacyFormatConverter
   ): CanonicalCreativeResponse<T> {
-    let projected = this.normalizeResponseToV3(taskType, data) as T;
+    let projected = this.normalizeEstablishedResponse(taskType, data) as T;
     const record = projected && typeof projected === 'object' ? (projected as Record<string, unknown>) : undefined;
     const canProjectRead =
       taskType === 'get_products'
@@ -5454,6 +6439,10 @@ export class SingleAgentClient {
       message = 'Property list not adhered to',
       enforceRequestPropertyList = true,
       propertyListResolveOptions,
+      resolvePublisherProperties,
+      maxPublisherLookups = 100,
+      publisherLookupTimeoutMs = 10_000,
+      publisherLookupBudgetMs = 10_000,
       ...explicitPolicy
     } = policyConfig || {};
     const policy: BuyerPropertyPolicy = {
@@ -5465,37 +6454,37 @@ export class SingleAgentClient {
           listId: string;
           agentUrl: string;
           identifierCount: number;
+          unsupportedIdentifierTypes: string[];
           cacheValidUntil?: string;
         }
       | undefined;
 
-    if (requestPropertyList && enforceRequestPropertyList) {
+    const referenceError = propertyListReferenceError(requestParams);
+    if ((requestPropertyList || referenceError) && enforceRequestPropertyList) {
       try {
-        const resolved = await resolvePropertyList(requestPropertyList, propertyListResolveOptions);
-        const comparableIdentifiers = comparablePropertyIdentifiers(resolved.identifiers);
+        if (referenceError) throw new Error(referenceError);
+        const resolved = await resolvePropertyList(requestPropertyList!, propertyListResolveOptions);
         const unsupportedIdentifiers = unsupportedPropertyIdentifiers(resolved.identifiers);
-        if (unsupportedIdentifiers.length > 0) {
-          throw new Error('property_list_unsupported_identifier_types');
-        }
-        if (comparableIdentifiers.length > 0 || resolved.identifiers.length === 0) {
-          policy.allowedPropertyIdentifiers = [...(policy.allowedPropertyIdentifiers ?? []), ...comparableIdentifiers];
-          policy.requireAllowedPropertyMatch = true;
-        }
+        policy.allowedPropertyIdentifiers = [...(policy.allowedPropertyIdentifiers ?? []), ...resolved.identifiers];
+        policy.requireAllowedPropertyMatch = true;
         policy.strict = policy.strict ?? true;
         resolvedRequestPropertyList = {
           listId: resolved.listId,
           agentUrl: resolved.agentUrl,
           identifierCount: resolved.identifiers.length,
+          unsupportedIdentifierTypes: [...new Set(unsupportedIdentifiers.map(identifier => identifier.type))],
           ...(resolved.cacheValidUntil ? { cacheValidUntil: resolved.cacheValidUntil } : {}),
         };
       } catch (err) {
         const errorCode = propertyListResolutionErrorCode(err);
-        const diagnosticAgentUrl = sanitizeDiagnosticUrl(requestPropertyList.agent_url);
+        const diagnosticAgentUrl = requestPropertyList
+          ? sanitizeDiagnosticUrl(requestPropertyList.agent_url)
+          : 'invalid_url';
         return attachMatch({
           success: false as const,
           status: 'failed' as const,
           data: response as unknown as T,
-          error: `${message}: could not resolve property_list ${requestPropertyList.list_id}`,
+          error: `${message}: could not resolve property_list`,
           metadata: {
             ...result.metadata,
             status: 'failed',
@@ -5508,7 +6497,7 @@ export class SingleAgentClient {
               message,
               diagnostics: [],
               request_property_list: {
-                list_id: requestPropertyList.list_id,
+                list_id: requestPropertyList?.list_id ?? 'invalid_reference',
                 agent_url: diagnosticAgentUrl,
                 resolution_error: errorCode,
               },
@@ -5523,7 +6512,7 @@ export class SingleAgentClient {
               mode,
               ok: false,
               request_property_list: {
-                list_id: requestPropertyList.list_id,
+                list_id: requestPropertyList?.list_id,
                 agent_url: diagnosticAgentUrl,
                 resolution_error: errorCode,
               },
@@ -5534,6 +6523,84 @@ export class SingleAgentClient {
     }
 
     if (!hasProductPropertyPolicyRules(policy)) return result;
+
+    if (
+      resolvePublisherProperties &&
+      policy.allowedPropertyIdentifiers?.some(
+        identifier => identifier.type !== 'domain' && identifier.type !== 'subdomain'
+      )
+    ) {
+      if (
+        !Number.isSafeInteger(maxPublisherLookups) ||
+        maxPublisherLookups < 1 ||
+        !Number.isSafeInteger(publisherLookupTimeoutMs) ||
+        publisherLookupTimeoutMs < 1 ||
+        publisherLookupTimeoutMs > 2_147_483_647 ||
+        !Number.isSafeInteger(publisherLookupBudgetMs) ||
+        publisherLookupBudgetMs < 1 ||
+        publisherLookupBudgetMs > 2_147_483_647
+      ) {
+        throw new ConfigurationError('Publisher lookup limits must be positive bounded integers');
+      }
+      const { validatePublisherDomain } = await import('../identifiers');
+      const catalogs: NonNullable<BuyerPropertyPolicy['publisherProperties']> &
+        Record<string, readonly ProductPolicyResolvedProperty[] | undefined> = Object.assign(
+        Object.create(null),
+        policy.publisherProperties
+      );
+      const domains = new Set(
+        response.products.flatMap(product =>
+          Array.isArray(product.publisher_properties)
+            ? product.publisher_properties.flatMap(selector =>
+                selector && typeof selector === 'object' && 'publisher_domain' in selector
+                  ? [selector.publisher_domain]
+                  : []
+              )
+            : []
+        )
+      );
+      const hosts = [
+        ...new Set(
+          [...domains].flatMap(domain =>
+            typeof domain === 'string' ? [normalizeDomainForPropertyPolicy(domain)?.host] : []
+          )
+        ),
+      ].filter((host): host is string => typeof host === 'string' && !Object.hasOwn(catalogs, host));
+      for (const host of hosts) catalogs[host] = undefined;
+      const lookupStartedAt = performance.now();
+      // Bound seller-driven fan-out; omitted/failed catalogs stay explicitly unknown.
+      for (const host of hosts.slice(0, maxPublisherLookups)) {
+        throwIfAborted(taskSignal);
+        const remainingBudgetMs = publisherLookupBudgetMs - (performance.now() - lookupStartedAt);
+        if (remainingBudgetMs <= 0) break;
+        if (!validatePublisherDomain(host).ok || isLikelyPrivateUrl(`https://${host}`)) continue;
+        const controller = new AbortController();
+        const signal = taskSignal ? AbortSignal.any([taskSignal, controller.signal]) : controller.signal;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        let budgetExpired = false;
+        try {
+          catalogs[host] = await Promise.race([
+            resolvePublisherProperties(host, { signal }),
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(
+                () => {
+                  if (remainingBudgetMs <= publisherLookupTimeoutMs) budgetExpired = true;
+                  controller.abort();
+                  reject(new Error('publisher_catalog_timeout'));
+                },
+                Math.min(publisherLookupTimeoutMs, remainingBudgetMs)
+              );
+            }),
+          ]);
+        } catch {
+          catalogs[host] = undefined;
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+        if (budgetExpired) break;
+      }
+      policy.publisherProperties = catalogs;
+    }
 
     let validation: ProductPropertyPolicyValidationResult<ProductPolicyProductLike>;
     try {
@@ -5560,6 +6627,7 @@ export class SingleAgentClient {
               list_id: resolvedRequestPropertyList.listId,
               agent_url: sanitizeDiagnosticUrl(resolvedRequestPropertyList.agentUrl),
               identifier_count: resolvedRequestPropertyList.identifierCount,
+              unsupported_identifier_types: resolvedRequestPropertyList.unsupportedIdentifierTypes,
               ...(resolvedRequestPropertyList.cacheValidUntil
                 ? { cache_valid_until: resolvedRequestPropertyList.cacheValidUntil }
                 : {}),
@@ -5765,7 +6833,7 @@ export class SingleAgentClient {
       waitForCompletion: async (pollInterval, signal) => {
         let completed = await submitted.waitForCompletion(pollInterval, signal);
         if (completed.success && completed.data) {
-          completed.data = this.normalizeResponseToV3(taskType, completed.data) as T;
+          completed.data = this.normalizeEstablishedResponse(taskType, completed.data) as T;
         }
         const terminal = completed.status === 'completed' || completed.status === 'failed';
         try {
@@ -5809,7 +6877,7 @@ export class SingleAgentClient {
       attachMatch({
         success: true as const,
         status: 'completed' as const,
-        data: this.normalizeResponseToV3(taskType, taskInfo.result),
+        data: this.normalizeEstablishedResponse(taskType, taskInfo.result),
         metadata: {
           taskId: taskInfo.taskId,
           taskName: taskInfo.taskType,
@@ -5913,8 +6981,7 @@ export class SingleAgentClient {
 
   /**
    * Adapt a request for the detected server wire version and the seller's
-   * AdCP protocol version. Applies wire-format adapters (v2.5) when talking
-   * to a v2 server, then applies protocol-version adapters (e.g. stripping
+   * AdCP protocol version. Applies protocol-version adapters (e.g. stripping
    * 3.1-only fields for a 3.0 seller). Returns the adapted params and any
    * drift log entries describing what was changed.
    *
@@ -5929,19 +6996,11 @@ export class SingleAgentClient {
     perCallToolSchemas?: ToolSchemaMap,
     perCallCapabilities?: AdcpCapabilities
   ): { params: any; driftLogs: Record<string, unknown>[] } {
+    if (serverVersion !== 'v3') {
+      throw new VersionUnsupportedError(taskType, 'version', 'v2', this.agent.agent_uri);
+    }
     const driftLogs: Record<string, unknown>[] = [];
     let adapted = params;
-
-    if (serverVersion !== 'v3') {
-      // Dispatch through the legacy v2.5 adapter registry. Per-tool pairs
-      // live in `src/lib/adapters/legacy/v2-5/<tool>.ts`. Tools without a
-      // registered pair (or pairs whose request side is pass-through)
-      // leave `adapted` unchanged. Adding a future legacy version means
-      // adding a sibling `legacy/<version>/` directory, not editing
-      // this dispatch.
-      const pair = getV25Adapter(taskType);
-      if (pair) adapted = pair.adaptRequest(adapted);
-    }
 
     // Strip any top-level fields not declared in the agent's tool schema.
     // This handles partial implementations (agents that omit some fields)
@@ -5967,32 +7026,6 @@ export class SingleAgentClient {
     const toolSchema = (perCallToolSchemas ?? this.cachedToolSchemas)?.get(taskType);
     if (toolSchema && Object.keys(toolSchema).length > 0) {
       const declaredFields = new Set(Object.keys(toolSchema));
-
-      // The v2 adapter may rename fields (e.g. brand → brand_manifest) that a
-      // v3 server — misdetected as v2 — doesn't declare. Reconcile known
-      // adapter mappings so the value isn't silently dropped.
-      //
-      // CRITICAL: only alias when the JS type of the moved value is
-      // compatible with the destination field's declared shape. v2.5 sellers
-      // (e.g. Wonderstruck) declare `brand` in their tool schema as a
-      // BrandReference object — v2 adapter produces a `brand_manifest` URL
-      // string, and blindly aliasing the string into the object slot causes
-      // the seller to reject with `Input should be a valid dictionary or
-      // instance of BrandReference`. Skip the alias when shapes don't match
-      // and let the field-stripping path drop the v2-shaped value cleanly.
-      const adapterAliases: [string, string][] = [['brand_manifest', 'brand']];
-      for (const [adapterField, schemaField] of adapterAliases) {
-        if (
-          adapted[adapterField] !== undefined &&
-          !declaredFields.has(adapterField) &&
-          declaredFields.has(schemaField) &&
-          adapted[schemaField] === undefined &&
-          valueMatchesSchemaType(adapted[adapterField], (toolSchema as Record<string, unknown>)[schemaField])
-        ) {
-          adapted[schemaField] = adapted[adapterField];
-          delete adapted[adapterField];
-        }
-      }
 
       // Protocol envelope fields are always preserved — they live at the
       // protocol layer, not in individual tool schemas.
@@ -6084,98 +7117,19 @@ export class SingleAgentClient {
     return { params: adapted, driftLogs };
   }
 
-  /**
-   * Normalize response to v3 format
-   *
-   * Converts v2 responses to v3 structure for consistent API surface.
-   */
-  private normalizeResponseToV3(taskType: string, data: any): any {
-    // Dispatch through the legacy v2.5 adapter registry. The pair's
-    // optional `normalizeResponse` runs when present; otherwise the
-    // response is passed through unchanged.
-    const pair = getV25Adapter(taskType);
-    if (pair?.normalizeResponse) return pair.normalizeResponse(data);
-    return data;
-  }
-
-  /**
-   * Check if request uses v3 features that the server doesn't support
-   *
-   * Returns an early empty result if the request requires v3 features
-   * that the server doesn't support. This treats "products matching unsupported
-   * capability" as an empty result set rather than an error.
-   *
-   * @returns TaskResult with empty data if v3 features are unsupported, null to proceed normally
-   */
-  private async getEarlyResultForUnsupportedFeatures<T>(
-    taskType: string,
-    params: any,
-    options?: ReadRequestOptions
-  ): Promise<TaskResult<T> | null> {
-    // Only check for tasks that have v3-specific features
-    if (taskType !== 'get_products') {
-      return null;
+  private normalizeEstablishedResponse(taskType: string, data: any): any {
+    if (!data) return data;
+    switch (taskType) {
+      case 'get_products':
+        return normalizeGetProductsResponse(data);
+      case 'create_media_buy':
+      case 'update_media_buy':
+        return normalizeMediaBuyResponse(data);
+      case 'list_creative_formats':
+        return normalizeFormatsResponse(data);
+      default:
+        return data;
     }
-
-    // Get capabilities to check what the server supports
-    const capabilities = await this.getCapabilities(options);
-
-    // If server is v3, all features are supported - proceed normally
-    if (capabilities.version === 'v3') {
-      return null;
-    }
-
-    // Check for v3-only features that would make this query return empty results.
-    //
-    // TODO: Once we remove backwards-compatibility stripping in adaptGetProductsRequestForV2,
-    // re-enable these guards so v3-only requests fail fast against v2 servers:
-    //   (params.property_list && !capabilities.features.propertyListFiltering) ||
-    //   (params.filters?.required_features?.includes('property_list_filtering') &&
-    //     !capabilities.features.propertyListFiltering) ||
-    //
-    // TODO: Surface the reason for empty results to the caller (e.g. metadata or a
-    // structured warning) so they can distinguish "no products matched" from "server
-    // lacks v3 feature support" vs "request failed". Right now empty results from a
-    // capability mismatch look identical to a seller that simply has no inventory.
-    const usesUnsupportedFeature =
-      // required_features: content_standards requires contentStandards
-      params.filters?.required_features?.includes('content_standards') && !capabilities.features.contentStandards;
-
-    if (!usesUnsupportedFeature) {
-      return null; // Proceed normally
-    }
-
-    // Log warning about v2 downgrade
-    console.warn(
-      `[AdCP] v3-only features not supported by server "${this.agent.id}" (${capabilities.version}). Returning empty results.`
-    );
-
-    // Return empty result - semantically "no products match this filter"
-    const emptyResponse = {
-      products: [],
-      property_list_applied: false,
-    } as T;
-
-    return {
-      success: true,
-      status: 'completed',
-      data: emptyResponse,
-      metadata: {
-        taskId: `early_${Date.now()}`,
-        taskName: taskType,
-        agent: {
-          id: this.agent.id,
-          name: this.agent.name,
-          protocol: this.normalizedAgent.protocol,
-        },
-        responseTimeMs: 0,
-        timestamp: new Date().toISOString(),
-        clarificationRounds: 0,
-        status: 'completed',
-        serverVersion: capabilities.version,
-        serverVersionSynthetic: capabilities._synthetic,
-      },
-    };
   }
 
   // ====== MEDIA BUY TASKS ======
@@ -6218,7 +7172,7 @@ export class SingleAgentClient {
     );
     return withTaskDeadline(snapshotTaskOptions(taskOptions), async effectiveOptions => {
       this.assertRequestSupportedByConfiguredVersion('get_products', params, effectiveOptions);
-      let request = params;
+      let request = await this.applyAccountPolicy('get_products', params, effectiveOptions);
       const legacyAccountId = (request as { account_id?: unknown }).account_id;
       const accountReference =
         request.account ??
@@ -6273,10 +7227,65 @@ export class SingleAgentClient {
         request = { ...request, buying_mode: 'wholesale' };
       }
       const account = canonicalAccountRoutingSnapshot(accountReference);
-      return this.executeAndHandle<CanonicalGetProductsResponse>(
+      const cache =
+        !effectiveOptions.skipRequestValidation &&
+        !effectiveOptions.preserveGovernedPayload &&
+        !inputHandler &&
+        !request.push_notification_config &&
+        !this.config.webhookUrlTemplate &&
+        !this.config.handlers?.onGetProductsStatusChange
+          ? this.config.productCache
+          : undefined;
+      // Scope derivation hashes credential material; only pay for it with an opt-in cache.
+      const cacheScope = cache
+        ? JSON.stringify([
+            this.accountScope(),
+            this.resolvedAdcpVersion,
+            this.capabilityEvidenceScopeKey,
+            effectiveOptions.contextId,
+          ])
+        : '';
+      const cacheParams = request as unknown as Record<string, unknown>;
+      const skipCacheRead = (options as CanonicalReadTaskOptions & { [SKIP_PRODUCT_CACHE]?: boolean })?.[
+        SKIP_PRODUCT_CACHE
+      ];
+      if (
+        cache &&
+        !skipCacheRead &&
+        cacheParams.if_wholesale_feed_version === undefined &&
+        cacheParams.if_pricing_version === undefined
+      ) {
+        const hit = cache.read<CanonicalGetProductsResponse>(cacheScope, cacheParams);
+        if (hit) {
+          throwIfAborted(effectiveOptions.signal);
+          if (hit.success && hit.status === 'completed')
+            this.rememberCanonicalProductRoutes(hit.data.products ?? [], account);
+          return attachMatch(
+            await this.applyProductPropertyPolicy(
+              hit,
+              'get_products',
+              productPolicyRequestSnapshot(request),
+              effectiveOptions.signal
+            )
+          );
+        }
+      }
+      const conditionalSnapshot = skipCacheRead
+        ? undefined
+        : cache?.read<CanonicalGetProductsResponse>(cacheScope, cacheParams, true);
+      const productEvidence: Omit<SellerFormatEvidence, 'productId'> | undefined = this.usesScopedDiscoveryTransport(
+        effectiveOptions
+      )
+        ? undefined
+        : {
+            scopeKey: this.getCapabilityEvidenceScope().scopeKey,
+            accountScope: this.canonicalAccountScope(account),
+            expiresAt: Date.now() + resolveAgentDiscoveryTtlMs(this.config.discoveryCache?.ttlMs),
+          };
+      const result = await this.executeAndHandle<CanonicalGetProductsResponse>(
         'get_products',
         'onGetProductsStatusChange',
-        request,
+        cache && !skipCacheRead ? cache.conditionalParams(cacheScope, cacheParams) : request,
         inputHandler,
         effectiveOptions,
         data => {
@@ -6287,7 +7296,7 @@ export class SingleAgentClient {
           const authoritativeProducts = Array.isArray((data as unknown as { products?: unknown[] }).products)
             ? (data as unknown as { products: unknown[] }).products
             : response.products;
-          this.rememberCanonicalProductRoutes(response.products, account, authoritativeProducts);
+          this.rememberCanonicalProductRoutes(response.products, account, authoritativeProducts, productEvidence);
           const { _message: _dropLegacyMessage, ...canonical } = response as typeof response & { _message?: unknown };
           void _dropLegacyMessage;
           return { ...canonical, projection: { diagnostics } } as CanonicalGetProductsResponse;
@@ -6296,6 +7305,45 @@ export class SingleAgentClient {
         undefined,
         projectionCatalogs
       );
+      const finishCache = async (
+        completed: TaskResult<CanonicalGetProductsResponse>
+      ): Promise<TaskResult<CanonicalGetProductsResponse>> => {
+        if (!cache) return completed;
+        const cachedResult = cache.write(cacheScope, cacheParams, completed, conditionalSnapshot, materialized => {
+          // The seller confirmed the stored catalog. Renew its private proof
+          // before ProductCache clones the materialized result into storage.
+          this.rememberCanonicalProductRoutes(materialized.data?.products ?? [], account, undefined, productEvidence);
+        });
+        if (cachedResult.success && cachedResult.status === 'completed') {
+          if (
+            !skipCacheRead &&
+            cacheParams.if_wholesale_feed_version === undefined &&
+            cacheParams.if_pricing_version === undefined &&
+            (cachedResult.data as { unchanged?: boolean }).unchanged === true
+          ) {
+            // A missing/mismatched conditional snapshot needs a real unconditional read.
+            return this.getProducts(params, inputHandler, {
+              ...options,
+              ...effectiveOptions,
+              [SKIP_PRODUCT_CACHE]: true,
+            } as CanonicalReadTaskOptions);
+          }
+          this.rememberCanonicalProductRoutes(cachedResult.data.products ?? [], account);
+        }
+        if (cachedResult.submitted) {
+          const submitted = cachedResult.submitted;
+          cachedResult.submitted = {
+            ...submitted,
+            waitForCompletion: (interval, signal) => submitted.waitForCompletion(interval, signal).then(finishCache),
+          };
+        }
+        if (cachedResult.deferred) {
+          const deferred = cachedResult.deferred;
+          cachedResult.deferred = { ...deferred, resume: input => deferred.resume(input).then(finishCache) };
+        }
+        return attachMatch(cachedResult);
+      };
+      return finishCache(result);
     });
   }
 
@@ -6415,6 +7463,8 @@ export class SingleAgentClient {
       params.account
     );
     const hasCreativeFormatData = hasMediaBuyCreativeFormatData(params);
+    if (this.config.experimentalIdentity33) await this.getCapabilities(taskOptions);
+    const signed33Webhooks = this.usesSigned33Webhooks();
     // Merge library defaults with consumer-provided reporting_webhook config
     // Library provides url/auth/frequency defaults, consumer can override any field
     // Generates a media_buy_delivery webhook URL using operation_id pattern: delivery_report_{agent_id}_{YYYY-MM}
@@ -6444,31 +7494,42 @@ export class SingleAgentClient {
           const consumerAuth = consumerReportingWebhook?.authentication;
           const consumerUrl = consumerReportingWebhook?.url;
           const consumerFrequency = consumerReportingWebhook?.reporting_frequency;
-          const defaultAuth = this.config.webhookSecret
-            ? { schemes: ['HMAC-SHA256'] as const, credentials: this.config.webhookSecret }
-            : undefined;
+          const defaultAuth =
+            !signed33Webhooks && this.config.webhookSecret
+              ? { schemes: ['HMAC-SHA256'] as const, credentials: this.config.webhookSecret }
+              : undefined;
           // The client secret is bound to the client-generated callback URL.
           // A caller-controlled endpoint must bring its own complete auth block
           // so the SDK never pairs a shared client credential with another host.
           const resolvedAuth =
             consumerAuth !== undefined ? consumerAuth : consumerUrl === undefined ? defaultAuth : undefined;
 
-          // `reporting-webhook.json` requires `authentication` throughout AdCP 3.x
-          // (the requirement lifts in 4.0 when RFC 9421 becomes the only path), so
-          // unlike `push_notification_config` the block cannot simply be omitted.
-          // With no configured secret and no caller-supplied credential there is
+          // `reporting-webhook.json` requires `authentication` before AdCP 3.3; from
+          // 3.3 a seller that signs webhooks under its profile accepts the
+          // registration without it. Without positively negotiated 3.3 signed
+          // webhooks the block therefore cannot simply be omitted, unlike
+          // `push_notification_config`. With no configured secret and no caller-supplied credential there is
           // nothing real to put there — registering a placeholder would tell the
           // seller its delivery reports are authenticated by a constant that ships
           // in this file. Skip the auto-injection instead and say why.
-          if (resolvedAuth === undefined || resolvedAuth === null) {
+          if ((!signed33Webhooks && resolvedAuth === undefined) || resolvedAuth === null) {
             // A caller who asked for a `reporting_webhook` explicitly gets an
             // error, not a silent edit: the request cannot be made spec-valid
             // without a credential, and quietly dropping a field the caller wrote
             // would make the SDK a translator of intent rather than a witness to
             // it. Only the library's OWN auto-injection is skipped silently.
+            if (consumerReportingWebhook && consumerUrl !== undefined && consumerAuth === undefined) {
+              throw new Error(
+                'reporting_webhook requires an `authentication` block without positively negotiated 3.3 signed webhooks: ' +
+                  'a caller-supplied `reporting_webhook.url` must bring its own `reporting_webhook.authentication` ' +
+                  '(the client never pairs `webhookSecret` with a caller-controlled URL). Omit `url` to use the ' +
+                  "client's webhookUrlTemplate callback, or remove `reporting_webhook` if you do not need automated " +
+                  'delivery reports.'
+              );
+            }
             if (consumerReportingWebhook) {
               throw new Error(
-                'reporting_webhook requires an `authentication` block for all of AdCP 3.x, and no credential ' +
+                'reporting_webhook requires an `authentication` block without positively negotiated 3.3 signed webhooks, and no credential ' +
                   'is available: set `webhookSecret` on the client, or pass `reporting_webhook.authentication` ' +
                   'explicitly. Remove `reporting_webhook` from the request if you do not need automated ' +
                   'delivery reports — the media buy itself does not require it.'
@@ -6497,9 +7558,25 @@ export class SingleAgentClient {
                 url: consumerUrl !== undefined ? consumerUrl : deliveryWebhookUrl,
                 reporting_frequency:
                   consumerFrequency !== undefined ? consumerFrequency : libraryDefaults.reporting_frequency,
-                authentication: resolvedAuth,
+                ...(resolvedAuth !== undefined && { authentication: resolvedAuth }),
+                ...(resolvedAuth === undefined &&
+                  this.selectedWebhookSigningProfile() && { signing_profile: this.selectedWebhookSigningProfile() }),
               },
             } as CanonicalCreateMediaBuyInput;
+            // Only the client's own callback is bound to the monthly delivery
+            // operation id. A caller-supplied URL is registered at dispatch under
+            // its URL-scoped id (deliveryWebhookRegistrationId), so buys with
+            // different caller URLs in the same month cannot collide.
+            if (signed33Webhooks && resolvedAuth === undefined && consumerUrl === undefined) {
+              await this.persistWebhookRegistration({
+                agent: this.normalizedAgent,
+                taskType: 'media_buy_delivery',
+                operationId,
+                callbackUrl: deliveryWebhookUrl,
+                mode: 'rfc9421',
+                signingProfile: this.selectedWebhookSigningProfile(),
+              });
+            }
           }
         }
       }
@@ -6513,19 +7590,27 @@ export class SingleAgentClient {
       this.validateBeforeCreativeCapabilityProbe('create_media_buy', params, taskOptions);
     }
     const wireMode = hasCreativeFormatData
-      ? this.resolveCreativeFormatWireMode('create_media_buy', await this.getCapabilities(taskOptions))
+      ? await this.resolveCreativeWireMode('create_media_buy', taskOptions, true, () =>
+          this.productOptionsSupportCanonicalWire('create_media_buy', params, [], options)
+        )
       : 'canonical';
     const wireParams = params as MutatingRequestInput<CanonicalCreateMediaBuyRequest>;
 
     const result = await this.executeAndHandle<CreateMediaBuyResponse>(
       'create_media_buy',
       'onCreateMediaBuyStatusChange',
-      projectMediaBuyCreativesForDelivery(
-        wireParams,
-        wireMode,
+      this.projectUndeclaredFormatOptions(
+        projectMediaBuyCreativesForDelivery(
+          wireParams,
+          wireMode,
+          'create_media_buy',
+          effectiveLegacyFormatConverter,
+          effectiveCanonicalFormatLegacyResolver
+        ),
         'create_media_buy',
-        effectiveLegacyFormatConverter,
-        effectiveCanonicalFormatLegacyResolver
+        wireMode,
+        wireParams.account,
+        canonicalFormatLegacyResolver
       ),
       inputHandler,
       taskOptions,
@@ -6621,17 +7706,25 @@ export class SingleAgentClient {
       this.validateBeforeCreativeCapabilityProbe('update_media_buy', params, taskOptions);
     }
     const wireMode = hasCreativeFormatData
-      ? this.resolveCreativeFormatWireMode('update_media_buy', await this.getCapabilities(taskOptions))
+      ? await this.resolveCreativeWireMode('update_media_buy', taskOptions, true, () =>
+          this.productOptionsSupportCanonicalWire('update_media_buy', params, [], options)
+        )
       : 'canonical';
     const result = await this.executeAndHandle<UpdateMediaBuyResponse>(
       'update_media_buy',
       'onUpdateMediaBuyStatusChange',
-      projectMediaBuyCreativesForDelivery(
-        params,
-        wireMode,
+      this.projectUndeclaredFormatOptions(
+        projectMediaBuyCreativesForDelivery(
+          params,
+          wireMode,
+          'update_media_buy',
+          effectiveLegacyFormatConverter,
+          effectiveCanonicalFormatLegacyResolver
+        ),
         'update_media_buy',
-        effectiveLegacyFormatConverter,
-        effectiveCanonicalFormatLegacyResolver
+        wireMode,
+        params.account,
+        canonicalFormatLegacyResolver
       ),
       inputHandler,
       taskOptions,
@@ -6721,7 +7814,6 @@ export class SingleAgentClient {
       projectionCatalogs ?? this.config.projectionCatalogs
     );
     this.validateBeforeCreativeCapabilityProbe('sync_creatives', params, taskOptions);
-    const wireMode = this.resolveCreativeFormatWireMode('sync_creatives', await this.getCapabilities(taskOptions));
     const configuredSelectorContainers = [
       ...((creativeFormatProjection?.selectorContainers ?? []) as ReadonlyArray<CreativeFormatSelectorContainer>),
     ];
@@ -6737,12 +7829,22 @@ export class SingleAgentClient {
             : []
         )
       : [];
-    const wireParams = projectSyncCreativesForDelivery(
-      params,
-      [...configuredSelectorContainers, ...assignmentPackageContainers],
+    const selectorContainers = [...configuredSelectorContainers, ...assignmentPackageContainers];
+    const wireMode = await this.resolveCreativeWireMode('sync_creatives', taskOptions, true, () =>
+      this.productOptionsSupportCanonicalWire('sync_creatives', params, selectorContainers, options)
+    );
+    const wireParams = this.projectUndeclaredFormatOptions(
+      projectSyncCreativesForDelivery(
+        params,
+        selectorContainers,
+        wireMode,
+        effectiveLegacyFormatConverter,
+        effectiveCanonicalFormatLegacyResolver
+      ),
+      'sync_creatives',
       wireMode,
-      effectiveLegacyFormatConverter,
-      effectiveCanonicalFormatLegacyResolver
+      params.account,
+      canonicalFormatLegacyResolver
     );
     return this.executeAndHandle<SyncCreativesResponse>(
       'sync_creatives',
@@ -6775,28 +7877,234 @@ export class SingleAgentClient {
     );
   }
 
-  private resolveCreativeFormatWireMode(taskType: string, capabilities: unknown): CreativeFormatWireMode {
+  /**
+   * Resolve the creative wire mode used by the canonical write methods without
+   * sending a mutation. Discovers capabilities and the current tool's input
+   * schema, or reuses fresh cached/primed evidence, with this client's wire pin.
+   *
+   * This context-free check returns `unknown` when capabilities and schema do
+   * not establish support. A write to a proven 3.1 seller can still select
+   * canonical delivery from matching seller-advertised product options;
+   * otherwise projection requires an unambiguous legacy reference.
+   * Conflicting evidence and unproven support with a 3.2+ buyer pin throw
+   * `CreativeFormatCapabilityError`, just as they do during a write.
+   */
+  async resolveCreativeFormatWireMode(
+    taskType: 'sync_creatives' | 'create_media_buy' | 'update_media_buy',
+    options?: ReadRequestOptions
+  ): Promise<CreativeFormatWireMode> {
+    return this.resolveCreativeWireMode(taskType, options, true);
+  }
+
+  private async resolveCreativeWireMode(
+    taskType: 'sync_creatives' | 'create_media_buy' | 'update_media_buy',
+    options: ReadRequestOptions | undefined,
+    canRediscover: boolean,
+    matchingProductOptions?: () => boolean
+  ): Promise<CreativeFormatWireMode> {
+    const discoveryContext: CapabilityDiscoveryContext = {};
+    const capabilities = await this.getCapabilities({
+      ...options,
+      [CAPABILITY_DISCOVERY_CONTEXT]: discoveryContext,
+    } as InternalReadRequestOptions);
+    const usesScopedFetch = this.usesScopedDiscoveryTransport(options);
+    const toolSchemas = discoveryContext.toolSchemas ?? (usesScopedFetch ? undefined : this.cachedToolSchemas);
     // Capabilities `adcp.build_version` is advisory deployment metadata. The
     // protocol schema explicitly forbids using it for negotiation, so wire
     // guarantees follow the release pin this client actually emits.
     const wireRelease = this.config.wireAdcpVersion ?? this.resolvedAdcpVersion;
     const declared = resolveCreativeFormatWireMode(capabilities, wireRelease);
-    const schema = creativeSchemaSupport(this.cachedToolSchemas?.get(taskType));
+    const document = toolSchemas && toolInputSchemasByProperties.get(toolSchemas)?.get(taskType);
+    const { creativeSchemaSupport } = await import('./creative-schema-support');
+    throwIfAborted(options?.signal);
+    const schema = creativeSchemaSupport(document ?? { properties: toolSchemas?.get(taskType) });
     if (declared !== 'unknown' && schema !== 'unknown' && declared !== schema) {
       throw new CreativeFormatCapabilityError(
         `Seller capability and ${taskType} input schema disagree about canonical creative support`
       );
     }
-    const resolved = declared !== 'unknown' ? declared : schema;
+    let resolved = declared !== 'unknown' ? declared : schema;
+    if (
+      resolved === 'unknown' &&
+      canUseProductOptionsForCreativeWire(capabilities, wireRelease) &&
+      matchingProductOptions?.()
+    ) {
+      resolved = 'canonical';
+    }
     const release = /^v?(\d+)\.(\d+)(?:\.|-|$)/.exec(wireRelease.trim());
     const canonicalRequiredByBuyerPin =
       release !== null && (Number(release[1]) > 3 || (Number(release[1]) === 3 && Number(release[2]) >= 2));
     if (resolved === 'unknown' && canonicalRequiredByBuyerPin) {
+      // Older SDKs wrote only property maps to shared backends. Rediscover
+      // once before refusing a referenced schema whose document was lost.
+      if (
+        canRediscover &&
+        !usesScopedFetch &&
+        this.normalizedAgent.protocol === 'mcp' &&
+        this.capabilitiesFromSharedCache &&
+        toolSchemas?.has(taskType) &&
+        !toolInputSchemasByProperties.has(toolSchemas)
+      ) {
+        await this.invalidateDiscoveryCache(options);
+        return this.resolveCreativeWireMode(taskType, options, false, matchingProductOptions);
+      }
       throw new CreativeFormatCapabilityError(
         `Cannot prove which AdCP release the seller serves for ${taskType}; a 3.2+ client will not guess a legacy creative wire shape`
       );
     }
     return resolved;
+  }
+
+  /** Product evidence applies to this request only; it must never prime a tool-wide capability. */
+  private productOptionsSupportCanonicalWire(
+    taskType: 'sync_creatives' | 'create_media_buy' | 'update_media_buy',
+    request: unknown,
+    selectorContainers: readonly CreativeFormatSelectorContainer[] = [],
+    options?: CreativeDeliveryTaskOptions
+  ): boolean {
+    if (!isPlainRecord(request) || this.usesScopedDiscoveryTransport(options)) return false;
+    const scopeKey = this.getCapabilityEvidenceScope().scopeKey;
+    const accountScope = this.canonicalAccountScope(request.account);
+    const optionRef = (value: unknown): CanonicalLegacyOptionRef | undefined => {
+      if (!isPlainRecord(value) || typeof value.format_option_id !== 'string' || !value.format_option_id) {
+        return undefined;
+      }
+      if (typeof value.publisher_domain === 'string') {
+        return {
+          scope: 'publisher',
+          publisher_domain: value.publisher_domain,
+          format_option_id: value.format_option_id,
+        };
+      }
+      if (value.scope !== undefined && value.scope !== 'product') return undefined;
+      return { scope: 'product', format_option_id: value.format_option_id };
+    };
+    const accepts = (container: CreativeFormatSelectorContainer, creative?: unknown, depth = 0): boolean => {
+      if (depth > 32) return false;
+      if (Array.isArray(container.selector_containers)) {
+        return (
+          container.selector_containers.length > 0 &&
+          container.selector_containers.every(nested => accepts(nested, creative, depth + 1))
+        );
+      }
+      const refs = Array.isArray(container.format_option_refs) ? container.format_option_refs.map(optionRef) : [];
+      if (refs.some(ref => ref === undefined)) return false;
+      const creativeRef = isPlainRecord(creative) ? optionRef(creative.format_option_ref) : undefined;
+      if (isPlainRecord(creative) && creative.format_option_ref !== undefined && !creativeRef) return false;
+      const isSellerDeclaration = (value: unknown): value is Readonly<Record<string, unknown>> => {
+        if (!isPlainRecord(value) || sellerDeclaredFormatOption(value) !== true || isSynthesizedFormatOption(value)) {
+          return false;
+        }
+        const evidence = sellerFormatEvidence(value);
+        if (
+          !evidence ||
+          evidence.scopeKey !== scopeKey ||
+          (typeof container.product_id === 'string' && evidence.productId !== container.product_id) ||
+          evidence.expiresAt <= Date.now() ||
+          (evidence.accountScope !== accountScope && evidence.accountScope !== 'none')
+        )
+          return false;
+        const ref = optionRef(value);
+        if (
+          ref &&
+          formatOptionOriginFromRoutes(
+            options?.canonicalFormatLegacyResolver,
+            ref,
+            typeof container.product_id === 'string' ? container.product_id : undefined
+          )?.seller_declared === false
+        )
+          return false;
+        return (
+          !ref ||
+          typeof container.product_id !== 'string' ||
+          this.cachedFormatOptionOrigin(request.account, ref, container.product_id)?.seller_declared !== false
+        );
+      };
+      const declarations: Readonly<Record<string, unknown>>[] = [
+        ...(Array.isArray(container.format_options) ? container.format_options : []).filter(isSellerDeclaration),
+        ...selectedFormatOptions(container).filter(isSellerDeclaration),
+      ];
+      if (typeof container.product_id === 'string') {
+        for (const ref of [...refs, ...(creativeRef ? [creativeRef] : [])]) {
+          if (!ref) continue;
+          const route = this.routeForOption(request.account, container.product_id, ref);
+          if (route?.kind === 'product' && route.declaration && isSellerDeclaration(route.declaration))
+            declarations.push(route.declaration);
+        }
+      }
+      const available = declarations.filter(declaration => declaration.experimental !== true);
+      const matchesRef = (declaration: Readonly<Record<string, unknown>>, ref: CanonicalLegacyOptionRef): boolean => {
+        const declaredRef = optionRef(declaration);
+        return declaredRef !== undefined && sameFormatOptionRef(declaredRef, ref);
+      };
+      if (!refs.every(ref => available.some(declaration => matchesRef(declaration, ref!)))) return false;
+      const selected = available.filter(
+        declaration => refs.length === 0 || refs.some(ref => matchesRef(declaration, ref!))
+      );
+      if (creative === undefined) return refs.length > 0 && selected.length > 0;
+      if (!isPlainRecord(creative) || typeof creative.format_kind !== 'string' || creative.format_id !== undefined)
+        return false;
+      return selected.some(
+        declaration =>
+          declaration.format_kind === creative.format_kind &&
+          (!creativeRef || matchesRef(declaration, creativeRef)) &&
+          creativeMatchesProductOption(creative, declaration)
+      );
+    };
+    if (taskType === 'sync_creatives') {
+      if (!Array.isArray(request.creatives) || request.creatives.length === 0) return false;
+      const creatives = request.creatives;
+      const assignments = Array.isArray(request.assignments) ? request.assignments : [];
+      // Existing creatives have no manifest here to compare against the seller's
+      // declarations. They cannot borrow evidence from another uploaded creative.
+      if (
+        !assignments.every(
+          value =>
+            isPlainRecord(value) &&
+            typeof value.package_id === 'string' &&
+            typeof value.creative_id === 'string' &&
+            creatives.some((creative: unknown) => isPlainRecord(creative) && creative.creative_id === value.creative_id)
+        )
+      )
+        return false;
+      return creatives.every(creative => {
+        if (!isPlainRecord(creative)) return false;
+        const assigned = new Set(
+          assignments.flatMap(value =>
+            isPlainRecord(value) && value.creative_id === creative.creative_id && typeof value.package_id === 'string'
+              ? [value.package_id]
+              : []
+          )
+        );
+        const relevant =
+          assigned.size === 0
+            ? selectorContainers
+            : selectorContainers.filter(
+                container => typeof container.package_id === 'string' && assigned.has(container.package_id)
+              );
+        return (
+          relevant.length > 0 &&
+          [...assigned].every(id => relevant.some(container => container.package_id === id)) &&
+          relevant.every(container => accepts(container, creative))
+        );
+      });
+    }
+    const packages = ['packages', 'new_packages'].flatMap(key => (Array.isArray(request[key]) ? request[key] : []));
+    let evidence = false;
+    return (
+      packages.length > 0 &&
+      packages.every(pkg => {
+        if (!isPlainRecord(pkg)) return false;
+        const creatives = Array.isArray(pkg.creatives) ? pkg.creatives : [];
+        const hasSelectors = Array.isArray(pkg.format_option_refs) && pkg.format_option_refs.length > 0;
+        if (!hasSelectors && creatives.length === 0) {
+          return pkg.format_kind === undefined && pkg.format_ids === undefined;
+        }
+        evidence = true;
+        return (!hasSelectors || accepts(pkg)) && creatives.every(creative => accepts(pkg, creative));
+      }) &&
+      evidence
+    );
   }
 
   /** Validate malformed creative payloads before capability discovery can perform I/O. */
@@ -7176,15 +8484,32 @@ export class SingleAgentClient {
     inputHandler: InputHandler | undefined,
     options: TaskOptions
   ): Promise<TaskResult<GetAdCPCapabilitiesResponse>> {
+    const scopeKey = this.config._reuseConfiguredDiscovery?.() ? this.getCapabilityEvidenceScope().scopeKey : undefined;
     const agent = await this.ensureEndpointDiscovered(options);
     this.executor.validateRequest('get_adcp_capabilities', params);
-    return this.executor.executeTask<GetAdCPCapabilitiesResponse>(
+    const result = await this.executor.executeTask<GetAdCPCapabilitiesResponse>(
       agent,
       'get_adcp_capabilities',
       params,
       inputHandler,
       options
     );
+    if (
+      this.config._reuseConfiguredDiscovery?.() &&
+      !this.usesScopedDiscoveryTransport(options) &&
+      scopeKey === this.getCapabilityEvidenceScope().scopeKey &&
+      Object.keys(params).length === 0 &&
+      this.runAgentInfo !== undefined &&
+      result.success &&
+      result.data &&
+      looksLikeV3Capabilities(result.data)
+    ) {
+      const capabilities = parseCapabilitiesResponse(structuredClone(result.data));
+      if (!capabilities._synthetic) {
+        this.cachedCapabilities = augmentCapabilitiesFromTools(capabilities, this.runAgentInfo.tools);
+      }
+    }
+    return result;
   }
 
   // ====== CREATIVE BUILD TASKS ======
@@ -7229,8 +8554,8 @@ export class SingleAgentClient {
     params: GetPrincipalRequest = {},
     inputHandler?: InputHandler,
     options?: TaskOptions
-  ): Promise<TaskResult<GetPrincipalResponse>> {
-    return this.executeAndHandle<GetPrincipalResponse>(
+  ): Promise<TaskResult<import('../identity-3.3/types').Identity33GetPrincipalResponse>> {
+    return this.executeAndHandle<import('../identity-3.3/types').Identity33GetPrincipalResponse>(
       'get_principal',
       'onGetPrincipalStatusChange',
       params,
@@ -7274,14 +8599,30 @@ export class SingleAgentClient {
   /**
    * Resolve an account for the authenticated caller. Explicit-account sellers
    * are discovered with list_accounts; implicit-account sellers are registered
-   * with sync_accounts and addressed by their natural key.
+   * with sync_accounts. Stable-ID sellers are addressed by ID; legacy implicit
+   * sellers keep their natural key. includeDetails also exposes the seller handle.
    */
   async resolveAccount(
-    hints: ResolveAccountOptions = {},
+    hints: ResolveAccountOptions & { includeDetails: true },
+    options?: TaskOptions,
+    onTaskResult?: (result: TaskResult<unknown>) => void
+  ): Promise<ResolveAccountResult>;
+  async resolveAccount(
+    hints?: ResolveAccountOptions & { includeDetails?: false },
+    options?: TaskOptions,
+    onTaskResult?: (result: TaskResult<unknown>) => void
+  ): Promise<AccountReference>;
+  async resolveAccount(
+    hints: ResolveAccountOptions & { includeDetails?: boolean },
+    options?: TaskOptions,
+    onTaskResult?: (result: TaskResult<unknown>) => void
+  ): Promise<AccountReference | ResolveAccountResult>;
+  async resolveAccount(
+    hints: ResolveAccountOptions & { includeDetails?: boolean } = {},
     options?: TaskOptions,
     /** @internal Allows the AgentClient wrapper to retain nested task session ids. */
     onTaskResult?: (result: TaskResult<unknown>) => void
-  ): Promise<AccountReference> {
+  ): Promise<AccountReference | ResolveAccountResult> {
     return withTaskDeadline(snapshotTaskOptions(options), async effectiveOptions => {
       const capabilities = await this.getCapabilities(effectiveOptions);
       if (capabilities._synthetic || !capabilities.account) {
@@ -7291,6 +8632,16 @@ export class SingleAgentClient {
           'The seller did not provide an account contract. Probe get_adcp_capabilities or pass an account reference explicitly.'
         );
       }
+      const resolved = (account: AccountReference, accountId?: string): AccountReference | ResolveAccountResult => {
+        const reference = this.accountWireReference(account, accountId, capabilities);
+        return hints.includeDetails
+          ? {
+              reference,
+              ...(accountId && { account_id: accountId }),
+              ...(!('account_id' in account) && { naturalKey: structuredClone(account) }),
+            }
+          : reference;
+      };
       if (capabilities.account.requireOperatorAuth) {
         const accounts: ListAccountsResponse['accounts'] = [];
         const seenCursors = new Set<string>();
@@ -7316,7 +8667,10 @@ export class SingleAgentClient {
             throw new Error('list_accounts did not return a completed account list.');
           }
           accounts.push(...result.data.accounts);
-          if (!result.data.pagination?.has_more) return selectListedAccount(accounts, hints);
+          if (!result.data.pagination?.has_more) {
+            const selected = selectListedAccount(accounts, hints);
+            return resolved(selected, 'account_id' in selected ? selected.account_id : undefined);
+          }
           const nextCursor = result.data.pagination.cursor;
           if (!nextCursor || seenCursors.has(nextCursor)) break;
           seenCursors.add(nextCursor);
@@ -7390,50 +8744,128 @@ export class SingleAgentClient {
           `Choose a supported billing party for sync_accounts (seller supports: ${supportedBilling.join(', ') || '(none)'}).`
         );
       }
-      const result = await this.syncAccounts(
-        {
-          accounts: [
-            {
-              ...account,
-              billing,
-            },
-          ],
-        },
-        undefined,
-        effectiveOptions
-      );
-      onTaskResult?.(result);
-      if (
-        !result.success ||
-        result.status !== 'completed' ||
-        !result.data ||
-        !('accounts' in result.data) ||
-        !Array.isArray(result.data.accounts)
-      ) {
-        throw new Error('sync_accounts did not return a completed account result.');
-      }
-      const synced = result.data.accounts.find(
-        row =>
-          row.brand?.domain === hints.brand!.domain &&
-          row.operator === hints.operator &&
-          (!hints.brand!.brand_id || row.brand.brand_id === hints.brand!.brand_id) &&
-          sameCountrySet(hints.brand!.countries, row.brand.countries) &&
-          (!hints.operatorUnit || row.operator_unit?.id === hints.operatorUnit.id) &&
-          (!hints.currency || row.currency === hints.currency) &&
-          (!hints.timezone || row.timezone === hints.timezone) &&
-          (row.sandbox === undefined || (row.sandbox === true) === (hints.sandbox === true))
-      );
-      if (synced?.status === 'pending_approval') {
-        throw new AccountPendingApprovalError(account, synced.account_id);
-      }
-      if (!synced || synced.action === 'failed' || synced.status !== 'active') {
-        throw new AccountRequiredError(
-          'implicit',
-          'resolveAccount',
-          'sync_accounts did not establish an active account for the requested brand and operator.'
+      if (!this.accountRegistryOptedIn()) {
+        // SDK 14.0 behavior: sync on every call so callers observe the
+        // seller's current status. The memoized registry path is opt-in.
+        const registry = this.usesStableAccountIds(capabilities) ? this.getAccountRegistry() : undefined;
+        const registryScope = registry ? this.accountScope() : undefined;
+        const observationEpoch = registry?.captureObservation();
+        const result = await this.syncAccounts(
+          {
+            accounts: [
+              {
+                ...account,
+                billing,
+                ...(hints.paymentTerms !== undefined && { payment_terms: hints.paymentTerms }),
+                ...(hints.billingEntity !== undefined && { billing_entity: hints.billingEntity }),
+              },
+            ],
+          } as MutatingRequestInput<SyncAccountsRequest>,
+          undefined,
+          effectiveOptions
         );
+        onTaskResult?.(result);
+        if (
+          !result.success ||
+          result.status !== 'completed' ||
+          !result.data ||
+          !('accounts' in result.data) ||
+          !Array.isArray(result.data.accounts)
+        ) {
+          throw new Error('sync_accounts did not return a completed account result.');
+        }
+        if (registry) {
+          if (registryScope !== this.accountScope())
+            throw new AccountRequiredError(
+              'implicit',
+              'resolveAccount',
+              'Caller credentials changed during provisioning.'
+            );
+          await registry.observeSync([account], result.data.accounts, false, observationEpoch);
+          if (registryScope !== this.accountScope())
+            throw new AccountRequiredError(
+              'implicit',
+              'resolveAccount',
+              'Caller credentials changed during provisioning.'
+            );
+        }
+        const matchingRows = result.data.accounts.filter(
+          row =>
+            row.brand?.domain === hints.brand!.domain &&
+            row.operator === hints.operator &&
+            (!hints.brand!.brand_id || row.brand.brand_id === hints.brand!.brand_id) &&
+            sameCountrySet(hints.brand!.countries, row.brand.countries) &&
+            (!hints.operatorUnit || row.operator_unit?.id === hints.operatorUnit.id) &&
+            (!hints.currency || row.currency === hints.currency) &&
+            (!hints.timezone || row.timezone === hints.timezone) &&
+            (row.sandbox === undefined || (row.sandbox === true) === (hints.sandbox === true))
+        );
+        if (registry && matchingRows.length > 1)
+          throw new AccountRequiredError(
+            'implicit',
+            'resolveAccount',
+            'sync_accounts returned ambiguous rows for the requested account.'
+          );
+        const syncedRow = matchingRows[0];
+        if (!syncedRow || syncedRow.action === 'failed') {
+          throw new AccountRequiredError(
+            'implicit',
+            'resolveAccount',
+            'sync_accounts did not establish an active account for the requested brand and operator.'
+          );
+        }
+        let current = registry ? await registry.get(account) : syncedRow;
+        if (registry && registryScope !== this.accountScope())
+          throw new AccountRequiredError(
+            'implicit',
+            'resolveAccount',
+            'Caller credentials changed during provisioning.'
+          );
+        if (registry && !current && registry.captureObservation() === observationEpoch) {
+          // An automatic cache eviction is not a seller status change. Fall back
+          // only when no newer authoritative repair could have superseded this row.
+          current = syncedRow;
+        }
+        if (
+          current &&
+          current.account_id !== syncedRow.account_id &&
+          registry?.captureObservation() === observationEpoch
+        )
+          throw new AccountRequiredError(
+            'implicit',
+            'resolveAccount',
+            'The seller account binding changed during resolution. Resolve the account again.'
+          );
+        if (current?.status === 'pending_approval') throw new AccountPendingApprovalError(account, current.account_id);
+        if (current?.status !== 'active')
+          throw new AccountRequiredError(
+            'implicit',
+            'resolveAccount',
+            'sync_accounts did not establish an active account for the requested brand and operator.'
+          );
+        return resolved(account, current.account_id);
       }
-      return account;
+      let synced;
+      try {
+        synced = await this.getAccountRegistry().ensure(
+          account,
+          {
+            billing,
+            paymentTerms: hints.paymentTerms,
+            billingEntity: hints.billingEntity,
+          },
+          effectiveOptions,
+          onTaskResult
+        );
+      } catch (error) {
+        if (error instanceof AccountNotFoundError)
+          throw new AccountRequiredError('implicit', 'resolveAccount', error.message);
+        throw error;
+      }
+      if (synced.status === 'pending_approval') throw new AccountPendingApprovalError(account, synced.account_id);
+      if (synced.status !== 'active')
+        throw new AccountRequiredError('implicit', 'resolveAccount', 'The account is not active.');
+      return resolved(account, synced.account_id);
     });
   }
 
@@ -7443,8 +8875,27 @@ export class SingleAgentClient {
   async syncAccounts(
     params: MutatingRequestInput<SyncAccountsRequest>,
     inputHandler?: InputHandler,
-    options?: TaskOptions
+    options?: TaskOptions,
+    /** @internal Registry-owned final dispatch boundary. */
+    dispatch?: import('./buyer-account-registry').BuyerAccountProvisioningDispatch
   ): Promise<TaskResult<SyncAccountsResponse>> {
+    if (dispatch)
+      return this.executeTaskUnprojected<SyncAccountsResponse>(
+        'sync_accounts',
+        params,
+        inputHandler,
+        options,
+        'onSyncAccountsStatusChange',
+        Object.assign(
+          async (effectiveParams: Record<string, unknown>) => {
+            if (dispatch.requireIdempotencyKey !== false && effectiveParams.idempotency_key !== dispatch.idempotencyKey)
+              throw new ConfigurationError('Account provisioning idempotency key changed before dispatch.');
+            await dispatch.beforeDispatch();
+            return { action: 'dispatch_ready' as const };
+          },
+          { terminalSettlement: 'executor' as const }
+        )
+      );
     return this.executeAndHandle<SyncAccountsResponse>(
       'sync_accounts',
       'onSyncAccountsStatusChange',
@@ -7840,6 +9291,7 @@ export class SingleAgentClient {
     const startTime = Date.now();
     let detectedServerVersion: 'v2' | 'v3' | undefined;
     let detectedServerVersionSynthetic: boolean | undefined;
+    params = await this.applyAccountPolicy(taskName, params, options);
     try {
       const normalizedParams = options?.preserveGovernedPayload
         ? params
@@ -7909,14 +9361,8 @@ export class SingleAgentClient {
             capabilityDiscoveryContext.capabilities
           );
 
-      // Symmetric warn-only post-adapter pass against the v2.5 schema bundle.
-      // Drift gets surfaced via result.metadata.debug_logs so adapter
-      // regressions in production aren't silently swallowed.
-      const v25DriftLogs: any[] = [...adaptDriftLogs];
-      if (webhookDriftLog) v25DriftLogs.push(webhookDriftLog);
-      if (serverVersion === 'v2') {
-        this.executor.validateAdaptedRequestAgainstV2(taskName, adaptedParams, v25DriftLogs);
-      }
+      const adaptationLogs: any[] = [...adaptDriftLogs];
+      if (webhookDriftLog) adaptationLogs.push(webhookDriftLog);
 
       const deferredClientContext: DeferredClientFinalizationContext = {
         kind: 'single-agent',
@@ -7928,8 +9374,12 @@ export class SingleAgentClient {
           serverVersionSynthetic: capabilityDiscoveryContext.capabilities._synthetic,
         }),
         productPolicyRequest: productPolicyRequestSnapshot(normalizedParams),
+        accountRegistry: this.accountRegistryContext(taskName, normalizedParams, effectiveOptions),
         ...(effectiveOptions?.taskId !== undefined && { optionTaskId: effectiveOptions.taskId }),
         ...(effectiveOptions?.contextId !== undefined && { optionContextId: effectiveOptions.contextId }),
+        ...(effectiveOptions?.skipStatusHandlers !== undefined && {
+          skipStatusHandlers: effectiveOptions.skipStatusHandlers,
+        }),
       };
       let result = await this.executor.executeTask<T>(
         agent,
@@ -7942,8 +9392,9 @@ export class SingleAgentClient {
         beforeDispatch,
         deferredClientContext
       );
+      if (!result.success) await this.invalidateDiscoveryOnCapabilityError(result.adcpError?.code, effectiveOptions);
 
-      const postAdapterLogs = [...inputSchemaStripLogs, ...v25DriftLogs];
+      const postAdapterLogs = [...inputSchemaStripLogs, ...adaptationLogs];
       if (postAdapterLogs.length > 0) {
         result.debug_logs = [...(result.debug_logs ?? []), ...postAdapterLogs];
       }
@@ -8172,6 +9623,11 @@ export class SingleAgentClient {
    */
   getProtocol(): 'mcp' | 'a2a' {
     return this.normalizedAgent.protocol;
+  }
+
+  /** Resolved MCP endpoint already used by this client; never performs discovery. */
+  getDiscoveredMcpEndpoint(): string | undefined {
+    return this.discoveredEndpoint;
   }
 
   /**
@@ -8494,9 +9950,41 @@ export class SingleAgentClient {
       parameters?: string[];
     }>;
   }> {
+    throwIfAborted(options?.signal);
+    const reuse = this.config._reuseConfiguredDiscovery?.() && !this.usesScopedDiscoveryTransport(options);
+    if (!reuse) return this.getAgentInfoLive(options);
+    const scopeKey = this.getCapabilityEvidenceScope().scopeKey;
+    if (this.runAgentInfo) return structuredClone(this.runAgentInfo);
+    const info = await this.getAgentInfoLive(options);
+    if (reuse && scopeKey === this.getCapabilityEvidenceScope().scopeKey) {
+      this.runAgentInfo = structuredClone(info);
+      const documents = new Map(
+        this.runAgentInfo.tools.filter(tool => tool.inputSchema).map(tool => [tool.name, tool.inputSchema!])
+      );
+      this.cachedToolSchemas = new Map(
+        [...documents].map(([name, schema]) => [name, (schema.properties ?? {}) as Record<string, unknown>])
+      );
+      toolInputSchemasByProperties.set(this.cachedToolSchemas, documents);
+    }
+    return info;
+  }
+
+  private async getAgentInfoLive(options?: ReadRequestOptions): Promise<{
+    name: string;
+    description?: string;
+    protocol: 'mcp' | 'a2a';
+    url: string;
+    tools: Array<{
+      name: string;
+      description?: string;
+      inputSchema?: Record<string, unknown>;
+      parameters?: string[];
+    }>;
+  }> {
     // adcp-client#1799 — wrap every wire call in the response-size cap so
     // `transport.maxResponseBytes` extends to discovery / tools-list bodies.
-    // `withResponseSizeLimit` is a no-op when no cap is configured.
+    // `withResponseSizeLimit` installs the 4 MiB default when no cap is
+    // configured (adcp-client#3253).
     const { withResponseSizeLimit } = await import('../protocols/responseSizeLimit');
     throwIfAborted(options?.signal);
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
@@ -8620,6 +10108,27 @@ export class SingleAgentClient {
         };
       }
 
+      // Inside a caller-owned connection scope, list on the scope's shared v1
+      // session so discovery and the tool calls that follow initialize once.
+      const { withScopedLegacyConnection } = await import('../protocols/mcp');
+      const scopedList = await withScopedLegacyConnection(connectOptions, 'tools/list', client =>
+        withResponseSizeLimit(maxResponseBytes, () => client.listTools(mcpListParams, mcpRequestOptions))
+      );
+      if (scopedList) {
+        return {
+          name: this.normalizedAgent.name,
+          description: undefined,
+          protocol: this.normalizedAgent.protocol,
+          url: agent.agent_uri,
+          tools: scopedList.value.tools.map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            parameters: tool.inputSchema?.properties ? Object.keys(tool.inputSchema.properties) : [],
+          })),
+        };
+      }
+
       const { client: mcpClient } = await connectMCP(connectOptions);
       try {
         const toolsList = await withResponseSizeLimit(maxResponseBytes, () =>
@@ -8735,7 +10244,7 @@ export class SingleAgentClient {
    * Get agent capabilities, including AdCP version support
    *
    * For v3 servers, calls get_adcp_capabilities tool.
-   * For v2 servers, builds synthetic capabilities from available tools.
+   * Requires AdCP 3 capability discovery; retired AdCP 2 agents are rejected.
    *
    * @returns Promise resolving to normalized capabilities object
    *
@@ -8756,7 +10265,7 @@ export class SingleAgentClient {
     this.synchronizeCapabilityEvidenceAuthorizationScope();
     const discoveryContext = (options as InternalReadRequestOptions | undefined)?.[CAPABILITY_DISCOVERY_CONTEXT];
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
-    const usesScopedFetch = transport?.trustedFetchFn !== undefined;
+    const usesScopedFetch = this.usesScopedDiscoveryTransport(options);
     // Application-owned evidence keeps its declared freshness bound after it
     // has been installed. Once expired, discard both capability and schema
     // evidence and perform ordinary discovery below.
@@ -8764,14 +10273,155 @@ export class SingleAgentClient {
       this.cachedCapabilities = undefined;
       this.cachedToolSchemas = undefined;
       this.primedCapabilitiesExpiresAt = undefined;
+      this.capabilitiesFromSharedCache = false;
+    }
+
+    // With a shared discoveryCache, local evidence is only valid for the policy
+    // (transport overrides, headers, version) it was gathered under, and only
+    // until anything sharing that key invalidates it.
+    const effectiveSharedKey =
+      this.config.discoveryCache && !usesScopedFetch && this.cachedCapabilities
+        ? this.sharedDiscoveryKey(options)
+        : undefined;
+    if (
+      this.config.discoveryCache &&
+      !usesScopedFetch &&
+      this.cachedCapabilities &&
+      (this.sharedEvidenceKey !== effectiveSharedKey ||
+        (effectiveSharedKey !== undefined &&
+          this.sharedEvidenceEpoch !== undefined &&
+          this.sharedEvidenceEpoch !== this.sharedInvalidationEpoch(effectiveSharedKey)))
+    ) {
+      this.cachedCapabilities = undefined;
+      this.cachedToolSchemas = undefined;
+      this.primedCapabilitiesExpiresAt = undefined;
+      this.capabilitiesFromSharedCache = false;
     }
 
     // Return cached if available
     if (!usesScopedFetch && this.cachedCapabilities) {
       if (discoveryContext) discoveryContext.toolSchemas = this.cachedToolSchemas;
-      this.maybeWarnV2Sunset(this.cachedCapabilities);
+      this.assertSupportedServer(this.cachedCapabilities);
       return this.cachedCapabilities;
     }
+
+    if (!usesScopedFetch && this.config.discoveryCache) {
+      return this.discoverCapabilitiesThroughSharedCache(options, usesScopedFetch, discoveryContext);
+    }
+    return this.discoverCapabilitiesLive(options, usesScopedFetch, discoveryContext);
+  }
+
+  /**
+   * Serve capabilities from the shared `discoveryCache`, or discover them live
+   * as the single in-process "leader" for this cache key. Concurrent clients
+   * for the same key wait for the leader under their *own* signal and deadline;
+   * a leader that fails or is cancelled never fails its followers, which then
+   * discover for themselves.
+   */
+  private async discoverCapabilitiesThroughSharedCache(
+    options: ReadRequestOptions | undefined,
+    usesScopedFetch: boolean,
+    discoveryContext: CapabilityDiscoveryContext | undefined
+  ): Promise<AdcpCapabilities> {
+    const config = this.config.discoveryCache!;
+    const key = this.sharedDiscoveryKey(options);
+    if (!key) return this.discoverCapabilitiesLive(options, usesScopedFetch, discoveryContext);
+
+    let flights = sharedDiscoveryFlights.get(config.cache);
+    if (!flights) {
+      flights = new Map();
+      sharedDiscoveryFlights.set(config.cache, flights);
+    }
+
+    for (let attempt = 0; ; attempt++) {
+      const readEpoch = this.discoveryEpochSnapshot(options);
+      const entry = await this.readSharedDiscovery(options);
+      const installed =
+        entry &&
+        (!readEpoch || this.discoveryEpochIs(readEpoch)) &&
+        this.installSharedCapabilities(entry, key, discoveryContext);
+      if (installed) return installed;
+
+      const flight = flights.get(key);
+      if (flight && attempt < MAX_SHARED_DISCOVERY_WAITS) {
+        const requestTimeoutMs = resolveRequestTimeoutMs(
+          options?.transport?.requestTimeoutMs ?? this.config.transport?.requestTimeoutMs
+        );
+        // Rejects only for this caller's own abort or timeout.
+        await withAbortSignal([options?.signal], requestTimeoutMs, () => flight);
+        continue;
+      }
+
+      let finish!: () => void;
+      const mine = new Promise<void>(resolve => (finish = resolve));
+      const ownsFlight = !flights.has(key);
+      if (ownsFlight) flights.set(key, mine);
+      try {
+        return await this.discoverCapabilitiesLive(options, usesScopedFetch, discoveryContext);
+      } finally {
+        if (ownsFlight) {
+          // The (weakly held) map stays: a follower may hold it, and dropping it
+          // would let a later caller start a second, unseen one.
+          flights.delete(key);
+        }
+        finish();
+      }
+    }
+  }
+
+  /** Install capabilities from a shared entry; `undefined` when the entry is not usable evidence. */
+  private installSharedCapabilities(
+    entry: AgentDiscoveryEntry,
+    key: string,
+    discoveryContext: CapabilityDiscoveryContext | undefined
+  ): AdcpCapabilities | undefined {
+    const capabilities = entry.capabilities;
+    if (!isCapabilityEvidence(capabilities) || capabilities._synthetic) return undefined;
+    const toolSchemas = entry.toolSchemas;
+    const hasToolEvidence = toolSchemas !== undefined || Array.isArray(capabilities.discoveredTools);
+    if (!hasToolEvidence) return undefined;
+    if (toolSchemas !== undefined && !isToolSchemaRecord(toolSchemas)) {
+      return undefined;
+    }
+    if (entry.toolInputSchemas !== undefined && (!toolSchemas || !isToolSchemaRecord(entry.toolInputSchemas))) {
+      return undefined;
+    }
+    let installed: AdcpCapabilities;
+    let schemas: Map<string, Record<string, unknown>> | undefined;
+    try {
+      installed = structuredClone(capabilities);
+      schemas = toolSchemas
+        ? new Map(Object.entries(toolSchemas).map(([tool, properties]) => [tool, structuredClone(properties)]))
+        : undefined;
+      if (schemas && entry.toolInputSchemas) {
+        toolInputSchemasByProperties.set(
+          schemas,
+          new Map(Object.entries(entry.toolInputSchemas).map(([tool, schema]) => [tool, structuredClone(schema)]))
+        );
+      }
+    } catch {
+      // A malformed entry from a custom backend is a miss, not a failed call.
+      return undefined;
+    }
+    this.cachedCapabilities = installed;
+    this.cachedToolSchemas = schemas;
+    this.primedCapabilitiesExpiresAt = entry.expiresAt;
+    this.capabilitiesFromSharedCache = true;
+    this.recordSharedEvidence(key);
+    if (discoveryContext) discoveryContext.toolSchemas = this.cachedToolSchemas;
+    this.assertSupportedServer(installed);
+    return installed;
+  }
+
+  private async discoverCapabilitiesLive(
+    options: ReadRequestOptions | undefined,
+    usesScopedFetch: boolean,
+    discoveryContext: CapabilityDiscoveryContext | undefined
+  ): Promise<AdcpCapabilities> {
+    const startedAtEpoch = this.discoveryEpochSnapshot(options);
+    // An invalidation that lands while this discovery is in flight wins: its
+    // result still serves this call but must not be re-installed anywhere.
+    const superseded = () => startedAtEpoch !== undefined && !this.discoveryEpochIs(startedAtEpoch);
 
     // First get tool list to support both detection methods
     const agentInfo = await this.getAgentInfo(options);
@@ -8783,13 +10433,15 @@ export class SingleAgentClient {
     // Make raw tool schemas available for field-level compatibility checks
     // (e.g. buying_mode on get_products). Scoped fetch keeps them in the
     // request-local discovery context; unscoped calls may share the cache.
-    const discoveredToolSchemas = new Map(
-      agentInfo.tools
-        .filter(t => t.inputSchema?.properties)
-        .map(t => [t.name, t.inputSchema!.properties as Record<string, unknown>])
+    const discoveredInputSchemas = new Map(
+      agentInfo.tools.filter(t => t.inputSchema).map(t => [t.name, t.inputSchema! as Record<string, unknown>])
     );
+    const discoveredToolSchemas = new Map(
+      [...discoveredInputSchemas].map(([name, schema]) => [name, (schema.properties ?? {}) as Record<string, unknown>])
+    );
+    toolInputSchemasByProperties.set(discoveredToolSchemas, discoveredInputSchemas);
     if (discoveryContext) discoveryContext.toolSchemas = discoveredToolSchemas;
-    if (!usesScopedFetch) this.cachedToolSchemas = discoveredToolSchemas;
+    if (!usesScopedFetch && !superseded()) this.cachedToolSchemas = discoveredToolSchemas;
 
     // Check if agent supports get_adcp_capabilities (v3)
     const advertisesCapabilitiesTool = tools.some(t => t.name === 'get_adcp_capabilities');
@@ -8846,46 +10498,66 @@ export class SingleAgentClient {
 
         if (result.success && result.data) {
           const capabilities = augmentCapabilitiesFromTools(parseCapabilitiesResponse(result.data), tools);
-          if (!usesScopedFetch) this.cachedCapabilities = capabilities;
-          this.maybeWarnV2Sunset(capabilities);
+          this.assertSupportedServer(capabilities);
+          if (!usesScopedFetch && !superseded()) {
+            this.cachedCapabilities = capabilities;
+            this.capabilitiesFromSharedCache = false;
+            // Only an authoritative, validated response is shared; every
+            // synthetic fallback below stays private to this instance.
+            if (!capabilities._synthetic && this.config.discoveryCache) {
+              this.recordSharedEvidence(this.sharedDiscoveryKey(options));
+              const stored = await this.writeSharedDiscovery(
+                options,
+                {
+                  capabilities: structuredClone(capabilities),
+                  toolSchemas: Object.fromEntries(discoveredToolSchemas),
+                  toolInputSchemas: Object.fromEntries(discoveredInputSchemas),
+                },
+                false,
+                startedAtEpoch
+              );
+              if (superseded()) {
+                // Invalidated while the write was in flight: drop this copy, but
+                // never a newer live result another call has installed since.
+                if (this.cachedCapabilities === capabilities) {
+                  this.cachedCapabilities = undefined;
+                  this.cachedToolSchemas = undefined;
+                  this.primedCapabilitiesExpiresAt = undefined;
+                }
+              } else {
+                // The live result honors the same freshness bound as shared copies.
+                this.primedCapabilitiesExpiresAt =
+                  stored?.expiresAt ?? Date.now() + resolveAgentDiscoveryTtlMs(this.config.discoveryCache.ttlMs);
+              }
+            }
+          }
+          this.assertSupportedServer(capabilities);
           return capabilities;
         }
         if (!advertisesCapabilitiesTool) {
           throw new Error('unadvertised official A2A capability probe was not supported');
         }
-        // Tightened v2 fallback (issue #1189). When `result.success` is false
-        // but `result.data` is structurally v3-shaped, the agent is a v3 agent
-        // with a wire-shape bug — typically a single failed schema validation
-        // on `get_adcp_capabilities`. Falling back to v2 in this case masks
-        // the original bug behind cascading "AdCP schema data for version v2.5
-        // not found" errors that nobody can debug. Parse the data anyway,
-        // surface the validation failure loudly, and continue with the
-        // v3 capabilities the agent actually returned.
-        //
-        // Override `version`/`majorVersions` after parse: when the response
-        // doesn't carry an explicit `adcp.major_versions` block (one of the
-        // valid v3-shape signals), `parseCapabilitiesResponse` defaults
-        // majorVersions to [2] which would re-classify a known-v3 response
-        // as v2 downstream. The heuristic established v3-shape; honor that.
+        // Recover usable capabilities from a structurally v3-shaped response
+        // that failed validation (issue #1189). Explicit unsupported version
+        // declarations must still be rejected before logging recovery or caching.
         // CodeQL: deliberately omit `result.error` from the log (matches the
         // existing fallback log below) — it can carry transport-level agent
         // identifiers that flow through the clear-text-logging tracker.
         if (result.data && looksLikeV3Capabilities(result.data)) {
+          const capabilities = augmentCapabilitiesFromTools(parseCapabilitiesResponse(result.data), tools);
+          this.assertSupportedServer(capabilities);
           console.warn(
             `[AdCP] Agent "${this.agent.id}" returned a get_adcp_capabilities response that ` +
               `failed validation, but the response is structurally v3-shaped. Treating as v3 ` +
               `(the agent has a wire-shape bug — that's the thing to fix).`,
             { hasError: !!result.error, hasData: !!result.data }
           );
-          const parsed = parseCapabilitiesResponse(result.data);
-          const v3Capabilities: AdcpCapabilities = {
-            ...parsed,
-            version: 'v3',
-            majorVersions: parsed.majorVersions.includes(3) ? parsed.majorVersions : ([3] as AdcpMajorVersion[]),
-          };
-          const capabilities = augmentCapabilitiesFromTools(v3Capabilities, tools);
-          if (!usesScopedFetch) this.cachedCapabilities = capabilities;
-          this.maybeWarnV2Sunset(capabilities);
+          if (!usesScopedFetch && !superseded()) {
+            this.cachedCapabilities = capabilities;
+            this.capabilitiesFromSharedCache = false;
+            this.recordSharedEvidence(this.sharedDiscoveryKey(options));
+          }
+          this.assertSupportedServer(capabilities);
           return capabilities;
         }
         // The call returned non-success and the response wasn't even
@@ -8920,6 +10592,7 @@ export class SingleAgentClient {
         // advertises get_adcp_capabilities but can't actually serve it).
         if (
           error instanceof AuthenticationRequiredError ||
+          error instanceof VersionUnsupportedError ||
           error instanceof ConfigurationError ||
           error instanceof TaskTimeoutError ||
           isAbortOrTimeoutError(error)
@@ -8943,21 +10616,17 @@ export class SingleAgentClient {
       // signal that it's v3 even though we couldn't read details.
       if (advertisesCapabilitiesTool) {
         const capabilities = augmentCapabilitiesFromTools(buildSyntheticV3Capabilities(tools), tools);
-        if (!usesScopedFetch) this.cachedCapabilities = capabilities;
-        this.maybeWarnV2Sunset(capabilities);
+        if (!usesScopedFetch && !superseded()) {
+          this.cachedCapabilities = capabilities;
+          this.capabilitiesFromSharedCache = false;
+          this.recordSharedEvidence(this.sharedDiscoveryKey(options));
+        }
+        this.assertSupportedServer(capabilities);
         return capabilities;
       }
     }
 
-    // No get_adcp_capabilities tool — the agent is verifiably v2 (the tool
-    // is v3-only). Synthesize v2 capabilities from the tool list.
-    console.warn(
-      `[AdCP] Agent "${this.agent.id}" detected as v2 (no get_adcp_capabilities tool). ` +
-        `Tools: [${tools.map(t => t.name).join(', ')}]`
-    );
-    const capabilities = buildSyntheticCapabilities(tools);
-    if (!usesScopedFetch) this.cachedCapabilities = capabilities;
-    return capabilities;
+    throw new VersionUnsupportedError('get_adcp_capabilities', 'synthetic', 'v2', this.agent.agent_uri);
   }
 
   /**
@@ -9001,10 +10670,32 @@ export class SingleAgentClient {
     }
     if (current === this.capabilityEvidenceAuthMaterial) return;
     this.capabilityEvidenceAuthMaterial = current;
+    this.discoveryEpoch++;
+    this.runAgentInfo = undefined;
     this.cachedCapabilities = undefined;
     this.cachedToolSchemas = undefined;
     this.primedCapabilitiesExpiresAt = undefined;
     this.capabilityEvidenceScopeKey = randomUUID();
+    if (this.config._reuseConfiguredDiscovery?.()) {
+      this.discoveredEndpoint = undefined;
+      this.discoveredAgent = undefined;
+      this.canonicalBaseUrl = undefined;
+      this.discoveredMcpEra = undefined;
+    }
+  }
+
+  /** A comply() run owns its configured fetch; per-call transport changes still discover separately. */
+  private usesScopedDiscoveryTransport(options?: ReadRequestOptions): boolean {
+    const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
+    if (!this.config._reuseConfiguredDiscovery?.()) return transport?.trustedFetchFn !== undefined;
+    const configured = normalizeTransportOptions(this.config.transport);
+    return (
+      transport?.trustedFetchFn !== configured?.trustedFetchFn ||
+      transport?.allowPrivateIp !== configured?.allowPrivateIp ||
+      transport?.maxResponseBytes !== configured?.maxResponseBytes ||
+      transport?.requestTimeoutMs !== configured?.requestTimeoutMs ||
+      transport?.legacyCompat?.enabled !== configured?.legacyCompat?.enabled
+    );
   }
 
   /**
@@ -9042,7 +10733,7 @@ export class SingleAgentClient {
         Object.values(snapshot.toolSchemas).every(
           properties => typeof properties === 'object' && properties !== null && !Array.isArray(properties)
         ));
-    const configuredScopedFetch = normalizeTransportOptions(this.config.transport)?.trustedFetchFn !== undefined;
+    const configuredScopedFetch = this.usesScopedDiscoveryTransport();
     const hasToolEvidence = snapshot?.toolSchemas !== undefined || Array.isArray(capabilities?.discoveredTools);
     if (
       !matchesScope ||
@@ -9055,6 +10746,7 @@ export class SingleAgentClient {
       this.cachedCapabilities = undefined;
       this.cachedToolSchemas = undefined;
       this.primedCapabilitiesExpiresAt = undefined;
+      this.capabilitiesFromSharedCache = false;
       return false;
     }
 
@@ -9064,6 +10756,10 @@ export class SingleAgentClient {
       ].map(name => ({ name }));
       this.cachedCapabilities = augmentCapabilitiesFromTools(structuredClone(capabilities), observedTools);
       this.primedCapabilitiesExpiresAt = expiresAt;
+      // Application-owned evidence, not a shared-cache copy: a failed feature
+      // check must not discard it as if it were stale shared evidence.
+      this.capabilitiesFromSharedCache = false;
+      this.recordSharedEvidence(this.sharedDiscoveryKey(), true);
       this.cachedToolSchemas = snapshot.toolSchemas
         ? new Map(
             Object.entries(snapshot.toolSchemas).map(([tool, properties]) => [
@@ -9081,32 +10777,508 @@ export class SingleAgentClient {
     }
   }
 
-  /**
-   * Emit a one-time warning when the agent reports v2 capabilities.
-   *
-   * v2 went unsupported on 2026-04-20 (AdCP 3.0 GA — adcp#2220). We still
-   * execute v2 code paths (no behaviour change), but clients integrating
-   * against an unsupported agent should hear about it loudly.
-   *
-   * Synthetic capabilities (no `get_adcp_capabilities` tool available) don't
-   * trigger the warning — we don't actually know the agent's version, and
-   * shouting at legitimately-unversioned agents would be noise.
-   *
-   * Suppression: `process.env.ADCP_ALLOW_V2 === '1'`.
-   */
-  private maybeWarnV2Sunset(capabilities: AdcpCapabilities): void {
-    if (this._v2WarningFired) return;
-    if (capabilities.version === 'v3') return;
-    if (capabilities._synthetic) return;
-    if (process.env.ADCP_ALLOW_V2 === '1') return;
+  /** Which kind of credential this client presents (never its value), so an unauthenticated client cannot adopt an authenticated one's evidence. */
+  private discoveryCredentialKind(): string {
+    const agent = this.normalizedAgent;
+    if (agent.oauth_client_credentials) return 'oauth-client-credentials';
+    if (agent.oauth_tokens) return 'oauth';
+    if (agent.auth_token) return 'bearer';
+    const headerNames = Object.keys(agent.headers ?? {}).map(name => name.toLowerCase());
+    return headerNames.includes('authorization') || headerNames.includes('x-adcp-auth') ? 'header' : 'none';
+  }
 
-    this._v2WarningFired = true;
-    console.warn(
-      `[adcp] Warning: agent ${this.agent.agent_uri} reports v2 capabilities. ` +
-        `v2 went unsupported on 2026-04-20 (AdCP 3.0 GA). ` +
-        `Upgrade the agent to v3 or set ADCP_ALLOW_V2=1 to suppress this warning. ` +
-        `See https://github.com/adcontextprotocol/adcp/issues/2220`
+  /** Epoch of this client's evidence for the call's effective shared key; `undefined` without a shared cache. */
+  private discoveryEpochSnapshot(
+    options?: ReadRequestOptions
+  ): { local: number; shared: number; key: string } | undefined {
+    const key = this.sharedDiscoveryKey(options);
+    if (!key || !this.config.discoveryCache) {
+      return this.config._reuseConfiguredDiscovery?.() ? { local: this.discoveryEpoch, shared: 0, key: '' } : undefined;
+    }
+    return { local: this.discoveryEpoch, shared: this.sharedInvalidationEpoch(key), key };
+  }
+
+  private discoveryEpochIs(epoch: { local: number; shared: number; key: string }): boolean {
+    return (
+      epoch.local === this.discoveryEpoch && (!epoch.key || epoch.shared === this.sharedInvalidationEpoch(epoch.key))
     );
+  }
+
+  /** The latest invalidation that applies to `key`: its own, combined with the cache's floor of forgotten ones. */
+  private sharedInvalidationRecord(key: string): SharedInvalidation | undefined {
+    const cache = this.config.discoveryCache!.cache;
+    const record = sharedInvalidations.get(cache)?.get(key);
+    const floor = sharedInvalidationFloors.get(cache);
+    if (!floor) return record;
+    if (!record) return floor;
+    return { epoch: Math.max(record.epoch, floor.epoch), at: Math.max(record.at, floor.at) };
+  }
+
+  private sharedInvalidationEpoch(key: string): number {
+    return this.sharedInvalidationRecord(key)?.epoch ?? 0;
+  }
+
+  private bumpSharedInvalidationEpoch(key: string): void {
+    const cache = this.config.discoveryCache!.cache;
+    let records = sharedInvalidations.get(cache);
+    if (!records) {
+      records = new Map();
+      sharedInvalidations.set(cache, records);
+    }
+    const now = Date.now();
+    // Re-inserting keeps the map ordered oldest-first for pruning.
+    records.delete(key);
+    records.set(key, { epoch: ++sharedInvalidationCounter, at: now });
+    for (const [oldKey, record] of records) {
+      if (records.size <= MAX_SHARED_INVALIDATION_RECORDS && record.at + MAX_AGENT_DISCOVERY_TTL_MS > now) break;
+      const floor = sharedInvalidationFloors.get(cache);
+      sharedInvalidationFloors.set(cache, {
+        epoch: Math.max(record.epoch, floor?.epoch ?? 0),
+        at: Math.max(record.at, floor?.at ?? 0),
+      });
+      records.delete(oldKey);
+    }
+  }
+
+  /**
+   * Remember which key the local capability evidence belongs to and, unless it
+   * is application-owned (`primeCapabilities`), the shared invalidation epoch it
+   * was obtained under. Application-owned evidence keeps its caller-declared
+   * freshness and is not discarded by another instance's invalidation.
+   */
+  private recordSharedEvidence(key: string | undefined, applicationOwned = false): void {
+    this.sharedEvidenceKey = key;
+    this.sharedEvidenceEpoch =
+      key && this.config.discoveryCache && !applicationOwned ? this.sharedInvalidationEpoch(key) : undefined;
+  }
+
+  /** Non-secret fingerprint of the request-signing identity, so keys never mix signing identities. */
+  private discoverySigningFingerprint(): unknown {
+    const signing = this.normalizedAgent.request_signing;
+    if (!signing) return undefined;
+    const provider = signing.kind === 'provider' ? signing.provider : undefined;
+    return {
+      kind: signing.kind ?? 'inline',
+      agentUrl: signing.agent_url ?? null,
+      kid: (provider ? provider.keyid : (signing as { kid?: string }).kid) ?? null,
+      alg: (provider ? provider.algorithm : (signing as { alg?: string }).alg) ?? null,
+      alwaysSign: signing.always_sign ?? null,
+      signSupported: signing.sign_supported ?? null,
+    };
+  }
+
+  /**
+   * Shared-discovery key for the effective transport policy of this call, or
+   * `undefined` when sharing is off or the call uses a scoped `trustedFetchFn`
+   * (whose network boundary is per-call, so its evidence is never shared).
+   */
+  private sharedDiscoveryKey(options?: ReadRequestOptions): string | undefined {
+    const config = this.config.discoveryCache;
+    if (!config) return undefined;
+    const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
+    if (transport?.trustedFetchFn !== undefined) return undefined;
+    return agentDiscoveryCacheKey({
+      protocol: this.normalizedAgent.protocol,
+      agentUri: this.normalizedAgent.agent_uri,
+      adcpVersion: this.resolvedAdcpVersion,
+      wireAdcpVersion: this.config.wireAdcpVersion,
+      authIdentity: config.authIdentity,
+      credentialKind: this.discoveryCredentialKind(),
+      headers: withAmbientIdentityHeaders(this.normalizedAgent.headers),
+      signing: this.discoverySigningFingerprint(),
+      allowPrivateIp: transport?.allowPrivateIp,
+      maxResponseBytes: transport?.maxResponseBytes,
+    });
+  }
+
+  /**
+   * Run a shared-cache operation under the caller's signal and a fixed backend
+   * deadline, so an unresponsive store can neither make a call uncancellable nor
+   * stall it beyond {@link SHARED_DISCOVERY_CACHE_TIMEOUT_MS}. Rejects on the
+   * caller's abort or when the backend fails or times out; callers decide which
+   * of those is a miss.
+   */
+  private boundedCacheOperation<T>(operation: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+    return withAbortSignal([signal], SHARED_DISCOVERY_CACHE_TIMEOUT_MS, () => Promise.resolve().then(operation));
+  }
+
+  /**
+   * Run one backend mutation (or read-modify-write) for a shared key strictly
+   * after every earlier mutation of that key in this process has actually
+   * settled. The caller's wait is still bounded: an unresponsive backend makes
+   * the caller see a miss, but later mutations stay queued behind the hung
+   * operation, so an old callback can never land after a newer one.
+   *
+   * The queue is bounded. A `droppable` mutation (a write or cleanup) is
+   * abandoned when its caller stopped waiting before it started, and is refused
+   * when the key's queue is full; refusal is a failed write, never a call
+   * failure. A `delete` is never refused for a known key: while one is queued
+   * and not yet started, a newer invalidation joins it. Only for a new key beyond
+   * the key cap is a delete refused — the invalidation tombstone still hides the
+   * entry from this process's readers.
+   */
+  private serializedCacheMutation<T>(
+    key: string,
+    operation: () => T | Promise<T>,
+    signal?: AbortSignal,
+    kind: 'delete' | 'droppable' = 'droppable'
+  ): Promise<T> {
+    const cache = this.config.discoveryCache!.cache;
+    let chains = sharedMutationChains.get(cache);
+    if (!chains) {
+      chains = new Map();
+      sharedMutationChains.set(cache, chains);
+    }
+    let queue = chains.get(key);
+    if (!queue && chains.size >= MAX_SHARED_MUTATION_KEYS) {
+      return Promise.reject(new Error('Shared discovery cache mutation queue is full.'));
+    }
+    if (kind === 'delete' && queue?.waitingDelete && !queue.waitingDelete.started) {
+      const joined = queue.waitingDelete.promise as Promise<T>;
+      return this.boundedCacheOperation(() => joined, signal);
+    }
+    if (kind === 'droppable' && queue && queue.pending >= MAX_PENDING_SHARED_MUTATIONS_PER_KEY) {
+      return Promise.reject(new Error('Shared discovery cache mutation queue is full.'));
+    }
+    if (!queue) {
+      queue = { tail: Promise.resolve(), pending: 0 };
+      chains.set(key, queue);
+    }
+    const current = queue;
+    const state = { abandoned: false, started: false };
+    const run = current.tail.then(() => {
+      if (kind === 'droppable' && state.abandoned) throw new Error('Shared discovery cache mutation abandoned.');
+      state.started = true;
+      if (current.waitingDelete?.promise === run) current.waitingDelete.started = true;
+      return operation();
+    });
+    current.pending++;
+    if (kind === 'delete') current.waitingDelete = { promise: run, started: false };
+    const tail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    current.tail = tail;
+    void tail.then(() => {
+      current.pending--;
+      if (current.waitingDelete?.promise === run) current.waitingDelete = undefined;
+      if (current.pending === 0) {
+        if (chains.get(key) === current) chains.delete(key);
+        if (chains.size === 0 && sharedMutationChains.get(cache) === chains) sharedMutationChains.delete(cache);
+      }
+    });
+    return this.boundedCacheOperation(() => run, signal).catch(error => {
+      state.abandoned = true;
+      throw error;
+    });
+  }
+
+  /** Is this stored entry structurally sound and not expired (before any caller-TTL cap)? */
+  private isLiveSharedEntry(entry: AgentDiscoveryEntry, now: number): boolean {
+    return (
+      Number.isFinite(entry.expiresAt) &&
+      Number.isFinite(entry.observedAt) &&
+      entry.expiresAt >= entry.observedAt &&
+      entry.expiresAt > now
+    );
+  }
+
+  /**
+   * Read a fresh, structurally valid shared entry. A backend failure or
+   * timeout is a miss, never a call failure; the caller's own abort propagates.
+   */
+  private async readSharedDiscovery(options?: ReadRequestOptions): Promise<AgentDiscoveryEntry | undefined> {
+    const key = this.sharedDiscoveryKey(options);
+    if (!key) return undefined;
+    const cache = this.config.discoveryCache!.cache;
+    const epoch = this.discoveryEpochSnapshot(options);
+    try {
+      const entry = await this.boundedCacheOperation(() => cache.get(key), options?.signal);
+      // A read that was in flight when the evidence was invalidated is a miss.
+      if (epoch && !this.discoveryEpochIs(epoch)) return undefined;
+      if (!entry) return undefined;
+      // An entry observed before the latest invalidation here is stale evidence
+      // the backend has not (yet) dropped: its delete may have failed or still be queued.
+      const invalidation = this.sharedInvalidationRecord(key);
+      if (invalidation && entry.observedAt <= invalidation.at) return undefined;
+      const now = Date.now();
+      if (!this.isLiveSharedEntry(entry, now)) {
+        // Remove it only if it is still the expired entry when the mutation runs:
+        // a fresh seed or write may have replaced it meanwhile.
+        await this.serializedCacheMutation(
+          key,
+          async () => {
+            const current = await cache.get(key);
+            if (current && !this.isLiveSharedEntry(current, Date.now())) await cache.delete(key);
+          },
+          options?.signal
+        );
+        return undefined;
+      }
+      // Hosts sharing a backend disagree about the time by a little; an entry
+      // observed further in the future than that is not trusted, but is not ours to delete.
+      if (entry.observedAt > now + SHARED_DISCOVERY_CLOCK_SKEW_MS) return undefined;
+      // Another client may have stored this entry under a longer TTL; this
+      // caller never trusts evidence older than its own configured window. The
+      // stored entry is left for callers whose TTL still admits it.
+      const callerExpiresAt = entry.observedAt + resolveAgentDiscoveryTtlMs(this.config.discoveryCache!.ttlMs);
+      if (!(callerExpiresAt > now)) return undefined;
+      return callerExpiresAt < entry.expiresAt ? { ...entry, expiresAt: callerExpiresAt } : entry;
+    } catch {
+      throwIfAborted(options?.signal);
+      return undefined;
+    }
+  }
+
+  /**
+   * Merge fresh evidence into the shared entry; the merged entry never outlives
+   * its oldest part. Returns the stored entry, or `undefined` when it was not
+   * stored: automatic writes
+   * ignore a `false` (a failed write only costs a later rediscovery), while
+   * {@link primeDiscoveryCache} reports it.
+   */
+  private async writeSharedDiscovery(
+    options: ReadRequestOptions | undefined,
+    patch: Pick<AgentDiscoveryEntry, 'endpoint' | 'capabilities' | 'toolSchemas' | 'toolInputSchemas'>,
+    replace = false,
+    epoch = this.discoveryEpochSnapshot(options)
+  ): Promise<AgentDiscoveryEntry | undefined> {
+    const key = this.sharedDiscoveryKey(options);
+    if (!key) return undefined;
+    // URL queries and fragments can carry credentials. Keep such endpoints
+    // local, while still allowing their capabilities and schemas to be shared.
+    if (patch.endpoint && !this.isDiscoverableEndpoint(patch.endpoint.agentUri)) {
+      patch = {
+        capabilities: patch.capabilities,
+        toolSchemas: patch.toolSchemas,
+        toolInputSchemas: patch.toolInputSchemas,
+      };
+      if (!patch.capabilities && !patch.toolSchemas) return undefined;
+    }
+    const config = this.config.discoveryCache!;
+    // An invalidation since `epoch` was taken wins over this writer. Staleness is
+    // judged when the mutation reaches the front of the key's queue and again
+    // after its read; a set already in flight when an invalidation arrives is
+    // followed (never preceded) by that invalidation's delete, so it cannot
+    // outlive it and no cleanup that could remove newer evidence is needed.
+    const stale = () => epoch !== undefined && !this.discoveryEpochIs(epoch);
+    try {
+      return await this.serializedCacheMutation(
+        key,
+        async () => {
+          if (stale()) return undefined;
+          // Fresh evidence is stamped strictly after the latest invalidation here,
+          // so the tombstone can tell it from anything observed before.
+          const invalidation = this.sharedInvalidationRecord(key);
+          const now = Math.max(Date.now(), (invalidation?.at ?? 0) + 1);
+          let existing: AgentDiscoveryEntry | undefined;
+          if (!replace) {
+            const raw = await config.cache.get(key);
+            // Nothing observed before the latest invalidation here is merged back
+            // in: not the entry, and not an endpoint carried inside a newer one.
+            if (
+              raw &&
+              this.isLiveSharedEntry(raw, now) &&
+              raw.observedAt <= now + SHARED_DISCOVERY_CLOCK_SKEW_MS &&
+              !(invalidation && raw.observedAt <= invalidation.at)
+            ) {
+              const endpointObservedAt = raw.endpoint?.observedAt ?? raw.observedAt;
+              existing = { ...raw };
+              if (
+                existing.endpoint &&
+                (!this.isDiscoverableEndpoint(existing.endpoint.agentUri) ||
+                  (invalidation && endpointObservedAt <= invalidation.at))
+              )
+                delete existing.endpoint;
+            }
+            if (stale()) return undefined;
+          }
+          // Fresh capabilities restart the entry's clock; each endpoint keeps its own
+          // observation time so merging never extends how long it may be trusted.
+          const restartsClock = !existing || patch.capabilities !== undefined;
+          const ttl = resolveAgentDiscoveryTtlMs(config.ttlMs);
+          const entry: AgentDiscoveryEntry = {
+            ...(existing?.capabilities && { capabilities: existing.capabilities }),
+            ...(existing?.toolSchemas && { toolSchemas: existing.toolSchemas }),
+            // Endpoint-only writes retain schema documents. Fresh tool evidence
+            // replaces them together, including clearing older full documents
+            // when the caller supplies only a property map.
+            ...(patch.toolSchemas === undefined &&
+              existing?.toolInputSchemas && {
+                toolInputSchemas: existing.toolInputSchemas,
+              }),
+            ...(existing?.endpoint && { endpoint: existing.endpoint }),
+            ...(patch.endpoint && { endpoint: { ...patch.endpoint, observedAt: now } }),
+            ...(patch.capabilities && { capabilities: patch.capabilities }),
+            ...(patch.toolSchemas && { toolSchemas: patch.toolSchemas }),
+            ...(patch.toolInputSchemas && { toolInputSchemas: patch.toolInputSchemas }),
+            observedAt: restartsClock || !existing ? now : Math.min(existing.observedAt, now),
+            expiresAt: restartsClock || !existing ? now + ttl : Math.min(existing.expiresAt, now + ttl),
+          };
+          await config.cache.set(key, structuredClone(entry));
+          return stale() ? undefined : entry;
+        },
+        options?.signal
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Is `agentUri` a credential-free URL on the configured agent's origin (all discovery ever tries)? */
+  private isDiscoverableEndpoint(agentUri: unknown): agentUri is string {
+    if (typeof agentUri !== 'string') return false;
+    try {
+      const candidate = new URL(agentUri);
+      return (
+        candidate.username === '' &&
+        candidate.password === '' &&
+        candidate.search === '' &&
+        candidate.hash === '' &&
+        candidate.origin === new URL(this.normalizedAgent.agent_uri).origin
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** Adopt a previously discovered MCP endpoint instead of re-probing the agent. */
+  private async adoptSharedEndpoint(options?: ReadRequestOptions): Promise<void> {
+    const readEpoch = this.discoveryEpochSnapshot(options);
+    const entry = await this.readSharedDiscovery(options);
+    if (readEpoch && !this.discoveryEpochIs(readEpoch)) return;
+    const endpoint = entry?.endpoint;
+    // A cached endpoint that is not a path variant of the configured URL is not
+    // something this client's discovery could have found.
+    if (!entry || !endpoint || !this.isDiscoverableEndpoint(endpoint.agentUri)) return;
+    // The endpoint is only as fresh as its own observation, under this caller's TTL.
+    const observedAt = Number.isFinite(endpoint.observedAt) ? (endpoint.observedAt as number) : entry.observedAt;
+    const sharedKey = this.sharedDiscoveryKey(options);
+    const tombstone = sharedKey ? this.sharedInvalidationRecord(sharedKey) : undefined;
+    if (tombstone && observedAt <= tombstone.at) return;
+    const expiresAt = Math.min(
+      entry.expiresAt,
+      observedAt + resolveAgentDiscoveryTtlMs(this.config.discoveryCache!.ttlMs)
+    );
+    if (!(expiresAt > Date.now()) || observedAt > Date.now() + SHARED_DISCOVERY_CLOCK_SKEW_MS) return;
+    this.discoveredEndpoint = endpoint.agentUri;
+    this.discoveredEndpointKey = this.sharedDiscoveryKey(options);
+    this.discoveredEndpointEpoch = this.discoveredEndpointKey
+      ? this.sharedInvalidationEpoch(this.discoveredEndpointKey)
+      : undefined;
+    this.discoveredEndpointExpiresAt = expiresAt;
+    this.canonicalBaseUrl = this.computeBaseUrl(endpoint.agentUri);
+    if (endpoint.mcpEra === 'legacy' || endpoint.mcpEra === 'modern') {
+      this.discoveredMcpEra = endpoint.mcpEra;
+      // The era verdict is as old as the endpoint observation, not this adoption.
+      this.discoveredMcpEraAt = observedAt;
+    }
+  }
+
+  /**
+   * Drop discovery evidence for this client: its in-memory capability and
+   * tool-schema caches, the discovered endpoint, and the shared
+   * `discoveryCache` entry (when configured). The next call rediscovers.
+   *
+   * Call this when you learn the seller changed (a deploy, a version bump, a
+   * capability-dependent error you observed). The SDK also invalidates by
+   * itself when a feature check fails against shared evidence, and when a
+   * seller answers with a version or capability error.
+   */
+  async invalidateDiscoveryCache(options?: Pick<TaskOptions, 'transport'>): Promise<void> {
+    this.runAgentInfo = undefined;
+    if (this.config._reuseConfiguredDiscovery?.()) this.canonicalBaseUrl = undefined;
+    this.cachedCapabilities = undefined;
+    this.cachedToolSchemas = undefined;
+    this.primedCapabilitiesExpiresAt = undefined;
+    this.capabilitiesFromSharedCache = false;
+    this.capabilityEvidenceScopeKey = randomUUID();
+    this.discoveryEpoch++;
+    if (this.normalizedAgent._needsDiscovery) {
+      this.discoveredEndpoint = undefined;
+      this.discoveredAgent = undefined;
+      this.discoveredMcpEra = undefined;
+      this.discoveredEndpointKey = undefined;
+      this.discoveredEndpointEpoch = undefined;
+      this.discoveredEndpointExpiresAt = undefined;
+    }
+    const key = this.sharedDiscoveryKey(options);
+    if (!key) return;
+    this.bumpSharedInvalidationEpoch(key);
+    try {
+      const cache = this.config.discoveryCache!.cache;
+      // Queued behind any write already in flight, ahead of any later one.
+      await this.serializedCacheMutation(key, () => cache.delete(key), undefined, 'delete');
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /**
+   * Pre-seed the shared `discoveryCache` with capability evidence the caller
+   * already holds (for example from a registry sync), so no client sharing
+   * this identity probes the seller within the TTL. Unlike
+   * {@link primeCapabilities} the seeded evidence outlives this instance.
+   *
+   * Returns `true` only once the backing cache has accepted the entry. Returns
+   * `false` — having seeded nothing — when sharing is not configured, the
+   * client uses a scoped `trustedFetchFn`, or the evidence is synthetic,
+   * malformed or not cloneable. When the cache rejects the write or does not
+   * answer within the backend deadline, the result is also `false`, but the
+   * outcome is indeterminate: a write already handed to the backend may still
+   * land, whereas one still queued behind earlier operations is dropped. Treat
+   * `false` as "not confirmed", and seed again (or invalidate) rather than
+   * assuming the cache is empty. Seed `endpoint` as well
+   * to skip the endpoint probe on the first call; without it that probe still
+   * runs once per cold client.
+   */
+  async primeDiscoveryCache(seed: AgentDiscoverySeed): Promise<boolean> {
+    const key = this.sharedDiscoveryKey();
+    const capabilities = seed?.capabilities;
+    if (!key || !isCapabilityEvidence(capabilities) || capabilities._synthetic) return false;
+    const toolSchemas = seed.toolSchemas;
+    if (toolSchemas !== undefined && !isToolSchemaRecord(toolSchemas)) {
+      return false;
+    }
+    if (toolSchemas === undefined && !Array.isArray(capabilities.discoveredTools)) return false;
+    if (seed.endpoint !== undefined && !this.isDiscoverableEndpoint(seed.endpoint.agentUri)) return false;
+    try {
+      const stored = await this.writeSharedDiscovery(
+        undefined,
+        {
+          capabilities: structuredClone(capabilities),
+          ...(toolSchemas && { toolSchemas: structuredClone(toolSchemas) as Record<string, Record<string, unknown>> }),
+          ...(seed.endpoint && {
+            endpoint: {
+              agentUri: seed.endpoint.agentUri,
+              ...(seed.endpoint.mcpEra && { mcpEra: seed.endpoint.mcpEra }),
+            },
+          }),
+        },
+        true
+      );
+      return stored !== undefined;
+    } catch {
+      // Evidence that cannot be cloned is not evidence.
+      return false;
+    }
+  }
+
+  /** Drop shared evidence when a seller answers with an error that says our cached view of it is stale. */
+  private async invalidateDiscoveryOnCapabilityError(
+    code: string | undefined,
+    options?: Pick<TaskOptions, 'transport'>
+  ): Promise<void> {
+    if (!this.config.discoveryCache || !code || !CAPABILITY_STALE_ERROR_CODES.has(code)) return;
+    // The entry that served this call lives under its effective (per-call) transport policy.
+    await this.invalidateDiscoveryCache(options);
+  }
+
+  /** Reject retired protocol generations before caching or dispatching. */
+  private assertSupportedServer(capabilities: AdcpCapabilities): void {
+    if (capabilities.version !== 'v3' || !capabilities.majorVersions.includes(3)) {
+      throw new VersionUnsupportedError('get_adcp_capabilities', 'version', capabilities.version, this.agent.agent_uri);
+    }
   }
 
   /**
@@ -9133,28 +11305,6 @@ export class SingleAgentClient {
   }
 
   /**
-   * Warn once per client when `requireSupportedMajor` routes a synthetic-v2
-   * seller through the v2 adapter — the agent did not expose
-   * `get_adcp_capabilities`, so the version was inferred from `tools/list`.
-   * A compliant v3 seller would declare itself; absence of a declaration is
-   * read as v2. Idempotency-TTL guarantees are unknown for these sellers,
-   * so BYOK retry callers should treat them as such.
-   *
-   * One-shot via `_syntheticV2WarningFired` (matches `maybeWarnV2Sunset`
-   * cadence).
-   */
-  private maybeWarnSyntheticV2(): void {
-    if (this._syntheticV2WarningFired) return;
-    this._syntheticV2WarningFired = true;
-    console.warn(
-      `[adcp] Warning: agent ${this.agent.agent_uri} does not expose get_adcp_capabilities. ` +
-        `Routing as v2 (synthetic) — idempotency-TTL guarantee is unknown. ` +
-        `Ask the agent operator to declare v3 via get_adcp_capabilities if v3 routing is intended. ` +
-        `Branch on client.isSyntheticV2() to tighten retry policies for these sellers.`
-    );
-  }
-
-  /**
    * Detect server AdCP version
    *
    * @returns 'v2' or 'v3' based on server capabilities
@@ -9163,38 +11313,16 @@ export class SingleAgentClient {
     const capabilities = await this.getCapabilities(options);
     const discoveryContext = (options as InternalReadRequestOptions | undefined)?.[CAPABILITY_DISCOVERY_CONTEXT];
     if (discoveryContext) discoveryContext.capabilities = capabilities;
+    this.assertSupportedServer(capabilities);
     return capabilities.version;
-  }
-
-  /**
-   * Whether the seller's capabilities are synthesized from `tools/list`
-   * with no authoritative `get_adcp_capabilities` response — i.e. the
-   * dispatcher routes through the v2 adapter and idempotency-TTL is
-   * unknown. Use this to gate retry behavior for sellers whose retry
-   * safety can't be derived from declared capabilities (lower attempt
-   * caps, longer backoff, or fall back to natural-key recovery).
-   *
-   * Returns `false` for declared v2 sellers, declared v3 sellers, and
-   * synthetic v3 sellers (which advertise the v3 discovery tool even
-   * when the call itself failed).
-   *
-   * Caveat for synthetic v3: the predicate returns `false`, but TTL is
-   * still unknown for those sellers — `getIdempotencyReplayTtlSeconds()`
-   * throws until the agent's capabilities endpoint is fixed (issue
-   * #1217). Retry-policy consumers that need a complete "TTL unknown"
-   * gate should additionally check `getCapabilities()._synthetic`.
-   */
-  async isSyntheticV2(): Promise<boolean> {
-    const capabilities = await this.getCapabilities();
-    return capabilities._synthetic === true && capabilities.version === 'v2';
   }
 
   /**
    * Check if server supports a specific AdCP major version
    */
-  async supportsVersion(version: 2 | 3): Promise<boolean> {
+  async supportsVersion(version: 3): Promise<boolean> {
     const capabilities = await this.getCapabilities();
-    return capabilities.majorVersions.includes(version);
+    return version === 3 && capabilities.majorVersions.includes(3);
   }
 
   /**
@@ -9206,8 +11334,7 @@ export class SingleAgentClient {
    *
    * Fails closed when the seller is v3 but does not declare the field: the
    * spec makes the declaration REQUIRED, and silently defaulting to 24h
-   * would mislead buyers about retry safety. Callers on v2 servers get
-   * `undefined` instead of a throw — v2 pre-dates the idempotency envelope.
+   * would mislead buyers about retry safety.
    */
   async getIdempotencyReplayTtlSeconds(): Promise<number | undefined> {
     const capabilities = await this.getCapabilities();
@@ -9216,7 +11343,6 @@ export class SingleAgentClient {
       assertValidIdempotencyReplayTtlSeconds(capabilities.idempotency.replayTtlSeconds);
       return capabilities.idempotency.replayTtlSeconds;
     }
-    if (capabilities.version !== 'v3') return undefined;
     throw new ConfigurationError(
       `Agent "${this.agent.id}" is v3 but does not declare adcp.idempotency.replay_ttl_seconds. ` +
         `The spec requires this for v3 sellers — treating the agent as non-compliant rather than ` +
@@ -9249,8 +11375,27 @@ export class SingleAgentClient {
    * with an actionable error message.
    */
   async require(...features: FeatureName[]): Promise<void> {
-    const capabilities = await this.getCapabilities();
-    const missing = features.filter(f => !resolveFeature(capabilities, f));
+    await this.assertFeaturesSupported(features);
+  }
+
+  /**
+   * Throw {@link FeatureUnsupportedError} when a feature is missing, deciding on
+   * live capabilities when the refusal would rest on shared evidence that may
+   * predate a seller upgrade.
+   */
+  private async assertFeaturesSupported(
+    requiredFeatures: readonly FeatureName[],
+    options?: ReadRequestOptions
+  ): Promise<void> {
+    let capabilities = await this.getCapabilities(options);
+    let missing = requiredFeatures.filter(f => !resolveFeature(capabilities, f));
+    if (missing.length > 0 && this.capabilitiesFromSharedCache) {
+      // Shared evidence may predate a seller upgrade: before refusing the
+      // call, drop it and decide on live capabilities.
+      await this.invalidateDiscoveryCache(options);
+      capabilities = await this.getCapabilities(options);
+      missing = requiredFeatures.filter(f => !resolveFeature(capabilities, f));
+    }
     if (missing.length > 0) {
       throw new FeatureUnsupportedError(missing, listDeclaredFeatures(capabilities), this.agent.agent_uri);
     }
@@ -9264,7 +11409,10 @@ export class SingleAgentClient {
     this.cachedCapabilities = undefined;
     this.cachedToolSchemas = undefined;
     this.primedCapabilitiesExpiresAt = undefined;
+    this.capabilitiesFromSharedCache = false;
     this.capabilityEvidenceScopeKey = randomUUID();
+    this.discoveryEpoch++;
+    if (this.config.discoveryCache) await this.invalidateDiscoveryCache();
     return this.getCapabilities();
   }
 
@@ -9280,11 +11428,7 @@ export class SingleAgentClient {
     const requiredFeatures = TASK_FEATURE_MAP[taskName];
     if (!requiredFeatures || requiredFeatures.length === 0) return;
 
-    const capabilities = await this.getCapabilities(options);
-    const missing = requiredFeatures.filter(f => !resolveFeature(capabilities, f));
-    if (missing.length > 0) {
-      throw new FeatureUnsupportedError(missing, listDeclaredFeatures(capabilities), this.agent.agent_uri);
-    }
+    await this.assertFeaturesSupported(requiredFeatures, options);
   }
 
   /**
@@ -9297,10 +11441,18 @@ export class SingleAgentClient {
   private assertRequestSupportedByConfiguredVersion(
     taskName: string,
     params: unknown,
-    _options?: TaskOptions,
+    options?: TaskOptions,
     canonicalCreativeInvocation = false
   ): void {
     const configuredVersion = this.config.wireAdcpVersion ?? this.resolvedAdcpVersion;
+    const accountWireVersion = options?.wireAdcpVersion ?? configuredVersion;
+    if (isPre32AdcpVersion(this.resolvedAdcpVersion) || isPre32AdcpVersion(accountWireVersion)) {
+      this.assertLegacySyncAccountsIdentity(
+        taskName,
+        params,
+        isPre32AdcpVersion(this.resolvedAdcpVersion) ? this.resolvedAdcpVersion : accountWireVersion
+      );
+    }
     const beta6Issue = beta6ReportingRequestIssue(taskName, params);
     if (beta6Issue && !isAdcpVersionAtLeast(configuredVersion, '3.2.0-beta.6')) {
       this.throwBeta6ReportingUnsupported(taskName, beta6Issue, configuredVersion);
@@ -9402,6 +11554,27 @@ export class SingleAgentClient {
     canonicalCreativeInvocation = false,
     serverVersion?: 'v2' | 'v3'
   ): void {
+    if (taskName === 'sync_accounts') {
+      const advertisedVersions = capabilities?.supportedVersions ?? [];
+      const servedVersion = capabilities?.servedVersion ?? capabilities?._raw?.adcp_version;
+      // The selected release takes precedence over the seller's broader
+      // supported set. A build version is never evidence of wire support.
+      const supports32 =
+        serverVersion !== 'v2' &&
+        (typeof servedVersion === 'string'
+          ? isAdcpVersionAtLeast(servedVersion, '3.2.0-0')
+          : advertisedVersions.some(version => isAdcpVersionAtLeast(version, '3.2.0-0')));
+      if (!supports32) {
+        this.assertLegacySyncAccountsIdentity(
+          taskName,
+          params,
+          typeof servedVersion === 'string'
+            ? servedVersion
+            : advertisedVersions.join(', ') || serverVersion || 'unknown',
+          'the target seller has not negotiated AdCP 3.2 support'
+        );
+      }
+    }
     const beta6Issue = beta6ReportingRequestIssue(taskName, params);
     if (beta6Issue) {
       const advertisedVersions = capabilities?.supportedVersions ?? [];
@@ -9469,6 +11642,57 @@ export class SingleAgentClient {
         incompatibility: 'the target seller does not advertise AdCP 3.1 support',
         suffix: 'Retry with a meaningful signal_spec, or probe signals.discovery_modes before issuing wholesale calls.',
       });
+    }
+  }
+
+  /** Account-key fields must never be silently ignored by legacy sellers. */
+  private assertLegacySyncAccountsIdentity(
+    taskName: string,
+    params: unknown,
+    currentVersion: string,
+    incompatibility = `this client is pinned to ${currentVersion}`
+  ): void {
+    if (taskName !== 'sync_accounts' || !params || typeof params !== 'object') return;
+    const accounts = (params as Record<string, unknown>).accounts;
+    if (!Array.isArray(accounts)) return;
+    for (const [index, entry] of accounts.entries()) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      // Settings updates can address a natural key under `account`. Inspect
+      // both locations even on mixed-mode rows: legacy sellers may ignore
+      // `account` and provision from the top-level fields instead.
+      for (const [key, path] of [
+        [entry, `accounts[${index}]`],
+        [entry.account, `accounts[${index}].account`],
+      ] as const) {
+        if (!key || typeof key !== 'object' || Array.isArray(key)) continue;
+        const brand = key.brand;
+        const identityField = ['operator_unit', 'currency', 'timezone'].find(
+          field => Object.hasOwn(key, field) && key[field] !== undefined
+        );
+        const field = identityField
+          ? `${path}.${identityField}`
+          : brand && typeof brand === 'object' && Object.hasOwn(brand, 'countries') && brand.countries !== undefined
+            ? `${path}.brand.countries`
+            : undefined;
+        if (!field) continue;
+        const suggestion =
+          'Use AdCP 3.2 or later on both the client (adcpVersion and wireAdcpVersion) and seller, ' +
+          'or explicitly project to a legacy account key by removing operator_unit, currency, timezone, ' +
+          'and brand.countries. Distinct keys may then share a seller account.';
+        throw new ProtocolFeatureUnsupportedError([`${taskName}.${field}`], [], this.agent.agent_uri, {
+          message: `${taskName} ${field} requires AdCP 3.2 or later; ${incompatibility}. No request was sent. ${suggestion}`,
+          field,
+          suggestion,
+          details: {
+            feature: `${taskName}.${field}`,
+            required_version: '3.2',
+            capability_path: 'adcp.supported_versions',
+            current_version: currentVersion,
+            tool: taskName,
+            field,
+          },
+        });
+      }
     }
   }
 
@@ -9550,35 +11774,17 @@ export class SingleAgentClient {
    *   2. `capabilities.idempotency.replayTtlSeconds` present (spec-required
    *      for real major-3+ sellers)
    *
-   * Sellers whose capabilities are synthesized from `tools/list` (no
-   * authoritative `get_adcp_capabilities` response) are treated as v2: a
-   * compliant v3 seller would declare itself, so absence of a declaration
-   * is taken as evidence of v2. The dispatcher routes the request through
-   * the v2 wire-shape adapter. A one-time warning surfaces the routing
-   * decision so adopters can audit it; retry-safety (idempotency TTL) is
-   * unknown for these sellers and BYOK callers should treat them as such.
-   *
-   * Per-client `allowV2: true` or, when that's undefined,
-   * `ADCP_ALLOW_V2=1` in the environment bypasses the guard entirely.
+   * Synthetic v3 evidence is accepted only when the agent advertises discovery.
+   * Agents without discovery and AdCP 2-only agents are rejected.
    *
    * Throws `VersionUnsupportedError` with the specific reason on failure.
    */
   async requireSupportedMajor(taskType: string = 'request', options?: ReadRequestOptions): Promise<void> {
-    if (this.isV2Allowed()) return;
     const capabilities = await this.getCapabilities(options);
 
-    // Synthetic capabilities — no authoritative `get_adcp_capabilities`
-    // response, so the version + idempotency-TTL fields couldn't be read.
-    // Route as the synthesized version (v2 when the v3 discovery tool is
-    // absent from tools/list, v3 when the tool is present but the call
-    // failed). Emit a one-time per-client warning so adopters can audit
-    // the routing decision and the skipped TTL guarantee.
+    this.assertSupportedServer(capabilities);
     if (capabilities._synthetic) {
-      if (capabilities.version === 'v3') {
-        this.maybeWarnSyntheticV3();
-      } else {
-        this.maybeWarnSyntheticV2();
-      }
+      this.maybeWarnSyntheticV3();
       return;
     }
     // Prefer release-precision matching when the seller advertises
@@ -9592,11 +11798,8 @@ export class SingleAgentClient {
         throw new VersionUnsupportedError(taskType, 'version', capabilities.version, this.agent.agent_uri);
       }
     } else {
-      // `AdcpMajorVersion` is currently `2 | 3` — cast through `number[]` because
-      // the parsed major is a plain number; a future SDK release that supports
-      // major 4 will widen the union.
       const expectedMajor = parseAdcpMajorVersion(this.resolvedAdcpVersion);
-      const advertisedMajors = capabilities.majorVersions as readonly number[];
+      const advertisedMajors = capabilities.majorVersions;
       if (!Number.isFinite(expectedMajor) || !advertisedMajors.includes(expectedMajor)) {
         throw new VersionUnsupportedError(taskType, 'version', capabilities.version, this.agent.agent_uri);
       }
@@ -9617,11 +11820,6 @@ export class SingleAgentClient {
    */
   async requireV3(taskType: string = 'request'): Promise<void> {
     return this.requireSupportedMajor(taskType);
-  }
-
-  private isV2Allowed(): boolean {
-    if (this.config.allowV2 !== undefined) return this.config.allowV2 === true;
-    return process.env.ADCP_ALLOW_V2 === '1';
   }
 
   // ====== STATIC HELPER METHODS ======
@@ -9673,7 +11871,46 @@ export class SingleAgentClient {
    * injected fields before the adapter gets a chance to clean them up, so
    * the two passes have to agree on "extra keys are fine."
    */
+  private usesIdentity33Schemas(): boolean {
+    return (
+      this.config.experimentalIdentity33 === true &&
+      this.cachedCapabilities?._synthetic === false &&
+      isAdcpVersionAtLeast(this.cachedCapabilities.servedVersion, '3.3.0')
+    );
+  }
+  private usesSigned33Webhooks(): boolean {
+    const capabilities = this.cachedCapabilities;
+    return (
+      this.config.experimentalIdentity33 === true &&
+      capabilities?._synthetic === false &&
+      isAdcpVersionAtLeast(capabilities.servedVersion, '3.3.0') &&
+      (capabilities._raw?.webhook_signing as { supported?: boolean } | undefined)?.supported === true
+    );
+  }
+  private selectedWebhookSigningProfile(): 'adcp/webhook-signing/v1' | 'web-bot-auth' | undefined {
+    if (!this.usesSigned33Webhooks()) return undefined;
+    const advertisement = this.cachedCapabilities?._raw?.webhook_signing as
+      | { profiles?: string[]; profile?: string }
+      | undefined;
+    const profile =
+      this.config.webhookSigningProfile ??
+      (advertisement?.profile === 'web-bot-auth' ||
+      (advertisement?.profiles?.length === 1 && advertisement.profiles[0] === 'web-bot-auth')
+        ? 'web-bot-auth'
+        : 'adcp/webhook-signing/v1');
+    if (profile === 'web-bot-auth' && !advertisement?.profiles?.includes(profile))
+      throw new ConfigurationError(
+        'Seller did not advertise the selected Web Bot Auth webhook profile',
+        'webhookSigningProfile'
+      );
+    return profile;
+  }
+
   private validateRequest(taskType: string, params: any): void {
+    if (this.config.experimentalIdentity33 && this.usesIdentity33Schemas()) {
+      this.executor.validateRequest(taskType, params);
+      return;
+    }
     const schema = this.getRequestSchema(taskType);
     if (!schema) {
       return; // No schema available for this task type
@@ -9834,6 +12071,7 @@ function normalizeRfc9421WebhookHeaders(
   const singletonHeaders = new Set([
     'signature',
     'signature-input',
+    'signature-agent',
     'content-digest',
     'content-type',
     'x-adcp-signature',

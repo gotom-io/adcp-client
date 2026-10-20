@@ -54,7 +54,7 @@ function keypair(kid = 'seller-webhook-2026') {
   };
 }
 
-async function registeredRfcClient() {
+async function registeredRfcClient(verificationOptions = {}) {
   const store = new InMemoryWebhookRegistrationStore();
   const callbackUrl = 'https://buyer.example/webhooks/get_products/op-rfc-1';
   await store.putIfAbsent({
@@ -72,7 +72,7 @@ async function registeredRfcClient() {
   const { signer, publicJwk } = keypair();
   const client = new SingleAgentClient(agent, {
     webhookRegistrationStore: store,
-    webhookVerification: { jwks: new StaticJwksResolver([publicJwk]) },
+    webhookVerification: { jwks: new StaticJwksResolver([publicJwk]), ...verificationOptions },
   });
   return { client, callbackUrl, signer };
 }
@@ -221,6 +221,47 @@ test('webhook registrations own and fence delegated-operator authorization conte
 });
 
 describe('SingleAgentClient RFC 9421 webhook receiver', () => {
+  test('preserves retries for transient discovery and publisher refresh failures', async () => {
+    for (const verificationOptions of [
+      {
+        jwks: {
+          resolve: async () => {
+            throw new AgentResolverError('request_signature_brand_json_unreachable', 'temporarily offline');
+          },
+        },
+      },
+      {
+        publisherPins: async () => [
+          {
+            publisher: 'publisher.example',
+            signingKeys: [],
+            refresh: async () => {
+              throw new Error('temporarily offline');
+            },
+          },
+        ],
+      },
+    ]) {
+      const { client, callbackUrl, signer } = await registeredRfcClient(verificationOptions);
+      const rawBody = JSON.stringify(envelope());
+      const signed = signWebhook(
+        { method: 'POST', url: callbackUrl, headers: { 'content-type': 'application/json' }, body: rawBody },
+        signer
+      );
+      const result = await client.verifyAndParseWebhook({
+        rawBody,
+        headers: signed.headers,
+        taskType: 'get_products',
+        operationId: 'op-rfc-1',
+        requestMethod: 'POST',
+        requestUrl: callbackUrl,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'webhook_verification_unavailable');
+      assert.equal(result.cause.code, 'webhook_signature_key_unknown');
+      assert.equal(result.cause.retryable, true);
+    }
+  });
   test('verifies the registered seller, public URL, and exact raw bytes', async () => {
     const { client, callbackUrl, signer } = await registeredRfcClient();
     const rawBody = JSON.stringify(envelope());
@@ -1553,6 +1594,74 @@ describe('webhook registration provenance', () => {
     assert.strictEqual(calls, 0);
   });
 
+  test('registers task-webhook operation IDs for AdCP 3.1 and later on every transport', () => {
+    const callbackUrl = 'https://buyer.example/webhook/task-status';
+    const operationId = 'op-registration-31';
+    const webhookSecret = 's'.repeat(32);
+    const webhookToken = 't'.repeat(32);
+    const transports = [agent, { ...agent, protocol: 'a2a' }, { ...agent, _inProcessMcpClient: {} }];
+    for (const adcpVersion of ['3.1', '3.1.0', '3.1.18', '3.1.24', '3.2-beta.4', '3.2.4']) {
+      for (const target of transports) {
+        const prepared = prepareProtocolToolCall(
+          target,
+          {},
+          {
+            adcpVersion,
+            webhookUrl: callbackUrl,
+            webhookSecret,
+            webhookToken,
+            operationId,
+          }
+        );
+        assert.deepStrictEqual(prepared.args.push_notification_config, {
+          url: callbackUrl,
+          token: webhookToken,
+          authentication: { schemes: ['HMAC-SHA256'], credentials: webhookSecret },
+          operation_id: operationId,
+        });
+        assert.strictEqual(prepared.operationId, operationId);
+        if (target.protocol === 'a2a') {
+          assert.deepStrictEqual(prepared.pushNotificationConfig, {
+            url: callbackUrl,
+            token: webhookToken,
+            authentication: { schemes: ['HMAC-SHA256'], credentials: webhookSecret },
+          });
+        }
+      }
+    }
+  });
+
+  test('generates and returns a unique operation ID for each AdCP 3.1 task registration', () => {
+    const options = { adcpVersion: '3.1.24', webhookUrl: 'https://buyer.example/webhook/task-status' };
+    for (const target of [agent, { ...agent, protocol: 'a2a' }, { ...agent, _inProcessMcpClient: {} }]) {
+      const first = prepareProtocolToolCall(target, {}, options);
+      const second = prepareProtocolToolCall(target, {}, options);
+      assert.match(first.operationId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      assert.strictEqual(first.args.push_notification_config.operation_id, first.operationId);
+      assert.strictEqual(second.args.push_notification_config.operation_id, second.operationId);
+      assert.notStrictEqual(first.operationId, second.operationId);
+    }
+  });
+
+  test('keeps AdCP 3.0 task registrations free of operation IDs', () => {
+    for (const target of [agent, { ...agent, protocol: 'a2a' }, { ...agent, _inProcessMcpClient: {} }]) {
+      for (const legacy of [{ adcpVersion: '3.0.25' }]) {
+        const prepared = prepareProtocolToolCall(
+          target,
+          {},
+          {
+            ...legacy,
+            webhookUrl: 'https://buyer.example/webhook/task-status',
+            webhookSecret: 's'.repeat(32),
+            operationId: 'op-not-supported-on-this-version',
+          }
+        );
+        assert.strictEqual(prepared.operationId, undefined);
+        assert.strictEqual(prepared.args.push_notification_config?.operation_id, undefined);
+      }
+    }
+  });
+
   test('prepares MCP and A2A placement exactly and never treats reporting_webhook as task registration', async () => {
     const reporting = { url: 'https://buyer.example/reporting' };
     const callbackUrl = 'https://buyer.example/webhook/op-placement';
@@ -1582,20 +1691,20 @@ describe('webhook registration provenance', () => {
     );
     assert.deepStrictEqual(inProcess.args.push_notification_config, { url: callbackUrl, operation_id: operationId });
 
-    const legacyA2a = prepareProtocolToolCall(a2aAgent, {}, { webhookUrl: callbackUrl, adcpVersion: '3.1.18' });
+    const legacyA2a = prepareProtocolToolCall(a2aAgent, {}, { webhookUrl: callbackUrl, adcpVersion: '3.0.25' });
     assert.strictEqual(legacyA2a.args.push_notification_config, undefined);
     assert.deepStrictEqual(legacyA2a.pushNotificationConfig, { url: callbackUrl });
 
     const callerDowngrade = prepareProtocolToolCall(
       a2aAgent,
-      { adcp_version: '3.1', adcp_major_version: 3 },
+      { adcp_version: '3.0', adcp_major_version: 3 },
       { webhookUrl: callbackUrl, operationId }
     );
     assert.strictEqual(callerDowngrade.args.push_notification_config, undefined);
     const callerUpgrade = prepareProtocolToolCall(
       a2aAgent,
-      { adcp_version: '3.2-beta.5', adcp_major_version: 3 },
-      { webhookUrl: callbackUrl, operationId, adcpVersion: '3.1.18' }
+      { adcp_version: '3.1', adcp_major_version: 3 },
+      { webhookUrl: callbackUrl, operationId, adcpVersion: '3.0.25' }
     );
     assert.deepStrictEqual(callerUpgrade.args.push_notification_config, {
       url: callbackUrl,
@@ -1831,17 +1940,19 @@ describe('seller-pinned webhook JWK discovery cache', () => {
     assert.strictEqual(resolutions, 1);
     assert.strictEqual(await resolver.resolve('unknown-key'), null);
     assert.strictEqual(await resolver.resolve('unknown-key'), null);
-    assert.strictEqual(resolutions, 2);
+    assert.strictEqual(resolutions, 1, 'the just-fetched JWKS is authoritative within the cooldown');
     assert.strictEqual(await resolver.resolve('different-attacker-key'), null);
-    assert.strictEqual(resolutions, 2, 'unknown-kid cooldown is global, not attacker-keyed');
+    assert.strictEqual(resolutions, 1, 'unknown-kid cooldown is global, not attacker-keyed');
     now += 31;
     assert.strictEqual(await resolver.resolve('unknown-key'), null);
-    assert.strictEqual(resolutions, 3);
+    assert.strictEqual(resolutions, 2);
   });
 
-  test('binds A2A discovery protocol and retries immediately after a failed refresh', async () => {
+  test('binds A2A discovery protocol and bounds retries after a failed refresh', async () => {
     let resolutions = 0;
+    let now = 1_700_000_000;
     const resolver = new ResolvedAgentJwksResolver('https://seller.example/a2a', 'a2a', {
+      now: () => now,
       resolve: async (_agentUrl, options) => {
         resolutions += 1;
         assert.strictEqual(options.protocol, 'a2a');
@@ -1850,6 +1961,9 @@ describe('seller-pinned webhook JWK discovery cache', () => {
       },
     });
     await assert.rejects(resolver.resolve('recovered-key'), /temporary discovery failure/);
+    await assert.rejects(resolver.resolve('recovered-key'), /discovery cooldown/);
+    assert.strictEqual(resolutions, 1);
+    now += 30;
     assert.strictEqual((await resolver.resolve('recovered-key')).kid, 'recovered-key');
     assert.strictEqual(resolutions, 2);
   });

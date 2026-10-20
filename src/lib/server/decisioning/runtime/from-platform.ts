@@ -1,3 +1,9 @@
+import {
+  isIdentity33SchemaScope,
+  withIdentity33SchemaScope,
+  bindIdentity33SchemaScope,
+} from '../../../validation/schema-loader';
+import { existingSyncAccounts, checkSyncAccountRows, projectAccountList } from '../../account-sync-contract';
 /**
  * Build an `AdcpServer` from a `DecisioningPlatform` impl.
  *
@@ -49,6 +55,8 @@
  * @public
  */
 
+import { isAccountProvisioningTask } from '../../account-provisioning';
+import { warnAccountReferenceDeprecation } from '../../account-reference-warnings';
 import { randomUUID } from 'node:crypto';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import type { AdcpServer } from '../../adcp-server';
@@ -567,7 +575,10 @@ function projectResponseCreativeIdentities(
   let projected: Record<string, unknown> = dataRecord;
   if (isProjectionProductInput(projected)) {
     if (wireMode === 'canonical') {
-      const canonical = toCanonicalOnlyResponse({ products: [projected] }, { legacyFormatConverter });
+      const canonical = toCanonicalOnlyResponse(
+        { products: [projected] },
+        { legacyFormatConverter, _inferDualEmissionLegacyRefs: false }
+      );
       if (canonical.diagnostics.length > 0 || canonical.response.products.length !== 1) {
         throw new CreativeFormatProjectionError(
           operation,
@@ -904,6 +915,7 @@ function asCanonicalProductResponse<T extends { products?: unknown[] }>(
   validateDualProductFormatDeclarations(response, legacyFormatConverter);
   const projected = toCanonicalOnlyResponse(response as T & { products?: V1Product[] }, {
     legacyFormatConverter,
+    _inferDualEmissionLegacyRefs: false,
   });
   const blockingDiagnostics = projected.diagnostics.filter(
     diagnostic => diagnostic.code !== 'LEGACY_FORMAT_ID_DROPPED_UNMAPPED'
@@ -1905,6 +1917,53 @@ function missingAccountError(toolName: string, resolution: AccountResolutionMode
 }
 
 /**
+ * Per-server policy for the implicit-mode identity-metadata check below.
+ * `strict` mirrors `strictAccountReferences`; the compatibility default warns
+ * and keeps the SDK 14.0 behavior of trusting the store's returned account.
+ */
+interface ImplicitIdentityPolicy {
+  readonly strict: boolean;
+}
+
+/** Fail-closed default for call sites that never see an implicit natural key. */
+const STRICT_IMPLICIT_IDENTITY_POLICY: ImplicitIdentityPolicy = Object.freeze({ strict: true });
+
+/** Names the first natural-key field whose returned identity metadata disagrees with the request. */
+function implicitIdentityMismatch(
+  identity: Partial<Extract<AccountReference, { brand: unknown }>>,
+  ref: Extract<AccountReference, { brand: unknown }>
+): string | undefined {
+  // Missing identity metadata remains compatible with existing custom stores;
+  // every identity field they do return must agree with the requested key.
+  if (identity.brand && identity.brand.domain !== ref.brand.domain) return 'brand.domain';
+  if (
+    identity.brand?.brand_id !== undefined &&
+    ref.brand.brand_id !== undefined &&
+    identity.brand.brand_id !== ref.brand.brand_id
+  )
+    return 'brand.brand_id';
+  if (
+    identity.brand?.countries !== undefined &&
+    ref.brand.countries !== undefined &&
+    [...identity.brand.countries].sort().join('\0') !== [...ref.brand.countries].sort().join('\0')
+  )
+    return 'brand.countries';
+  if (identity.operator !== undefined && identity.operator !== ref.operator) return 'operator';
+  if (
+    identity.operator_unit !== undefined &&
+    ref.operator_unit !== undefined &&
+    identity.operator_unit.id !== ref.operator_unit.id
+  )
+    return 'operator_unit';
+  if (identity.currency !== undefined && ref.currency !== undefined && identity.currency !== ref.currency)
+    return 'currency';
+  if (identity.timezone !== undefined && ref.timezone !== undefined && identity.timezone !== ref.timezone)
+    return 'timezone';
+  if (identity.sandbox !== undefined && identity.sandbox !== (ref.sandbox === true)) return 'sandbox';
+  return undefined;
+}
+
+/**
  * Defense in depth for `resolution: 'derived'`: the account a resolver hands
  * back for a buyer-named `{ account_id }` MUST be that account.
  *
@@ -1920,14 +1979,38 @@ function missingAccountError(toolName: string, resolution: AccountResolutionMode
  * `ACCOUNT_NOT_FOUND` envelope — no signal about whether the named account
  * exists. `createDerivedAccountStore` already fails closed here; this makes
  * hand-rolled stores fail closed too.
+ *
+ * For `resolution: 'implicit'` natural keys (#3091), returned identity
+ * metadata that disagrees with the supplied key is refused only under
+ * `strictAccountReferences`. Custom stores that canonicalize identity (brand
+ * aliases, case, sandbox-only fleets) were accepted in SDK 14.0, so the
+ * compatibility default warns instead.
  */
 function assertResolvedAccountMatchesRef<T extends { id: string }>(
   resolution: AccountResolutionMode | undefined,
   ref: AccountReference | undefined,
   account: T | null,
-  logger: AdcpLogger
+  logger: AdcpLogger,
+  implicitIdentity: ImplicitIdentityPolicy = STRICT_IMPLICIT_IDENTITY_POLICY
 ): T | null {
   if (account == null) return null;
+  if (normalizeAccountResolution(resolution) === 'implicit' && ref && 'brand' in ref) {
+    const field = implicitIdentityMismatch(account as T & Partial<Extract<AccountReference, { brand: unknown }>>, ref);
+    if (field === undefined) return account;
+    if (implicitIdentity.strict) return null;
+    // Server-side only: the mismatched account id goes to the adopter's logger
+    // metadata, never into a buyer-facing response.
+    warnAccountReferenceDeprecation(
+      logger,
+      'ADCP_IMPLICIT_ACCOUNT_IDENTITY_MISMATCH',
+      `[adcp/sdk] DEPRECATED: accounts.resolve returned an account whose ${field} does not match the supplied ` +
+        `natural key on a resolution: 'implicit' platform. The account was accepted for compatibility; the next ` +
+        `major release (or strictAccountReferences: true) refuses it with ACCOUNT_NOT_FOUND. Resolve by the ` +
+        `complete natural key and return identity metadata that matches it.`,
+      { field, accountId: account.id }
+    );
+    return account;
+  }
   if (normalizeAccountResolution(resolution) !== 'derived') return account;
   const requestedId = refAccountId(ref);
   if (requestedId === undefined || account.id === requestedId) return account;
@@ -2563,6 +2646,11 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
     RequiredCapabilitiesFor<P['capabilities']['specialisms'][number]>,
   opts: RequiredOptsFor<P>
 ): DecisioningAdcpServer {
+  if (Boolean(opts.identity33) !== isIdentity33SchemaScope())
+    return withIdentity33SchemaScope(() => {
+      const instance = createAdcpServerFromPlatform<P>(platform, opts);
+      return opts.identity33 ? bindIdentity33SchemaScope(instance) : instance;
+    }, Boolean(opts.identity33));
   // Runtime-only compatibility for pre-13 JavaScript/config objects. The
   // public type exposes these raw handler groups only under legacyHandlers;
   // retaining the hidden fallback avoids turning a type migration into an
@@ -2579,6 +2667,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
   // the platform's exact account type on the public migration seam while
   // keeping that historical internal boundary localized here.
   const runtimeOpts = opts as unknown as CreateAdcpServerFromPlatformOptions<Account>;
+  const implicitIdentityPolicy: ImplicitIdentityPolicy = { strict: runtimeOpts.strictAccountReferences === true };
   const runtimeLegacyHandlers = legacyHandlers as unknown as LegacyDecisioningHandlerGroups<Account>;
   validatePlatform(platform, {
     creative: legacyHandlers.creative,
@@ -3266,8 +3355,12 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
         const account = assertResolvedAccountMatchesRef(
           platform.accounts.resolution,
           ref,
-          await platform.accounts.resolve(ref, toResolveCtx(ctx, ctx.toolName, ctx.input)),
-          fwLogger
+          await platform.accounts.resolve(
+            ref,
+            toResolveCtx(ctx, ctx.toolName, ctx.toolName === 'sync_accounts' ? structuredClone(ctx.input) : ctx.input)
+          ),
+          fwLogger,
+          implicitIdentityPolicy
         );
         resolved = account != null;
         resolvedAccountId = account?.id;
@@ -3317,7 +3410,10 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       const compactAccountRequired =
         COMPACT_MEDIA_BUY_MUTATION_TOOLS.has(ctx.toolName) && authenticatedPrincipalFor(ctx) !== undefined;
       try {
-        const account = await platform.accounts.resolve(undefined, toResolveCtx(ctx, ctx.toolName, ctx.input));
+        const account = await platform.accounts.resolve(
+          undefined,
+          toResolveCtx(ctx, ctx.toolName, ctx.toolName === 'sync_accounts' ? structuredClone(ctx.input) : ctx.input)
+        );
         resolved = account != null;
         resolvedAccountId = account?.id;
         if (account == null && compactAccountRequired) {
@@ -3451,7 +3547,7 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       mergeOpts
     ),
     accounts: (() => {
-      const platformAccountHandlers = buildAccountHandlers(platform, ctxFor, fwLogger);
+      const platformAccountHandlers = buildAccountHandlers(platform, ctxFor, fwLogger, implicitIdentityPolicy);
       const merged = mergeHandlers(opts.accounts, platformAccountHandlers, 'accounts', mergeOpts);
       return guardDerivedSyncGovernance(
         guardAdopterSyncAccounts(merged, platform, platformAccountHandlers, fwLogger),
@@ -3475,7 +3571,8 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
         platform.agentRegistry,
         fwLogger,
         runtimeOpts.resolveSessionKey,
-        opts.credentialPolicy
+        opts.credentialPolicy,
+        implicitIdentityPolicy
       );
       return {
         ...opts.customTools,
@@ -3830,7 +3927,8 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
             platform.accounts.resolution,
             accountRef,
             resolvedAccount,
-            fwLogger
+            fwLogger,
+            implicitIdentityPolicy
           );
 
           // Record the resolved account's explicit mode (if any). Used by the
@@ -4072,7 +4170,8 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
   agentRegistry: BuyerAgentRegistry | undefined,
   logger: AdcpLogger,
   resolveSessionKey: AdcpServerConfig<Account>['resolveSessionKey'] | undefined,
-  credentialPolicy: CredentialPolicy | undefined
+  credentialPolicy: CredentialPolicy | undefined,
+  implicitIdentityPolicy: ImplicitIdentityPolicy
 ) {
   const credentialPolicyPatterns =
     credentialPolicy === undefined || typeof credentialPolicy === 'string' ? undefined : credentialPolicy.patterns;
@@ -4261,7 +4360,8 @@ function buildTasksGetTool<P extends DecisioningPlatform<any, any>>(
             platform.accounts.resolution,
             ref as AccountReference,
             await platform.accounts.resolve(ref as AccountReference, resolveCtx),
-            logger
+            logger,
+            implicitIdentityPolicy
           );
           if (resolved) {
             resolvedAccountId = resolved.id;
@@ -5006,6 +5106,7 @@ interface DispatchHitlOpts {
   ownerScope?: string;
   pushNotificationUrl?: string;
   pushNotificationToken?: string;
+  pushNotificationSigningProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth';
   pushNotificationOperationId?: string;
   servedAdcpVersion?: string;
   emitWebhook?: HandlerContext<Account>['emitWebhook'];
@@ -5588,6 +5689,7 @@ async function emitTaskWebhook(
   try {
     const result = await opts.emitWebhook({
       url: opts.pushNotificationUrl,
+      ...(opts.pushNotificationSigningProfile && { signingProfile: opts.pushNotificationSigningProfile }),
       payload: wirePayload,
       delivery_id: resolveWebhookDeliveryId(opts, taskId),
     });
@@ -5705,6 +5807,7 @@ function toResolveCtx(
     {
       ...(ctx.authInfo !== undefined && { authInfo: ctx.authInfo }),
       ...(toolName !== undefined && { toolName }),
+      provisioning: isAccountProvisioningTask(toolName),
       ...(ctx.agent != null && { agent: ctx.agent }),
       ...(input != null && { input }),
     },
@@ -6245,7 +6348,7 @@ function extractPushConfig(
   params: unknown,
   _logger: AdcpLogger,
   opts: { allowPrivateWebhookUrls?: boolean } = {}
-): { url?: string; token?: string; operationId?: string } {
+): { url?: string; token?: string; operationId?: string; signingProfile?: 'adcp/webhook-signing/v1' | 'web-bot-auth' } {
   if (!params || typeof params !== 'object') return {};
   const cfg = (params as { push_notification_config?: unknown }).push_notification_config;
   // `undefined` is the one supplied value that preserves the absent-config
@@ -6259,7 +6362,15 @@ function extractPushConfig(
       field: 'push_notification_config',
     });
   }
-  const cfgObj = cfg as { url?: unknown; token?: unknown; operation_id?: unknown };
+  const cfgObj = cfg as { url?: unknown; token?: unknown; operation_id?: unknown; signing_profile?: unknown };
+  if (
+    cfgObj.signing_profile !== undefined &&
+    !['adcp/webhook-signing/v1', 'web-bot-auth'].includes(cfgObj.signing_profile as string)
+  )
+    throw new AdcpError('INVALID_REQUEST', {
+      message: 'Unsupported webhook signing profile',
+      field: 'push_notification_config.signing_profile',
+    });
   const rawUrl = cfgObj.url;
   const rawToken = cfgObj.token;
   const rawOperationId = cfgObj.operation_id;
@@ -6322,6 +6433,9 @@ function extractPushConfig(
   }
 
   return {
+    ...(cfgObj.signing_profile !== undefined && {
+      signingProfile: cfgObj.signing_profile as 'adcp/webhook-signing/v1' | 'web-bot-auth',
+    }),
     ...(url !== undefined && { url }),
     ...(token !== undefined && { token }),
     ...(operationId !== undefined && { operationId }),
@@ -6525,6 +6639,7 @@ function buildProposalNegotiationHandlers<P extends DecisioningPlatform<any, any
               accountId: reqCtx.account.id,
               ownerScope: taskOwnerScopeFor(ctx, reqCtx.account.id),
               pushNotificationUrl: push.url,
+              pushNotificationSigningProfile: push.signingProfile,
               pushNotificationToken: push.token,
               pushNotificationOperationId: push.operationId,
               servedAdcpVersion: ctx.servedAdcpVersion,
@@ -6616,6 +6731,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
             accountId,
             ownerScope: taskOwnerScopeFor(ctx, accountId),
             pushNotificationUrl: push.url,
+            pushNotificationSigningProfile: push.signingProfile,
             pushNotificationToken: push.token,
             pushNotificationOperationId: push.operationId,
             servedAdcpVersion: ctx.servedAdcpVersion,
@@ -6766,6 +6882,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                 accountId: reqCtx.account.id,
                 ownerScope: taskOwnerScopeFor(ctx, reqCtx.account.id),
                 pushNotificationUrl: push.url,
+                pushNotificationSigningProfile: push.signingProfile,
                 pushNotificationToken: push.token,
                 pushNotificationOperationId: push.operationId,
                 servedAdcpVersion: ctx.servedAdcpVersion,
@@ -6898,6 +7015,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                 accountId,
                 ownerScope: taskOwnerScopeFor(ctx, accountId),
                 pushNotificationUrl: push.url,
+                pushNotificationSigningProfile: push.signingProfile,
                 pushNotificationToken: push.token,
                 pushNotificationOperationId: push.operationId,
                 servedAdcpVersion: ctx.servedAdcpVersion,
@@ -7031,6 +7149,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                 accountId: reqCtx.account.id,
                 ownerScope: taskOwnerScopeFor(ctx, reqCtx.account.id),
                 pushNotificationUrl: push.url,
+                pushNotificationSigningProfile: push.signingProfile,
                 pushNotificationToken: push.token,
                 pushNotificationOperationId: push.operationId,
                 servedAdcpVersion: ctx.servedAdcpVersion,
@@ -7151,6 +7270,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                 accountId: reqCtx.account.id,
                 ownerScope: taskOwnerScopeFor(ctx, reqCtx.account.id),
                 pushNotificationUrl: push.url,
+                pushNotificationSigningProfile: push.signingProfile,
                 pushNotificationToken: push.token,
                 pushNotificationOperationId: push.operationId,
                 servedAdcpVersion: ctx.servedAdcpVersion,
@@ -7205,6 +7325,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                 accountId: reqCtx.account.id,
                 ownerScope: taskOwnerScopeFor(ctx, reqCtx.account.id),
                 pushNotificationUrl: push.url,
+                pushNotificationSigningProfile: push.signingProfile,
                 pushNotificationToken: push.token,
                 pushNotificationOperationId: push.operationId,
                 servedAdcpVersion: ctx.servedAdcpVersion,
@@ -7629,6 +7750,7 @@ function buildCreativeHandlers<P extends DecisioningPlatform<any, any>>(
                 accountId: reqCtx.account.id,
                 ownerScope: taskOwnerScopeFor(ctx, reqCtx.account.id),
                 pushNotificationUrl: push.url,
+                pushNotificationSigningProfile: push.signingProfile,
                 pushNotificationToken: push.token,
                 pushNotificationOperationId: push.operationId,
                 servedAdcpVersion: ctx.servedAdcpVersion,
@@ -7864,6 +7986,7 @@ function buildSignalsHandlers<P extends DecisioningPlatform<any, any>>(
               accountId,
               ownerScope: taskOwnerScopeFor(ctx, accountId),
               pushNotificationUrl: push.url,
+              pushNotificationSigningProfile: push.signingProfile,
               pushNotificationToken: push.token,
               pushNotificationOperationId: push.operationId,
               servedAdcpVersion: ctx.servedAdcpVersion,
@@ -8950,7 +9073,8 @@ function enforceSyncAccountsCommercialPolicy<P extends DecisioningPlatform<any, 
 function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
   platform: P,
   ctxFor: CtxForFn,
-  logger: AdcpLogger = DEFAULT_FRAMEWORK_LOGGER
+  logger: AdcpLogger = DEFAULT_FRAMEWORK_LOGGER,
+  implicitIdentityPolicy: ImplicitIdentityPolicy = STRICT_IMPLICIT_IDENTITY_POLICY
 ): AccountHandlers<Account> {
   const accounts = platform.accounts;
 
@@ -8968,37 +9092,56 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
 
   if (accounts.upsert) {
     handlers.syncAccounts = async (params, ctx) => {
+      const dryRun = params.dry_run === true;
+      const originalCount = ((params.accounts as unknown[]) ?? []).length;
       const resolveCtx = toResolveCtx(ctx, 'sync_accounts', params);
       const policy = enforceSyncAccountsCommercialPolicy(platform, params as Record<string, unknown>, resolveCtx);
+      const requested = structuredClone(policy.acceptedEntries);
+      const indices = ((params.accounts as unknown[]) ?? [])
+        .map((_, index) => index)
+        .filter(index => !policy.failedRows.has(index));
       if (normalizeAccountResolution(accounts.resolution) === 'derived') {
-        await assertDerivedSyncAccountEntriesReachable(accounts, policy.acceptedEntries, resolveCtx, logger);
+        await assertDerivedSyncAccountEntriesReachable(
+          accounts,
+          requested,
+          toResolveCtx(ctx, 'sync_accounts', structuredClone(policy.acceptedParams)),
+          logger
+        );
       }
       const dispatchCtx =
         policy.failedRows.size === 0 ? resolveCtx : toResolveCtx(ctx, 'sync_accounts', policy.acceptedParams);
       return projectSync(
-        () =>
-          policy.acceptedEntries.length > 0
-            ? accounts.upsert!(policy.acceptedEntries as AccountReference[], dispatchCtx)
-            : Promise.resolve([]),
-        rows => {
-          if (rows.length !== policy.acceptedEntries.length) {
+        async () => {
+          const existing = await existingSyncAccounts(accounts, requested, dispatchCtx, logger);
+          const writeParams = structuredClone(policy.acceptedParams);
+          const entries = writeParams.accounts as SyncAccountsEntry[];
+          const rows =
+            entries.length > 0
+              ? await accounts.upsert!(entries as AccountReference[], {
+                  ...toResolveCtx(ctx, 'sync_accounts', writeParams),
+                  existing: existing.map(account =>
+                    account ? { ...account, billing: account.billing && { ...account.billing } } : null
+                  ),
+                })
+              : [];
+          if (rows.length !== requested.length) {
             throw new Error(
               `sync_accounts accounts.upsert returned ${rows.length} ${
                 rows.length === 1 ? 'row' : 'rows'
-              } for ${policy.acceptedEntries.length} accepted account ${
-                policy.acceptedEntries.length === 1 ? 'entry' : 'entries'
-              }`
+              } for ${requested.length} accepted account ${requested.length === 1 ? 'entry' : 'entries'}`
             );
           }
+          return checkSyncAccountRows(accounts, requested, existing, rows, indices, dispatchCtx, logger);
+        },
+        rows => {
           if (policy.failedRows.size === 0) {
             return {
-              ...(params.dry_run === true && { dry_run: true }),
+              ...(dryRun && { dry_run: true }),
               accounts: rows.map(toWireSyncAccountRow),
             };
           }
           const combined: SyncAccountsResultRow[] = [];
           let acceptedIndex = 0;
-          const originalCount = ((params.accounts as unknown[]) ?? []).length;
           for (let index = 0; index < originalCount; index += 1) {
             const failed = policy.failedRows.get(index);
             if (failed !== undefined) {
@@ -9009,7 +9152,7 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
             }
           }
           return {
-            ...(params.dry_run === true && { dry_run: true }),
+            ...(dryRun && { dry_run: true }),
             accounts: combined.map(toWireSyncAccountRow),
           };
         }
@@ -9050,7 +9193,7 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
           const page = await accounts.list!(filter, resolveCtx);
           const response = {
             status: 'completed' as const,
-            accounts: page.items.map(toWireAccount),
+            accounts: await projectAccountList(accounts, page.items, resolveCtx, logger),
             pagination: {
               has_more: page.nextCursor != null,
               ...(page.nextCursor != null && { cursor: page.nextCursor }),
@@ -9076,7 +9219,8 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
         accounts.resolution,
         accountRef,
         await accounts.resolve(accountRef, resolveCtx),
-        logger
+        logger,
+        implicitIdentityPolicy
       );
       if (!resolved) {
         const suggestion = accountNotFoundSuggestion(accounts.resolution);
@@ -9119,7 +9263,8 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
         accounts.resolution,
         accountRef,
         await accounts.resolve(accountRef, resolveCtx),
-        logger
+        logger,
+        implicitIdentityPolicy
       );
       if (!resolved) {
         const suggestion = accountNotFoundSuggestion(accounts.resolution);

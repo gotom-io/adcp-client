@@ -19,6 +19,7 @@ export {
   withExternalSchemaRoot,
   registerSchemaOverlay,
   clearSchemaOverlays,
+  withServedReleaseSchemaRoots,
 } from './schema-loader';
 export type { Direction, ResponseVariant } from './schema-loader';
 export { validateOutgoingRequest, validateIncomingResponse, resolveValidationModes } from './client-hooks';

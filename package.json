@@ -1,6 +1,6 @@
 {
   "name": "@adcp/sdk",
-  "version": "14.0.0",
+  "version": "16.0.0",
   "description": "AdCP SDK — client, server, and compliance harnesses for the AdContext Protocol (MCP + A2A)",
   "workspaces": [
     ".",
@@ -79,16 +79,6 @@
       "require": {
         "types": "./dist/lib/enums.d.ts",
         "default": "./dist/lib/enums.js"
-      }
-    },
-    "./types/v2-5": {
-      "import": {
-        "types": "./dist/lib/types/v2-5/index.d.mts",
-        "default": "./dist/lib/types/v2-5/index.mjs"
-      },
-      "require": {
-        "types": "./dist/lib/types/v2-5/index.d.ts",
-        "default": "./dist/lib/types/v2-5/index.js"
       }
     },
     "./types/*": {
@@ -284,6 +274,16 @@
         "default": "./dist/lib/schemas/index.js"
       }
     },
+    "./schemas/browser": {
+      "import": {
+        "types": "./dist/lib/schemas/browser.d.mts",
+        "default": "./dist/lib/schemas/browser.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/schemas/browser.d.ts",
+        "default": "./dist/lib/schemas/browser.js"
+      }
+    },
     "./compliance-fixtures": {
       "import": {
         "types": "./dist/lib/compliance-fixtures/index.d.mts",
@@ -409,6 +409,16 @@
         "types": "./dist/lib/media-buy/actions.d.ts",
         "default": "./dist/lib/media-buy/actions.js"
       }
+    },
+    "./identity-3.3": {
+      "import": {
+        "types": "./dist/lib/identity-3.3/index.d.mts",
+        "default": "./dist/lib/identity-3.3/index.mjs"
+      },
+      "require": {
+        "types": "./dist/lib/identity-3.3/index.d.ts",
+        "default": "./dist/lib/identity-3.3/index.js"
+      }
     }
   },
   "typesVersions": {
@@ -427,9 +437,6 @@
       ],
       "types": [
         "dist/lib/types/index.d.ts"
-      ],
-      "types/v2-5": [
-        "dist/lib/types/v2-5/index.d.ts"
       ],
       "wholesale-feed-sync": [
         "dist/lib/wholesale-feed-sync/index.d.ts"
@@ -478,6 +485,9 @@
       ],
       "schemas": [
         "dist/lib/schemas/index.d.ts"
+      ],
+      "schemas/browser": [
+        "dist/lib/schemas/browser.d.ts"
       ],
       "compliance-fixtures": [
         "dist/lib/compliance-fixtures/index.d.ts"
@@ -529,6 +539,9 @@
       ],
       "media-buy/actions": [
         "dist/lib/media-buy/actions.d.ts"
+      ],
+      "identity-3.3": [
+        "dist/lib/identity-3.3/index.d.ts"
       ]
     }
   },
@@ -541,10 +554,11 @@
     "!dist/lib/schemas-data/*/bundled/**/*",
     "bin/**/*.js",
     "skills/**/*",
+    "!skills/*.previous/**/*",
     ".claude-plugin/**/*",
     "compliance/cache/3.0.25/**/*",
-    "compliance/cache/3.1.24/**/*",
-    "compliance/cache/3.2.1/**/*",
+    "compliance/cache/3.1.29/**/*",
+    "compliance/cache/3.2.5/**/*",
     "ADCP_VERSION",
     "docs/README.md",
     "docs/TYPE-SUMMARY.md",
@@ -561,8 +575,8 @@
     "docs/examples/**/*",
     "examples/README.md",
     "examples/CONTRIBUTING.md",
+    "examples/storyboards/account-sync-contract.yaml",
     "examples/adcp.config.json",
-    "examples/reliable-reporting-service/README.md",
     "examples/reliable-reporting-buyer/**/*",
     "examples/seller-3.2-starter.ts",
     "examples/supply-path-verification.ts",
@@ -596,10 +610,10 @@
     "sync:agents": "node scripts/import-claude-agents.mjs",
     "prepublishOnly": "npm run clean && npm run sync-schemas:all && (test -f src/lib/types/tools.generated.ts || npm run generate-types) && npm run build:lib && npm run check:publish-protocol-artifacts && node --test-timeout=60000 --test-force-exit --test test/lib/adcp-client.test.js test/lib/validation.test.js test/lib/zod-schemas.test.js",
     "build": "npm run build:lib",
-    "build:lib": "npm run sync-version && npm run schemas:ensure && tsx scripts/generate-wire-spec-fields.ts && tsup && NODE_OPTIONS=--max-old-space-size=8192 tsc --project tsconfig.lib.json --emitDeclarationOnly && tsx scripts/copy-schemas-to-dist.ts && tsx scripts/copy-reporting-source-schemas.ts && tsx scripts/copy-reporting-consumer-status-fixtures.ts && tsx scripts/sync-canonical-storyboard-fixtures.ts --copy-dist && tsx scripts/copy-v2-projection-catalog.ts && tsx scripts/generate-per-tool-types.ts && tsx scripts/generate-dmts-declarations.ts",
+    "build:lib": "npm run sync-version && npm run schemas:ensure && tsx scripts/generate-wire-spec-fields.ts && tsup && NODE_OPTIONS=--max-old-space-size=8192 tsc --project tsconfig.lib.json --emitDeclarationOnly && tsx scripts/copy-schemas-to-dist.ts && tsx scripts/copy-reporting-source-schemas.ts && tsx scripts/copy-reporting-consumer-status-fixtures.ts && tsx scripts/sync-canonical-storyboard-fixtures.ts --copy-dist && tsx scripts/copy-v2-projection-catalog.ts && tsx scripts/generate-per-tool-types.ts && tsx scripts/generate-dmts-declarations.ts && npm run build --workspace=@adcp/reporting-storage",
     "build:test-agents": "npm run build:lib && tsc -p test-agents/tsconfig.json --rootDir test-agents",
     "pretest": "npm run build:lib",
-    "test": "npm run test:node && npm test --workspace=packages/eslint-plugin --if-present && npm test --workspace=@adcp/reference-renderers",
+    "test": "npm run test:node && npm test --workspace=packages/eslint-plugin --if-present && npm test --workspace=@adcp/reference-renderers && npm run test:reporting-storage",
     "test:node": "npm run test:node:fast && npm run test:node:slow",
     "test:node:fast": "node scripts/run-node-tests.mjs --group fast",
     "test:node:fast:shard": "node scripts/run-node-tests.mjs --group fast --shard-env",
@@ -625,8 +639,7 @@
     "test:protocol-comparison": "node test/utils/comprehensive-protocol-comparison.js",
     "test:status-report": "node test/utils/final-status-report.js",
     "sync-schemas": "tsx scripts/sync-schemas.ts",
-    "sync-schemas:v2.5": "tsx scripts/sync-v2-5-schemas.ts",
-    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.1.24 && npm run sync-schemas -- 3.0.25 && npm run sync-schemas:v2.5",
+    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.1.29 && npm run sync-schemas -- 3.0.25",
     "sync:canonical-storyboard-fixtures": "tsx scripts/sync-canonical-storyboard-fixtures.ts --update",
     "check:canonical-storyboard-fixtures": "tsx scripts/sync-canonical-storyboard-fixtures.ts --check",
     "sync-registry-schemas": "tsx scripts/generate-registry-types.ts --sync",
@@ -635,8 +648,7 @@
     "generate-types": "tsx scripts/generate-types.ts && tsx scripts/generate-enum-arrays.ts && tsx scripts/generate-inline-enum-arrays.ts && tsx scripts/generate-manifest-derived.ts && tsx scripts/generate-entity-hydration.ts && tsx scripts/generate-media-buy-update-fields.ts && tsx scripts/generate-media-buy-action-metadata.ts",
     "generate-manifest-derived": "tsx scripts/generate-manifest-derived.ts",
     "generate-entity-hydration": "tsx scripts/generate-entity-hydration.ts",
-    "generate-types:v2.5": "tsx scripts/generate-v2-5-types.ts",
-    "generate-types:all": "npm run generate-types && npm run generate-types:v2.5",
+    "generate-types:all": "npm run generate-types",
     "generate-registry-types": "tsx scripts/generate-registry-types.ts",
     "generate-enum-arrays": "tsx scripts/generate-enum-arrays.ts",
     "generate-inline-enum-arrays": "tsx scripts/generate-inline-enum-arrays.ts",
@@ -647,20 +659,23 @@
     "compliance:fork-matrix": "node --test --test-timeout=300000 'test/examples/hello-*.test.js' test/examples/proxy-seller-snap.test.js",
     "typecheck:skill-examples": "tsx scripts/typecheck-skill-examples.ts",
     "check:skill-sync": "tsx scripts/check-skill-sync.ts",
-    "check:package": "npm run check:runtime-compat && npm run check:packed-artifact && npm run check:publish-protocol-artifacts && npm run typecheck:examples && publint --strict && node --max-old-space-size=8192 ./node_modules/@arethetypeswrong/cli/dist/index.js --pack . --exclude-entrypoints compliance-fixtures/reporting-consumer-status-v1.json compliance-fixtures/principal.yaml compliance-fixtures/reporting-core.yaml compliance-fixtures/canonical-storyboards-provenance.json",
-    "check:packed-artifact": "node scripts/check-packed-artifact.mjs && node scripts/check-reporting-consumer-package.mjs",
+    "check:package": "npm run check:runtime-compat && npm run check:packed-artifact && npm run check:publish-protocol-artifacts && npm run typecheck:examples && publint --strict && node --max-old-space-size=8192 ./node_modules/@arethetypeswrong/cli/dist/index.js --pack . --exclude-entrypoints compliance-fixtures/reporting-consumer-status-v1.json compliance-fixtures/principal.yaml compliance-fixtures/reporting-core.yaml compliance-fixtures/canonical-storyboards-provenance.json && npm run check --workspace=@adcp/reporting-storage && node --max-old-space-size=8192 ./node_modules/@arethetypeswrong/cli/dist/index.js --pack packages/reporting-storage",
+    "check:packed-artifact": "node scripts/check-packed-artifact.mjs && node scripts/check-reporting-consumer-package.mjs && node scripts/check-reporting-storage-package.mjs",
     "check:runtime-compat": "node scripts/check-runtime-compat.mjs",
-    "check:package-size": "node scripts/check-package-size.mjs",
+    "check:package-size": "node scripts/check-package-size.mjs && node packages/reporting-storage/scripts/check-package.mjs --size",
     "check:publish-protocol-artifacts": "node scripts/check-publish-protocol-artifacts.mjs",
     "verify:package": "node scripts/verify-package.mjs",
+    "validate:reporting-gcp": "node packages/reporting-storage/scripts/validate-reporting-gcp.mjs",
     "check:adopter-types": "tsx scripts/check-adopter-types.ts",
     "check:adopter-types-narrow": "tsx scripts/check-adopter-types-narrow.ts",
     "sync-version": "tsx scripts/sync-version.ts",
     "validate-schemas": "tsx scripts/validate-schemas.ts",
     "lint": "eslint 'src/lib/testing/**/*.ts'",
     "lint:fix": "eslint 'src/lib/testing/**/*.ts' --fix",
+    "lint:boundaries": "eslint --config eslint.boundaries.config.mjs 'src/**/*.{ts,tsx,js,mjs,cjs}' 'bin/**/*.js' 'examples/**/*.{ts,js,mjs}'",
     "lint:workflows": "node scripts/lint-workflows.js",
     "typecheck": "NODE_OPTIONS=--max-old-space-size=8192 tsc --noEmit",
+    "typecheck:reporting-storage": "npm run typecheck --workspace=@adcp/reporting-storage",
     "typecheck:examples": "tsc --noEmit --project tsconfig.examples.json",
     "clean": "rm -rf dist/",
     "docs": "typedoc",
@@ -668,8 +683,9 @@
     "docs:serve": "npx http-server docs -p 4000 -o",
     "docs:open": "open docs/api/index.html || xdg-open docs/api/index.html || start docs/api/index.html",
     "ci:validate": "node scripts/ci-validate.js",
-    "ci:quick": "npm run format:check && npm run typecheck && npm run build:lib && npm test",
+    "ci:quick": "npm run format:check && npm run typecheck && npm run build:lib && npm run typecheck:reporting-storage && npm test",
     "test:zod-openapi-portability": "node --test test/lib/zod-openapi-portability.test.js",
+    "test:schemas-browser": "node --test-timeout=60000 --test test/lib/schemas-browser.test.js",
     "ci:schema-check": "npm run sync-schemas && npm run generate-types && npm run generate-registry-types -- --sync && git diff --exit-code -I '// Generated at:' src/lib/types/ src/lib/agents/ src/lib/media-buy/action-metadata.generated.ts src/lib/media-buy/update-fields.generated.ts src/lib/registry/types.generated.ts schemas/registry/registry.yaml || (echo '⚠️  Generated files are out of sync. Run: npm run sync-schemas && npm run generate-types && npm run generate-registry-types -- --sync' && exit 1)",
     "ci:codegen-strict": "tsx scripts/check-no-loose-oneof.ts",
     "ci:docs-check": "npm run generate-agent-docs && npm run generate-release-worksheet && git diff --exit-code -I '> Generated at:' docs/llms.txt docs/TYPE-SUMMARY.md docs/migration-14.x-rc-worksheet.md || (echo '⚠️  Generated docs are out of sync. Run: npm run generate-agent-docs && npm run generate-release-worksheet' && exit 1)",
@@ -684,7 +700,8 @@
     "registry:mcp": "tsx src/registry/mcp-server.ts",
     "format": "prettier --write \"./**/*.{css,html,js,ts,tsx,json}\"",
     "format:check": "prettier --check \"./**/*.{css,html,js,ts,tsx,json}\"",
-    "review:codex": "bash scripts/codex-review.sh"
+    "review:codex": "bash scripts/codex-review.sh",
+    "test:reporting-storage": "npm test --workspace=@adcp/reporting-storage"
   },
   "keywords": [
     "adcp",
@@ -712,14 +729,15 @@
     "email": "bugs@adcontextprotocol.org"
   },
   "dependencies": {
-    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/client": "2.2.0",
     "@modelcontextprotocol/ext-apps": "2.0.0",
     "@modelcontextprotocol/node": "2.0.0",
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.2.0",
     "@types/ws": "^8.18.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "fast-check": "^4.9.0",
+    "http-message-sig": "0.3.0",
     "jose": "^6.2.10",
     "pg": "^8.23.0",
     "secure-json-parse": "^4.1.0",
@@ -732,7 +750,7 @@
   },
   "peerDependencies": {
     "@a2a-js/sdk": "^1.0.1",
-    "@modelcontextprotocol/sdk": "^1.24.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@opentelemetry/api": "^1.0.0",
     "redis": "^4.6.0 || ^5.0.0 || ^6.0.0",
     "zod": "^4.1.5"
@@ -749,10 +767,10 @@
     "@a2a-js/sdk": "^1.0.1",
     "@apidevtools/json-schema-ref-parser": "^15.5.2",
     "@arethetypeswrong/cli": "^0.18.5",
-    "@changesets/cli": "^2.31.1",
+    "@changesets/cli": "^3.0.3",
     "@commitlint/cli": "^20.5.3",
     "@commitlint/config-conventional": "^20.5.3",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@opentelemetry/api": "^1.9.1",
     "@types/express": "4.17.25",
     "@types/node": "^20.19.43",
@@ -776,6 +794,8 @@
     "typedoc-plugin-markdown": "^4.13.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.68.0",
+    "web-bot-auth": "0.2.0",
+    "workerd": "1.20260730.1",
     "zod": "^4.4.3",
     "zod-openapi": "^5.4.3"
   },
@@ -789,14 +809,14 @@
     "js-yaml": "^4.1.1",
     "@apidevtools/json-schema-ref-parser@^15.0.0": {
       ".": "$@apidevtools/json-schema-ref-parser",
-      "js-yaml": "^5.2.2"
+      "js-yaml": "^5.4.3"
     },
     "@changesets/parse": {
       "js-yaml": "^3.15.2"
     },
     "minimatch": "^10.2.1"
   },
-  "adcp_version": "3.2.1",
+  "adcp_version": "3.2.5",
   "sideEffects": [
     "**/default-invariants.*"
   ]

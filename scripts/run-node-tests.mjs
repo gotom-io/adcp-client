@@ -15,6 +15,8 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 export const LOCAL_TEST_BATCH_SIZE = 25;
 
 export const SLOW_NODE_TESTS = new Set([
+  // Bundles the signing modules with esbuild and runs them in a workerd subprocess.
+  'test/lib/signing-webcrypto.test.js',
   'test/lib/account-change-feed-packed.test.js',
   'test/canonical-creatives-a2a-e2e.test.js',
   'test/generate-zod-object-intersections.test.js',
@@ -28,6 +30,9 @@ export const SLOW_NODE_TESTS = new Set([
   'test/examples/hello-seller-adapter-guaranteed.test.js',
   'test/lib/cli-auth-scheme.test.js',
   'test/lib/cli-removed-flags.test.js',
+  // Repeated CLI scaffolding, compile checks and PostgreSQL doctor probes
+  // exceed the fast lane's 60s file limit when schema-heavy files run alongside.
+  'test/lib/cli-project-dx.test.js',
   'test/lib/cli-soft-fail.test.js',
   // Spawns the CLI fifteen times while repairing and validating compliance
   // bundles. It takes ~41s standing alone, leaving too little margin under the
@@ -54,12 +59,12 @@ export const SLOW_NODE_TESTS = new Set([
   // heavy file, while remaining stable in the single-concurrency slow lane.
   'test/lib/handler-controlled-flow.test.js',
   'test/lib/media-buy-lifecycle-release-gate.test.js',
-  // Exercises 54 real-PostgreSQL activity/recovery cases. The expanded
-  // reserved-before-I/O and retry coverage is intentionally comprehensive and
-  // now exceeds the fast lane's exact 60-second per-file ceiling on a cold DB.
-  'test/lib/reporting-notification-activity-pg.test.js',
   'test/lib/storyboard-notices.test.js',
   'test/lib/storyboard-requires-gate.test.js',
+  // Sixty full/standalone cases load two real schema authorities. A cold
+  // concurrent CI shard hit the fast lane's exact 60s file limit (no failed
+  // assertion); retain every case in the existing serialized slow lane.
+  'test/lib/storyboard-creative-build-probe-authority.test.js',
   // Boots live MCP agents and loads two real compliance bundles; ~25s standing
   // alone, which leaves no margin under the fast suite's 60s per-test ceiling
   // once a shard runs files concurrently.

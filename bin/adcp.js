@@ -49,6 +49,7 @@ const {
   printSoftFailBlock,
   defaultComplianceTimeoutSeconds,
   escapeTerminalControlChars,
+  formatJwtExpClaim,
   formatStepSkipLines,
   formatStepVerdictLines,
   isCoverageUnavailableStep,
@@ -1386,9 +1387,7 @@ async function ensureOAuthTokensForAlias(alias, url, { quiet = false, allowHttp 
     return existing;
   }
 
-  // Spread the in-flight PKCE verifier too: if a prior attempt crashed mid-
-  // flow the verifier lives on the saved record, and without it the MCP SDK
-  // throws "No PKCE code verifier found" when the AS redirects back.
+  // A fresh login starts a new PKCE leg and rediscovers the authorization server.
   const tempAgent = {
     id: alias,
     name: alias,
@@ -1396,7 +1395,6 @@ async function ensureOAuthTokensForAlias(alias, url, { quiet = false, allowHttp 
     protocol: 'mcp',
     ...(existing?.oauth_client && { oauth_client: existing.oauth_client }),
     ...(existing?.oauth_tokens && { oauth_tokens: existing.oauth_tokens }),
-    ...(existing?.oauth_code_verifier && { oauth_code_verifier: existing.oauth_code_verifier }),
   };
 
   const { Client: MCPClient } = require('@modelcontextprotocol/sdk/client/index.js');
@@ -1969,13 +1967,16 @@ COMMANDS:
   doctor [options]            Check project secrets, SDK drift, and migrations
   storyboard <subcommand>     Test agent flows (run, list, show, step)
   specialism <subcommand>     Inspect a compliance specialism (list, show)
-  grade <subject> <url>       Conformance graders (e.g. request-signing)
+  grade <subject> <url>       Conformance graders (e.g. request-signing; with
+                              --transport a2a it also grades the A2A
+                              operation-resolution vectors)
   fuzz <url>                  Property-based conformance fuzzing against schemas
   resolve <agent-url>         Walk the brand_json_url discovery chain
                               (capabilities -> brand.json -> JWKS) and print
                               the per-step trace. Triages request_signature_brand_*
                               rejections.
   signing <subcommand>        RFC 9421 signing key tools (generate, verify)
+  identity <subcommand>       Experimental 3.3 trust validation and signed directory authoring
   check-network               Validate managed publisher network deployment
   diagnose-auth <alias|url>   Diagnose OAuth handshake with ranked hypotheses
                               (alias: "adcp diagnose oauth <alias|url>")
@@ -2022,7 +2023,6 @@ OPTIONS:
   --wait            Wait for async/webhook responses
   --json            Raw JSON output
   --debug           Debug output
-  --allow-v2        Suppress the v2-sunset warning (unsupported since 2026-04-20)
   --help, -h        Show help
 
 BUILT-IN AGENTS:
@@ -2120,7 +2120,7 @@ RUN OPTIONS (full assessment):
   --media-buy-lifecycle-compat
                       Route compact media-buy storyboard steps through the
                       SDK compatibility coordinator so the same storyboard can
-                      exercise established v2.5–3.2 sellers.
+                      exercise established AdCP 3.0–3.2 sellers.
   --media-buy-compat-losses LOSSES
                       Comma-separated guarantee losses explicitly accepted by
                       that coordinator (for example feed_version_not_atomic).
@@ -2194,7 +2194,10 @@ REQUEST-SIGNING VECTOR OPTIONS (signed_requests storyboard):
                                   discovery. Pass raw for agents that
                                   expose AdCP tools as per-operation HTTP
                                   endpoints. Mirrors
-                                  \`adcp grade request-signing --transport\`.
+                                  \`adcp grade request-signing --transport\`,
+                                  which with a2a additionally grades the A2A
+                                  operation-resolution vectors (required_for
+                                  keyed on the DataPart skill, adcp#7945).
   --signing-skip-vectors IDS      Comma-separated vector ids to skip (graded
                                   operator_skip), e.g.
                                   025-jwk-alg-crv-mismatch. Unknown ids are
@@ -4218,7 +4221,7 @@ function printFixtureResolution(records, coverageGaps) {
     const scope = record.product_handle ? `${record.product_handle}/` : '';
     if (record.status === 'resolved') {
       const ids = record.seller_ids || {};
-      const sellerId = ids.pricing_option_id || ids.product_id || '?';
+      const sellerId = ids.pricing_option_id || ids.product_id || ids.capability_id || ids.format_id?.id || '?';
       console.log(`  ✅ ${record.fixture_type} ${scope}${record.handle} → ${sellerId} (${record.strategy})`);
     } else if (record.status === 'unsatisfied') {
       continue;
@@ -5756,9 +5759,12 @@ const STEP_LABELS = {
 };
 
 function renderDiagnosisReport(report) {
-  console.log(`\n🔍 OAuth Diagnosis — ${report.agentUrl}`);
+  // Everything below except the step labels and verdict badges can come from
+  // the agent or its authorization server, so escape it before printing.
+  const esc = escapeTerminalControlChars;
+  console.log(`\n🔍 OAuth Diagnosis — ${esc(report.agentUrl)}`);
   if (report.aliasId && report.aliasId !== report.agentUrl) {
-    console.log(`   Alias: ${report.aliasId}`);
+    console.log(`   Alias: ${esc(report.aliasId)}`);
   }
   console.log(`   Generated: ${report.generatedAt}\n`);
 
@@ -5772,22 +5778,23 @@ function renderDiagnosisReport(report) {
     }
     if (step.http) {
       const statusBadge = step.http.status === 0 ? 'ERR' : `HTTP ${step.http.status}`;
-      console.log(`${prefix}  ↳ ${step.http.method} ${step.http.url}  ${statusBadge}`);
-      if (step.http.error) console.log(`      error: ${step.http.error}`);
+      console.log(`${prefix}  ↳ ${step.http.method} ${esc(step.http.url)}  ${statusBadge}`);
+      if (step.http.error) console.log(`      error: ${esc(step.http.error)}`);
       const wwwAuth = step.http.headers['www-authenticate'];
-      if (wwwAuth) console.log(`      WWW-Authenticate: ${wwwAuth}`);
+      if (wwwAuth) console.log(`      WWW-Authenticate: ${esc(wwwAuth)}`);
     } else if (step.decodedToken) {
       const audClaim = step.decodedToken.claims.aud;
-      const aud = audClaim === undefined ? '(missing)' : JSON.stringify(audClaim);
-      const iss = step.decodedToken.claims.iss ?? '(missing)';
-      const exp = step.decodedToken.claims.exp;
-      const expStr = exp ? new Date(exp * 1000).toISOString() : '(missing)';
+      const aud = audClaim === undefined ? '(missing)' : esc(JSON.stringify(audClaim));
+      const issClaim = step.decodedToken.claims.iss;
+      const iss =
+        issClaim === undefined ? '(missing)' : esc(typeof issClaim === 'string' ? issClaim : JSON.stringify(issClaim));
+      const expStr = formatJwtExpClaim(step.decodedToken.claims.exp);
       console.log(`${prefix}  ↳ JWT: iss=${iss}  aud=${aud}  exp=${expStr}`);
     } else {
       console.log(`${prefix}  ↳ (no token / opaque token)`);
     }
     if (step.notes) {
-      for (const note of step.notes) console.log(`      note: ${note}`);
+      for (const note of step.notes) console.log(`      note: ${esc(note)}`);
     }
   }
 
@@ -5795,9 +5802,9 @@ function renderDiagnosisReport(report) {
   for (const h of report.hypotheses) {
     const badge = formatVerdict(h.verdict);
     const id = h.id.padEnd(3);
-    console.log(`\n  ${id} ${badge}  ${h.title}`);
-    console.log(`       ${h.summary}`);
-    for (const ev of h.evidence) console.log(`       · ${ev}`);
+    console.log(`\n  ${id} ${badge}  ${esc(h.title)}`);
+    console.log(`       ${esc(h.summary)}`);
+    for (const ev of h.evidence) console.log(`       · ${esc(ev)}`);
   }
 
   const likely = report.hypotheses.filter(h => h.verdict === 'likely');
@@ -5809,9 +5816,9 @@ function renderDiagnosisReport(report) {
     for (const h of likely) {
       const fix = h.evidence.find(e => e.startsWith('Fix:'));
       if (fix) {
-        console.log(`  ${h.id}: ${fix.replace(/^Fix:\s*/, '')}`);
+        console.log(`  ${h.id}: ${esc(fix.replace(/^Fix:\s*/, ''))}`);
       } else {
-        console.log(`  ${h.id}: ${h.summary}`);
+        console.log(`  ${h.id}: ${esc(h.summary)}`);
       }
     }
     console.log();
@@ -5833,6 +5840,13 @@ function formatVerdict(verdict) {
 
 async function main() {
   const args = process.argv.slice(2);
+  if (args.some(arg => arg === '--allow-v2' || arg.startsWith('--allow-v2='))) {
+    console.error(
+      'ERROR: --allow-v2 has been removed. AdCP 2 reached end of life on 2026-08-01; upgrade the agent to AdCP 3. See https://github.com/adcontextprotocol/adcp-client/blob/main/docs/migration-drop-adcp-2.md'
+    );
+    process.exit(2);
+  }
+  if (args[0] === 'identity') return require('./adcp-identity.js').handleIdentityCommand(args.slice(1));
 
   // `--version` / `-v` is handled before subcommands and before the
   // staleness probe — it should be a fast, side-effect-free identity
@@ -5850,14 +5864,6 @@ async function main() {
   // skipped in CI, non-TTY, --json, and when ADCP_SKIP_VERSION_CHECK=1.
   scheduleVersionCheck(LIBRARY_VERSION);
 
-  // Global: suppress the v2-sunset warning before any subcommand runs.
-  // v2 went unsupported on 2026-04-20 (AdCP 3.0 GA, adcp#2220) — the library
-  // warns whenever an agent advertises v2 capabilities. The flag is for
-  // legacy holdouts who know what they're doing.
-  if (args.includes('--allow-v2')) {
-    process.env.ADCP_ALLOW_V2 = '1';
-  }
-
   // Handle subcommands before global --help so their own --help works
   if (args[0] === 'registry') {
     const code = await handleRegistryCommand(args.slice(1));
@@ -5868,7 +5874,7 @@ async function main() {
   if (args[0] === 'init') {
     const { handleInitCommand } = require('./adcp-project.js');
     await handleInitCommand(
-      args.slice(1).filter(arg => arg !== '--allow-v2' && arg !== '--allow-http'),
+      args.slice(1).filter(arg => arg !== '--allow-http'),
       { libraryVersion: LIBRARY_VERSION }
     );
     return;
@@ -5877,7 +5883,7 @@ async function main() {
   if (args[0] === 'doctor') {
     const { handleDoctorCommand } = require('./adcp-project.js');
     await handleDoctorCommand(
-      args.slice(1).filter(arg => arg !== '--allow-v2' && arg !== '--allow-http'),
+      args.slice(1).filter(arg => arg !== '--allow-http'),
       {
         libraryVersion: LIBRARY_VERSION,
         adcpVersion: ADCP_VERSION,
@@ -6662,7 +6668,12 @@ credential material — never sync or commit.
     }
 
     const agentConfig = getAgent(alias);
-    if (!agentConfig.oauth_tokens) {
+    if (
+      !agentConfig.oauth_tokens &&
+      !agentConfig.oauth_client &&
+      !agentConfig.oauth_code_verifier &&
+      !agentConfig.oauth_discovery_state
+    ) {
       console.log(`\nAgent '${alias}' has no OAuth tokens to clear.\n`);
       process.exit(0);
     }
@@ -6671,6 +6682,7 @@ credential material — never sync or commit.
     delete agentConfig.oauth_tokens;
     delete agentConfig.oauth_client;
     delete agentConfig.oauth_code_verifier;
+    delete agentConfig.oauth_discovery_state;
     saveAgent(alias, agentConfig);
 
     console.log(`\n✅ Cleared OAuth tokens for '${alias}'`);

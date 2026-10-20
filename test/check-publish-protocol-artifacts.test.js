@@ -8,19 +8,18 @@ const modulePromise = import(
   pathToFileURL(path.resolve(__dirname, '..', 'scripts', 'check-publish-protocol-artifacts.mjs')).href
 );
 
-const currentProtocolVersion = '3.2.1';
-const compatibleVersions = ['v2.5', 'v3', '3.0.25', '3.1.24', currentProtocolVersion, '3.2'];
+const currentProtocolVersion = '3.2.5';
+const compatibleVersions = ['v3', '3.0.1', '3.0.25', '3.1.24', '3.1.29', '3.2.4', currentProtocolVersion, '3.2'];
 
 function fixture(overrides = {}) {
   return {
     packageInfo: {
       files: [
-        { path: 'dist/lib/schemas-data/v2.5/bundled.schemas.br' },
         { path: 'dist/lib/schemas-data/3.0/bundled.schemas.br' },
         { path: 'dist/lib/schemas-data/3.1/bundled.schemas.br' },
         { path: 'dist/lib/schemas-data/3.2/bundled.schemas.br' },
         { path: 'compliance/cache/3.0.25/index.json' },
-        { path: 'compliance/cache/3.1.24/index.json' },
+        { path: 'compliance/cache/3.1.29/index.json' },
         { path: `compliance/cache/${currentProtocolVersion}/index.json` },
         { path: 'docs/releases/14.0.0-beta.0.md' },
       ],
@@ -37,6 +36,26 @@ test('allows the current release, stable compatibility bundles, and historical b
   assert.doesNotThrow(() => assertPublishProtocolArtifacts(fixture()));
 });
 
+test('rejects retired AdCP 2 schemas, type exports, and advertised versions', async () => {
+  const { assertPublishProtocolArtifacts } = await modulePromise;
+  for (const path of ['dist/lib/schemas-data/v2.5/bundled.schemas.br', 'dist/lib/types/v2-5/index.d.ts']) {
+    const value = fixture();
+    value.packageInfo.files.push({ path });
+    assert.throws(() => assertPublishProtocolArtifacts(value), /v2[.-]5/);
+  }
+  assert.throws(
+    () => assertPublishProtocolArtifacts(fixture({ compatibleVersions: ['v2.5', 'v3'] })),
+    /retired AdCP 2/
+  );
+  assert.throws(
+    () =>
+      assertPublishProtocolArtifacts(
+        fixture({ manifest: { exports: { './types/v2-5': './dist/lib/types/v2-5/index.js' } } })
+      ),
+    /v2-5/
+  );
+});
+
 test('rejects superseded schema, compliance, and type preview bundles', async () => {
   const { assertPublishProtocolArtifacts } = await modulePromise;
   for (const [forbiddenPath, expected] of [
@@ -51,29 +70,34 @@ test('rejects superseded schema, compliance, and type preview bundles', async ()
   }
 });
 
-test('requires the exact maintained stable compliance inventory', async () => {
+test('requires the exact current and maintained stable compliance inventory', async () => {
   const { assertPublishProtocolArtifacts } = await modulePromise;
   const missingStable = fixture();
   missingStable.packageInfo.files = missingStable.packageInfo.files.filter(
-    file => !file.path.startsWith('compliance/cache/3.1.24/')
+    file => !file.path.startsWith('compliance/cache/3.1.29/')
   );
   assert.throws(
     () => assertPublishProtocolArtifacts(missingStable),
-    /3\.1\.24 \(required compliance bundle is missing\)/
+    /3\.1\.29 \(required compliance bundle is missing\)/
   );
 
-  const staleStable = fixture();
-  staleStable.packageInfo.files.push({ path: 'compliance/cache/3.0.1/index.json' });
-  assert.throws(() => assertPublishProtocolArtifacts(staleStable), /unsupported compliance bundle 3\.0\.1/);
+  for (const staleVersion of ['3.0.1', '3.1.24', '3.2.4']) {
+    const staleStable = fixture();
+    staleStable.packageInfo.files.push({ path: `compliance/cache/${staleVersion}/index.json` });
+    assert.throws(
+      () => assertPublishProtocolArtifacts(staleStable),
+      error => error.message.includes(`unsupported compliance bundle ${staleVersion}`)
+    );
+  }
 });
 
-test('requires every maintained stable schema root including v2.5', async () => {
+test('requires every maintained stable schema root including AdCP 3.0', async () => {
   const { assertPublishProtocolArtifacts } = await modulePromise;
-  const missingV25 = fixture();
-  missingV25.packageInfo.files = missingV25.packageInfo.files.filter(
-    file => !file.path.startsWith('dist/lib/schemas-data/v2.5/')
+  const missingV30 = fixture();
+  missingV30.packageInfo.files = missingV30.packageInfo.files.filter(
+    file => !file.path.startsWith('dist/lib/schemas-data/3.0/')
   );
-  assert.throws(() => assertPublishProtocolArtifacts(missingV25), /v2\.5 \(required schema bundle is missing\)/);
+  assert.throws(() => assertPublishProtocolArtifacts(missingV30), /3\.0 \(required schema bundle is missing\)/);
 });
 
 test('rejects preview type entry points and superseded advertised previews', async () => {
@@ -106,12 +130,11 @@ test('allows a beta only when it is the exact current primary pin', async () => 
         compatibleVersions: [beta, '4.0-beta.2'],
         packageInfo: {
           files: [
-            { path: 'dist/lib/schemas-data/v2.5/index.json' },
             { path: 'dist/lib/schemas-data/3.0/bundled.schemas.br' },
             { path: 'dist/lib/schemas-data/3.1/bundled.schemas.br' },
             { path: `dist/lib/schemas-data/${beta}/bundled.schemas.br` },
             { path: 'compliance/cache/3.0.25/index.json' },
-            { path: 'compliance/cache/3.1.24/index.json' },
+            { path: 'compliance/cache/3.1.29/index.json' },
             { path: `compliance/cache/${beta}/index.json` },
           ],
         },

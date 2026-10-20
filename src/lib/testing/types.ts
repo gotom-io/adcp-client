@@ -102,7 +102,7 @@ export interface TestOptions {
   /**
    * Route compact media-buy storyboard steps through the SDK compatibility
    * coordinator. This lets the same compact-first storyboard exercise native
-   * 3.2 sellers and established v2.5–3.2 sellers without task-name branching.
+   * 3.2 sellers and established AdCP 3.0–3.2 sellers without task-name branching.
    * Mutating guarantee losses remain fail-closed unless named here.
    */
   mediaBuyLifecycleCompatibility?: import('../media-buy/compatibility').MediaBuyLifecycleCoordinatorOptions;
@@ -126,6 +126,45 @@ export interface TestOptions {
    * authoritative over the SDK's generated Zod snapshot for the run.
    */
   schemaRoot?: string;
+  /**
+   * Schema roots for releases the agent may echo in its
+   * `get_adcp_capabilities` response, keyed by AdCP version (`'3.2'`,
+   * `'3.2.5'`, `'3.3.0-beta.1'`). Values are schema-data roots in the same
+   * shape as `schemaRoot`.
+   *
+   * A 3.0 pin sends only `adcp_major_version`, so an agent may serve and echo
+   * a newer release in the same major (versioning spec, "Server echoes").
+   * The SDK validates that capabilities response against the echoed release
+   * when the echo is the pin's major, is listed in the response's
+   * `adcp.supported_versions`, and has a schema root: an entry here, an
+   * external root registered for it, or the SDK's bundled schemas. That
+   * applies to discovery's capability notices, `getAdcpCapabilities()` and
+   * storyboard `response_schema` checks on `get_adcp_capabilities`, including
+   * when `schemaRoot` is set for the pin. Otherwise validation stays on the
+   * pin.
+   *
+   * Entries are used for that capabilities validation only. Every other
+   * task's response, storyboard selection and grading stay on the pin. Each
+   * root is checked against its key once per process; a malformed map throws
+   * before the run starts. Honored by `comply()`, `runStoryboard()` and
+   * `runStoryboardStep()`; other callers can use `withServedReleaseSchemaRoots`.
+   * The echo is compared with the run's pin, so storyboard checks apply it
+   * only when the run has one (`adcpVersion`, or the storyboard or compliance
+   * bundle's `adcp_version`); `comply()` always does.
+   *
+   * @example
+   * ```ts
+   * await comply(agentUrl, {
+   *   complianceDir: hosted30.complianceDir,
+   *   schemaRoot: hosted30.schemaRoot,
+   *   servedReleaseSchemaRoots: {
+   *     '3.1.29': hosted31.schemaRoot,
+   *     '3.2.5': hosted32.schemaRoot,
+   *   },
+   * });
+   * ```
+   */
+  servedReleaseSchemaRoots?: Readonly<Record<string, string>>;
   /**
    * Whether strict AJV response-schema failures contribute to storyboard
    * grading. Defaults to `true`, matching the hosted compliance grader.
@@ -160,7 +199,7 @@ export interface TestOptions {
    * - `basic`: cleartext `username` and `password`, encoded internally.
    * - `oauth`: saved OAuth tokens (access_token + refresh_token). MCP only.
    *   The library auto-refreshes on 401. Obtain tokens interactively via
-   *   `adcp --save-auth <alias> --oauth`, then pass the saved blob here for
+   *   `adcp --save-auth <alias> <url> --oauth`, then pass the saved blob here for
    *   non-interactive reuse.
    * - `oauth_client_credentials`: RFC 6749 §4.4 machine-to-machine flow.
    *   The library exchanges the secret for a fresh access token before each
@@ -174,6 +213,15 @@ export interface TestOptions {
         type: 'oauth';
         tokens: import('../types/adcp').AgentOAuthTokens;
         client?: import('../types/adcp').AgentOAuthClient;
+        /**
+         * Trusted runtime storage for refreshed OAuth configuration. Bound before
+         * client normalization; never sent to the agent. The adapter receives
+         * the testing client's ID (`test`), so capture any database context or
+         * tenant identity in the adapter itself. Shared clients require the
+         * same adapter object. Persistence alone does not coordinate concurrent
+         * refreshes of a rotating grant.
+         */
+        storage?: import('../auth/oauth/types').OAuthConfigStorage;
       }
     | {
         type: 'oauth_client_credentials';
@@ -296,6 +344,8 @@ export interface TestOptions {
   };
   /** @internal Pre-created client from comply() — avoids per-scenario MCP reconnection */
   _client?: unknown;
+  /** @internal Bound failed discovery retries to one attempt per storyboard. */
+  _discoveryPass?: object;
   /**
    * @internal Pre-discovered profile from comply() — skips per-scenario discovery.
    * @deprecated Use `StoryboardRunOptions.profile` for storyboard profile reuse.
@@ -319,10 +369,24 @@ export interface TestOptions {
 
 export interface TestStepResult {
   step: string;
+  /** Authored storyboard step identifier, independent of the display title. */
+  step_id?: string;
   task?: string;
   passed: boolean;
   duration_ms: number;
   details?: string;
+  /**
+   * Compact runner verdicts; excludes request/response payloads and diagnostic values.
+   * Skipped steps are not observable even when their retained validations have verdicts.
+   */
+  validations?: Array<{
+    id?: string;
+    check: string;
+    passed: boolean;
+    severity?: 'required' | 'advisory';
+    not_applicable?: boolean;
+    severity_promoted_from_advisory?: boolean;
+  }>;
   error?: string;
   response_preview?: string;
   // Structured data for collectObservations() — decoupled from response_preview display

@@ -1,3 +1,4 @@
+import type { CreativeBuildProbeSpec } from './creative-build-probe';
 /**
  * Types for storyboard-driven testing.
  *
@@ -273,6 +274,8 @@ export interface Storyboard {
    * Omitted handles retain the compatibility strategy `["seed"]`.
    */
   fixture_resolution?: StoryboardFixtureResolution;
+  /** Opt-in runner preparation; does not add an agent protocol capability. */
+  creative_build_probe?: CreativeBuildProbeSpec;
   /**
    * Initial context values declared by the storyboard YAML. Runner callers may
    * override these defaults with `StoryboardRunOptions.context`.
@@ -460,7 +463,7 @@ export type FixtureResolutionEvidence = FixtureResolutionAttempt;
 
 /** Machine-readable record emitted exactly once for every fixture handle. */
 export interface FixtureResolutionRecord {
-  fixture_type: 'product' | 'pricing_option';
+  fixture_type: 'product' | 'pricing_option' | 'creative_format';
   handle: string;
   product_handle?: string;
   requirements: FixtureMatchClause[];
@@ -468,8 +471,10 @@ export interface FixtureResolutionRecord {
   status: FixtureResolutionStatus;
   strategy?: FixtureResolutionStrategy;
   seller_ids?: {
-    product_id: string;
+    product_id?: string;
     pricing_option_id?: string;
+    capability_id?: string;
+    format_id?: Record<string, unknown>;
   };
 }
 
@@ -936,6 +941,9 @@ export interface RateLimitTripSpec {
 export type StoryboardValidationCheck =
   | 'response_schema'
   | 'field_present'
+  /** Every item carries a non-null field at `array[*].field`; absent, null,
+   *  or empty arrays grade not_applicable rather than passing vacuously. */
+  | 'all_fields_present'
   | 'field_absent'
   // Envelope-scoped variants — the asserted path lives on the v3 protocol
   // envelope (`status`, `task_id`, `message`, `replayed`, `governance_context`,
@@ -1129,6 +1137,7 @@ export type StoryboardValidationCheck =
    * adcp-client#2060.
    */
   | 'canonical_format_satisfaction'
+  | 'property_list_reference'
   /**
    * Assert the cardinality of the array at `path`. Two configurations are
    * supported: exact-count via `value: N` (passes only when the resolved
@@ -1319,6 +1328,20 @@ export interface RefsResolveScope {
 }
 
 export interface StoryboardValidation {
+  /** Managing endpoint; $agent_url uses the issuer's discovered MCP endpoint (adcp#8289). */
+  agent_url?: string;
+  /** Creation-response path to the issued list ID. Defaults to list.list_id. */
+  list_id_path?: string;
+  /** Creation-response path to the read-only credential. Defaults to auth_token. */
+  auth_token_path?: string;
+  /** Existing owner-created control list; accepts a resolved $context.<key>. */
+  denied_list_id?: string;
+  /** Maximum identifiers requested per page, 1 through 10000. Required by the probe. */
+  page_size?: number;
+  /** Maximum pages to traverse, 1 through 100. Required by the probe. */
+  max_pages?: number;
+  /** Exact unordered snapshot, compared by (type, value). Required by the probe. */
+  expected_identifiers?: Array<{ type: string; value: string }>;
   /** Stable authored validation identifier echoed into runner results when present. */
   id?: string;
   /** Known validation kind, or a future string graded not_applicable by older runners. */
@@ -2403,6 +2426,7 @@ export type RequirementName =
   | 'webhook_replay_receiver'
   | 'trusted_match_context_router_runner'
   | 'trusted_match_publisher_auth_runner'
+  | 'property_list_reference_runner'
   | 'request_signer'
   | 'multi_agent';
 
@@ -2421,6 +2445,7 @@ export const KNOWN_REQUIREMENTS: ReadonlySet<RequirementName> = new Set([
   'webhook_replay_receiver',
   'trusted_match_context_router_runner',
   'trusted_match_publisher_auth_runner',
+  'property_list_reference_runner',
   'request_signer',
   'multi_agent',
 ] as const satisfies readonly RequirementName[]);
@@ -2449,12 +2474,9 @@ export interface SchemaValidationError {
  * a deprecation or future-required advisory is the kind of thing a CI
  * gate or dashboard SHOULD have explicit handling for.
  *
- * Code naming generally follows the dot-namespaced convention `<topic>.<event>`
- * (e.g. `request_signing.required`, `webhook_signing.legacy_hmac_fallback.removed`);
- * prefer the upstream runner-output contract's canonical code when it
- * registers a different spelling. The *when* lives in the `effective_version`
- * field, never in the code. This keeps the surface stable across spec versions
- * — codes don't proliferate `_in_4_0` / `_in_5_0` siblings as the spec evolves.
+ * Use the upstream runner-output contract's canonical codes so consumers can
+ * aggregate the same advisory across runners. Keep each code stable for the
+ * same advisory, including its version suffix where the contract defines one.
  *
  * Adding a new code is a wire-surface change AND a TypeScript breaking
  * change for adopters who narrowed on `code`. Coordinate with the upstream
@@ -2468,10 +2490,10 @@ export type NoticeCode =
   | 'signed_requests_specialism_deprecated'
   /** Agent lacks `request_signing.supported: true`. Required for spend-committing
    *  operations in AdCP 4.0 per `effective_version`. */
-  | 'request_signing.required'
+  | 'request_signing_required_in_4_0'
   /** Agent advertises `webhook_signing.legacy_hmac_fallback: true`. Removed in
    *  AdCP 4.0 per `effective_version`. */
-  | 'webhook_signing.legacy_hmac_fallback.removed'
+  | 'legacy_hmac_fallback_removed_in_4_0'
   /** Runner stripped request fields missing from the agent's advertised tool input schema. */
   | 'input_schema_field_stripped'
   /** The preflight get_adcp_capabilities response failed schema validation. */
@@ -2586,9 +2608,9 @@ export interface ValidationResult {
   /** Optional remediation hint. */
   remediation?: string;
   /**
-   * Marker for an implemented check whose declared applicability conditions
-   * were not met. Unknown authored check kinds fail closed; they never set
-   * this flag or contribute a false green result. Entries carrying this flag
+   * Marker for a check that could not be graded because its applicability
+   * conditions were not met or the runner does not recognize its authored kind.
+   * Entries carrying this flag
    * contribute to `validations_not_applicable` so consumers can distinguish
    * inapplicable coverage from clean passes.
    */
@@ -2674,6 +2696,12 @@ export interface StoryboardStepResult {
   title: string;
   task: string;
   passed: boolean;
+  /**
+   * False when a failed step is diagnostic only and does not count toward
+   * the storyboard verdict (for example, an optional discovery phase).
+   * Absent on ordinary failures, including mandatory OAuth and invariant checks.
+   */
+  counts_toward_failure?: boolean;
   /** True when the step was not executed */
   skipped?: boolean;
   /**

@@ -11,6 +11,7 @@ import { parse } from 'yaml';
 import type { Storyboard } from './types';
 import { MUTATING_TASKS } from '../../utils/idempotency';
 import { validateFixtureResolutionDeclarations } from './fixture-resolution';
+import { validateCreativeBuildProbeSpec } from './creative-build-probe';
 import { valid as validSemver } from 'semver';
 import { parsePhaseCondition } from './phase-condition';
 
@@ -98,6 +99,7 @@ export function normalizeValidationOnlyTasks(storyboard: Storyboard): Storyboard
  * already-validated inputs.
  */
 export function validateStoryboardShape(storyboard: Storyboard): void {
+  if (storyboard.creative_build_probe !== undefined) validateCreativeBuildProbeSpec(storyboard.creative_build_probe);
   validateRequires(storyboard);
   validateRequiresAllCapabilities(storyboard);
   validateFixtureResolutionDeclarations(storyboard);
@@ -113,6 +115,16 @@ export function validateStoryboardShape(storyboard: Storyboard): void {
         if (!Array.isArray(rawStep.validations) || rawStep.validations.length === 0) {
           throw new Error(`[${storyboard.id}] phase '${phase.id}' step '${step.id}': missing task and validations`);
         }
+      }
+      if (step.validations?.some(validation => validation.check === 'property_list_reference')) {
+        if (storyboard.requires?.[0] !== 'property_list_reference_runner')
+          throw new Error(
+            `[${storyboard.id}] ${step.id}: property_list_reference requires property_list_reference_runner as the first storyboard requirement.`
+          );
+        if (step.parallel_dispatch)
+          throw new Error(
+            `[${storyboard.id}] ${step.id}: property_list_reference requires one issued reference, without parallel_dispatch.`
+          );
       }
       resolveContributesShorthand(storyboard.id, phase, step);
       validateFixtureForMutatingStep(storyboard.id, phase, step);

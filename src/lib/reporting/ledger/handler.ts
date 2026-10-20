@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { ADCP_MAJOR_VERSION, ADCP_VERSION, toReleasePrecisionVersion } from '../../version';
 import { AdcpError } from '../../server/decisioning/async-outcome';
+import { getSchemaDocumentByRef } from '../../validation/schema-loader';
 import type { GetReportingStatusResponse } from '../../types';
 import type { ReportingAdjustmentReceipt, ReportingMaterialization, ReportingReceipt } from '../../types';
 import { canonicalJsonV1 } from '../source';
@@ -19,10 +20,13 @@ import {
   reportingEffectiveConsumerMismatchEscalationV1,
   projectReportingConsumerStatusMismatchV1,
   projectReportingObligationHealthV1,
+  projectReportingUnreadableRevisionHealthV1,
 } from './health';
 import { compareReportingInstants } from './instant';
+import { getRevisionMetadataFromStore, readRevisionRowsFromStore } from './revision-metadata';
+import { isReportingRowStoreError } from './row-storage-errors';
 import { reportingPeriodSchedule } from './schedule';
-import { ReportingLedgerSnapshotUnavailableError } from './types';
+import { isReportingLedgerErrorNamed } from './types';
 import type {
   ReportingConsumerMismatchEscalationV1,
   ReportingHealthV1,
@@ -36,6 +40,7 @@ import type {
   ReportingLedgerSnapshotQueryV1,
   ReportingLedgerStore,
   ReportingManagedDeliveryBindingV1,
+  CreateReportingDeliveryHandlerOptionsV1,
   ReportingDeliveryHandlerV1,
   ReportingStatusHandlerV1,
 } from './types';
@@ -53,6 +58,17 @@ export interface ReportingStatusConsumerScopeOptionsV1<TContext = unknown> {
   consumerMismatchEscalation?: ReportingConsumerMismatchEscalationV1;
 }
 
+// The no-consumer-scope reader needs only a resolved account; transport state is unused.
+export function createReportingStatusHandler(
+  store: ReportingLedgerStore
+): (
+  request: Parameters<ReportingStatusHandlerV1>[0],
+  context: Pick<Parameters<ReportingStatusHandlerV1>[1], 'account' | 'signal'>
+) => ReturnType<ReportingStatusHandlerV1>;
+export function createReportingStatusHandler<TContext = unknown>(
+  store: ReportingLedgerStore,
+  options?: ReportingStatusConsumerScopeOptionsV1<TContext>
+): ReportingStatusHandlerV1;
 export function createReportingStatusHandler<TContext = unknown>(
   store: ReportingLedgerStore,
   options?: ReportingStatusConsumerScopeOptionsV1<TContext>
@@ -70,7 +86,12 @@ export function createReportingStatusHandler<TContext = unknown>(
     )
   );
   const activeReadsByAccount = new Map<string, number>();
-  return async (request, context) => {
+  // Fail at wiring time, not on the first read, if the pinned release defines no usable page-size bounds.
+  reportingPageBounds();
+  return async (
+    request: Parameters<ReportingStatusHandlerV1>[0],
+    context: Pick<Parameters<ReportingStatusHandlerV1>[1], 'account' | 'signal'>
+  ) => {
     const raw = request as unknown as Record<string, unknown>;
     const resolvedAccount = isRecord(context.account) ? context.account : {};
     const resolvedAccountId =
@@ -108,12 +129,7 @@ export function createReportingStatusHandler<TContext = unknown>(
         ...(typeof raw.changes_after === 'string' ? { changes_after: raw.changes_after } : {}),
         ...(isRecord(raw.period) ? { period: raw.period as { start?: string; end?: string } } : {}),
       } as ReportingLedgerSnapshotQueryV1;
-      const pagination = isRecord(raw.pagination) ? raw.pagination : {};
-      const limitValue = pagination.max_results ?? pagination.limit ?? 100;
-      const limit =
-        typeof limitValue === 'number' && Number.isFinite(limitValue)
-          ? Math.max(1, Math.min(500, Math.trunc(limitValue)))
-          : 100;
+      const { pageSize: limit, pagination } = reportingPagination(raw.pagination);
       const cursor = typeof pagination.cursor === 'string' ? pagination.cursor : undefined;
       let snapshotId: string | undefined;
       if (cursor) {
@@ -129,7 +145,10 @@ export function createReportingStatusHandler<TContext = unknown>(
         try {
           snapshot = await store.createSnapshot(query);
         } catch (error) {
-          if (error instanceof ReportingLedgerSnapshotUnavailableError || error instanceof ReportingReadCapacityError) {
+          if (
+            isReportingLedgerErrorNamed(error, 'ReportingLedgerSnapshotUnavailableError') ||
+            error instanceof ReportingReadCapacityError
+          ) {
             return lookupUnavailable(view);
           }
           if (isContinuityError(error)) return operationalUnavailable(view);
@@ -141,7 +160,10 @@ export function createReportingStatusHandler<TContext = unknown>(
         try {
           page = await store.readSnapshotPage(snapshotId ?? snapshot!.snapshotId, accountId, cursor, limit);
         } catch (error) {
-          if (error instanceof ReportingLedgerSnapshotUnavailableError || error instanceof ReportingReadCapacityError) {
+          if (
+            isReportingLedgerErrorNamed(error, 'ReportingLedgerSnapshotUnavailableError') ||
+            error instanceof ReportingReadCapacityError
+          ) {
             return lookupUnavailable(view);
           }
           if (isContinuityError(error)) return operationalUnavailable(view);
@@ -195,30 +217,36 @@ export function createReportingStatusHandler<TContext = unknown>(
           page.snapshot.ledgerAsOf,
           reportingLedgerScopeClosed(query, page.snapshot.ledgerAsOf, ledgerCoverage.complete)
         );
-        const persistedIssues =
-          projection.health === 'delayed' || projection.health === 'action_required'
-            ? page.snapshot.issues.filter(
-                issue =>
-                  issue.reporting_obligation_id === obligation.reporting_obligation_id &&
-                  !issue.resolvedAt &&
-                  // A CONSUMER_STATUS_MISMATCH is caller-scoped, but the issue
-                  // store is keyed by obligation alone and carries no consumer
-                  // dimension. Republishing a persisted one would hand every
-                  // other consumer on the same obligation the causing
-                  // `reporting_status_id`, its `opened_at` (i.e. another
-                  // tenant's exact ingest timing), and any `external_ref`
-                  // ticket key — the precise cross-tenant leak the field's own
-                  // contract forbids. This projection recomputes the mismatch
-                  // from the caller's current leaf on every read, so the
-                  // persisted copy is redundant as well as unsafe.
-                  issue.code !== 'CONSUMER_STATUS_MISMATCH' &&
-                  // Retiring an issue removes it from the projection rather
-                  // than publishing it at a terminal state, which is what lets
-                  // a reader treat a nonempty `issues[]` as degradation.
-                  issue.issueState !== 'resolved' &&
-                  issue.issueState !== 'waived'
-              )
-            : [];
+        const persistedIssues = page.snapshot.issues.filter(
+          issue =>
+            issue.reporting_obligation_id === obligation.reporting_obligation_id &&
+            !issue.resolvedAt &&
+            // A CONSUMER_STATUS_MISMATCH is caller-scoped, but the issue
+            // store is keyed by obligation alone and carries no consumer
+            // dimension. Republishing a persisted one would hand every
+            // other consumer on the same obligation the causing
+            // `reporting_status_id`, its `opened_at` (i.e. another
+            // tenant's exact ingest timing), and any `external_ref`
+            // ticket key — the precise cross-tenant leak the field's own
+            // contract forbids. This projection recomputes the mismatch
+            // from the caller's current leaf on every read, so the
+            // persisted copy is redundant as well as unsafe.
+            issue.code !== 'CONSUMER_STATUS_MISMATCH' &&
+            (projection.health === 'delayed' ||
+              projection.health === 'action_required' ||
+              issue.code === 'REVISION_UNREADABLE') &&
+            // Retiring an issue removes it from the projection rather
+            // than publishing it at a terminal state, which is what lets
+            // a reader treat a nonempty `issues[]` as degradation.
+            issue.issueState !== 'resolved' &&
+            issue.issueState !== 'waived'
+        );
+        const persistedHealth = projectReportingUnreadableRevisionHealthV1(
+          obligation,
+          revisions,
+          page.snapshot.issues,
+          projection.health
+        );
         const consumerStatusHistory = (page.snapshot.consumerStatuses ?? []).filter(value =>
           consumerStatusMatchesObligation(value, obligation)
         );
@@ -240,7 +268,7 @@ export function createReportingStatusHandler<TContext = unknown>(
                 obligation,
                 currentConsumerStatus,
                 revisions,
-                projection.health,
+                persistedHealth,
                 page.snapshot.ledgerAsOf,
                 consumerMismatchEscalation
               );
@@ -255,6 +283,7 @@ export function createReportingStatusHandler<TContext = unknown>(
           compareReportingInstants(page.snapshot.ledgerAsOf, obligation.recoveryDeadlineAt) > 0;
         const baseProjection = {
           ...projection,
+          health: persistedHealth,
           issues: uniqueIssues([...persistedIssues, ...projection.issues, ...(mismatch ? [mismatch.issue] : [])]),
         };
         const managed = projectManagedDelivery({
@@ -337,11 +366,32 @@ export function createReportingStatusHandler<TContext = unknown>(
         const id = query.reporting_revision_id;
         const inSnapshot = id ? page.snapshot.revisions.some(value => value.reporting_revision_id === id) : false;
         let revision = null;
+        let revisionRows: Record<string, unknown>[] | undefined;
         if (id && inSnapshot) {
           try {
-            revision = await store.getRevision(id, accountId);
+            revision = await getRevisionMetadataFromStore(store, id, accountId);
+            // The status view carries rows inline only while they fit one
+            // bounded read; larger revisions are paged through the exact
+            // delivery read, which is the protocol's row transport.
+            const rowCount = revision?.binding.rowCount ?? 0;
+            if (revision && rowCount <= REPORTING_STATUS_REVISION_VIEW_MAX_ROWS) {
+              const page =
+                rowCount === 0
+                  ? { rows: [], total: 0 }
+                  : await readRevisionRowsFromStore(store, {
+                      reporting_revision_id: id,
+                      account_id: accountId,
+                      offset: 0,
+                      limit: rowCount,
+                      ...(context.signal ? { signal: context.signal } : {}),
+                    });
+              if (!page || page.total !== rowCount) revision = null;
+              else revisionRows = page.rows;
+            }
           } catch (error) {
-            if (error instanceof ReportingReadCapacityError) return lookupUnavailable(view);
+            if (error instanceof ReportingReadCapacityError || isReportingRowStoreError(error)) {
+              return lookupUnavailable(view);
+            }
             throw error;
           }
         }
@@ -372,7 +422,7 @@ export function createReportingStatusHandler<TContext = unknown>(
             revision_content_sha256: revision.wireRevision.revision_content_sha256,
             row_count: revision.binding.rowCount,
           },
-          reporting_rows: revision.rows,
+          ...(revisionRows ? { reporting_rows: revisionRows } : {}),
           adjustments: revisionAdjustments.map(value => value.wireAdjustment),
           ...(consumerId ? { consumer_statuses: (page.consumerStatuses ?? []).map(wireConsumerStatus) } : {}),
           materializations: (page.materializations ?? []).filter(
@@ -492,16 +542,128 @@ export function createReportingStatusHandler<TContext = unknown>(
         ),
         issues: issues.map(wireIssue),
       } as never;
+    } catch (error) {
+      if (isReportingLedgerErrorNamed(error, 'ReportingLedgerIssueIntegrityError')) return operationalUnavailable(view);
+      throw error;
     } finally {
       releaseReadSlot();
     }
   };
 }
 
-/** Exact revision reader for createAdcpServer's getMediaBuyDelivery slot. */
-export function createReportingDeliveryHandler(store: ReportingLedgerStore): ReportingDeliveryHandlerV1 {
+/**
+ * Largest revision whose rows the `get_reporting_status` `revision` view
+ * returns inline. Larger revisions omit `reporting_rows` there; callers page
+ * them through the exact `get_media_buy_delivery` read.
+ */
+export const REPORTING_STATUS_REVISION_VIEW_MAX_ROWS = 10_000;
+
+interface ReportingPageBounds {
+  readonly minimum: number;
+  readonly maximum: number;
+  readonly default: number;
+}
+
+let pageBounds: ReportingPageBounds | undefined;
+
+/**
+ * The page-size bounds AdCP defines for `pagination.max_results`, read from the pinned release's
+ * `core/pagination-request.json` rather than written here, so a schema change carries through.
+ */
+function reportingPageBounds(): ReportingPageBounds {
+  if (pageBounds) return pageBounds;
+  const document = getSchemaDocumentByRef('core/pagination-request.json');
+  const field = (document?.schema.properties as Record<string, Record<string, unknown>> | undefined)?.max_results;
+  const { minimum, maximum, default: initial } = field ?? {};
+  if (
+    !Number.isSafeInteger(minimum) ||
+    !Number.isSafeInteger(maximum) ||
+    !Number.isSafeInteger(initial) ||
+    (minimum as number) < 1 ||
+    (maximum as number) < (minimum as number) ||
+    (initial as number) < (minimum as number) ||
+    (initial as number) > (maximum as number)
+  ) {
+    throw new Error('The AdCP pagination-request schema does not define bounds for max_results');
+  }
+  pageBounds = Object.freeze({
+    minimum: minimum as number,
+    maximum: maximum as number,
+    default: initial as number,
+  });
+  return pageBounds;
+}
+
+/**
+ * `pagination` as AdCP defines it: an object whose `max_results` is an integer within the schema's bounds
+ * (the schema's default when absent) and whose `cursor` is a string. Anything else is a `VALIDATION_ERROR`, as
+ * for any other schema-invalid field, so the same request behaves the same on every seller. (`pagination.limit`
+ * is not an AdCP field.)
+ */
+function reportingPagination(value: unknown): { pageSize: number; pagination: Record<string, unknown> } {
+  const bounds = reportingPageBounds();
+  if (value !== undefined && !isRecord(value)) {
+    throw new AdcpError('VALIDATION_ERROR', { message: 'pagination must be an object', field: 'pagination' });
+  }
+  const pagination = value ?? {};
+  if (pagination.cursor !== undefined && typeof pagination.cursor !== 'string') {
+    throw new AdcpError('VALIDATION_ERROR', {
+      message: 'pagination.cursor must be a string',
+      field: 'pagination.cursor',
+    });
+  }
+  const size = pagination.max_results;
+  if (size === undefined) return { pageSize: bounds.default, pagination };
+  if (typeof size !== 'number' || !Number.isInteger(size) || size < bounds.minimum || size > bounds.maximum) {
+    throw new AdcpError('VALIDATION_ERROR', {
+      message: `pagination.max_results must be an integer from ${bounds.minimum} to ${bounds.maximum}`,
+      field: 'pagination.max_results',
+      suggestion: `Send an integer from ${bounds.minimum} to ${bounds.maximum}, or omit it for the default of ${bounds.default}.`,
+    });
+  }
+  return { pageSize: size, pagination };
+}
+
+/**
+ * Nondisclosing not-found for exact revision reads. Unknown, unauthorized,
+ * expired and compacted revisions, and an unusable pagination cursor, all
+ * return this identical error so a response never reveals whether a revision
+ * exists for another account. It is correctable/terminal, never transient: the
+ * reference will not start resolving by retrying.
+ */
+function reportingRevisionNotFound(): AdcpError {
+  return new AdcpError('REFERENCE_NOT_FOUND', {
+    message: 'Reporting revision is unavailable',
+    field: 'reporting_revision_id',
+  });
+}
+
+/** The SDK ledger holds no revision of this id for the resolved account. */
+const SDK_REVISION_NOT_OWNED = Symbol('sdk-revision-not-owned');
+
+/**
+ * Exact revision reader for createAdcpServer's getMediaBuyDelivery slot.
+ *
+ * With `legacyRevisionReader`, a revision the SDK ledger does not hold for the
+ * resolved account is offered to that reader (see
+ * {@link ReportingLegacyRevisionReaderV1}). The SDK always answers first, and
+ * only that one not-found case falls through.
+ */
+export function createReportingDeliveryHandler(
+  store: ReportingLedgerStore,
+  options: CreateReportingDeliveryHandlerOptionsV1 = {}
+): ReportingDeliveryHandlerV1 {
+  const legacyRevisionReader = options.legacyRevisionReader;
+  if (legacyRevisionReader !== undefined && typeof legacyRevisionReader !== 'function') {
+    throw new TypeError('legacyRevisionReader must be a function');
+  }
+  // Fail at wiring time, not on the first read, if the pinned release defines no usable page-size bounds.
+  reportingPageBounds();
   const activeReadsByAccount = new Map<string, number>();
-  return async (request, context) => {
+  const readFromSdkLedger = async (
+    request: Parameters<ReportingDeliveryHandlerV1>[0],
+    context: Parameters<ReportingDeliveryHandlerV1>[1]
+  ): Promise<Awaited<ReturnType<ReportingDeliveryHandlerV1>> | typeof SDK_REVISION_NOT_OWNED> => {
     const accountId = resolvedAccountId(context.account);
     let releaseReadSlot: () => void;
     try {
@@ -517,19 +679,18 @@ export function createReportingDeliveryHandler(store: ReportingLedgerStore): Rep
     try {
       const raw = request as unknown as Record<string, unknown>;
       if (typeof raw.reporting_revision_id !== 'string' || !raw.reporting_revision_id) {
-        throw new Error('Ledger delivery reads require reporting_revision_id');
+        throw new AdcpError('VALIDATION_ERROR', {
+          message: 'Ledger delivery reads require reporting_revision_id',
+          field: 'reporting_revision_id',
+        });
       }
-      const revision = await store.getRevision(raw.reporting_revision_id, accountId);
-      if (!revision) throw new Error('Reporting revision is unavailable');
+      // Refuse schema-invalid pagination before reading anything, whichever ledger would have answered.
+      const { pageSize: maxResults, pagination } = reportingPagination(raw.pagination);
+      const revision = await getRevisionMetadataFromStore(store, raw.reporting_revision_id, accountId);
+      if (!revision) return SDK_REVISION_NOT_OWNED;
       const obligation = await store.getObligation(revision.reporting_obligation_id);
-      if (!obligation || obligation.account.account_id !== accountId) {
-        throw new Error('Reporting revision is unavailable');
-      }
-      const pagination = isRecord(raw.pagination) ? raw.pagination : {};
-      const maxResults =
-        typeof pagination.max_results === 'number' && Number.isFinite(pagination.max_results)
-          ? Math.max(1, Math.min(500, Math.trunc(pagination.max_results)))
-          : 100;
+      if (!obligation || obligation.account.account_id !== accountId) return SDK_REVISION_NOT_OWNED;
+      const totalCount = revision.binding.rowCount;
       let offset = 0;
       if (typeof pagination.cursor === 'string') {
         try {
@@ -542,18 +703,52 @@ export function createReportingDeliveryHandler(store: ReportingLedgerStore): Rep
             typeof cursor.offset !== 'number' ||
             !Number.isSafeInteger(cursor.offset) ||
             cursor.offset < 0 ||
-            cursor.offset >= revision.rows.length
+            cursor.offset >= totalCount
           ) {
             throw new Error('invalid');
           }
           offset = cursor.offset;
         } catch {
-          throw new Error('Reporting delivery cursor is invalid');
+          throw reportingRevisionNotFound();
         }
       }
-      const reportingRows = revision.rows.slice(offset, offset + maxResults);
+      let reportingRows: Record<string, unknown>[] = [];
+      if (totalCount > 0) {
+        let page;
+        try {
+          page = await readRevisionRowsFromStore(store, {
+            reporting_revision_id: revision.reporting_revision_id,
+            account_id: accountId,
+            offset,
+            limit: maxResults,
+            ...(context.signal ? { signal: context.signal } : {}),
+          });
+        } catch (error) {
+          // Expired rows read exactly like an unknown revision. Missing or
+          // corrupt rows inside the retention window are never reported as
+          // absent and never released unverified.
+          if (isReportingRowStoreError(error)) {
+            if (error.code === 'ROWS_EXPIRED') throw reportingRevisionNotFound();
+            throw new AdcpError('SERVICE_UNAVAILABLE', {
+              message: 'Reporting revision rows are temporarily unavailable',
+            });
+          }
+          throw error;
+        }
+        // The revision vanished between the metadata read and the row read:
+        // it is gone, which reads like any other unknown revision.
+        if (!page) throw reportingRevisionNotFound();
+        // A retained revision whose stored rows disagree with its committed
+        // binding is an integrity failure, never not-found and never released.
+        if (page.total !== totalCount) {
+          throw new AdcpError('SERVICE_UNAVAILABLE', {
+            message: 'Reporting revision rows are temporarily unavailable',
+          });
+        }
+        reportingRows = page.rows;
+      }
       const nextOffset = offset + reportingRows.length;
-      const hasMore = nextOffset < revision.rows.length;
+      const hasMore = nextOffset < totalCount;
       return {
         reporting_period: { start: obligation.period.start, end: obligation.period.end },
         media_buy_deliveries: [],
@@ -574,7 +769,7 @@ export function createReportingDeliveryHandler(store: ReportingLedgerStore): Rep
         errors: [],
         pagination: {
           has_more: hasMore,
-          total_count: revision.rows.length,
+          total_count: totalCount,
           ...(hasMore
             ? {
                 cursor: Buffer.from(
@@ -588,6 +783,16 @@ export function createReportingDeliveryHandler(store: ReportingLedgerStore): Rep
     } finally {
       releaseReadSlot();
     }
+  };
+  return async (request, context) => {
+    const result = await readFromSdkLedger(request, context);
+    if (result !== SDK_REVISION_NOT_OWNED) return result;
+    // The SDK read slot is released: a slow legacy reader must not starve SDK
+    // reads for the account. The adopter bounds its own reader's concurrency.
+    if (!legacyRevisionReader) throw reportingRevisionNotFound();
+    const legacy = await legacyRevisionReader(request, context);
+    if (legacy === null || legacy === undefined) throw reportingRevisionNotFound();
+    return legacy;
   };
 }
 
@@ -1017,6 +1222,7 @@ function wireIssue(issue: ReportingLedgerIssueV1) {
     ...(issue.issueState === 'open' || issue.issueState === 'acknowledged' ? { issue_state: issue.issueState } : {}),
     ...(issue.externalRef ? { external_ref: issue.externalRef } : {}),
     ...(issue.reporting_status_id ? { reporting_status_id: issue.reporting_status_id } : {}),
+    ...(issue.reporting_revision_id ? { reporting_revision_id: issue.reporting_revision_id } : {}),
     ...(issue.reporting_obligation_id === 'scope' ? {} : { reporting_obligation_id: issue.reporting_obligation_id }),
   };
 }

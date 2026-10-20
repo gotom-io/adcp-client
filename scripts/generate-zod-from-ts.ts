@@ -23,6 +23,60 @@ const TOOLS_SOURCE_FILE = path.join(__dirname, '../src/lib/types/tools.generated
 const OUTPUT_FILE = path.join(__dirname, '../src/lib/types/schemas.generated.ts');
 
 /**
+ * Schema construction only creates local validators and captures their dependencies.
+ * Wrap the entire initializer in a pure IIFE so unused definitions, including all
+ * nested Zod calls and format helpers, can be removed by consumer bundlers. Marking
+ * only the outer Zod call pure would leave its effectful-looking arguments behind.
+ * Run this last so structural post-processors still see their original expressions.
+ */
+function postProcessPureInitializers(content: string): string {
+  const source = ts.createSourceFile('adcp-generated-zod.ts', content, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const edits: { start: number; end: number; text: string }[] = [];
+  for (const statement of source.statements) {
+    // Generated initializers must construct local validators, without shared
+    // registry setup or other externally observable initialization effects.
+    if (
+      ts.isImportDeclaration(statement) ||
+      ts.isTypeAliasDeclaration(statement) ||
+      ts.isInterfaceDeclaration(statement) ||
+      (ts.isExportDeclaration(statement) && statement.isTypeOnly)
+    ) {
+      continue;
+    }
+    if (!ts.isVariableStatement(statement)) {
+      throw new Error('Generated schemas may only contain imports, types, and const declarations.');
+    }
+    if (!(statement.declarationList.flags & ts.NodeFlags.Const)) {
+      throw new Error('Generated schema initializers must be const before marking them pure.');
+    }
+    for (const declaration of statement.declarationList.declarations) {
+      const initializer = declaration.initializer;
+      if (!initializer) continue;
+      const start = initializer.getStart(source);
+      const leadingTrivia = content.slice(initializer.getFullStart(), start);
+      if (
+        leadingTrivia.includes('@__PURE__') &&
+        ts.isCallExpression(initializer) &&
+        initializer.arguments.length === 0 &&
+        ts.isParenthesizedExpression(initializer.expression) &&
+        ts.isArrowFunction(initializer.expression.expression) &&
+        initializer.expression.expression.parameters.length === 0
+      ) {
+        continue;
+      }
+      edits.push({
+        start,
+        end: initializer.end,
+        text: `/* @__PURE__ */ (() => (${initializer.getText(source)}))()`,
+      });
+    }
+  }
+  return edits
+    .reverse()
+    .reduce((result, edit) => result.slice(0, edit.start) + edit.text + result.slice(edit.end), content);
+}
+
+/**
  * Post-process generated Zod schemas to convert .optional() to .nullish() globally.
  * This is needed because real-world API responses often send explicit null values for optional
  * fields, but ts-to-zod generates .optional() which only accepts undefined.
@@ -1117,24 +1171,244 @@ function postProcessRecordIntersections(content: string): string {
  * projection must preserve the primitive runtime shape.
  */
 function postProcessPrimitiveIntersections(content: string): string {
-  const emptyObject = String.raw`z\.object\(\{\}\)(?:\.passthrough\(\))?`;
-  const emptyObjectUnion = String.raw`z\.union\(\[\s*${emptyObject}(?:\s*,\s*${emptyObject})+\s*\]\)`;
-  const emptyObjectThenPrimitive = new RegExp(
-    String.raw`(?:${emptyObject}|${emptyObjectUnion})\.and\(z\.(string|number|boolean)\(\)\)`,
-    'g'
-  );
-  const primitiveThenEmptyObject = new RegExp(
-    String.raw`z\.(string|number|boolean)\(\)\.and\((?:${emptyObject}|${emptyObjectUnion})\)`,
-    'g'
-  );
-
   let result = content;
-  let previous: string;
-  do {
-    previous = result;
-    result = result.replace(emptyObjectThenPrimitive, 'z.$1()').replace(primitiveThenEmptyObject, 'z.$1()');
-  } while (result !== previous);
-  return result;
+  for (;;) {
+    const source = ts.createSourceFile('adcp-generated-zod.ts', result, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const declarations = new Map<string, ts.Expression>();
+    for (const statement of source.statements) {
+      if (!ts.isVariableStatement(statement)) continue;
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name) && declaration.initializer) {
+          declarations.set(declaration.name.text, declaration.initializer);
+        }
+      }
+    }
+    const isZodCall = (node: ts.Expression, method: string): node is ts.CallExpression =>
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === 'z' &&
+      node.expression.name.text === method;
+    const isMarker = (node: ts.Expression): boolean => {
+      if (ts.isParenthesizedExpression(node)) return isMarker(node.expression);
+      if (isZodCall(node, 'object')) {
+        const shape = node.arguments[0];
+        return !!shape && ts.isObjectLiteralExpression(shape) && shape.properties.length === 0;
+      }
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === 'passthrough' &&
+        node.arguments.length === 0
+      ) {
+        return isMarker(node.expression.expression);
+      }
+      if (isZodCall(node, 'union')) {
+        const arms = node.arguments[0];
+        return !!arms && ts.isArrayLiteralExpression(arms) && arms.elements.length > 0 && arms.elements.every(isMarker);
+      }
+      return false;
+    };
+    const isPrimitive = (node: ts.Expression, seen = new Set<string>()): boolean => {
+      if (ts.isParenthesizedExpression(node)) return isPrimitive(node.expression, seen);
+      if (ts.isIdentifier(node)) {
+        if (seen.has(node.text)) return false;
+        const initializer = declarations.get(node.text);
+        return !!initializer && isPrimitive(initializer, new Set([...seen, node.text]));
+      }
+      if (
+        ['string', 'number', 'boolean', 'bigint', 'null', 'literal', 'enum'].some(method => isZodCall(node, method))
+      ) {
+        // Literal arrays and objects are not primitive values.
+        return (
+          !isZodCall(node, 'literal') ||
+          node.arguments.every(
+            argument =>
+              ts.isStringLiteral(argument) ||
+              ts.isNumericLiteral(argument) ||
+              argument.kind === ts.SyntaxKind.TrueKeyword ||
+              argument.kind === ts.SyntaxKind.FalseKeyword ||
+              argument.kind === ts.SyntaxKind.NullKeyword
+          )
+        );
+      }
+      if (isZodCall(node, 'union')) {
+        const arms = node.arguments[0];
+        return (
+          !!arms &&
+          ts.isArrayLiteralExpression(arms) &&
+          arms.elements.length > 0 &&
+          arms.elements.every(arm => isPrimitive(arm, seen))
+        );
+      }
+      return false;
+    };
+    const edits: Array<{ start: number; end: number; text: string }> = [];
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === 'and' &&
+        node.arguments.length === 1
+      ) {
+        const left = node.expression.expression;
+        const right = node.arguments[0];
+        const primitive =
+          isMarker(left) && isPrimitive(right) ? right : isPrimitive(left) && isMarker(right) ? left : undefined;
+        if (primitive) {
+          edits.push({ start: node.getStart(source), end: node.end, text: primitive.getText(source) });
+          return;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    if (edits.length === 0) return result;
+    result = edits
+      .reverse()
+      .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), result);
+  }
+}
+
+/**
+ * `not.const` and `not.enum` become empty object marker arms in the TypeScript
+ * projection. Removing those impossible primitive intersections must retain
+ * the canonical exclusions. Narrow the finite vocabulary from its source
+ * enum, keeping validators portable to Zod's JSON Schema exporter.
+ */
+function postProcessPrimitiveEnumExclusions(
+  content: string,
+  cacheRoot = path.join(__dirname, '../schemas/cache/latest')
+): string {
+  const readSource = (file: string): any => JSON.parse(readFileSync(path.join(cacheRoot, file), 'utf8'));
+  const excludedValues = (schema: any): string[] => {
+    if (isDeepStrictEqual(schema, { const: schema?.const }) && typeof schema.const === 'string') {
+      return [schema.const];
+    }
+    if (
+      isDeepStrictEqual(schema, { enum: schema?.enum }) &&
+      Array.isArray(schema.enum) &&
+      schema.enum.every((value: unknown) => typeof value === 'string')
+    ) {
+      return schema.enum;
+    }
+    throw new Error('Unsupported canonical primitive enum exclusion.');
+  };
+  const domain = (schema: any, enumFile: string, additionalExclusions: string[] = []): string[] => {
+    const arms = schema?.allOf;
+    if (
+      !Array.isArray(arms) ||
+      arms.length !== 2 ||
+      typeof arms[0]?.$ref !== 'string' ||
+      !arms[0].$ref.endsWith(`/${enumFile}`) ||
+      !isDeepStrictEqual(arms[0], { $ref: arms[0].$ref }) ||
+      !isDeepStrictEqual(arms[1], { not: arms[1]?.not })
+    ) {
+      throw new Error(`Unsupported canonical primitive enum intersection for ${enumFile}.`);
+    }
+    const enumeration = readSource(enumFile);
+    if (
+      enumeration.type !== 'string' ||
+      !Array.isArray(enumeration.enum) ||
+      !enumeration.enum.every((value: unknown) => typeof value === 'string')
+    ) {
+      throw new Error(`Expected a canonical string enum in ${enumFile}.`);
+    }
+    const excluded = new Set([...excludedValues(arms[1].not), ...additionalExclusions]);
+    const allowed = enumeration.enum.filter((value: string) => !excluded.has(value));
+    if (allowed.length === 0 || allowed.length === enumeration.enum.length) {
+      throw new Error(`Canonical exclusions did not narrow ${enumFile} to a non-empty vocabulary.`);
+    }
+    return allowed;
+  };
+  const macro = readSource('core/macro-resolution-capability.json');
+  const vast = readSource('core/assets/vast-tracker-asset.json');
+  const daast = readSource('core/assets/daast-tracker-asset.json');
+  const notification = readSource('core/agent-notification-config.json');
+  const notificationState = readSource('core/agent-notification-config-state.json');
+  const packageMetric = readSource('core/package-delivery-metric-value.json');
+  const aggregate = readSource('core/delivery-metric-aggregate.json');
+  const packageExclusion = packageMetric.allOf?.[1]?.not;
+  if (
+    !isDeepStrictEqual(packageExclusion, {
+      properties: { metric_id: packageExclusion?.properties?.metric_id },
+      required: ['metric_id'],
+    }) ||
+    !packageMetric.allOf?.[0]?.$ref?.endsWith('/core/delivery-metric-aggregate.json#/oneOf/0')
+  ) {
+    throw new Error('Unsupported package delivery metric exclusion.');
+  }
+  const targets = [
+    {
+      name: 'MacroProcessingCapabilitySchema',
+      field: 'supported_contexts',
+      reference: 'MacroValueContextSchema',
+      values: domain(macro.properties.supported_contexts.items, 'enums/macro-value-context.json'),
+    },
+    {
+      name: 'VASTTrackerAssetSchema',
+      field: 'vast_event',
+      reference: 'VASTTrackingEventSchema',
+      values: domain(vast.properties.vast_event, 'enums/vast-tracking-event.json'),
+    },
+    {
+      name: 'DAASTTrackerAssetSchema',
+      field: 'daast_event',
+      reference: 'DAASTTrackingEventSchema',
+      values: domain(daast.properties.daast_event, 'enums/daast-tracking-event.json'),
+    },
+    {
+      name: 'PackageDeliveryMetricValueSchema',
+      field: 'metric_id',
+      reference: 'AvailableMetricSchema',
+      values: domain(
+        aggregate.oneOf[0].properties.metric_id,
+        'enums/available-metric.json',
+        excludedValues(packageExclusion.properties.metric_id)
+      ),
+    },
+    {
+      name: 'AgentNotificationConfigSchema',
+      field: 'event_types',
+      reference: 'NotificationTypeSchema',
+      values: domain(notification.properties.event_types.items, 'enums/notification-type.json'),
+    },
+    {
+      name: 'AgentNotificationConfigStateSchema',
+      field: 'event_types',
+      reference: 'NotificationTypeSchema',
+      values: domain(notificationState.properties.event_types.items, 'enums/notification-type.json'),
+    },
+  ];
+  const source = ts.createSourceFile('adcp-generated-zod.ts', content, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  for (const target of targets) {
+    const schema = findSchemaVariable(source, target.name);
+    if (!schema) throw new Error(`Missing ${target.name} while restoring canonical primitive exclusions.`);
+    const fields = collectObjectPropertyValues(schema, [target.field]);
+    if (fields.length === 0) throw new Error(`Missing ${target.name}.${target.field}.`);
+    const narrowed = `z.enum(${JSON.stringify(target.values)})`;
+    for (const field of fields) {
+      let found = false;
+      const visit = (node: ts.Node): void => {
+        if (ts.isIdentifier(node) && node.text === target.reference) {
+          edits.push({ start: node.getStart(source), end: node.end, text: narrowed });
+          found = true;
+          return;
+        }
+        if (node.getText(source) === narrowed) {
+          found = true;
+          return;
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(field);
+      if (!found) throw new Error(`Unsupported ${target.name}.${target.field} primitive projection.`);
+    }
+  }
+  return edits
+    .sort((a, b) => b.start - a.start)
+    .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), content);
 }
 
 /**
@@ -1153,6 +1427,125 @@ function postProcessCanonicalFormatMarkerIntersections(content: string): string 
       'CanonicalFormatBaseSchema.merge(z.object('
     )
     .replace(/SizeModeMutexSchema\.and\(z\.object\(/g, 'z.object({}).passthrough().merge(z.object(');
+}
+
+/**
+ * Keep `CompactTaskSubmittedSchema` (and the `RequestProposalsAsyncSubmitted` /
+ * `RefineProposalsAsyncSubmitted` aliases of it) a ZodObject.
+ *
+ * The canonical schema is `allOf: [version-envelope, protocol-envelope]` plus
+ * its own `properties`, so ts-to-zod emits `Envelope.merge(Envelope).and(z.object(...))`
+ * — a ZodIntersection with no `.shape`/`.extend()`/`.pick()`/`.omit()`, unlike the
+ * plain object this public export was in 3.2.3. `.merge()` lets the right side win
+ * on overlap, so it matches the intersection only while every top-level key the
+ * compact object shares with either envelope is a strict narrowing of the envelope's
+ * declaration (`status: TaskStatus` → `'submitted'`, optional `task_id` → required
+ * non-empty, `message` + `maxLength`) and all three objects keep the same
+ * unknown-key policy. This pass therefore pins the actual overlap SET and each
+ * overlapping declaration, and fails generation on any drift — including a new
+ * overlapping field — rather than silently dropping an envelope constraint.
+ */
+const COMPACT_TASK_SUBMITTED_KNOWN_OVERLAP: Readonly<Record<string, { envelope: string; compact: string }>> = {
+  status: { envelope: 'TaskStatusSchema', compact: 'z.literal("submitted")' },
+  task_id: { envelope: 'z.string().optional()', compact: 'z.string().min(1)' },
+  message: { envelope: 'z.string().optional()', compact: 'z.string().max(2000).optional()' },
+  context: { envelope: 'ContextObjectSchema.optional()', compact: 'ContextObjectSchema.optional()' },
+};
+
+function postProcessCompactTaskSubmittedEnvelope(content: string): string {
+  const fail = (reason: string): never => {
+    throw new Error(
+      `postProcessCompactTaskSubmittedEnvelope: ${reason}; merging would no longer match the canonical ` +
+        'allOf intersection. Review the envelope projection before changing this pass.'
+    );
+  };
+  const blockOf = (name: string): { start: number; end: number; text: string } => {
+    const start = content.indexOf(`export const ${name} = `);
+    const end = content.indexOf('\n\nexport const ', start + 1);
+    if (start === -1 || end === -1)
+      throw new Error(`postProcessCompactTaskSubmittedEnvelope: unable to locate ${name}.`);
+    return { start, end, text: content.slice(start, end) };
+  };
+  // Top-level keys (name -> initializer source) of the first `z.object({...})` in a schema
+  // declaration, plus whether it is directly `.passthrough()`. AST-based so nested objects'
+  // keys (e.g. inside `payload` or `errors`) are never mistaken for top-level fields.
+  const topLevelObject = (name: string, text: string): { keys: Map<string, string>; passthrough: boolean } => {
+    const source = ts.createSourceFile(`${name}.ts`, text, ts.ScriptTarget.Latest, true);
+    let found: ts.CallExpression | undefined;
+    const visit = (node: ts.Node): void => {
+      if (found) return;
+      if (ts.isCallExpression(node) && node.expression.getText(source) === 'z.object') {
+        found = node;
+        return;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    const literal = found?.arguments[0];
+    if (!found || !literal || !ts.isObjectLiteralExpression(literal))
+      fail(`${name} no longer starts with z.object({...})`);
+    const keys = new Map<string, string>();
+    for (const property of (literal as ts.ObjectLiteralExpression).properties) {
+      if (
+        !ts.isPropertyAssignment(property) ||
+        !(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name))
+      ) {
+        fail(`${name} has a non-plain top-level property (${property.getText(source)})`);
+      }
+      const assignment = property as ts.PropertyAssignment;
+      keys.set((assignment.name as ts.Identifier | ts.StringLiteral).text, assignment.initializer.getText(source));
+    }
+    const access = found!.parent;
+    const passthrough =
+      ts.isPropertyAccessExpression(access) &&
+      access.name.text === 'passthrough' &&
+      ts.isCallExpression(access.parent) &&
+      access.parent.expression === access;
+    return { keys, passthrough };
+  };
+
+  const version = topLevelObject('AdCPVersionEnvelopeSchema', blockOf('AdCPVersionEnvelopeSchema').text);
+  const protocol = topLevelObject('ProtocolEnvelopeSchema', blockOf('ProtocolEnvelopeSchema').text);
+  const compact = blockOf('CompactTaskSubmittedSchema');
+  const own = topLevelObject('CompactTaskSubmittedSchema', compact.text);
+  const from = 'AdCPVersionEnvelopeSchema.merge(ProtocolEnvelopeSchema).and(z.object({';
+  if (!compact.text.includes(from)) {
+    throw new Error('postProcessCompactTaskSubmittedEnvelope: expected the generated envelope intersection.');
+  }
+
+  for (const [name, shape] of [
+    ['AdCPVersionEnvelopeSchema', version],
+    ['ProtocolEnvelopeSchema', protocol],
+    ['CompactTaskSubmittedSchema', own],
+  ] as const) {
+    if (!shape.passthrough) fail(`${name} is no longer a passthrough object (unknown-key policy differs)`);
+  }
+
+  // The overlap SET must equal the reviewed set: a new shared key (e.g. a future envelope field the
+  // compact object also declares) would be silently overridden by `.merge()`.
+  const overlap = new Map<string, { envelope: string; compact: string }>();
+  for (const [key, compactInit] of own.keys) {
+    const envelopeInits = [version.keys.get(key), protocol.keys.get(key)].filter((v): v is string => v !== undefined);
+    if (envelopeInits.length > 1) fail(`${key} is declared by both envelopes`);
+    if (envelopeInits.length === 1) overlap.set(key, { envelope: envelopeInits[0], compact: compactInit });
+  }
+  const actual = [...overlap.keys()].sort().join(',');
+  const expected = Object.keys(COMPACT_TASK_SUBMITTED_KNOWN_OVERLAP).sort().join(',');
+  if (actual !== expected) {
+    fail(`top-level overlap with the envelopes changed (expected {${expected}}, found {${actual}})`);
+  }
+  for (const [key, declared] of overlap) {
+    const reviewed = COMPACT_TASK_SUBMITTED_KNOWN_OVERLAP[key];
+    if (declared.envelope !== reviewed.envelope || declared.compact !== reviewed.compact) {
+      fail(
+        `overlapping field ${key} changed (envelope \`${declared.envelope}\` / compact \`${declared.compact}\`, ` +
+          `reviewed \`${reviewed.envelope}\` / \`${reviewed.compact}\`)`
+      );
+    }
+  }
+
+  const to = 'AdCPVersionEnvelopeSchema.merge(ProtocolEnvelopeSchema).merge(z.object({';
+  return content.slice(0, compact.start) + compact.text.replace(from, to) + content.slice(compact.end);
 }
 
 /**
@@ -1984,6 +2377,102 @@ function postProcessReportingEvidenceStrictness(content: string): string {
     result = result.slice(0, target.expressionStart) + strict + result.slice(target.expressionEnd);
   }
   return result;
+}
+
+/** Restore code-specific issue constraints lost by the TypeScript projection. */
+function postProcessReportingStatusIssueConstraints(
+  content: string,
+  source = JSON.parse(
+    readFileSync(path.join(__dirname, '../schemas/cache/latest/core/reporting-status-issue.json'), 'utf8')
+  )
+): string {
+  const rules: Record<
+    string,
+    {
+      required: string[];
+      constants: Record<string, string>;
+      action?: { severity: string; then: string; else: string };
+    }
+  > = {};
+  for (const arm of source.allOf) {
+    const code = arm.if?.properties?.code?.const;
+    if (
+      typeof code !== 'string' ||
+      rules[code] ||
+      !source.properties.code.enum.includes(code) ||
+      !isDeepStrictEqual(arm.if, { properties: { code: { const: code } }, required: ['code'] }) ||
+      Object.keys(arm).some(key => !['if', 'then'].includes(key))
+    )
+      throw new Error('Unsupported reporting issue code conditional');
+    const required: string[] = arm.then.required ?? [];
+    const constants: Record<string, string> = {};
+    for (const [field, constraint] of Object.entries(arm.then.properties ?? {})) {
+      const value = (constraint as { const?: unknown }).const;
+      if (
+        typeof value !== 'string' ||
+        !isDeepStrictEqual(constraint, { const: value }) ||
+        !source.properties[field]?.enum?.includes(value)
+      ) {
+        throw new Error(`Unsupported reporting issue constant for ${code}.${field}`);
+      }
+      constants[field] = value;
+    }
+    if (
+      !Array.isArray(required) ||
+      required.some(field => !Object.hasOwn(source.properties, field)) ||
+      Object.keys(arm.then).some(key => !['required', 'properties', 'if', 'then', 'else'].includes(key))
+    ) {
+      throw new Error(`Unsupported reporting issue constraints for ${code}`);
+    }
+    const rule: (typeof rules)[string] = { required, constants };
+    if (arm.then.if || arm.then.then || arm.then.else) {
+      const severity = arm.then.if?.properties?.severity?.const;
+      const thenAction = arm.then.then?.properties?.recommended_action?.const;
+      const elseAction = arm.then.else?.properties?.recommended_action?.const;
+      if (
+        !source.properties.severity ||
+        typeof severity !== 'string' ||
+        !isDeepStrictEqual(arm.then.if, { properties: { severity: { const: severity } } }) ||
+        !isDeepStrictEqual(arm.then.then, { properties: { recommended_action: { const: thenAction } } }) ||
+        !isDeepStrictEqual(arm.then.else, { properties: { recommended_action: { const: elseAction } } }) ||
+        !source.properties.recommended_action.enum.includes(thenAction) ||
+        !source.properties.recommended_action.enum.includes(elseAction)
+      ) {
+        throw new Error(`Unsupported reporting issue action conditional for ${code}`);
+      }
+      rule.action = { severity, then: thenAction, else: elseAction };
+    }
+    rules[code] = rule;
+  }
+  const target = findSchemaExportExpressions(content).find(entry => entry.name === 'ReportingStatusIssueSchema');
+  if (!target) throw new Error('ReportingStatusIssueSchema was not generated');
+  const expression = `${target.expression}.superRefine((value, ctx) => {
+      // reporting issue canonical code constraints
+      const rules: Record<string, {
+          required: string[];
+          constants: Record<string, string>;
+          action?: { severity: string; then: string; else: string };
+      }> = ${JSON.stringify(rules)};
+      const rule = Object.hasOwn(rules, value.code) ? rules[value.code] : undefined;
+      if (!rule) return;
+      for (const field of rule.required) {
+          if ((value as Record<string, unknown>)[field] === undefined) {
+              ctx.addIssue({ code: "custom", path: [field], message: field + " is required for " + value.code });
+          }
+      }
+      for (const [field, expected] of Object.entries(rule.constants)) {
+          if ((value as Record<string, unknown>)[field] !== expected) {
+              ctx.addIssue({ code: "custom", path: [field], message: "Expected " + expected });
+          }
+      }
+      if (rule.action) {
+          const expected = value.severity === rule.action.severity ? rule.action.then : rule.action.else;
+          if (value.recommended_action !== expected) {
+              ctx.addIssue({ code: "custom", path: ["recommended_action"], message: "Expected " + expected });
+          }
+      }
+  })`;
+  return content.slice(0, target.expressionStart) + expression + content.slice(target.expressionEnd);
 }
 
 /**
@@ -5638,6 +6127,7 @@ async function generateZodSchemas() {
     // global extension passthrough policy intentionally does not cover.
     zodSchemas = postProcessGetReportingStatusViewRequiredFields(zodSchemas, reportingStatusRequiredByView);
     zodSchemas = postProcessReportingEvidenceStrictness(zodSchemas);
+    zodSchemas = postProcessReportingStatusIssueConstraints(zodSchemas);
     zodSchemas = postProcessReportingConsumerStatusConstraints(zodSchemas);
     zodSchemas = postProcessGetReportingStatusEvidenceStrictness(zodSchemas, reportingStatusClosedStructuresBySource);
     zodSchemas = postProcessReportingFileManifestStrictness(zodSchemas, reportingFileManifestClosedStructuresBySource);
@@ -5677,6 +6167,10 @@ async function generateZodSchemas() {
     zodSchemas = postProcessCanonicalVastAudioConstraints(zodSchemas);
     zodSchemas = postProcessPricingOptionConstraints(zodSchemas);
     zodSchemas = postProcessJsonSchemaUriFormats(zodSchemas);
+    zodSchemas = postProcessPrimitiveEnumExclusions(zodSchemas);
+    // Inspect the final canonical primitive constraints before checking that
+    // the compact object's fields safely narrow the shared envelopes.
+    zodSchemas = postProcessCompactTaskSubmittedEnvelope(zodSchemas);
 
     // Compatibility aliases can make jsts emit repeated format/placement
     // intersections. Collapse them before annotation so adopter OpenAPI
@@ -5706,7 +6200,7 @@ async function generateZodSchemas() {
     // Create header with metadata
     const header = `// Generated Zod v4 schemas from TypeScript types\n// Generated at: ${new Date().toISOString()}\n// Sources:\n//   - ${path.basename(CORE_SOURCE_FILE)} (core types)\n//   - ${path.basename(TOOLS_SOURCE_FILE)} (tool types)\n//\n// These schemas provide runtime validation for AdCP data structures\n// Generated using ts-to-zod from TypeScript type definitions\n\n`;
 
-    const finalContent = header + addBackwardCompatSchemaAliases(zodSchemas);
+    const finalContent = header + postProcessPureInitializers(addBackwardCompatSchemaAliases(zodSchemas));
 
     // Write the output
     const changed = writeFileIfChanged(OUTPUT_FILE, finalContent);
@@ -5735,6 +6229,9 @@ if (require.main === module) {
 }
 
 export const __test__ = {
+  postProcessPureInitializers,
+  postProcessPrimitiveIntersections,
+  postProcessPrimitiveEnumExclusions,
   postProcessCompatibilityPurchaseCoordinatorInput,
   postProcessForPassthrough,
   postProcessTupleRestArrays,
@@ -5745,6 +6242,7 @@ export const __test__ = {
   postProcessMarkerUnionObjectIntersections,
   postProcessRepeatedProductIntersections,
   postProcessCanonicalFormatSlots,
+  postProcessCompactTaskSubmittedEnvelope,
   postProcessCreativeBriefRequiredDisclosures,
   reportingStatusViewRequiredFields,
   reportingStatusClosedStructures,

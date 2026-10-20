@@ -14,8 +14,8 @@
  *     `content-type`, and `content-digest` — `content-digest` is unconditional
  *     for webhooks (vs policy-driven on requests) because every webhook
  *     carries a JSON body.
- *   - JWKS resolved via the publisher's `brand.json` `agents[]` `jwks_uri`,
- *     not the request-path capability document.
+ *   - JWKS resolved via the capabilities-selected operator brand.json;
+ *     publisher pins narrow its keys for applicable inventory.
  *
  * Checklist steps below mirror the 14-step shape in
  * `docs/building/implementation/security.mdx#verifier-checklist-for-webhooks`
@@ -24,14 +24,23 @@
  */
 
 import { buildSignatureBase, canonicalTargetUri, getHeaderValue } from './canonicalize';
-import { contentDigestMatches } from './content-digest';
+import { contentDigestMatches, type SfBinaryEncoding } from './content-digest';
 import { RequestSignatureError, WebhookSignatureError } from './errors';
+import { AgentResolverError } from './agent-resolver/errors';
+import { BrandJsonResolverError } from './brand-jwks';
 import { parseSignature, parseSignatureInput, type ParsedSignatureInput } from './parser';
-import { jwkToPublicKey, verifySignature } from './crypto';
-import type { JwksResolver } from './jwks';
+import { jwkToPublicKey, verifySignatureAsync } from './crypto';
+import type { JwksResolution, JwksResolver } from './jwks';
+import { assertPublisherPins, type PublisherSigningKeyPin } from './publisher-pins';
 import { InMemoryReplayStore, type ReplayStore } from './replay';
 import { InMemoryRevocationStore, type RevocationStore } from './revocation';
 import { ALLOWED_ALGS, CLOCK_SKEW_TOLERANCE_SECONDS, MAX_SIGNATURE_WINDOW_SECONDS } from './types';
+
+function keyDiscoveryRetryable(error: unknown): boolean {
+  if (error instanceof AgentResolverError) return error.recovery === 'transient';
+  if (error instanceof BrandJsonResolverError) return error.recovery === 'transient';
+  return true;
+}
 
 export const WEBHOOK_SIGNING_TAG = 'adcp/webhook-signing/v1';
 
@@ -59,6 +68,20 @@ export const WEBHOOK_MANDATORY_COMPONENTS: ReadonlyArray<string> = [
 
 export interface VerifyWebhookOptions {
   jwks: JwksResolver;
+  /**
+   * Trusted receiver configuration for the Signature byte sequence.
+   * Defaults to `legacy-base64url`, as the AdCP webhook-v1 profile requires
+   * throughout 3.x. Set `rfc8941-base64` only for an explicitly configured
+   * peer emitting standard padded Base64 (for example, a generic RFC 9421
+   * request signer with the webhook tag). There is no encoding fallback.
+   * URL canonicalization remains AdCP 3.2 in either mode; Signature encoding
+   * does not identify a webhook's AdCP version.
+   */
+  signatureEncoding?: SfBinaryEncoding;
+  /** Applicable publishers from the verifier's own media-buy record. */
+  publisherPins?: readonly PublisherSigningKeyPin[];
+  /** Log the underlying request_signature_* discovery cause locally. */
+  onKeyResolutionError?: (error: unknown) => void;
   replayStore: ReplayStore;
   revocationStore: RevocationStore;
   /** Now in seconds since epoch. Defaults to `Date.now() / 1000`. */
@@ -105,6 +128,7 @@ export async function verifyWebhookSignature(
   request: WebhookRequestLike,
   options: VerifyWebhookOptions
 ): Promise<VerifyWebhookResult> {
+  const signatureEncoding = resolveSignatureEncoding(options.signatureEncoding);
   const currentTime = options.now ?? (() => Date.now() / 1000);
   const now = currentTime();
   const requiredTag = options.requiredTag ?? WEBHOOK_SIGNING_TAG;
@@ -124,12 +148,12 @@ export async function verifyWebhookSignature(
   let parsedSig: ReturnType<typeof parseSignature>;
   try {
     parsedInput = parseSignatureInput(sigInputHeader);
-    parsedSig = parseSignature(sigHeader, parsedInput.label);
+    parsedSig = parseSignature(sigHeader, parsedInput.label, signatureEncoding);
   } catch (err) {
     throw new WebhookSignatureError(
       'webhook_signature_header_malformed',
       1,
-      err instanceof Error ? err.message : String(err)
+      `${err instanceof Error ? err.message : String(err)} (webhook signatureEncoding="${signatureEncoding}").`
     );
   }
 
@@ -169,9 +193,25 @@ export async function verifyWebhookSignature(
   const canonicalWebhookTarget = validateTargetUri(request.url);
 
   // Step 7: resolve keyid.
-  const keyResolution = options.jwks.resolveWithMetadata
-    ? await options.jwks.resolveWithMetadata(parsedInput.params.keyid)
-    : { jwk: await options.jwks.resolve(parsedInput.params.keyid) };
+  let keyResolution: JwksResolution;
+  try {
+    keyResolution = options.jwks.resolveWithMetadata
+      ? await options.jwks.resolveWithMetadata(parsedInput.params.keyid)
+      : { jwk: await options.jwks.resolve(parsedInput.params.keyid) };
+  } catch (error) {
+    try {
+      options.onKeyResolutionError?.(error);
+    } catch {
+      /* Logging cannot change verification. */
+    }
+    throw new WebhookSignatureError(
+      'webhook_signature_key_unknown',
+      7,
+      'Signing key discovery or publisher pin check failed.',
+      undefined,
+      keyDiscoveryRetryable(error)
+    );
+  }
   const jwk = keyResolution.jwk;
   if (!jwk) {
     throw new WebhookSignatureError(
@@ -282,8 +322,9 @@ export async function verifyWebhookSignature(
     parsedInput.signatureParamsValue,
     '3.2'
   );
-  const publicKey = jwkToPublicKey(jwk);
-  const valid = verifySignature(parsedInput.params.alg, publicKey, Buffer.from(base, 'utf8'), parsedSig.bytes);
+  // Validates the JWK (malformed keys are rejected before verification).
+  jwkToPublicKey(jwk);
+  const valid = await verifySignatureAsync(parsedInput.params.alg, jwk, Buffer.from(base, 'utf8'), parsedSig.bytes);
   if (!valid) {
     throw new WebhookSignatureError(
       'webhook_signature_invalid',
@@ -302,6 +343,27 @@ export async function verifyWebhookSignature(
     );
   }
 
+  // Refresh publisher pins only after authenticating the signature and body,
+  // so a forged signature cannot trigger forced adagents.json fetches.
+  if (options.publisherPins) {
+    try {
+      await assertPublisherPins(jwk, options.publisherPins, currentTime);
+    } catch (error) {
+      try {
+        options.onKeyResolutionError?.(error);
+      } catch {
+        /* Logging cannot change verification. */
+      }
+      throw new WebhookSignatureError(
+        'webhook_signature_key_unknown',
+        7,
+        'Signing key is outside the applicable publisher pins.',
+        undefined,
+        keyDiscoveryRetryable(error)
+      );
+    }
+  }
+
   // Resolution can be valid at step 7 and expire while cryptographic and
   // digest verification are in flight. Recheck immediately before accepting
   // the delivery or consuming replay capacity.
@@ -312,7 +374,8 @@ export async function verifyWebhookSignature(
   // Step 13: commit nonce. Insert AFTER every prior check passes — this is
   // the load-bearing invariant that keeps external traffic from growing the
   // cap (any signature failing at step 10 never consumes an entry).
-  const remaining = parsedInput.params.expires - now + CLOCK_SKEW_TOLERANCE_SECONDS;
+  // Acceptance is inclusive of `expires + skew`; the nonce must outlive it.
+  const remaining = parsedInput.params.expires - now + CLOCK_SKEW_TOLERANCE_SECONDS + 1;
   const ttl = Math.max(remaining, MAX_SIGNATURE_WINDOW_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS);
   const insertResult = await options.replayStore.insert(jwk.kid, replayScope, parsedInput.params.nonce, ttl, now);
   if (insertResult === 'replayed') {
@@ -337,7 +400,7 @@ export async function verifyWebhookSignature(
     assertDelegatedOperatorAuthorizationActive(keyResolution.operatorAuthorizationValidUntil, currentTime());
   }
 
-  const agent_url = options.agentUrlForKeyid?.(jwk.kid);
+  const agent_url = keyResolution.agentUrl ?? options.agentUrlForKeyid?.(jwk.kid);
   return {
     status: 'verified',
     keyid: jwk.kid,
@@ -346,6 +409,13 @@ export async function verifyWebhookSignature(
     // fractional clock above for exact authorization-expiry enforcement.
     verified_at: Math.floor(now),
   };
+}
+
+function resolveSignatureEncoding(encoding: SfBinaryEncoding = 'legacy-base64url'): SfBinaryEncoding {
+  if (encoding !== 'legacy-base64url' && encoding !== 'rfc8941-base64') {
+    throw new TypeError('signatureEncoding must be "legacy-base64url" or "rfc8941-base64".');
+  }
+  return encoding;
 }
 
 function assertDelegatedOperatorAuthorizationActive(validUntil: number | undefined, now: number): void {
@@ -543,10 +613,12 @@ export interface CreateWebhookVerifierOptions extends Omit<VerifyWebhookOptions,
 export function createWebhookVerifier(
   options: CreateWebhookVerifierOptions
 ): (request: WebhookRequestLike) => Promise<VerifyWebhookResult> {
+  const signatureEncoding = resolveSignatureEncoding(options.signatureEncoding);
   // Instantiate defaults once at creation time so every request handled by
   // this verifier shares the same replay / revocation state. Per-request
   // construction would defeat replay detection entirely.
   const replayStore = options.replayStore ?? new InMemoryReplayStore();
   const revocationStore = options.revocationStore ?? new InMemoryRevocationStore();
-  return (request: WebhookRequestLike) => verifyWebhookSignature(request, { ...options, replayStore, revocationStore });
+  return (request: WebhookRequestLike) =>
+    verifyWebhookSignature(request, { ...options, signatureEncoding, replayStore, revocationStore });
 }

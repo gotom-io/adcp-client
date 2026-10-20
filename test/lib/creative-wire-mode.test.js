@@ -1,0 +1,708 @@
+const { describe, test } = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  AgentClient,
+  SingleAgentClient,
+  CreativeFormatCapabilityError,
+  CreativeFormatProjectionError,
+  VersionUnsupportedError,
+  parseCapabilitiesResponse,
+  packageRefsForFormatOptions,
+  toCanonicalOnlyProduct,
+} = require('../../dist/lib/index.js');
+const {
+  projectSyncCreativesForDelivery,
+  projectMediaBuyCreativesForDelivery,
+} = require('../../dist/lib/v2/projection/index.js');
+
+const {
+  rememberSellerDeclaredFormatOption,
+  rememberSellerFormatEvidence,
+} = require('../../dist/lib/v2/projection/legacy-metadata.js');
+
+const AGENT = { id: 'wire-mode', name: 'Wire mode', agent_uri: 'https://seller.example/mcp', protocol: 'mcp' };
+const canonicalSchema = { creatives: { items: { properties: { creative_id: {}, format_kind: {} } } } };
+const legacySchema = { creatives: { items: { properties: { creative_id: {}, format_id: {} } } } };
+
+function prime(client, response, toolSchemas = {}) {
+  assert.equal(
+    client.primeCapabilities({
+      scope: client.getCapabilityEvidenceScope(),
+      capabilities: parseCapabilitiesResponse({ adcp: { major_versions: [3] }, ...response }),
+      observedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      toolSchemas,
+    }),
+    true
+  );
+}
+
+describe('public creative wire mode resolution', () => {
+  for (const Client of [SingleAgentClient, AgentClient]) {
+    test(`${Client.name} resolves each tool from primed evidence without dispatching`, async () => {
+      const client = new Client(AGENT, { wireAdcpVersion: '3.1' });
+      prime(
+        client,
+        { adcp: { major_versions: [3], supported_versions: ['3.0', '3.1'] } },
+        {
+          sync_creatives: canonicalSchema,
+          create_media_buy: legacySchema,
+        }
+      );
+      const single = client instanceof SingleAgentClient ? client : client.client;
+      single.getAgentInfo = async () => assert.fail('primed evidence must avoid discovery');
+      single.executor.executeTask = async () => assert.fail('preflight must not dispatch a tool');
+
+      assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives'), 'canonical');
+      assert.equal(await client.resolveCreativeFormatWireMode('create_media_buy'), 'legacy');
+      assert.equal(await client.resolveCreativeFormatWireMode('update_media_buy'), 'unknown');
+    });
+  }
+
+  const cases = [
+    ['explicit canonical support', '3.1', { media_buy: { features: { canonical_creatives: true } } }, {}, 'canonical'],
+    ['explicit legacy support', '3.1', { media_buy: { features: { canonical_creatives: false } } }, {}, 'legacy'],
+    ['3.0 buyer pin', '3.0', {}, {}, 'legacy'],
+    ['3.2 seller contract', '3.2', { adcp: { major_versions: [3], supported_versions: ['3.2'] } }, {}, 'canonical'],
+    [
+      '3.2 buyer downshifts to 3.1 schema',
+      '3.2',
+      { adcp: { major_versions: [3], supported_versions: ['3.1'] } },
+      legacySchema,
+      'legacy',
+    ],
+    ['3.1 peer with no evidence', '3.1', {}, {}, 'unknown'],
+    ['3.2 buyer with no evidence', '3.2', {}, {}, CreativeFormatCapabilityError],
+    [
+      'capabilities disagree with schema',
+      '3.1',
+      { media_buy: { features: { canonical_creatives: true } } },
+      legacySchema,
+      CreativeFormatCapabilityError,
+    ],
+    [
+      '3.2 seller denies canonical support',
+      '3.2',
+      {
+        adcp: { major_versions: [3], supported_versions: ['3.2'] },
+        media_buy: { features: { canonical_creatives: false } },
+      },
+      {},
+      CreativeFormatCapabilityError,
+    ],
+  ];
+  for (const [name, wireAdcpVersion, response, schema, expected] of cases) {
+    test(name, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion });
+      prime(client, response, { sync_creatives: schema });
+      if (typeof expected === 'string') {
+        assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives'), expected);
+      } else {
+        await assert.rejects(client.resolveCreativeFormatWireMode('sync_creatives'), expected);
+      }
+    });
+  }
+
+  test('incompatible seller versions are refused as cached evidence and on rediscovery', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.2' });
+    const response = { adcp: { major_versions: [3], supported_versions: ['4.0'] } };
+    assert.equal(
+      client.primeCapabilities({
+        scope: client.getCapabilityEvidenceScope(),
+        capabilities: parseCapabilitiesResponse(response),
+        observedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        toolSchemas: { sync_creatives: canonicalSchema },
+      }),
+      false
+    );
+    client.ensureEndpointDiscovered = async () => AGENT;
+    client.getAgentInfo = async () => ({ tools: [{ name: 'get_adcp_capabilities' }] });
+    client.executor.executeTask = async (_agent, tool) => {
+      assert.equal(tool, 'get_adcp_capabilities');
+      return { success: true, data: response };
+    };
+    await assert.rejects(client.resolveCreativeFormatWireMode('sync_creatives'), VersionUnsupportedError);
+  });
+
+  test('cold discovery reads capabilities and tool schemas once and honors cancellation', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    const signal = new AbortController().signal;
+    const discoveryCalls = [];
+    const toolCalls = [];
+    client.ensureEndpointDiscovered = async () => AGENT;
+    client.getAgentInfo = async options => {
+      discoveryCalls.push(options);
+      return {
+        tools: [
+          { name: 'get_adcp_capabilities', inputSchema: { properties: {} } },
+          { name: 'sync_creatives', inputSchema: { properties: canonicalSchema } },
+        ],
+      };
+    };
+    client.executor.executeTask = async (_agent, tool, _params, _handler, options) => {
+      toolCalls.push({ tool, options });
+      return { success: true, data: { adcp: { major_versions: [3], supported_versions: ['3.1'] } } };
+    };
+
+    assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives', { signal }), 'canonical');
+    assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives'), 'canonical');
+    assert.equal(discoveryCalls.length, 1);
+    assert.equal(discoveryCalls[0].signal, signal);
+    assert.deepEqual(
+      toolCalls.map(call => call.tool),
+      ['get_adcp_capabilities']
+    );
+    assert.equal(toolCalls[0].options.signal, signal);
+
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(client.resolveCreativeFormatWireMode('sync_creatives', { signal: controller.signal }), {
+      name: 'AbortError',
+    });
+    assert.equal(discoveryCalls.length, 1);
+  });
+
+  test('scoped preflight and writes use discovered schemas and leave shared evidence intact', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    prime(client, {}, { sync_creatives: legacySchema });
+    const transport = { trustedFetchFn: async () => assert.fail('stubbed discovery must not fetch') };
+    client.ensureEndpointDiscovered = async () => AGENT;
+    client.getAgentInfo = async options => {
+      assert.equal(options.transport.trustedFetchFn, transport.trustedFetchFn);
+      return {
+        tools: [
+          { name: 'get_adcp_capabilities', inputSchema: { properties: {} } },
+          { name: 'sync_creatives', inputSchema: { properties: canonicalSchema } },
+        ],
+      };
+    };
+    client.executor.executeTask = async (_agent, tool) => {
+      assert.equal(tool, 'get_adcp_capabilities');
+      return { success: true, data: { adcp: { major_versions: [3], supported_versions: ['3.1'] } } };
+    };
+
+    assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives', { transport }), 'canonical');
+    let captured;
+    client.executeAndHandle = async (_task, _handler, params) => {
+      captured = params;
+      return { success: true, status: 'completed', data: {} };
+    };
+    await client.syncCreatives(
+      {
+        account: { account_id: 'account-1' },
+        idempotency_key: 'scoped-write-key-001',
+        creatives: [{ creative_id: 'creative-1', name: 'Image', format_kind: 'image', assets: {} }],
+      },
+      undefined,
+      { transport }
+    );
+    assert.equal(captured.creatives[0].format_kind, 'image');
+    assert.equal(captured.creatives[0].format_id, undefined);
+    assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives'), 'legacy');
+  });
+
+  for (const [method, task] of [
+    ['createMediaBuy', 'create_media_buy'],
+    ['updateMediaBuy', 'update_media_buy'],
+  ]) {
+    test(`${method} uses the mode preflight resolves for its own tool`, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+      const packageSchema = { packages: { items: { properties: legacySchema } } };
+      prime(client, {}, { sync_creatives: canonicalSchema, [task]: packageSchema });
+      const selectors = packageRefsForFormatOptions(
+        {
+          format_options: [
+            {
+              format_option_id: 'image-mrec',
+              format_kind: 'image',
+              params: {},
+              v1_format_ref: [{ agent_url: AGENT.agent_uri, id: 'display_300x250_image' }],
+            },
+          ],
+        },
+        ['image-mrec']
+      );
+      const pkg = {
+        ...selectors,
+        package_id: 'package-1',
+        creatives: [{ creative_id: 'creative-1', name: 'Image', format_kind: 'image', assets: {} }],
+      };
+      const params =
+        method === 'createMediaBuy'
+          ? {
+              account: { account_id: 'account-1' },
+              idempotency_key: 'create-parity-key-001',
+              brand: { domain: 'brand.example' },
+              start_time: 'asap',
+              end_time: '2027-12-31T00:00:00Z',
+              packages: [{ ...pkg, product_id: 'product-1', budget: 1000, pricing_option_id: 'pricing-1' }],
+            }
+          : {
+              idempotency_key: 'update-parity-key-001',
+              media_buy_id: 'buy-1',
+              packages: [pkg],
+            };
+      const mode = await client.resolveCreativeFormatWireMode(task);
+      assert.equal(mode, 'legacy');
+      assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives'), 'canonical');
+      let captured;
+      client.executeAndHandle = async (calledTask, _handler, wireParams) => {
+        assert.equal(calledTask, task);
+        captured = wireParams;
+        return { success: true, status: 'completed', data: {} };
+      };
+      await client[method](params);
+      assert.deepEqual(captured, projectMediaBuyCreativesForDelivery(params, mode, task));
+    });
+  }
+
+  for (const [schema, expected] of [
+    [canonicalSchema, 'canonical'],
+    [legacySchema, 'legacy'],
+  ]) {
+    test(`${expected} preflight matches syncCreatives projection or failure`, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+      prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } }, { sync_creatives: schema });
+      const params = {
+        account: { account_id: 'account-1' },
+        idempotency_key: 'wire-mode-parity',
+        creatives: [{ creative_id: 'creative-1', name: 'Image', format_kind: 'image', assets: {} }],
+        assignments: [{ creative_id: 'creative-1', package_id: 'package-1' }],
+      };
+      const selectors = [{ package_id: 'package-1' }];
+      const mode = await client.resolveCreativeFormatWireMode('sync_creatives');
+      let captured;
+      client.executeAndHandle = async (_task, _handler, wireParams) => {
+        captured = wireParams;
+        return { success: true, status: 'completed', data: {} };
+      };
+
+      if (expected === 'legacy') {
+        assert.throws(() => projectSyncCreativesForDelivery(params, selectors, mode), CreativeFormatProjectionError);
+        await assert.rejects(client.syncCreatives(params), CreativeFormatProjectionError);
+        assert.equal(captured, undefined);
+        selectors[0].format_ids = [
+          { agent_url: 'https://creative.adcontextprotocol.org/', id: 'display_300x250_image' },
+        ];
+      }
+      const projected = projectSyncCreativesForDelivery(params, selectors, mode);
+      await client.syncCreatives(params, undefined, { creativeFormatProjection: { selectorContainers: selectors } });
+      assert.deepEqual(captured, projected);
+    });
+  }
+});
+
+describe('request-local 3.1 product creative wire evidence (#3312)', () => {
+  const option = { format_option_id: 'mrec', format_kind: 'image', params: { width: 300, height: 250 } };
+  const creative = {
+    creative_id: 'c1',
+    name: 'Image',
+    format_kind: 'image',
+    format_option_ref: { scope: 'product', format_option_id: 'mrec' },
+    assets: { image: { asset_type: 'image', url: 'https://cdn.example/ad.png', width: 300, height: 250 } },
+  };
+  const baseContainer = { package_id: 'pkg-1', format_options: [option] };
+  const request = { account: { account_id: 'account-1' }, idempotency_key: 'product-wire-001', creatives: [creative] };
+
+  // The public MCP integration suite exercises how discovery installs this proof.
+  // These unit fixtures model a verified seller response in this client's scope.
+  function markSellerContainer(client, container) {
+    for (const option of container.format_options ?? []) {
+      rememberSellerDeclaredFormatOption(option, true);
+      rememberSellerFormatEvidence(option, {
+        scopeKey: client.getCapabilityEvidenceScope().scopeKey,
+        accountScope: JSON.stringify(request.account),
+        productId: container.product_id ?? 'product-a',
+        expiresAt: Date.now() + 60_000,
+      });
+    }
+    return container;
+  }
+
+  for (const Client of [SingleAgentClient, AgentClient]) {
+    test(`${Client.name} uses seller-authored options without requiring legacy references`, async () => {
+      const client = new Client(AGENT, { wireAdcpVersion: '3.1' });
+      prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+      const single = client instanceof SingleAgentClient ? client : client.client;
+      const sent = [];
+      single.executeAndHandle = async (_task, _handler, params) => {
+        sent.push(params);
+        return { success: true, status: 'completed', data: {} };
+      };
+      const container = markSellerContainer(client, structuredClone(baseContainer));
+      await client.syncCreatives(request, undefined, {
+        creativeFormatProjection: { selectorContainers: [container] },
+      });
+      assert.deepEqual(sent[0].creatives[0], creative);
+      const unpinned = structuredClone(request);
+      delete unpinned.creatives[0].format_option_ref;
+      await client.syncCreatives(unpinned, undefined, {
+        creativeFormatProjection: { selectorContainers: [container] },
+      });
+      assert.deepEqual(sent[1].creatives[0], unpinned.creatives[0]);
+      const assigned = {
+        ...structuredClone(request),
+        assignments: [{ creative_id: 'c1', package_id: 'pkg-1' }],
+      };
+      await client.syncCreatives(assigned, undefined, {
+        creativeFormatProjection: { selectorContainers: [container] },
+      });
+      assert.deepEqual(sent[2].creatives[0], creative);
+      assert.deepEqual(sent[2].assignments, assigned.assignments);
+      assert.equal(await client.resolveCreativeFormatWireMode('sync_creatives'), 'unknown');
+      await assert.rejects(client.syncCreatives(request), CreativeFormatProjectionError);
+      assert.equal(sent.length, 3, 'request evidence is never reused as a global capability');
+    });
+  }
+
+  const refusals = [
+    [
+      'unmatched option',
+      r => {
+        r.creatives[0].format_option_ref.format_option_id = 'missing';
+      },
+    ],
+    [
+      'conflicting kind',
+      r => {
+        r.creatives[0].format_kind = 'html5';
+      },
+    ],
+    [
+      'conflicting dimensions',
+      r => {
+        r.creatives[0].assets.image.width = 728;
+      },
+    ],
+    [
+      'missing dimensions',
+      r => {
+        r.creatives[0].assets = {};
+      },
+    ],
+    [
+      'uncovered batch member',
+      r => {
+        r.creatives.push({ ...structuredClone(creative), creative_id: 'c2', format_kind: 'html5' });
+      },
+    ],
+    [
+      'uncovered assignment',
+      r => {
+        r.assignments = [
+          { creative_id: 'c1', package_id: 'pkg-1' },
+          { creative_id: 'c1', package_id: 'pkg-2' },
+        ];
+      },
+    ],
+    [
+      'assignment to an unrelated package',
+      r => {
+        r.assignments = [{ creative_id: 'c1', package_id: 'pkg-2' }];
+      },
+    ],
+    [
+      'assignment of an existing creative alongside a covered upload',
+      r => {
+        r.assignments = [
+          { creative_id: 'c1', package_id: 'pkg-1' },
+          { creative_id: 'existing-creative', package_id: 'pkg-2' },
+        ];
+      },
+    ],
+    [
+      'existing creative without a manifest even in a covered package',
+      r => {
+        r.assignments = [{ creative_id: 'existing-creative', package_id: 'pkg-1' }];
+      },
+    ],
+    [
+      'uncovered selected option',
+      (_r, c) => {
+        c.format_option_refs = [{ scope: 'product', format_option_id: 'missing' }];
+      },
+    ],
+    [
+      'experimental declaration',
+      (_r, c) => {
+        c.format_options[0].experimental = true;
+      },
+    ],
+    [
+      'missing required slot',
+      (_r, c) => {
+        c.format_options[0].params.slots = [{ asset_group_id: 'image_main', asset_type: 'image', required: true }];
+      },
+    ],
+    [
+      'slot count below declared minimum',
+      (_r, c) => {
+        c.format_options[0].params.slots = [{ asset_group_id: 'image', asset_type: 'image', min: 2 }];
+      },
+    ],
+    [
+      'slot count above declared maximum',
+      (r, c) => {
+        c.format_options[0].params.slots = [{ asset_group_id: 'image', asset_type: 'image', max: 1 }];
+        r.creatives[0].assets.image = [r.creatives[0].assets.image, structuredClone(r.creatives[0].assets.image)];
+      },
+    ],
+    [
+      'wrong slot asset type',
+      (_r, c) => {
+        c.format_options[0].params.slots = [{ asset_group_id: 'image', asset_type: 'video', required: true }];
+      },
+    ],
+  ];
+  for (const [name, change] of refusals) {
+    test(`does not infer canonical support for ${name}`, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+      prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+      client.executeAndHandle = async () => assert.fail('incompatible product evidence must not dispatch');
+      const input = structuredClone(request);
+      const container = structuredClone(baseContainer);
+      change(input, container);
+      markSellerContainer(client, container);
+      await assert.rejects(
+        client.syncCreatives(input, undefined, {
+          creativeFormatProjection: { selectorContainers: [container] },
+        }),
+        CreativeFormatProjectionError
+      );
+    });
+  }
+
+  for (const wireAdcpVersion of ['3.0', '3.1', '3.2']) {
+    test(`product options do not invent a negotiated release (${wireAdcpVersion} buyer)`, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion });
+      prime(client, {});
+      client.executeAndHandle = async () => assert.fail('missing release evidence must not dispatch');
+      await assert.rejects(
+        client.syncCreatives(request, undefined, {
+          creativeFormatProjection: { selectorContainers: [baseContainer] },
+        }),
+        wireAdcpVersion === '3.2' ? CreativeFormatCapabilityError : CreativeFormatProjectionError
+      );
+    });
+  }
+
+  test('SDK-synthesized options retain legacy delivery, including selections', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+    const formatId = { agent_url: 'https://creative.adcontextprotocol.org', id: 'display_300x250_image' };
+    const product = toCanonicalOnlyProduct({ product_id: 'legacy', format_ids: [formatId] }).product;
+    const optionId = product.format_options[0].format_option_id;
+    let captured;
+    client.executeAndHandle = async (_task, _handler, params) => {
+      captured = params;
+      return { success: true, status: 'completed', data: {} };
+    };
+    const input = structuredClone(request);
+    input.creatives[0].format_option_ref.format_option_id = optionId;
+    for (const container of [product, packageRefsForFormatOptions(product, [optionId])]) {
+      await client.syncCreatives(input, undefined, { creativeFormatProjection: { selectorContainers: [container] } });
+      assert.equal(captured.creatives[0].format_id.id, formatId.id);
+      assert.equal(captured.creatives[0].format_kind, undefined);
+    }
+  });
+
+  test('required slots and size ranges can establish support without an option pin', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+    const container = structuredClone(baseContainer);
+    container.format_options[0].params = {
+      min_width: 300,
+      max_width: 400,
+      min_height: 200,
+      max_height: 300,
+      slots: [{ asset_group_id: 'image', asset_type: 'image', required: true, min: 1, max: 1 }],
+    };
+    markSellerContainer(client, container);
+    const input = structuredClone(request);
+    delete input.creatives[0].format_option_ref;
+    let captured;
+    client.executeAndHandle = async (_task, _handler, params) => {
+      captured = params;
+      return { success: true, status: 'completed', data: {} };
+    };
+    await client.syncCreatives(input, undefined, { creativeFormatProjection: { selectorContainers: [container] } });
+    assert.deepEqual(captured.creatives[0], input.creatives[0]);
+  });
+
+  for (const scenario of [
+    'expired',
+    'different client',
+    'different account',
+    'different product',
+    'mutated declaration',
+  ]) {
+    test(`positive seller proof is rejected when ${scenario}`, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+      prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+      const container = markSellerContainer(client, structuredClone(baseContainer));
+      const proof = {
+        scopeKey: client.getCapabilityEvidenceScope().scopeKey,
+        accountScope: JSON.stringify(request.account),
+        productId: container.product_id ?? 'product-a',
+        expiresAt: Date.now() + 60_000,
+      };
+      if (scenario === 'expired') proof.expiresAt = 0;
+      if (scenario === 'different client') proof.scopeKey = 'another-client';
+      if (scenario === 'different product') container.product_id = 'product-b';
+      if (scenario === 'different account') proof.accountScope = JSON.stringify({ account_id: 'other-account' });
+      rememberSellerFormatEvidence(container.format_options[0], proof);
+      if (scenario === 'mutated declaration') container.format_options[0].params = {};
+      client.executeAndHandle = async () => assert.fail('invalid seller proof must not dispatch');
+      await assert.rejects(
+        client.syncCreatives(request, undefined, {
+          creativeFormatProjection: { selectorContainers: [container] },
+        }),
+        CreativeFormatProjectionError
+      );
+    });
+  }
+
+  test('request-scoped transports do not consume cached product evidence', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+    const container = markSellerContainer(client, structuredClone(baseContainer));
+    client.getCapabilities = async () =>
+      parseCapabilitiesResponse({ adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+    client.executeAndHandle = async () => assert.fail('another authorization transport cannot use this proof');
+    await assert.rejects(
+      client.syncCreatives(request, undefined, {
+        transport: { trustedFetchFn: async () => assert.fail('discovery is stubbed') },
+        creativeFormatProjection: { selectorContainers: [container] },
+      }),
+      CreativeFormatProjectionError
+    );
+  });
+
+  for (const withResolver of [false, true]) {
+    test(`fresh clients never treat serialized synthesized products as seller proof (resolver: ${withResolver})`, async () => {
+      const formatId = { agent_url: 'https://creative.adcontextprotocol.org', id: 'display_300x250_image' };
+      const product = toCanonicalOnlyProduct({ product_id: 'legacy', format_ids: [formatId] }).product;
+      const persisted = JSON.parse(JSON.stringify(product));
+      const routes = require('../../dist/lib/index.js').legacyRoutesForProduct('legacy', product.format_options, {
+        sellerProduct: { product_id: 'legacy', format_ids: [formatId] },
+      });
+      const resolver = require('../../dist/lib/index.js').canonicalFormatLegacyResolverFromRoutes(routes);
+      const client = new SingleAgentClient(AGENT, {
+        wireAdcpVersion: '3.1',
+        ...(withResolver ? { canonicalFormatLegacyResolver: resolver } : {}),
+      });
+      prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+      let captured;
+      client.executeAndHandle = async (_task, _handler, params) => {
+        captured = params;
+        return { success: true, status: 'completed', data: {} };
+      };
+      const input = structuredClone(request);
+      input.creatives[0].format_option_ref.format_option_id = persisted.format_options[0].format_option_id;
+      const options = { creativeFormatProjection: { selectorContainers: [persisted] } };
+      if (withResolver) {
+        await client.syncCreatives(input, undefined, options);
+        assert.equal(captured.creatives[0].format_id.id, formatId.id);
+        assert.equal(captured.creatives[0].format_kind, undefined);
+      } else {
+        await assert.rejects(client.syncCreatives(input, undefined, options), CreativeFormatProjectionError);
+        assert.equal(captured, undefined);
+      }
+    });
+  }
+
+  test('main-slot dimensions are independent of asset object key order', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+    const container = structuredClone(baseContainer);
+    container.format_options[0].params.slots = [{ asset_group_id: 'main', asset_type: 'image', required: true }];
+    markSellerContainer(client, container);
+    let captured;
+    client.executeAndHandle = async (_task, _handler, params) => {
+      captured = params;
+      return { success: true, status: 'completed', data: {} };
+    };
+    const main = creative.assets.image;
+    const logo = { ...main, width: 100, height: 100 };
+    for (const assets of [
+      { logo, main },
+      { main, logo },
+    ]) {
+      const input = { ...request, creatives: [{ ...creative, assets }] };
+      await client.syncCreatives(input, undefined, { creativeFormatProjection: { selectorContainers: [container] } });
+      assert.deepEqual(captured.creatives[0], input.creatives[0]);
+    }
+  });
+
+  for (const [kind, assetType] of [
+    ['video_vast', 'vast'],
+    ['audio_daast', 'daast'],
+  ]) {
+    test(`${kind} declaration matches tag duration without inspecting companion logos`, async () => {
+      const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+      prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+      const container = structuredClone(baseContainer);
+      container.format_options[0].format_kind = kind;
+      container.format_options[0].params = {
+        ...(kind === 'video_vast'
+          ? { duration_ms_exact: 30000, duration_ms_range: [1000, 5000] }
+          : { duration_ms_range: [15000, 60000] }),
+        slots: [{ asset_group_id: 'tag', asset_type: assetType, required: true }],
+      };
+      markSellerContainer(client, container);
+      const input = {
+        ...request,
+        creatives: [
+          {
+            ...creative,
+            format_kind: kind,
+            assets: {
+              logo: { ...creative.assets.image, width: 100, height: 100 },
+              tag: {
+                asset_type: assetType,
+                delivery_type: 'url',
+                url: 'https://cdn.example/tag.xml',
+                duration_ms: 30000,
+              },
+            },
+          },
+        ],
+      };
+      let captured;
+      client.executeAndHandle = async (_task, _handler, params) => {
+        captured = params;
+        return { success: true, status: 'completed', data: {} };
+      };
+      await client.syncCreatives(input, undefined, { creativeFormatProjection: { selectorContainers: [container] } });
+      assert.deepEqual(captured.creatives[0], input.creatives[0]);
+    });
+  }
+
+  test('a conventional companion name cannot mask incompatible required-slot dimensions', async () => {
+    const client = new SingleAgentClient(AGENT, { wireAdcpVersion: '3.1' });
+    prime(client, { adcp: { major_versions: [3], supported_versions: ['3.1'] } });
+    const container = structuredClone(baseContainer);
+    container.format_options[0].params.slots = [{ asset_group_id: 'main', asset_type: 'image', required: true }];
+    markSellerContainer(client, container);
+    const input = {
+      ...request,
+      creatives: [
+        {
+          ...creative,
+          assets: {
+            main: { ...creative.assets.image, width: 728, height: 90 },
+            image: creative.assets.image,
+          },
+        },
+      ],
+    };
+    client.executeAndHandle = async () => assert.fail('companion dimensions cannot establish main-slot compatibility');
+    await assert.rejects(
+      client.syncCreatives(input, undefined, {
+        creativeFormatProjection: { selectorContainers: [container] },
+      }),
+      CreativeFormatProjectionError
+    );
+  });
+});

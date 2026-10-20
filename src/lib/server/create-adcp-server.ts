@@ -1,3 +1,30 @@
+import { assertWebBotAuthSigningKey, getWebBotAuthLegacyOriginGate } from '../signing/web-bot-auth';
+import {
+  isIdentity33SchemaScope,
+  withIdentity33SchemaScope,
+  bindIdentity33SchemaScope,
+} from '../validation/schema-loader';
+import { validateAgentOnboarding } from '../identity-3.3/lifecycle';
+import { isIdentity33UnboundContext } from '../identity-3.3/server';
+import {
+  WEB_BOT_AUTH_DRAFT_REVISION,
+  getWebBotAuthAuthorizationFailure,
+  webBotAuthToolFailure,
+  selectSignatureProfile,
+  verifyWebBotAuth,
+  advertisesOnlyWebBotAuth,
+  unsignedWebBotAuthError,
+  webBotAuthAcceptSignature,
+  isWebBotAuthRevocationChecked,
+  webBotAuthUnavailableResponse,
+  WebBotAuthUnavailableError,
+  deferWebBotAuthPrincipalFailure,
+  webBotAuthPrincipalFailureError,
+  type WebBotAuthAuthorizationFailure,
+  WebBotAuthError,
+} from '../signing/web-bot-auth';
+import { validateIdentity33Payload } from '../identity-3.3/validation';
+import { IdentityAuthorizationError, TrustRecordUnavailableError } from '../identity-3.3/trust';
 /**
  * Declarative AdCP server builder.
  *
@@ -191,11 +218,14 @@ function hasIdempotencyClearAll(store: IdempotencyStore): boolean {
 // fence itself still prevents a transient renewal outage from reopening the
 // mutation.
 const IDEMPOTENCY_CLAIM_RENEW_INTERVAL_MS = 60_000;
+import { isAccountProvisioningTask } from './account-provisioning';
+import { warnAccountReferenceDeprecation } from './account-reference-warnings';
 import { isMutatingTask, requestUsesIdempotency, IDEMPOTENCY_KEY_PATTERN, MUTATING_TASKS } from '../utils/idempotency';
 import { STATUS_FREE_SYNC_RESPONSE_TOOLS } from '../utils/envelope-status-compat';
 import { validateRequest, validateResponse, formatIssues, type ValidationIssue } from '../validation/schema-validator';
 import { validateSyncReportingStatusEnvelope } from '../validation/sync-reporting-status-envelope';
 import { buildAdcpValidationErrorPayload } from '../validation/schema-errors';
+import { validationDiagnosticsTruncated } from '../validation/diagnostic-limits';
 import { hashPayload, IdempotencyClaimOwnershipError, type IdempotencyStore } from './idempotency';
 import {
   createWebhookEmitter,
@@ -204,6 +234,7 @@ import {
   type WebhookEmitterOptions,
 } from './webhook-emitter';
 import { createExpressVerifier, type ExpressLike } from '../signing/middleware';
+import { resolveRequestOperation } from '../signing/operation-resolution';
 import { isSandboxOrMockAccount } from './account-mode';
 import {
   isSandboxRequest as isSandboxRequestForSeeding,
@@ -594,6 +625,8 @@ export interface SessionKeyContext<TAccount = unknown> {
  * resolved `TAccount` rather than re-resolving inside every handler.
  */
 export interface ResolveAccountContext {
+  /** Whether this task may create/activate accounts or accept default terms. */
+  readonly provisioning?: boolean;
   /** The AdCP tool being called. */
   toolName: AdcpServerToolName;
   /** Immutable SDK-selected AdCP release for this request. */
@@ -1190,6 +1223,11 @@ export interface ProtocolHandlers<TAccount = unknown> {
 export interface AccountHandlers<TAccount = unknown> {
   listAccountChanges?: DomainHandler<'list_account_changes', TAccount>;
   listAccounts?: DomainHandler<'list_accounts', TAccount>;
+  /**
+   * Synchronous results must contain one row per dispatched entry in input
+   * order. With schema validation enabled, the framework may withhold invalid
+   * notification entries and merge their failures back into the response.
+   */
   syncAccounts?: DomainHandler<'sync_accounts', TAccount>;
   syncGovernance?: DomainHandler<'sync_governance', TAccount>;
   getAccountFinancials?: DomainHandler<'get_account_financials', TAccount>;
@@ -1246,7 +1284,7 @@ export interface AdcpCapabilitiesConfig {
    */
   supported_versions?: string[];
   features?: Partial<MediaBuyFeatures>;
-  account?: Partial<AccountCapabilities>;
+  account?: Partial<AccountCapabilities> & { agent_onboarding?: import('../identity-3.3/types').AgentOnboarding };
   creative?: Partial<CreativeCapabilities>;
   extensions_supported?: readonly string[];
   /**
@@ -1263,7 +1301,9 @@ export interface AdcpCapabilitiesConfig {
    * claim without a working verifier is graded as FAIL by the conformance
    * runner (see `@adcp/sdk/testing/storyboard/request-signing`).
    */
-  request_signing?: NonNullable<GetAdCPCapabilitiesResponse['request_signing']>;
+  request_signing?: NonNullable<GetAdCPCapabilitiesResponse['request_signing']> & {
+    profiles?: ('adcp/request-signing/v1' | 'web-bot-auth')[];
+  };
   /**
    * Specialism claims the agent supports. Each entry maps to a storyboard
    * bundle under `/compliance/{version}/specialisms/{id}/`; the AAO
@@ -1337,9 +1377,17 @@ export interface AdcpCapabilitiesOverrides {
   experimental_features?: GetAdCPCapabilitiesResponse['experimental_features'] | null;
   account?: Partial<NonNullable<GetAdCPCapabilitiesResponse['account']>> | null;
   compliance_testing?: GetAdCPCapabilitiesResponse['compliance_testing'] | null;
-  webhook_signing?: GetAdCPCapabilitiesResponse['webhook_signing'] | null;
+  webhook_signing?:
+    | (NonNullable<GetAdCPCapabilitiesResponse['webhook_signing']> & {
+        profiles?: ('adcp/webhook-signing/v1' | 'web-bot-auth')[];
+      })
+    | null;
   identity?: GetAdCPCapabilitiesResponse['identity'] | null;
-  request_signing?: GetAdCPCapabilitiesResponse['request_signing'] | null;
+  request_signing?:
+    | (NonNullable<GetAdCPCapabilitiesResponse['request_signing']> & {
+        profiles?: ('adcp/request-signing/v1' | 'web-bot-auth')[];
+      })
+    | null;
   wholesale_feed_versioning?: GetAdCPCapabilitiesResponse['wholesale_feed_versioning'] | null;
   wholesale_feed_webhooks?: GetAdCPCapabilitiesResponse['wholesale_feed_webhooks'] | null;
 }
@@ -1383,6 +1431,8 @@ export interface AdcpCapabilitiesOverrides {
  * abuse / replay-detection guards would be per-request (i.e. broken).
  */
 export interface SignedRequestsConfig {
+  webBotAuth?: import('./auth-signature').VerifySignatureAsAuthenticatorOptions['webBotAuth'];
+  assertLegacyOriginAllowed?: (agentUrl: string) => Promise<void>;
   /** Resolves verification keys by `keyid`. */
   jwks: JwksResolver;
   /** Stores `(keyid, signature-bytes, expires)` tuples for replay detection. */
@@ -1702,6 +1752,8 @@ export type WebhooksConfig = Pick<
   WebhookEmitterOptions,
   | 'signerKey'
   | 'signerProvider'
+  | 'webBotAuth'
+  | 'signingProfile'
   | 'retries'
   | 'deliveryStore'
   | 'idempotencyKeyStore'
@@ -1726,6 +1778,11 @@ export type WebhooksConfig = Pick<
 };
 
 export interface AdcpServerConfig<TAccount = unknown> {
+  /** Experimental 3.3 authorization, invoked before idempotency and handler side effects. */
+  identity33?: {
+    authorize: (ctx: HandlerContext<TAccount>, tool: string, params: unknown) => Promise<void>;
+  };
+
   name: string;
   version: string;
 
@@ -1824,6 +1881,34 @@ export interface AdcpServerConfig<TAccount = unknown> {
    * principal across requests.
    */
   resolveAccount?: (ref: AccountReference, ctx: ResolveAccountContext) => Promise<TAccount | null>;
+
+  /**
+   * Opt in to strict buyer-supplied account references. Default `false` in
+   * SDK 14; becomes the default in the next major release.
+   *
+   * When `true`:
+   * - A request that carries `account` on a server without `resolveAccount`
+   *   fails with `ACCOUNT_NOT_FOUND` instead of reaching the handler
+   *   unverified. An auth-only `resolveAccountFromAuth` does not authorize an
+   *   arbitrary reference.
+   * - A seller that declares `capabilities.account.requiredForProducts`
+   *   refuses `get_products` with `ACCOUNT_REQUIRED` when the request carries
+   *   no account and authentication resolves none.
+   * - `list_accounts.account` is treated as a filter: `resolveAccount` is not
+   *   called for it, and `ctx.account` comes from `resolveAccountFromAuth`.
+   * - On `createAdcpServerFromPlatform` with `accounts.resolution: 'implicit'`,
+   *   an account whose returned identity metadata (`brand`, `operator`,
+   *   `operator_unit`, `currency`, `timezone`, `sandbox`) disagrees with the
+   *   supplied natural key is refused with `ACCOUNT_NOT_FOUND`.
+   *
+   * When `false` (default), each case keeps the SDK 14.0 behavior and logs a
+   * deprecation warning once per process per warning code (`logger.warn`, plus
+   * `process.emitWarning` outside `NODE_ENV=production`); later occurrences
+   * log at debug level. Configure a reference-aware `resolveAccount` that
+   * returns `null` for unknown or unauthorized references, then set this
+   * flag. See `docs/guides/account-resolution.md`.
+   */
+  strictAccountReferences?: boolean;
 
   /**
    * Resolve an account when the wire request doesn't carry one.
@@ -3141,12 +3226,133 @@ function shallowToolInputHintSchema(toolName: string): AnySchema | undefined {
   return schema;
 }
 
+/** Only notification event enums have this per-account rejection contract. */
+function isAccountNotificationEventIssue(issue: ValidationIssue): boolean {
+  return (
+    issue.keyword === 'enum' && /^\/accounts\/\d+\/notification_configs\/\d+\/event_types\/\d+$/.test(issue.pointer)
+  );
+}
+
+function rejectedSyncAccountRow(entry: Record<string, unknown>): Record<string, unknown> {
+  const identity =
+    entry.account !== undefined
+      ? { account: entry.account }
+      : Object.fromEntries(
+          ['brand', 'operator', 'operator_unit', 'currency', 'timezone', 'sandbox']
+            .filter(key => entry[key] !== undefined)
+            .map(key => [key, entry[key]])
+        );
+  return {
+    ...identity,
+    action: 'failed',
+    // Provisioning was declined. A failed settings update does not establish
+    // the existing account's lifecycle state, so leave that status unknown.
+    ...(entry.account === undefined && { status: 'rejected' }),
+    errors: [],
+  };
+}
+
+function accountNotificationFailureRows(
+  accounts: Record<string, unknown>[],
+  issues: ValidationIssue[],
+  deleteMissing: boolean
+): Map<number, Record<string, unknown>> {
+  const rows = new Map<number, Record<string, unknown>>();
+  for (const issue of issues) {
+    const [, accountIndex, configIndex, eventIndex] = issue.pointer.match(
+      /^\/accounts\/(\d+)\/notification_configs\/(\d+)\/event_types\/(\d+)$/
+    )!;
+    const index = Number(accountIndex);
+    const entry = accounts[index]!;
+    let row = rows.get(index);
+    if (row === undefined) {
+      row = rejectedSyncAccountRow(entry);
+      rows.set(index, row);
+    }
+    (row.errors as Record<string, unknown>[]).push({
+      code: 'VALIDATION_ERROR',
+      recovery: 'correctable',
+      message: issue.message,
+      field: `notification_configs[${configIndex}].event_types[${eventIndex}]`,
+    });
+  }
+  // Filtering a replacement roster would make rejected-but-present accounts
+  // look omitted and let a handler deactivate them. Refuse the whole roster
+  // explicitly rather than silently disabling the requested deletion policy.
+  if (deleteMissing) {
+    for (const [index, entry] of accounts.entries()) {
+      if (rows.has(index)) continue;
+      rows.set(index, {
+        ...rejectedSyncAccountRow(entry),
+        errors: [
+          {
+            code: 'VALIDATION_ERROR',
+            recovery: 'correctable',
+            message:
+              'delete_missing cannot be applied while account notification event types are invalid. Correct the rejected entries and retry.',
+            field: 'delete_missing',
+          },
+        ],
+      });
+    }
+  }
+  return rows;
+}
+
+function restoreSyncAccountErrorIndices(
+  row: Record<string, unknown>,
+  acceptedIndices: number[]
+): Record<string, unknown> {
+  if (!isPlainObject(row)) return row;
+  const restorePath = (path: string, pointer = false) => {
+    const match = pointer ? /^\/accounts\/(\d+)(?=\/|$)/.exec(path) : /^accounts\[(\d+)\](?=\.|\[|$)/.exec(path);
+    if (match === null) return path;
+    const originalIndex = acceptedIndices[Number(match[1])];
+    if (originalIndex === undefined) return path;
+    return `${pointer ? `/accounts/${originalIndex}` : `accounts[${originalIndex}]`}${path.slice(match[0].length)}`;
+  };
+  const restoreIssues = (issues: unknown[]) =>
+    issues.map(issue =>
+      isPlainObject(issue) && typeof issue.pointer === 'string'
+        ? { ...issue, pointer: restorePath(issue.pointer, true) }
+        : issue
+    );
+  const restoreField = (error: unknown) => {
+    if (!isPlainObject(error)) return error;
+    return {
+      ...error,
+      ...(typeof error.field === 'string' && { field: restorePath(error.field) }),
+      ...(Array.isArray(error.issues) && { issues: restoreIssues(error.issues) }),
+      ...(isPlainObject(error.details) &&
+        Array.isArray(error.details.issues) && {
+          details: { ...error.details, issues: restoreIssues(error.details.issues) },
+        }),
+    };
+  };
+  return {
+    ...row,
+    ...(Array.isArray(row.errors) && { errors: row.errors.map(restoreField) }),
+    ...(isPlainObject(row.adcp_error) && { adcp_error: restoreField(row.adcp_error) }),
+  };
+}
+
+function restoreSyncAccountEnvelopeErrorIndices(response: McpToolResponse, acceptedIndices: number[]): McpToolResponse {
+  const body = response.structuredContent;
+  if (body === undefined || !(Array.isArray(body.errors) || isPlainObject(body.adcp_error))) return response;
+  const restored = cloneFormattedResponse(response);
+  const mirrorsStructuredContent = contentTextMirrorsStructuredContent(restored, body);
+  restored.structuredContent = restoreSyncAccountErrorIndices(body, acceptedIndices);
+  syncContentJsonText(restored, restored.structuredContent, mirrorsStructuredContent);
+  return restored;
+}
+
 function validateFrameworkPayload(
   toolName: string,
   direction: 'request' | 'response',
   payload: unknown,
   version: Parameters<typeof validateRequest>[2],
-  proposalCapabilities?: ProposalRefinementCapabilities
+  proposalCapabilities?: ProposalRefinementCapabilities,
+  identity33 = false
 ) {
   // `sync_reporting_status` is intentionally a partial-success batch. Validate
   // the official envelope here while leaving each item to the registered
@@ -3154,6 +3360,8 @@ function validateFrameworkPayload(
   if (toolName === 'sync_reporting_status' && direction === 'request') {
     return validateSyncReportingStatusEnvelope(payload, version);
   }
+  if (identity33 && toolName !== 'refine_proposals' && toolName !== 'sync_reporting_status')
+    return validateIdentity33Payload(toolName, direction, payload, version);
   if (toolName !== 'refine_proposals') {
     return direction === 'request'
       ? validateRequest(toolName, payload, version)
@@ -4279,17 +4487,37 @@ function resolveEffectiveSignedRequestPolicy(
  *
  * `serve()` buffers the request body into `req.rawBody` before invoking the
  * preTransport hook, so the verifier sees the exact bytes the signer hashed
- * for Content-Digest. For MCP the operation name comes from the JSON-RPC
- * `params.name`; the resolver below falls back to `undefined` for non-JSON or
- * non-`tools/call` bodies, which makes the verifier treat them as not-in-
- * `required_for` rather than rejecting (discovery probes, health checks).
+ * for Content-Digest. The operation comes from `resolveRequestOperation`:
+ * `params.name` for MCP `tools/call`, the sole DataPart's `skill` for A2A
+ * message methods, and none for other JSON-RPC methods and non-POST requests
+ * (discovery probes, health checks). A POST whose body does not resolve to
+ * exactly one operation is rejected with `request_body_malformed`.
+ *
+ * `createA2AAdapter` reuses this same function on the A2A JSON-RPC path.
  */
 function buildSignedRequestsPreTransport(
   signedRequests: SignedRequestsConfig,
   effectiveRequestSigning: EffectiveSignedRequestPolicy,
   adcpVersion?: string
 ): AdcpPreTransport {
+  const legacyOriginGate =
+    signedRequests.assertLegacyOriginAllowed ??
+    getWebBotAuthLegacyOriginGate(signedRequests.webBotAuth?.resolvePrincipal);
+  if (signedRequests.webBotAuth && !legacyOriginGate)
+    throw new Error(
+      'Web Bot Auth requires an origin-binding migration fence; use createIdentity33PrincipalResolver or supply assertLegacyOriginAllowed'
+    );
+  if (
+    signedRequests.webBotAuth &&
+    !signedRequests.webBotAuth.isRevoked &&
+    !isWebBotAuthRevocationChecked(signedRequests.webBotAuth.resolvePrincipal)
+  )
+    throw new Error(
+      'Web Bot Auth requires origin revocation: use createIdentity33PrincipalResolver({ revocation }) or supply isRevoked'
+    );
   const requiredFor = effectiveRequestSigning.required_for ?? [];
+  const advertisedProfiles = (effectiveRequestSigning as { profiles?: readonly string[] }).profiles;
+  const webBotAuthAdvertised = !!signedRequests.webBotAuth && !!advertisedProfiles?.includes('web-bot-auth');
   const verifier = createExpressVerifier({
     capability: {
       supported: true,
@@ -4304,30 +4532,79 @@ function buildSignedRequestsPreTransport(
     revocationStore: signedRequests.revocationStore,
     adcpVersion,
     ...(signedRequests.agentUrlForKeyid ? { agentUrlForKeyid: signedRequests.agentUrlForKeyid } : {}),
-    resolveOperation: req => {
-      const raw = (req as { rawBody?: string }).rawBody;
-      if (!raw) return undefined;
-      try {
-        const parsed = JSON.parse(raw) as unknown;
-        const messages = Array.isArray(parsed) ? parsed : [parsed];
-        const operations = messages.flatMap(message => {
-          if (message == null || typeof message !== 'object') return [];
-          const candidate = message as { method?: unknown; params?: { name?: unknown } };
-          return candidate.method === 'tools/call' && typeof candidate.params?.name === 'string'
-            ? [candidate.params.name]
-            : [];
-        });
-        return operations.find(operation => requiredFor.includes(operation)) ?? operations[0];
-      } catch {
-        // Non-JSON or malformed body — let transport handle rejection.
-      }
-      return undefined;
-    },
+    // One resolver for MCP `tools/call` and A2A message methods; a body that
+    // does not resolve to exactly one operation is rejected by the verifier
+    // (`request_body_malformed`), never treated as "not in required_for".
+    resolveOperation: req => resolveRequestOperation({ rawBody: req.rawBody, method: req.method, url: req.url }),
   });
 
   return async function adcpPreTransport(req, res) {
     const serveContext = getServeRequestContext(req);
     const canonicalPublicUrl = serveContext?.publicUrl ? new URL(serveContext.publicUrl) : undefined;
+    if (selectSignatureProfile({ headers: req.headers }) === 'web-bot-auth') {
+      try {
+        if (!signedRequests.webBotAuth || !canonicalPublicUrl) throw new WebBotAuthError(403, 'profile_disabled');
+        if (req.method !== 'GET' && req.rawBody === undefined) throw new WebBotAuthError(403, 'raw_body_missing');
+        const requestTarget = canonicalPublicUrl.origin + (req.url?.startsWith('/') ? req.url : '/' + (req.url ?? ''));
+        const signers = await verifyWebBotAuth(
+          { method: req.method ?? 'POST', url: requestTarget, headers: req.headers, body: req.rawBody ?? '' },
+          {
+            // Identity verification needs only key discovery and replay state;
+            // revocation and binding belong to the principal resolver.
+            directory: signedRequests.webBotAuth.directory,
+            replayStore: signedRequests.replayStore,
+            ...(signedRequests.webBotAuth.isRevoked && { isRevoked: signedRequests.webBotAuth.isRevoked }),
+          }
+        );
+        const operation = resolveRequestOperation({ rawBody: req.rawBody, method: req.method, url: req.url });
+        let principal: AuthPrincipal;
+        let deferredFailure: WebBotAuthAuthorizationFailure | undefined;
+        try {
+          principal = await signedRequests.webBotAuth.resolvePrincipal(signers, operation);
+        } catch (error) {
+          // Signatures verified: this is an authorization outcome, not a signature failure.
+          if (error instanceof WebBotAuthError || error instanceof WebBotAuthUnavailableError) throw error;
+          // Only tool calls can carry a deferred failure; refuse everything else.
+          if (typeof operation !== 'string') throw webBotAuthPrincipalFailureError(error);
+          const deferred = deferWebBotAuthPrincipalFailure(signers, error);
+          principal = { principal: deferred.principal };
+          deferredFailure = deferred.authorizationFailure;
+        }
+        const signer = signers[signers.length - 1]!;
+        const failed = signers.find(s => s.authorizationFailure);
+        const guardedPrincipal = {
+          ...principal,
+          extra: {
+            ...principal.extra,
+            webBotAuthAuthorization: {
+              signer: failed ?? signer,
+              ...((failed?.authorizationFailure ?? deferredFailure) && {
+                authorizationFailure: failed?.authorizationFailure ?? deferredFailure,
+              }),
+            },
+          },
+        };
+        attachVerifiedSignerAuth(req, guardedPrincipal, {
+          keyid: signer.keyid,
+          agent_url: signer.origin,
+          verified_at: signer.verified_at,
+        });
+        return false;
+      } catch (error) {
+        if (error instanceof WebBotAuthUnavailableError) {
+          // Infrastructure outage: an application-layer answer, not a signature outcome.
+          const outage = webBotAuthUnavailableResponse();
+          res.writeHead(outage.status, { ...outage.headers, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(outage.body));
+          return true;
+        }
+        const rejected = error instanceof WebBotAuthError ? error : new WebBotAuthError(403, 'identity_rejected');
+        res.writeHead(rejected.status, { ...rejected.headers, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(rejected.body));
+        return true;
+      }
+    }
+
     const reqShim: ExpressLike = {
       method: req.method ?? 'POST',
       url: req.url ?? '/mcp',
@@ -4353,6 +4630,27 @@ function buildSignedRequestsPreTransport(
             res.setHeader(k, v);
             return {
               json(body: unknown) {
+                // An unsigned request that must be signed, when Web Bot Auth is
+                // advertised (adcp#7894 "Error responses"): WBA-only answers
+                // 403 with Accept-Signature; alongside the RFC 9421 profile the
+                // 401 request_signature_required also carries Accept-Signature.
+                if (
+                  webBotAuthAdvertised &&
+                  code === 401 &&
+                  (body as { error?: unknown } | null)?.error === 'request_signature_required'
+                ) {
+                  const hasBody = !!req.rawBody;
+                  if (advertisesOnlyWebBotAuth(advertisedProfiles)) {
+                    const refused = unsignedWebBotAuthError(hasBody);
+                    res.removeHeader('WWW-Authenticate');
+                    res.statusCode = refused.status;
+                    for (const [name, value] of Object.entries(refused.headers)) res.setHeader(name, value);
+                    res.setHeader('Content-Type', 'application/json');
+                    res.end(JSON.stringify(refused.body));
+                    return;
+                  }
+                  res.setHeader('Accept-Signature', webBotAuthAcceptSignature('sig1', hasBody));
+                }
                 res.setHeader('Content-Type', 'application/json');
                 res.end(JSON.stringify(body));
               },
@@ -4384,6 +4682,7 @@ function buildSignedRequestsPreTransport(
         resolve();
       };
       res.once('finish', () => {
+        verifierCompleted = true;
         if (res.writableEnded) handled = true;
         done();
       });
@@ -4391,8 +4690,7 @@ function buildSignedRequestsPreTransport(
         if (!verifierCompleted) handled = true;
         done();
       });
-      verifier(reqShim, resShim, err => {
-        verifierCompleted = true;
+      verifier(reqShim, resShim, async err => {
         if (err) {
           // Log internally; a leaked stack trace to the caller would
           // enumerate the verifier pipeline (js/stack-trace-exposure).
@@ -4412,6 +4710,11 @@ function buildSignedRequestsPreTransport(
         const verifiedSigner = reqShim.verifiedSigner as import('../signing/types').VerifiedSigner | undefined;
         if (!err && verifiedSigner) {
           try {
+            if (legacyOriginGate) {
+              if (!verifiedSigner.agent_url)
+                throw new AuthError('Legacy signer origin is required for migration fencing');
+              await legacyOriginGate(verifiedSigner.agent_url);
+            }
             const principal = principalForVerifiedSigner(verifiedSigner, signedRequests.makePrincipal);
             attachVerifiedSignerAuth(req, principal, verifiedSigner);
           } catch (identityError) {
@@ -4431,6 +4734,7 @@ function buildSignedRequestsPreTransport(
             handled = true;
           }
         }
+        verifierCompleted = true;
         if (res.writableEnded) handled = true;
         done();
       });
@@ -4776,8 +5080,6 @@ function bundledReleasesForMajors(majors: readonly number[], configured: ParsedA
     if (!acceptedMajors.has(parsed.major) || compareAdcpRelease(parsed, configured) > 0) continue;
     const key = `${parsed.major}.${parsed.minor}${parsed.prerelease ? `-${parsed.prerelease}` : ''}`;
     const existing = releases.get(key);
-    // Preserve the v2.5 alias because that is the actual bundled directory;
-    // stable semver patches otherwise collapse to release precision.
     if (!existing || parsed.value.startsWith('v')) releases.set(key, parsed);
   }
   // A server may explicitly opt into a bundled forward release before the
@@ -4982,6 +5284,11 @@ function isAuthDerivedAccountNotFound(err: unknown): boolean {
  * `get_adcp_capabilities` is auto-generated from registered tools.
  */
 export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TAccount>): AdcpServer {
+  if (Boolean(config.identity33) !== isIdentity33SchemaScope())
+    return withIdentity33SchemaScope(() => {
+      const instance = createAdcpServer(config);
+      return config.identity33 ? bindIdentity33SchemaScope(instance) : instance;
+    }, Boolean(config.identity33));
   const {
     name,
     version,
@@ -4989,6 +5296,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     defaultAdcpVersion: configuredDefaultAdcpVersion,
     mcpToolProfile = 'auto',
     requireCompactMutationAccountScope = false,
+    strictAccountReferences = false,
     resolveAccount,
     resolveAccountFromAuth,
     resolveSessionKey,
@@ -5014,6 +5322,15 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     toolSchemas,
     structuredContentTextFallback = 'always',
   } = config;
+  if (
+    capConfig?.major_versions?.some(major => major < 3) ||
+    capConfig?.supported_versions?.some(version => parseAdcpMajorVersion(version) < 3)
+  ) {
+    throw new ConfigurationError(
+      'AdCP 2 reached end of life on 2026-08-01. Server capabilities must advertise AdCP 3 only.',
+      'capabilities'
+    );
+  }
   if (taskRegistry !== undefined && taskRegistry.scopeVersion !== 1) {
     throw new Error(
       'createAdcpServer: taskRegistry.scopeVersion must be 1. Migrate custom registries to the account/principal-scoped TaskRegistry signatures before use.'
@@ -5120,7 +5437,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // but make this server instance negotiate and advertise the release it
   // actually serves. An explicit older pin is rejected below.
   const adcpVersion = resolveAdcpVersion(
-    configuredAdcpVersion ?? (config.proposalNegotiation ? ADCP_VERSION : undefined)
+    configuredAdcpVersion ?? (config.identity33 ? '3.3' : config.proposalNegotiation ? ADCP_VERSION : undefined)
   );
   const toolVersionRanges = parseToolVersionRanges(config.toolVersions);
   const toolAvailableForRelease = (toolName: string, release: string): boolean =>
@@ -5238,6 +5555,28 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // the failure path so both spec-mandated layers ride on every
   // failing response. Tools without an Error arm are untouched.
   // RFC: docs/proposals/adcperror-two-layer-emission.md.
+  const identityOnboarding = capConfig?.account?.agent_onboarding ?? capConfig?.account?.agentOnboarding;
+  if (identityOnboarding) {
+    if (!config.identity33) throw new Error('agent_onboarding requires the identity33 experiment');
+    validateAgentOnboarding(
+      identityOnboarding,
+      { sandbox: capConfig?.account?.sandbox, supported_billing: capConfig?.account?.supportedBilling },
+      capConfig?.overrides?.experimental_features ?? []
+    );
+  }
+  if (
+    signedRequests?.webBotAuth &&
+    (!config.identity33 ||
+      !(capConfig?.overrides?.request_signing?.profiles ?? capConfig?.request_signing?.profiles)?.includes(
+        'web-bot-auth'
+      ))
+  )
+    throw new Error('Web Bot Auth verifier requires identity33 and request_signing.profiles advertisement');
+  if (config.webhooks?.signingProfile === 'web-bot-auth')
+    throw new Error('Select Web Bot Auth on each trusted webhook registration, not as a server-wide default');
+  if (config.webhooks?.webBotAuth && !config.identity33)
+    throw new Error('Web Bot Auth webhook signing requires the identity33 experiment');
+  if (config.webhooks?.webBotAuth?.key) assertWebBotAuthSigningKey(config.webhooks.webBotAuth.key);
   const toolsWithErrorArm = getToolsWithErrorArm(adcpVersion);
 
   // Defaults gated on `process.env.NODE_ENV`:
@@ -5370,7 +5709,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   //
   // - **3.1+ canonical (recommended):** `capabilities.request_signing.supported: true`.
   //   The universal signed_requests storyboard runs on this signal alone and
-  //   the runner emits `request_signing.required` notices for buyers.
+  //   the runner emits `request_signing_required_in_4_0` notices for buyers.
   // - **Back-compat:** `specialisms: ['signed-requests']`. The 3.0-era enum
   //   is preserved through the AdCP 4.0 deprecation cycle (adcp#3075). The
   //   runner emits `signed_requests_specialism_deprecated` notice when this
@@ -5745,7 +6084,9 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       validationMode === 'off'
         ? ({ valid: true, issues: [], schemaId: undefined } as const)
         : validateRequest(toolName, params, requestServedRelease(params)?.validationVersion ?? adcpVersion);
-    const issues = [...(outcome.valid ? [] : outcome.issues), ...accountIssues];
+    // Account-extension errors force rejection even in warn mode. Keep that
+    // reason first when serialized diagnostics reach their cap.
+    const issues = [...accountIssues, ...(outcome.valid ? [] : outcome.issues)];
     if (issues.length === 0) return undefined;
     if (validationMode === 'strict' || accountIssues.length > 0) {
       return adcpError(
@@ -6113,8 +6454,13 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       const hasAccount = 'account' in schema.shape;
 
       const wrap = meta?.wrap ?? ((data: any, summary?: string) => genericResponse(toolName, data, summary));
-      const toolHandler = async (params: any, extra: any) => {
+      const toolHandler = async (params: any, extra: any): Promise<any> => {
+        const authorizationFailure = getWebBotAuthAuthorizationFailure(extra?.authInfo?.extra);
+        if (authorizationFailure) return webBotAuthToolFailure(authorizationFailure, servedAdcpVersion);
+        if (config.identity33 && !isIdentity33SchemaScope())
+          return withIdentity33SchemaScope(() => toolHandler(params, extra));
         const callRequestValidationMode = effectiveRequestValidationMode(extra, toolName);
+        let notificationFailureRows = new Map<number, Record<string, unknown>>();
         const releaseSelection = selectServedAdcpRelease(params, capConfig, adcpVersion, defaultAdcpVersion);
         let releaseError: McpToolResponse | undefined;
         let requestRelease: ServedAdcpRelease;
@@ -6197,6 +6543,29 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               },
             })
           );
+        }
+        for (const field of ['push_notification_config', 'reporting_webhook', 'artifact_webhook']) {
+          const registration = params[field];
+          if (!registration || typeof registration !== 'object' || Array.isArray(registration)) continue;
+          const selectedProfile = (registration as { signing_profile?: unknown }).signing_profile;
+          if (selectedProfile === undefined) continue;
+          const offered = (capabilitiesData.webhook_signing as { profiles?: string[] } | undefined)?.profiles ?? [
+            'adcp/webhook-signing/v1',
+          ];
+          if (
+            typeof selectedProfile !== 'string' ||
+            !offered.includes(selectedProfile) ||
+            (selectedProfile === 'web-bot-auth' &&
+              (!config.identity33 || !isAdcpVersionAtLeast(requestRelease.wireVersion, '3.3'))) ||
+            (selectedProfile === 'web-bot-auth' &&
+              (registration as { authentication?: unknown }).authentication !== undefined)
+          )
+            return finalize(
+              adcpError('INVALID_REQUEST', {
+                message: 'Unsupported or ambiguous webhook signing profile',
+                field: `${field}.signing_profile`,
+              })
+            );
         }
         const operationIdError = pushOperationIdError(params, requestRelease);
         if (operationIdError) return finalize(operationIdError);
@@ -6619,7 +6988,8 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             'request',
             params,
             requestRelease.validationVersion,
-            proposalRefinementCapabilities
+            proposalRefinementCapabilities,
+            !!config.identity33 && isAdcpVersionAtLeast(requestRelease.wireVersion, '3.3')
           );
           if (!outcome.valid) {
             if ('refinementError' in outcome && outcome.refinementError?.code === 'UNSUPPORTED_FEATURE') {
@@ -6650,10 +7020,46 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             // (`/foo/idempotency_key`) won't match this filter and the
             // strict-mode failure will correctly bubble up — drift is
             // surfaced rather than silently swallowed.
-            const issues =
+            let issues =
               idempotencyDisabled && requestIsStateChanging
-                ? outcome.issues.filter(i => !(i.keyword === 'required' && i.pointer === '/idempotency_key'))
+                ? outcome.issues.filter(
+                    i =>
+                      !(
+                        i.keyword === 'required' &&
+                        i.pointer === '/idempotency_key' &&
+                        !validationDiagnosticsTruncated([i])
+                      )
+                  )
                 : outcome.issues;
+            if (toolName === 'sync_accounts' && effectiveFrameworkRequestValidationMode === 'strict') {
+              const eventIssues = issues.filter(isAccountNotificationEventIssue);
+              // Do not construct account identities from otherwise malformed
+              // entries; strict mode rejects the remaining issues below. Sole
+              // event-type failures become account rows instead of a
+              // request-level rejection. Warn mode stays advisory, as in 14.0:
+              // the full request reaches the handler with a logged warning.
+              if (eventIssues.length > 0 && eventIssues.length === issues.length) {
+                const failedRows = accountNotificationFailureRows(
+                  params.accounts,
+                  eventIssues,
+                  params.delete_missing === true
+                );
+                // Older releases require brand/operator on failed rows and
+                // cannot represent an opaque settings-update account reference.
+                // Keep request-level validation when the negotiated response
+                // cannot express these failures, before any sibling can commit.
+                if (
+                  validateResponse(
+                    'sync_accounts',
+                    { accounts: [...failedRows.values()] },
+                    requestRelease.validationVersion
+                  ).valid
+                ) {
+                  notificationFailureRows = failedRows;
+                  issues = [];
+                }
+              }
+            }
             if (issues.length > 0) {
               if (effectiveFrameworkRequestValidationMode === 'strict') {
                 // Thread `exposeSchemaPath` the same way response-side does
@@ -6677,14 +7083,49 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           }
         }
 
+        if (config.identity33) {
+          try {
+            await config.identity33.authorize(ctx, toolName, params);
+          } catch (error) {
+            // A trust-record outage is retryable, never a denial.
+            if (error instanceof TrustRecordUnavailableError)
+              return finalize(adcpError('SERVICE_UNAVAILABLE', { message: error.message, recovery: 'transient' }));
+            if (error instanceof IdentityAuthorizationError)
+              return finalize(
+                adcpError('PERMISSION_DENIED', {
+                  message: error.message,
+                  ...(error.details && { details: { ...error.details } }),
+                })
+              );
+            if (error instanceof AdcpError) return finalize(projectThrownAdcpError(error));
+            return finalize(adcpError('PERMISSION_DENIED', { message: 'Agent authorization failed' }));
+          }
+        }
+
         // --- Account resolution ---
-        if (hasAccount && params.account != null && resolveAccount) {
+        let unresolvedAccountPassThrough = false;
+        // `list_accounts.account` is a filter. Strict mode treats it as one;
+        // the SDK 14.0 default still resolves it as the request's account.
+        const suppliedAccountRef =
+          hasAccount && params.account != null && !(strictAccountReferences && toolName === 'list_accounts');
+        if (suppliedAccountRef && toolName === 'list_accounts') {
+          warnAccountReferenceDeprecation(
+            logger,
+            'ADCP_LIST_ACCOUNTS_FILTER_RESOLVED',
+            '[adcp/createAdcpServer] DEPRECATED: list_accounts.account is resolved as the request account ' +
+              '(SDK 14.0 behavior). The next major release, or strictAccountReferences: true, treats it as a ' +
+              'filter: resolveAccount is not called for it and ctx.account comes from resolveAccountFromAuth.',
+            { tool: toolName }
+          );
+        }
+        if (suppliedAccountRef && resolveAccount) {
           try {
             const account = await resolveAccount(
               params.account,
               withImmutableServedAdcpVersion(
                 {
                   toolName: toolName as AdcpServerToolName,
+                  provisioning: isAccountProvisioningTask(toolName),
                   authInfo: ctx.authInfo,
                   ...(ctx.agent != null && { agent: ctx.agent }),
                   input: params,
@@ -6725,17 +7166,36 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               })
             );
           }
-        } else if (hasAccount && toolName === 'list_creative_formats' && params.account != null) {
-          // The rc.7 discovery request may select an account. An auth-derived
-          // resolver cannot authorize an arbitrary buyer-supplied reference.
-          return finalize(
-            adcpError('ACCOUNT_NOT_FOUND', {
-              message: 'The specified account cannot be resolved',
-              field: 'account',
-              suggestion: 'Omit account to use the authenticated account',
-            })
-          );
-        } else if ((!hasAccount || params.account == null) && resolveAccountFromAuth) {
+        } else if (suppliedAccountRef) {
+          // An auth-derived resolver cannot authorize an arbitrary
+          // buyer-supplied reference. The rc.7 `list_creative_formats`
+          // selector has always been refused; other tools keep the SDK 14.0
+          // pass-through unless the seller opts in to strict references.
+          if (strictAccountReferences || toolName === 'list_creative_formats') {
+            return finalize(
+              adcpError('ACCOUNT_NOT_FOUND', {
+                message: 'The specified account cannot be resolved',
+                field: 'account',
+                suggestion:
+                  'The seller must configure resolveAccount to authorize supplied references; use list_accounts to discover an authorized account',
+              })
+            );
+          }
+          if (toolName !== 'list_accounts') {
+            warnAccountReferenceDeprecation(
+              logger,
+              'ADCP_UNRESOLVED_ACCOUNT_REFERENCE',
+              '[adcp/createAdcpServer] DEPRECATED: a request carried a buyer-supplied account reference, but no ' +
+                'resolveAccount is configured. The reference reached the handler unverified (ctx.account is ' +
+                'undefined). The next major release refuses it with ACCOUNT_NOT_FOUND. Configure a ' +
+                'reference-aware resolveAccount that returns null for unknown or unauthorized references, then ' +
+                'set strictAccountReferences: true. See ' +
+                'https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/account-resolution.md',
+              { tool: toolName }
+            );
+          }
+          unresolvedAccountPassThrough = true;
+        } else if (!suppliedAccountRef && resolveAccountFromAuth) {
           // Auth-derived path for tools without a supplied `account` field
           // (provide_performance_feedback, list_creative_formats, the
           // `tasks/get` polling path). Single-tenant agents return their
@@ -6748,6 +7208,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               withImmutableServedAdcpVersion(
                 {
                   toolName: toolName as AdcpServerToolName,
+                  provisioning: isAccountProvisioningTask(toolName),
                   authInfo: ctx.authInfo,
                   ...(ctx.agent != null && { agent: ctx.agent }),
                   input: params,
@@ -6783,6 +7244,34 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
                 })
               );
             }
+          }
+        }
+
+        if (
+          (toolName === 'get_products' || toolName === 'list_products') &&
+          capConfig?.account?.requiredForProducts &&
+          ctx.account == null &&
+          // A supplied reference the compatibility pass-through handed to the
+          // handler satisfies the seller's declared requirement.
+          !unresolvedAccountPassThrough
+        ) {
+          if (!strictAccountReferences) {
+            warnAccountReferenceDeprecation(
+              logger,
+              'ADCP_REQUIRED_FOR_PRODUCTS_NOT_ENFORCED',
+              '[adcp/createAdcpServer] DEPRECATED: this seller declares account.required_for_products, but ' +
+                `${toolName} ran without an account (SDK 14.0 behavior). The next major release, or ` +
+                'strictAccountReferences: true, refuses it with ACCOUNT_REQUIRED.',
+              { tool: toolName }
+            );
+          } else {
+            return finalize(
+              adcpError('ACCOUNT_REQUIRED', {
+                message: 'This seller requires an account for product discovery',
+                field: 'account',
+                suggestion: 'Provision an account with sync_accounts or discover one with list_accounts',
+              })
+            );
           }
         }
 
@@ -6917,11 +7406,15 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           }
         }
         const callerScopedResolver =
-          toolName === 'sync_agent_notification_configs'
-            ? config.protocol?.resolveScope
-            : toolName === 'get_principal' || toolName === 'sync_principal'
-              ? config.protocol?.resolvePrincipalScope
-              : undefined;
+          config.identity33 &&
+          (toolName === 'get_principal' || (toolName === 'sync_principal' && params.dry_run === true)) &&
+          isIdentity33UnboundContext(ctx)
+            ? undefined
+            : toolName === 'sync_agent_notification_configs'
+              ? config.protocol?.resolveScope
+              : toolName === 'get_principal' || toolName === 'sync_principal'
+                ? config.protocol?.resolvePrincipalScope
+                : undefined;
         if (callerScopedResolver || toolName === 'report_plan_adjustment') {
           if (ctx.authInfo === undefined && ctx.agent === undefined) {
             return finalize(
@@ -7203,14 +7696,54 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
 
         // --- Handler ---
         let mutationHandlerCompleted = false;
+        const acceptedAccountIndices: number[] | undefined =
+          notificationFailureRows.size > 0
+            ? params.accounts.flatMap((_entry: unknown, index: number) =>
+                notificationFailureRows.has(index) ? [] : [index]
+              )
+            : undefined;
+        const restoreHandlerErrorIndices = (response: McpToolResponse) =>
+          acceptedAccountIndices === undefined
+            ? response
+            : restoreSyncAccountEnvelopeErrorIndices(response, acceptedAccountIndices);
         try {
           if (webhookEmitter) {
             const tenantScope = webhookTenantScopeForContext(ctx);
             const scopedEmitter =
               tenantScope === undefined ? configuredWebhookEmitter! : webhookEmitter.forTenantScope(tenantScope);
-            ctx.emitWebhook = scopedEmitter.emit.bind(scopedEmitter);
+            const profileBindings = ['push_notification_config', 'reporting_webhook', 'artifact_webhook'].flatMap(
+              field => {
+                const value = params[field] as
+                  | { url?: string; signing_profile?: 'adcp/webhook-signing/v1' | 'web-bot-auth' }
+                  | undefined;
+                return value?.url && value.signing_profile ? [{ url: value.url, profile: value.signing_profile }] : [];
+              }
+            );
+            ctx.emitWebhook = delivery =>
+              scopedEmitter.emit({
+                ...delivery,
+                ...(delivery.signingProfile === undefined &&
+                  profileBindings.some(binding => binding.url === delivery.url) && {
+                    signingProfile: profileBindings.find(binding => binding.url === delivery.url)!.profile,
+                  }),
+              });
           }
-          const result = await handler(params, ctx);
+          // Preserve the original params through authorization and replay
+          // lookup above. Filter only at dispatch, so the replay fingerprint
+          // includes rejected entries and they never reach a subscriber writer.
+          const handlerParams =
+            notificationFailureRows.size === 0
+              ? params
+              : {
+                  ...params,
+                  accounts: params.accounts.filter(
+                    (_entry: unknown, index: number) => !notificationFailureRows.has(index)
+                  ),
+                };
+          const result =
+            notificationFailureRows.size > 0 && handlerParams.accounts.length === 0
+              ? { accounts: [], ...(params.dry_run === true && { dry_run: true }) }
+              : await handler(handlerParams, ctx);
           mutationHandlerCompleted = true;
           // Narrow Error / Submitted arms of the *Response union before
           // reaching the success-arm builder: wrap() on an Error payload
@@ -7262,6 +7795,60 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
             }
           } else {
             formatted = wrap(result);
+          }
+          formatted = restoreHandlerErrorIndices(formatted);
+
+          if (
+            notificationFailureRows.size > 0 &&
+            !isErrorResponse(formatted) &&
+            !(Array.isArray(formatted.structuredContent?.errors) && formatted.structuredContent?.accounts === undefined)
+          ) {
+            // Adopters may return cached or frozen formatted responses. The
+            // JSON mirror update below must never modify handler-owned data.
+            formatted = cloneFormattedResponse(formatted);
+            const body = formatted.structuredContent!;
+            // Platform policy errors use request-relative accounts[i] paths.
+            // Restore those indices after removing notification-invalid rows.
+            const acceptedRows = Array.isArray(body.accounts)
+              ? body.accounts.map(row => restoreSyncAccountErrorIndices(row, acceptedAccountIndices!))
+              : body.accounts;
+            const submitted = isSubmittedEnvelope(body);
+            let accounts: Record<string, unknown>[];
+            if (submitted) {
+              if (acceptedRows !== undefined && !Array.isArray(acceptedRows)) {
+                throw new Error('sync_accounts submitted accounts must be an array when present');
+              }
+              // Report terminal validation failures in the acknowledgement.
+              // Accepted entries remain pending under the adopter's task_id;
+              // the framework does not own their eventual task completion.
+              accounts = [
+                ...(Array.isArray(acceptedRows) ? acceptedRows : []),
+                ...[...notificationFailureRows.entries()].sort(([a], [b]) => a - b).map(([, row]) => row),
+              ];
+            } else {
+              if (!Array.isArray(acceptedRows) || acceptedRows.length !== handlerParams.accounts.length) {
+                throw new Error('sync_accounts handler must return one result row for each accepted account entry');
+              }
+              let acceptedIndex = 0;
+              accounts = params.accounts.map(
+                (_entry: unknown, index: number) => notificationFailureRows.get(index) ?? acceptedRows[acceptedIndex++]
+              );
+            }
+            const merged = { ...body, accounts };
+            if (isFormattedResponse(result)) {
+              const mirrorsStructuredContent = contentTextMirrorsStructuredContent(formatted, body);
+              formatted = { ...formatted, structuredContent: wrap(merged).structuredContent };
+              syncContentJsonText(formatted, formatted.structuredContent!, mirrorsStructuredContent);
+            } else {
+              const rejected = accounts.filter(row => row.action === 'failed').length;
+              const synced = accounts.length - rejected;
+              const summary = submitted
+                ? typeof body.message === 'string'
+                  ? body.message
+                  : `Task ${body.task_id} submitted`
+                : `Synced ${synced} account${synced === 1 ? '' : 's'}`;
+              formatted = wrap(merged, `${summary}; ${rejected} account${rejected === 1 ? '' : 's'} rejected`);
+            }
           }
 
           // --- Test-controller bridge: augment read-side tools with seeded fixtures. ---
@@ -7848,7 +8435,14 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           // their shape is enforced by the adcpError() builder.
           if (responseValidationMode !== 'off' && !isErrorResponse(formatted)) {
             const payload = formatted.structuredContent;
-            const outcome = validateFrameworkPayload(toolName, 'response', payload, requestRelease.validationVersion);
+            const outcome = validateFrameworkPayload(
+              toolName,
+              'response',
+              payload,
+              requestRelease.validationVersion,
+              undefined,
+              !!config.identity33 && isAdcpVersionAtLeast(requestRelease.wireVersion, '3.3')
+            );
             if (!outcome.valid) {
               logger.warn(
                 `Schema validation warning (response) for ${toolName}: ${formatIssues(outcome.issues, 3, { rootSchemaId: outcome.schemaId })}`,
@@ -8036,6 +8630,9 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               });
               thrownTypedEnvelope = projectThrownAdcpError(err);
             }
+            if (thrownTypedEnvelope !== undefined) {
+              thrownTypedEnvelope = restoreHandlerErrorIndices(thrownTypedEnvelope);
+            }
 
             const thrownRecovery = thrownTypedEnvelope ? thrownAdcpErrorRecovery(thrownTypedEnvelope) : undefined;
             let stableTypedOutcome =
@@ -8158,7 +8755,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               message: env.message,
               stack: err instanceof Error ? err.stack : undefined,
             });
-            return finalize(err);
+            return finalize(restoreHandlerErrorIndices(err));
           }
           // Raw `AdcpError` class throws — distinct from the
           // already-projected envelope above. The framework has long
@@ -8174,7 +8771,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
               message: err.message,
               stack: err.stack,
             });
-            return finalize(projectThrownAdcpError(err));
+            return finalize(restoreHandlerErrorIndices(projectThrownAdcpError(err)));
           }
           const reason = err instanceof Error ? err.message : String(err);
           // Log the full stack — `logger.error` with just the message turned
@@ -8277,6 +8874,8 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         _meta: frameworkToolMeta,
       },
       (async (params: any, extra: any) => {
+        const identityError = await authorizeAuxiliaryIdentityTool('get_task_status', params, extra);
+        if (identityError) return finalizeProtocolTaskToolResponse('get_task_status', params ?? {}, identityError);
         const credentialError = taskToolCredentialPolicyError('get_task_status', params ?? {}, extra);
         if (credentialError) {
           return finalizeProtocolTaskToolResponse('get_task_status', params ?? {}, credentialError, {
@@ -8377,6 +8976,8 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         _meta: frameworkToolMeta,
       },
       (async (params: any, extra: any) => {
+        const identityError = await authorizeAuxiliaryIdentityTool('list_tasks', params, extra);
+        if (identityError) return finalizeProtocolTaskToolResponse('list_tasks', params ?? {}, identityError);
         const credentialError = taskToolCredentialPolicyError('list_tasks', params ?? {}, extra);
         if (credentialError) {
           return finalizeProtocolTaskToolResponse('list_tasks', params ?? {}, credentialError, { echoContext: false });
@@ -8522,6 +9123,8 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
         );
       };
       const wrappedHandler = (async (...args: unknown[]) => {
+        const identityError = await authorizeAuxiliaryIdentityTool(customName, args[0], args[args.length - 1]);
+        if (identityError) return finalizeCustomResponse(identityError);
         // Preserve the MCP SDK's runtime callback shape exactly. In
         // particular, legacy dispatch may still pass a request arguments
         // object to schema-less custom tools; version selection must inspect
@@ -8581,6 +9184,19 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
 
   // Tool coherence warnings
   checkCoherence(registeredToolNames, logger);
+  if (
+    !resolveAccount &&
+    process.env.NODE_ENV !== 'production' &&
+    ['get_products', 'get_signals', 'request_proposals', 'create_media_buy'].some(tool => registeredToolNames.has(tool))
+  ) {
+    logger.warn(
+      strictAccountReferences
+        ? 'Account-carrying tools are registered without resolveAccount. Supplied references will fail with ACCOUNT_NOT_FOUND.'
+        : 'Account-carrying tools are registered without resolveAccount. Supplied references reach handlers unverified; ' +
+            'this is deprecated and they will fail with ACCOUNT_NOT_FOUND in the next major release. ' +
+            'Configure a reference-aware resolveAccount and set strictAccountReferences: true.'
+    );
+  }
 
   // --- Idempotency configuration guardrails ---
   //
@@ -8687,6 +9303,7 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       ...(capConfig.account.defaultBilling && { default_billing: capConfig.account.defaultBilling }),
       required_for_products: capConfig.account.requiredForProducts ?? false,
       sandbox: capConfig.account.sandbox ?? false,
+      ...(identityOnboarding && { agent_onboarding: identityOnboarding }),
       ...(capConfig.account.changeFeed !== undefined && { change_feed: capConfig.account.changeFeed }),
     };
   }
@@ -8735,7 +9352,20 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       ...capabilitiesData.webhook_signing,
       supported: true,
       profile,
-      algorithms: [algorithm],
+      algorithms: [
+        ...new Set([
+          algorithm,
+          // `algorithms` lists AdCP webhook-profile values; a Web Bot Auth key
+          // is Ed25519 (adcp#7894), which has the value `ed25519` here.
+          ...(webhooks.webBotAuth &&
+          ('privateKey' in webhooks.webBotAuth.key
+            ? webhooks.webBotAuth.key.privateKey.crv
+            : webhooks.webBotAuth.key.publicKey.crv) === 'Ed25519'
+            ? ['ed25519']
+            : []),
+        ]),
+      ] as ('ed25519' | 'ecdsa-p256-sha256')[],
+      ...(webhooks.webBotAuth && { profiles: ['adcp/webhook-signing/v1', 'web-bot-auth'] }),
       legacy_hmac_fallback: capabilitiesData.webhook_signing?.legacy_hmac_fallback ?? false,
       delivery_retry_horizon_seconds: webhooks.deliveryRetryHorizonSeconds ?? 86_400,
     };
@@ -8803,6 +9433,44 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
   // formally defines library_version in a future AdCP minor.
   (capabilitiesData as unknown as Record<string, unknown>).library_version = `@adcp/client@${LIBRARY_VERSION}`;
 
+  async function authorizeAuxiliaryIdentityTool(
+    toolName: string,
+    params: unknown,
+    extra: any
+  ): Promise<McpToolResponse | undefined> {
+    const failure = getWebBotAuthAuthorizationFailure(extra?.authInfo?.extra);
+    if (failure) return webBotAuthToolFailure(failure, servedAdcpVersion);
+    if (!config.identity33) return undefined;
+    try {
+      await config.identity33.authorize(
+        withImmutableServedAdcpVersion(
+          { toolName, stateStore, authInfo: extra?.authInfo, logger } as unknown as HandlerContext<TAccount>,
+          adcpVersion
+        ),
+        toolName,
+        params
+      );
+    } catch (error) {
+      if (error instanceof TrustRecordUnavailableError)
+        return adcpError('SERVICE_UNAVAILABLE', { message: error.message, recovery: 'transient' });
+      if (error instanceof IdentityAuthorizationError)
+        return adcpError('PERMISSION_DENIED', {
+          message: error.message,
+          ...(error.details && { details: { ...error.details } }),
+        });
+      if (error instanceof AdcpError) return projectThrownAdcpError(error);
+      return adcpError('PERMISSION_DENIED', { message: 'Agent authorization failed' });
+    }
+    return undefined;
+  }
+
+  for (const field of ['request_signing', 'webhook_signing'] as const) {
+    const signing = (
+      capabilitiesData as unknown as Record<string, { profiles?: string[]; wba_draft_revision?: string }>
+    )[field];
+    if (signing?.profiles?.includes('web-bot-auth')) signing.wba_draft_revision = WEB_BOT_AUTH_DRAFT_REVISION;
+  }
+
   // Passthrough inputSchema — framework validation is authoritative on
   // both transports (#909). Same rationale as the domain-tool loop above.
   server.registerTool(
@@ -8813,6 +9481,10 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
       _meta: frameworkToolMeta,
     },
     (async (params: any, extra: { authInfo?: ResolvedAuthInfo } = {}) => {
+      const authorizationFailure = getWebBotAuthAuthorizationFailure(extra.authInfo?.extra);
+      if (authorizationFailure) return webBotAuthToolFailure(authorizationFailure, servedAdcpVersion);
+      const identityError = await authorizeAuxiliaryIdentityTool('get_adcp_capabilities', params, extra);
+      if (identityError) return identityError;
       const callRequestValidationMode = effectiveRequestValidationMode(extra);
       const requestParams = isPlainObject(params) ? params : {};
       const releaseSelection = selectServedAdcpRelease(requestParams, capConfig, adcpVersion, defaultAdcpVersion);
@@ -8976,7 +9648,15 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
           delete validationPayload.media_buy.proposal_refinement;
           delete validationPayload.media_buy.lifecycle_tools;
         }
-        const responseOutcome = validateResponse('get_adcp_capabilities', validationPayload, release.validationVersion);
+        const responseOutcome =
+          config.identity33 && isAdcpVersionAtLeast(release.wireVersion, '3.3')
+            ? validateIdentity33Payload(
+                'get_adcp_capabilities',
+                'response',
+                validationPayload,
+                release.validationVersion
+              )
+            : validateResponse('get_adcp_capabilities', validationPayload, release.validationVersion);
         if (!responseOutcome.valid) {
           logger.warn(
             `Schema validation warning (response) for get_adcp_capabilities: ${formatIssues(responseOutcome.issues, 3, { rootSchemaId: responseOutcome.schemaId })}`,
@@ -9287,6 +9967,30 @@ export function createAdcpServer<TAccount = unknown>(config: AdcpServerConfig<TA
     tools: [...registeredToolNames],
     protocols,
     signedRequests: signedRequestsState,
+  });
+
+  if (config.identity33) {
+    for (const method of [
+      'initialize',
+      'tools/list',
+      'tools/call',
+      'resources/list',
+      'resources/read',
+      'prompts/list',
+      'prompts/get',
+      'tasks/get',
+      'tasks/list',
+      'tasks/cancel',
+      'tasks/result',
+    ])
+      wrapSdkRequestHandler(server, method, (original, request, extra) =>
+        withIdentity33SchemaScope(() => original(request, extra))
+      );
+  }
+
+  wrapSdkRequestHandler(server, 'tools/call', (original, request, extra) => {
+    const failure = getWebBotAuthAuthorizationFailure((extra as { authInfo?: ResolvedAuthInfo })?.authInfo?.extra);
+    return failure ? webBotAuthToolFailure(failure, servedAdcpVersion) : original(request, extra);
   });
 
   return wrapped;

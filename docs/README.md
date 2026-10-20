@@ -23,7 +23,13 @@ list_products → buy_products → control_media_buy
 
 Use the [buyer quick start](./guides/BUYER-QUICKSTART-3.2.md). For the complete
 tool and type inventory, use [llms.txt](./llms.txt) and the
-[type summary](./TYPE-SUMMARY.md).
+[type summary](./TYPE-SUMMARY.md). For server-side callers that create a client per request, see [discovery caching and MCP session reuse](./guides/DISCOVERY-CACHE-AND-SESSION-REUSE.md).
+
+## Upgrade from SDK 14.0
+
+Use the [14.0-to-14.1 upgrade checklist](./migration-14.0-to-14.1.md) for
+required changes, opt-in features, and stricter signature verification. SDK
+14.1.0 continues to use AdCP 3.2.1 on the wire.
 
 ## Upgrade from SDK 13
 

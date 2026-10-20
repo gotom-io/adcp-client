@@ -1,4 +1,5 @@
-import { createPrivateKey, randomBytes, sign as nodeSign, type JsonWebKey } from 'crypto';
+import { randomBytes } from 'crypto';
+import { signWithPrivateJwk } from './crypto';
 import {
   buildResponseSignatureBase,
   buildSignatureBase,
@@ -7,7 +8,7 @@ import {
   type ResponseLike,
   type SignatureParams,
 } from './canonicalize';
-import { computeContentDigest, type SfBinaryEncoding } from './content-digest';
+import { computeContentDigest, serializeByteSequenceMember, type SfBinaryEncoding } from './content-digest';
 import { RequestSignatureError, ResponseSignatureError, WebhookSignatureError } from './errors';
 import type { AdcpUse } from './jwks-helpers';
 import {
@@ -220,6 +221,7 @@ export function prepareRequestSignature(
   const windowSeconds = Math.min(options.windowSeconds ?? 300, MAX_SIGNATURE_WINDOW_SECONDS);
   const nonce = options.nonce ?? base64UrlRandom(16);
   const label = options.label ?? 'sig1';
+  assertLabelAndClock(label, now);
   const hasBody = (request.body ?? '').length > 0;
 
   // Keep the low-level helper backward compatible for callers that do not
@@ -269,11 +271,8 @@ export function prepareRequestSignature(
  */
 export function finalizeRequestSignature(prepared: PreparedRequestSignature, signature: Uint8Array): SignedRequest {
   const headers = { ...prepared.headers };
-  const sigB64 = Buffer.from(signature).toString(
-    prepared.binaryEncoding === 'legacy-base64url' ? 'base64url' : 'base64'
-  );
   headers['Signature-Input'] = `${prepared.label}=${formatSignatureParams(prepared.components, prepared.params)}`;
-  headers['Signature'] = `${prepared.label}=:${sigB64}:`;
+  headers['Signature'] = serializeByteSequenceMember(prepared.label, signature, prepared.binaryEncoding);
   return { headers, signatureBase: prepared.base, params: prepared.params };
 }
 
@@ -328,6 +327,7 @@ export function prepareWebhookSignature(
   const windowSeconds = Math.min(options.windowSeconds ?? 300, MAX_SIGNATURE_WINDOW_SECONDS);
   const nonce = options.nonce ?? base64UrlRandom(16);
   const label = options.label ?? 'sig1';
+  assertLabelAndClock(label, now);
 
   const headers: Record<string, string> = { ...flattenHeaders(request.headers) };
   headers['Content-Digest'] = computeContentDigest(request.body ?? '', 'legacy-base64url');
@@ -423,6 +423,7 @@ export function prepareResponseSignature(
   const windowSeconds = Math.min(options.windowSeconds ?? 300, MAX_SIGNATURE_WINDOW_SECONDS);
   const nonce = options.nonce ?? base64UrlRandom(16);
   const label = options.label ?? 'sig1';
+  assertLabelAndClock(label, now);
   const hasBody = (response.body ?? '').length > 0;
   const coverDigest = (options.coverContentDigest ?? true) && hasBody;
 
@@ -457,9 +458,9 @@ export function prepareResponseSignature(
 
 export function finalizeResponseSignature(prepared: PreparedResponseSignature, signature: Uint8Array): SignedResponse {
   const headers = { ...prepared.headers };
-  const sigB64 = Buffer.from(signature).toString('base64url');
   headers['Signature-Input'] = `${prepared.label}=${formatSignatureParams(prepared.components, prepared.params)}`;
-  headers['Signature'] = `${prepared.label}=:${sigB64}:`;
+  // Response signatures keep the AdCP 3.0/3.1 Base64URL byte-sequence form.
+  headers['Signature'] = serializeByteSequenceMember(prepared.label, signature, 'legacy-base64url');
   return { status: prepared.status, headers, signatureBase: prepared.base, params: prepared.params };
 }
 
@@ -475,14 +476,9 @@ export function signResponse(
 }
 
 function produceSignature(key: SignerKey, data: Buffer): Uint8Array {
-  const privateKey = createPrivateKey({
-    key: key.privateKey as JsonWebKey,
-    format: 'jwk',
-  });
-  if (key.alg === 'ed25519') {
-    return new Uint8Array(nodeSign(null, data, privateKey));
-  }
-  return new Uint8Array(nodeSign('sha256', data, { key: privateKey, dsaEncoding: 'ieee-p1363' }));
+  // Synchronous API: node:crypto with the key passed as a JWK, a shape both
+  // Node and workerd accept (#3243). The async signers prefer WebCrypto.
+  return signWithPrivateJwk(key.alg, key.privateKey as AdcpJsonWebKey, data);
 }
 
 function flattenHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string> {
@@ -494,6 +490,16 @@ function flattenHeaders(headers: Record<string, string | string[] | undefined>):
     out[k] = Array.isArray(v) ? v.map(entry => entry.trim()).join(', ') : v.trim();
   }
   return out;
+}
+
+/**
+ * Both fields are serialized as RFC 8941 Dictionaries, so the label must be a
+ * Dictionary key and `created`/`expires` integers. Checked before signing so a
+ * KMS call is never spent on a header that cannot be emitted.
+ */
+function assertLabelAndClock(label: string, now: number): void {
+  if (!/^[a-z*][a-z0-9_.*-]*$/.test(label)) throw new TypeError(`Signature label "${label}" is not an RFC 8941 key`);
+  if (!Number.isSafeInteger(now)) throw new TypeError('Signature clock must return integer epoch seconds');
 }
 
 function base64UrlRandom(byteLength: number): string {

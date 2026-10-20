@@ -178,10 +178,24 @@ export type Authenticator = (req: IncomingMessage) => AuthResult | Promise<AuthR
  */
 export class AuthError extends Error {
   readonly publicMessage: string;
-  constructor(publicMessage: string, options?: { cause?: unknown }) {
+  readonly status?: 400 | 403 | 429 | 503;
+  readonly body?: Record<string, unknown>;
+  readonly headers?: Record<string, string>;
+  constructor(
+    publicMessage: string,
+    options?: {
+      cause?: unknown;
+      status?: 400 | 403 | 429 | 503;
+      headers?: Record<string, string>;
+      body?: Record<string, unknown>;
+    }
+  ) {
     super(publicMessage);
     this.name = 'AuthError';
     this.publicMessage = publicMessage;
+    this.body = options?.body;
+    this.status = options?.status;
+    this.headers = options?.headers;
     if (options?.cause !== undefined) (this as Error & { cause?: unknown }).cause = options.cause;
   }
 }
@@ -624,6 +638,12 @@ export interface RespondUnauthorizedOptions {
    * directly.
    */
   signatureError?: RequestSignatureErrorCode;
+  /**
+   * Additional response headers, such as the Web Bot Auth `Accept-Signature`
+   * challenge added to an AdCP RFC 9421 `request_signature_required` answer.
+   * Cannot replace `WWW-Authenticate` or `Content-Type`.
+   */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -657,7 +677,13 @@ export function respondUnauthorized(
   if (options.resourceMetadata) parts.push(`resource_metadata="${escapeQuotes(options.resourceMetadata)}"`);
 
   const scheme = useSignatureChallenge ? 'Signature' : 'Bearer';
+  const extra = Object.fromEntries(
+    Object.entries(options.headers ?? {}).filter(
+      ([name]) => !['content-type', 'www-authenticate'].includes(name.toLowerCase())
+    )
+  );
   res.writeHead(options.status ?? 401, {
+    ...extra,
     'Content-Type': 'application/json',
     'WWW-Authenticate': `${scheme} ${parts.join(', ')}`,
   });

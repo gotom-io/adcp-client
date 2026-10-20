@@ -28,6 +28,8 @@ your context: `src/lib/types/*.generated.ts`, `src/lib/agents/index.generated.ts
 
 **Building a signals agent?** Read and follow `skills/build-signals-agent/SKILL.md` — covers marketplace vs owned data, segments, pricing, activation destinations.
 
+**Building seller-side Reliable Reporting (a durable reporting ledger)?** Read `docs/guides/REPORTING-LEDGER.md`. The protocol layer (`createReliableReportingService`, the handlers, the `ReportingLedgerStore` interface) is `@adcp/sdk/reporting/service` and `/ledger`; the PostgreSQL store, migrations, row storage, managed delivery and the production service are the separate pre-1.0 `@adcp/reporting-storage` package (`npm install @adcp/sdk @adcp/reporting-storage`). Coming from `@adcp/sdk/reporting/gcs|s3|azure|bigquery` or the store on the ledger subpath? See `docs/migration-reporting-storage-package.md`.
+
 **Building a retail media network?** Read and follow `skills/build-retail-media-agent/SKILL.md` — covers catalog sync, conversion tracking, performance feedback, dynamic ads.
 
 **Building a creative agent?** Read and follow `skills/build-creative-agent/SKILL.md` — covers ad servers, creative management platforms, format discovery, preview, and build.
@@ -86,6 +88,8 @@ Pick the specialisms you want to claim in `get_adcp_capabilities`. Each maps to 
 
 **Adding wire-version compat (e.g. SDK pin moves to v4, or a new legacy seller version)?** See [`docs/development/WIRE-VERSION-COMPAT.md`](./docs/development/WIRE-VERSION-COMPAT.md) — playbook for the schema cache, codegen, adapter registry, validation pinning, conformance fixtures, and smoke harness. Reference whenever you touch `src/lib/adapters/legacy/`, `src/lib/types/v*-*/`, or `schemas/cache/<version>/`.
 
+**Upgrading past AdCP 2 support?** See the [AdCP 2 retirement guide](./docs/migration-drop-adcp-2.md) for AdCP 3 discovery requirements, removed compatibility APIs, seller configuration changes, and exact older SDK pins.
+
 **Migrating from 13 to 14?** See [`docs/migration-13-to-14.md`](./docs/migration-13-to-14.md). One account-model breaking change to audit: **`accounts.resolution: 'derived'` is now an upstream-managed account-id namespace** (adcp-client#1647, upstream adcp#5062). It accepts `{ account_id }` and refuses the `{ brand, operator }` arm — the exact inverse of the 6.7-era behavior described further down this list. `accounts.list` (or `opts.accounts.listAccounts`) is required for the mode, `accounts.resolve` must verify the buyer-supplied id against what the caller's credential can reach (the framework fails a mismatch closed), `sync_accounts` natural-key provisioning entries fail per-row with `UNSUPPORTED_PROVISIONING` while `account: { account_id }` settings-update entries pass through after a reachability check, and a declared `'derived'` projects `account.require_operator_auth: true`. `createDerivedAccountStore` does the verification, the paging, and the `list_accounts` wiring for you — `toAccount` for one account per credential, `listAccounts` (+ optional `lookupAccount`) for a roster.
 
 **Upgrading from an SDK 14 prerelease (`14.0.0-rc.*`)?** Use the generated [`docs/migration-14.x-rc-worksheet.md`](./docs/migration-14.x-rc-worksheet.md) for the exact package/integrity, runtime and peer ranges, default and compatible wire releases, and the rc.33/rc.35 → rc.36 durability checklist. Existing applications adding one task should start with [`docs/guides/EXISTING-PLATFORM.md`](./docs/guides/EXISTING-PLATFORM.md).
@@ -128,6 +132,10 @@ Pick the specialisms you want to claim in `get_adcp_capabilities`. Each maps to 
 
 **IMPORTANT**: This project uses **Changesets** for version management and releases.
 
+### 🧪 SDK 16 is in changesets pre-mode (beta)
+
+`.changeset/pre.json` puts releases into pre-mode with the `beta` tag. Every release from `main` publishes as `16.0.0-beta.N` under the npm `beta` dist-tag, and `latest` stays on 15.x. This repo uses `@changesets/cli` 3.x, whose `pre.json` holds only `mode` and `tag` (3.x drops the 2.x `initialVersions`/`changesets` fields). Don't add them back. Pre-mode ends with `npx changeset pre exit` once the first adopter's SDK 16 cutover activates cleanly. That's a release-owner decision, so don't run it unprompted.
+
 ### 📦 When to Create a Changeset
 
 **ALWAYS create a changeset for:**
@@ -137,6 +145,8 @@ Pick the specialisms you want to claim in `get_adcp_capabilities`. Each maps to 
 - ✅ Published files (anything in `package.json` `files` field)
 - ✅ Schema changes (`src/schemas/`)
 - ✅ TypeScript types changes
+
+**Reliable Reporting storage package:** the storage implementations (PostgreSQL ledger store, row storage and the GCS, S3 and Azure providers, managed delivery, notification activity, the BigQuery sink, the production service) live in the separate, pre-1.0 `@adcp/reporting-storage` workspace package (`packages/reporting-storage`, imports `@adcp/reporting-storage`, `/managed`, `/notifications`, `/service`, `/gcs`, `/s3`, `/azure`, `/bigquery`). Every export of it is `@experimental`, so a breaking change there uses a `minor` changeset for `@adcp/reporting-storage` plus a migration note, not `major`; the store interfaces that stay in `@adcp/sdk/reporting/ledger` are `@experimental` and change together with it (policy in [`docs/guides/REPORTING-STABILITY.md`](./docs/guides/REPORTING-STABILITY.md), move guide in [`docs/migration-reporting-storage-package.md`](./docs/migration-reporting-storage-package.md)). `@adcp/sdk` must never import `@adcp/reporting-storage`: `test/lib/reporting-storage-boundary.test.js` and `npm run lint:boundaries` enforce it, and the storage package imports only public `@adcp/sdk` subpaths.
 
 **NO changeset needed for:**
 

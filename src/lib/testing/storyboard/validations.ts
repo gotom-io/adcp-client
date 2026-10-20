@@ -12,7 +12,11 @@ import { prepareResponseForSchemaValidation, TOOL_RESPONSE_SCHEMAS } from '../..
 import { injectLegacyEnvelopeStatus } from '../../utils/envelope-status-compat';
 import { TRANSPORT_SUFFIX_REGEX } from '../../utils/a2a-discovery';
 import { validateResponse, type ValidationIssue } from '../../validation/schema-validator';
-import { hasSchemaBundle, isExternalSchemaRootActive } from '../../validation/schema-loader';
+import {
+  hasSchemaBundle,
+  isExternalSchemaRootActive,
+  withServedValidationVersion,
+} from '../../validation/schema-loader';
 import { ADCP_VERSION, LIBRARY_VERSION } from '../../version';
 import { isPre31AdcpVersion } from '../../utils/adcp-version-config';
 import { gte as semverGte, valid as validSemver } from 'semver';
@@ -34,11 +38,13 @@ import { isJsonContentType } from '../test-controller';
 import { globToRegExp } from '../../utils/glob';
 import {
   parsePath,
+  parsePathWithWildcards,
   resolvePath,
   resolvePathAll,
   resolvePortableIdentifierPathAll,
   toJsonPointer,
   validatePortableIdentifierPath,
+  WILDCARD,
   type PortableIdentifierPathIssue,
 } from './path';
 import { canonicalTargetUri } from '../../signing/canonicalize';
@@ -277,12 +283,21 @@ export function decorateValidationResult(
 
 function runValidation(validation: StoryboardValidation, ctx: ValidationContext): ValidationResult {
   switch (validation.check) {
+    case 'property_list_reference':
+      return {
+        check: validation.check,
+        passed: false,
+        description: validation.description,
+        error: 'property_list_reference requires the asynchronous, credential-isolated storyboard runner.',
+      };
     case 'response_schema':
       return requireTaskResult(ctx, validation, tr => validateResponseSchema(validation, ctx, tr));
     case 'field_present':
       // field_present runs against either MCP task result data OR an HTTP probe body —
       // the storyboard's probe_protected_resource validates fields in the RFC 9728 JSON.
       return validateFieldPresent(validation, resolveTarget(ctx));
+    case 'all_fields_present':
+      return validateAllFieldsPresent(validation, resolveTarget(ctx));
     case 'field_absent':
       return validateFieldAbsent(validation, resolveTarget(ctx));
     case 'envelope_field_present':
@@ -537,6 +552,32 @@ function validateResponseSchema(
   ctx: ValidationContext,
   taskResult: TaskResult
 ): ValidationResult {
+  // Capabilities are negotiated before any pin applies: a 3.0 pin is served
+  // the agent's highest release in the major, echoed in `adcp_version`.
+  // Validate against that release (versioning spec, "Server echoes") when it
+  // is same-major, listed in the response's `supported_versions` and has a
+  // schema root, even when an external root is active for the pin. Otherwise
+  // keep the pin. Every other task stays on the pin.
+  const pinnedVersion = ctx.adcpVersion;
+  if (ctx.taskName === 'get_adcp_capabilities' && pinnedVersion !== undefined) {
+    return withServedValidationVersion(taskResult.data, pinnedVersion, validationVersion =>
+      validateResponseSchemaForVersion(
+        validation,
+        validationVersion === pinnedVersion
+          ? ctx
+          : { ...ctx, adcpVersion: validationVersion, responseAdcpVersion: validationVersion },
+        taskResult
+      )
+    );
+  }
+  return validateResponseSchemaForVersion(validation, ctx, taskResult);
+}
+
+function validateResponseSchemaForVersion(
+  validation: StoryboardValidation,
+  ctx: ValidationContext,
+  taskResult: TaskResult
+): ValidationResult {
   const taskName = ctx.taskName;
   const schemaIdentityVersion = ctx.adcpVersion ?? ctx.responseAdcpVersion ?? ADCP_VERSION;
   const { schema_id, schema_url } = resolveSchemaIdentity(ctx.responseSchemaRef, schemaIdentityVersion);
@@ -689,10 +730,21 @@ function validateResponseSchema(
 
 /** @internal Shared with the storyboard runner's Zod-rejection recovery path. */
 export function isExternalResponseSchemaAuthoritative(
-  ctx: Pick<ValidationContext, 'adcpVersion' | 'responseAdcpVersion'>
+  ctx: Pick<ValidationContext, 'adcpVersion' | 'responseAdcpVersion'> &
+    Partial<Pick<ValidationContext, 'taskName' | 'taskResult'>>
 ): boolean {
   const validationVersion = responseSchemaValidationVersion(ctx.adcpVersion, ctx.responseAdcpVersion);
-  return validationVersion !== undefined && isExternalSchemaRootActive(validationVersion);
+  if (validationVersion !== undefined && isExternalSchemaRootActive(validationVersion)) return true;
+  // A capabilities response validated against its echoed release is
+  // authoritative when that release's root is external (registered, or
+  // supplied through servedReleaseSchemaRoots), same as a pinned external root.
+  const pinnedVersion = ctx.adcpVersion;
+  if (ctx.taskName !== 'get_adcp_capabilities' || pinnedVersion === undefined || !ctx.taskResult) return false;
+  return withServedValidationVersion(
+    ctx.taskResult.data,
+    pinnedVersion,
+    version => version !== pinnedVersion && isExternalSchemaRootActive(version)
+  );
 }
 
 function responseSchemaValidationVersion(
@@ -918,6 +970,73 @@ function validateFieldPresent(validation: StoryboardValidation, taskResult: Task
     json_pointer: pointer,
     expected: validation.path,
     actual: value ?? null,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// all_fields_present: inspect every item without vacuous passes
+// ────────────────────────────────────────────────────────────
+
+function validateAllFieldsPresent(validation: StoryboardValidation, taskResult: TaskResult): ValidationResult {
+  const base = { check: validation.check, description: validation.description, path: validation.path };
+  const path = validation.path ?? '';
+  const segments = parsePathWithWildcards(path);
+  const wildcardIndex = segments.indexOf(WILDCARD);
+  const wildcardOffset = path.indexOf('[*].');
+  if (
+    wildcardOffset <= 0 ||
+    wildcardIndex <= 0 ||
+    typeof segments[wildcardIndex + 1] !== 'string' ||
+    segments.lastIndexOf(WILDCARD) !== wildcardIndex
+  ) {
+    return {
+      ...base,
+      passed: false,
+      error: 'all_fields_present requires an array path followed by exactly one [*] and a non-empty field path',
+      json_pointer: null,
+      expected: 'array[*].field',
+      actual: validation.path ?? null,
+    };
+  }
+
+  const arrayPath = path.slice(0, wildcardOffset);
+  const fieldPath = path.slice(wildcardOffset + '[*].'.length);
+  const arrayPointer = toJsonPointer(arrayPath);
+  const items = resolvePath(taskResult.data, arrayPath);
+  if (items == null || (Array.isArray(items) && items.length === 0)) {
+    return {
+      ...base,
+      passed: true,
+      not_applicable: true,
+      note: `Array '${arrayPath}' is absent, null, or empty; all_fields_present has no items to inspect`,
+    };
+  }
+  if (!Array.isArray(items)) {
+    return {
+      ...base,
+      passed: false,
+      error: `Expected an array at path: ${arrayPath}`,
+      json_pointer: arrayPointer,
+      expected: 'array',
+      actual: items,
+    };
+  }
+
+  const missing: string[] = [];
+  const fieldPointer = toJsonPointer(fieldPath);
+  for (let index = 0; index < items.length; index++) {
+    if (resolvePath(items[index], fieldPath) == null) {
+      missing.push(`${arrayPointer}/${index}${fieldPointer}`);
+    }
+  }
+  if (missing.length === 0) return { ...base, passed: true };
+  return {
+    ...base,
+    passed: false,
+    error: `${missing.length} of ${items.length} items lack a non-null '${fieldPath}' (first: ${missing[0]})`,
+    json_pointer: missing[0]!,
+    expected: validation.path,
+    actual: missing,
   };
 }
 

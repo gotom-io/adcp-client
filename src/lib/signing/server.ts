@@ -22,7 +22,12 @@ export {
   type ResponseLike,
   type SignatureParams,
 } from './canonicalize';
-export { computeContentDigest, contentDigestMatches, parseContentDigest } from './content-digest';
+export {
+  computeContentDigest,
+  contentDigestMatches,
+  parseContentDigest,
+  type SfBinaryEncoding,
+} from './content-digest';
 export {
   requestContextFromExpress,
   requestContextFromFetch,
@@ -33,7 +38,7 @@ export {
   type RequestContextFromExpressOptions,
   type RequestContextFromLambdaOptions,
 } from './request-context';
-export { jwkToPublicKey, verifySignature } from './crypto';
+export { jwkToPublicKey, verifySignature, verifySignatureAsync } from './crypto';
 export {
   RequestSignatureError,
   RequestSigningErrorCodeMetadata,
@@ -95,6 +100,14 @@ export {
 } from './types';
 export { verifyRequestSignature, type VerifyRequestOptions } from './verifier';
 export {
+  isUnresolvableOperation,
+  resolveRequestOperation,
+  UNRESOLVABLE_OPERATION,
+  type OperationResolutionInput,
+  type ResolvedOperation,
+  type UnresolvableOperation,
+} from './operation-resolution';
+export {
   createWebhookVerifier,
   isWebhookLoopbackHost,
   verifyWebhookSignature,
@@ -118,6 +131,8 @@ export { signResponseAsync } from './signer-async';
 export {
   resolveAgent,
   ResolvedAgentJwksResolver,
+  canonicalAgentOrigin,
+  CanonicalizeError,
   getAgentJwks,
   createAgentJwksSet,
   AgentResolverError,
@@ -144,3 +159,5 @@ export {
   type ResolvedAgentJwksResolverOptions,
   type TraceStep,
 } from './agent-resolver';
+
+export type { PublisherSigningKeyPin } from './publisher-pins';

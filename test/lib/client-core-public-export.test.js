@@ -36,12 +36,26 @@ function runColdProbe(moduleFormat) {
   const script = `
     ${isEsm ? '' : "const { createRequire } = require('node:module');"}
     const core = ${load('@adcp/sdk/client/core')};
+    const schemaProbeAgent = { id: 'schema-probe', name: 'Schema probe', agent_uri: 'https://seller.example/mcp', protocol: 'mcp' };
+    const schemaProbeClient = new core.SingleAgentClient(schemaProbeAgent, { wireAdcpVersion: '3.2' });
+    schemaProbeClient.getAgentInfo = async () => ({ tools: [
+      { name: 'get_adcp_capabilities', inputSchema: { properties: {} } },
+      { name: 'sync_creatives', inputSchema: {
+        properties: { creatives: { items: { $ref: '#/$defs/Creative' } } },
+        $defs: { Creative: { properties: { creative_id: {}, format_kind: {} } } }
+      } }
+    ] });
+    schemaProbeClient.ensureEndpointDiscovered = async () => schemaProbeAgent;
+    schemaProbeClient.executor.executeTask = async () => ({ success: true, data: { adcp: { major_versions: [3], supported_versions: ['3.1'] } } });
+    if (await schemaProbeClient.resolveCreativeFormatWireMode('sync_creatives') !== 'canonical') {
+      throw new Error('creative schema inspection lazy path failed');
+    }
     ${
       isEsm
         ? ''
         : `
           const eagerFiles = Object.keys(require.cache);
-          for (const excluded of ['schemas.generated.js', 'response-schemas.js', 'tool-request-schemas.js', 'media-buy/compatibility.js']) {
+          for (const excluded of ['schemas.generated.js', 'response-schemas.js', 'tool-request-schemas.js', 'media-buy/compatibility.js', 'dist/lib/identifiers.js', 'dist/lib/registry/index.js']) {
             if (eagerFiles.some(file => file.endsWith(excluded))) throw new Error(excluded + ' loaded eagerly');
           }
         `
@@ -137,6 +151,8 @@ test('@adcp/sdk/client/core keeps heavy generated-schema surfaces out of its eag
     'utils/response-schemas.mjs',
     'utils/tool-request-schemas.mjs',
     'media-buy/compatibility.mjs',
+    'identifiers.mjs',
+    'registry/index.mjs',
   ]) {
     assert.ok(![...visited].some(file => file.endsWith(excluded)), `${excluded} must stay on demand`);
   }

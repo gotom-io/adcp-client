@@ -2107,6 +2107,18 @@ export interface PackageSignalTargetingGroup {
  */
 export interface DemographicTargetingIntent {
   age: DemographicAgeRange & {
+    /**
+     * User-level age determination bases the buyer permits for this predicate. Sellers MUST use only these bases or reject the request; they MUST NOT silently fall back to another basis. When omitted, the buyer imposes no determination-basis constraint beyond product capability and any age_restriction. population_estimate is structurally unavailable because aggregate evidence cannot identify an eligible user.
+     *
+     * @minItems 1
+     */
+    accepted_bases?: [AgeDeterminationBasis, ...AgeDeterminationBasis[]];
+    /**
+     * Verification methods acceptable when verified is an accepted basis. This field narrows verified demographic execution; age_restriction.accepted_methods independently governs legal eligibility and the two sets are intersected when both are present.
+     *
+     * @minItems 1
+     */
+    accepted_verification_methods?: [AgeVerificationMethod, ...AgeVerificationMethod[]];
   };
 }
 /**
@@ -10590,7 +10602,7 @@ export interface ReportingWebhook {
   token?: string;
   /**
    * @deprecated
-   * Legacy authentication configuration for webhook delivery (A2A-compatible). Opts the receiver into Bearer or HMAC-SHA256 signing. Both schemes are deprecated; the preferred signing profile for new integrations is RFC 9421, where the seller signs with a key published at its brand.json agents[] entry and the buyer verifies against the seller's JWKS — no shared secret crosses the wire (see docs/building/implementation/security.mdx#webhook-callbacks). This field is required in AdCP 3.x; the requirement is removed in AdCP 4.0 when the default RFC 9421 path becomes the only path.
+   * Legacy authentication configuration for webhook delivery (A2A-compatible). Opts the receiver into Bearer or HMAC-SHA256 signing. Both schemes are deprecated; the preferred signing profile for new integrations is RFC 9421, where the seller signs with a key published at its brand.json agents[] entry and the buyer verifies against the seller's JWKS — no shared secret crosses the wire (see docs/building/by-layer/L1/security.mdx#webhook-callbacks). This field is required in AdCP 3.x; the requirement is removed in AdCP 4.0 when the default RFC 9421 path becomes the only path.
    */
   authentication: {
     /**
@@ -11783,7 +11795,7 @@ export type CreateMediaBuyRequest = (
     token?: string;
     /**
      * @deprecated
-     * Legacy authentication configuration for webhook delivery (A2A-compatible). Opts the receiver into Bearer or HMAC-SHA256 signing. Both schemes are deprecated; the preferred signing profile for new integrations is RFC 9421, where the seller signs with a key published at its brand.json agents[] entry and the buyer verifies against the seller's JWKS — no shared secret crosses the wire (see docs/building/implementation/security.mdx#webhook-callbacks). This field is required in AdCP 3.x; the requirement is removed in AdCP 4.0 when the default RFC 9421 path becomes the only path.
+     * Legacy authentication configuration for webhook delivery (A2A-compatible). Opts the receiver into Bearer or HMAC-SHA256 signing. Both schemes are deprecated; the preferred signing profile for new integrations is RFC 9421, where the seller signs with a key published at its brand.json agents[] entry and the buyer verifies against the seller's JWKS — no shared secret crosses the wire (see docs/building/by-layer/L1/security.mdx#webhook-callbacks). This field is required in AdCP 3.x; the requirement is removed in AdCP 4.0 when the default RFC 9421 path becomes the only path.
      */
     authentication: {
       /**
@@ -15125,6 +15137,7 @@ export type ReportingPackageID = string;
  */
 export type ReportingStatusIssue = {
 } & {
+} & {
   /**
    * Seller-issued stable identifier for this logical issue: re-emissions and later polls of the same unresolved condition reuse it, and resolution retires it, so consumers can project AdCP reporting issues into durable work items. A recurrence after resolution receives a new id.
    */
@@ -15139,6 +15152,7 @@ export type ReportingStatusIssue = {
     | 'RESOURCE_EXPIRED'
     | 'READER_INCOMPATIBLE'
     | 'HISTORY_UNAVAILABLE'
+    | 'REVISION_UNREADABLE'
     | 'RECEIPT_REQUIRED'
     | 'RECEIPT_REJECTED'
     | 'ADJUSTMENT_RECEIPT_REQUIRED'
@@ -15172,6 +15186,10 @@ export type ReportingStatusIssue = {
    */
   message?: string;
   reporting_obligation_id?: string;
+  /**
+   * Published revision this issue concerns. Required when code is REVISION_UNREADABLE.
+   */
+  reporting_revision_id?: string;
   /**
    * Current authenticated consumer status statement that caused this mismatch.
    */
@@ -15205,6 +15223,7 @@ export type ReportingStatusIssue = {
     | 'RESOURCE_EXPIRED'
     | 'READER_INCOMPATIBLE'
     | 'HISTORY_UNAVAILABLE'
+    | 'REVISION_UNREADABLE'
     | 'RECEIPT_REQUIRED'
     | 'RECEIPT_REJECTED'
     | 'ADJUSTMENT_RECEIPT_REQUIRED'
@@ -15238,6 +15257,10 @@ export type ReportingStatusIssue = {
    */
   message?: string;
   reporting_obligation_id?: string;
+  /**
+   * Published revision this issue concerns. Required when code is REVISION_UNREADABLE.
+   */
+  reporting_revision_id?: string;
   /**
    * Current authenticated consumer status statement that caused this mismatch.
    */
@@ -26708,7 +26731,7 @@ export interface UpdateCollectionListRequest {
   filters?: CollectionListFilters;
   brand?: BrandReference;
   /**
-   * Update the webhook URL for list change notifications (set to empty string to remove). Governance agents MUST validate this URL against SSRF per docs/building/implementation/security#webhook-url-validation-ssrf.
+   * Update the webhook URL for list change notifications (set to empty string to remove). Governance agents MUST validate this URL against SSRF per docs/building/by-layer/L1/security#webhook-url-validation-ssrf.
    */
   webhook_url?: string;
   context?: ContextObject;
@@ -32920,7 +32943,7 @@ export interface GetAdCPCapabilitiesResponse {
     supported_account_currency_modes?: AccountCurrencyMode[];
     timezone?: AccountTimezoneCapability;
     /**
-     * Whether an account reference is required for get_products. When true, the buyer must establish an account before browsing products. When false (default), the buyer can browse products without an account — useful for price comparison and discovery before committing to a seller.
+     * Whether an account reference is required for get_products. When true, the buyer must establish an account before browsing products. When false (default), the buyer can browse products without an account — useful for price comparison and discovery before committing to a seller. Before an account is provisioned, the buyer omits account rather than sending a natural key that does not resolve yet. See /docs/accounts/overview#account-references-before-provisioning.
      */
     required_for_products?: boolean;
     /**
@@ -33881,7 +33904,7 @@ export interface GetAdCPCapabilitiesResponse {
      */
     covers_content_digest?: 'required' | 'forbidden' | 'either';
     /**
-     * AdCP protocol operation names (e.g., 'create_media_buy') for which this agent rejects an unsigned request with request_signature_required unless an independently valid configured fallback authenticator succeeds. Not MCP tool names, A2A skill names, or any transport-specific rename — verifiers MUST NOT accept operation names that are not defined by the AdCP protocol spec. JSON-RPC protocol method names like `tasks/cancel` belong in `protocol_methods_required_for`, not here. Empty in 3.0 by default; sellers populate selectively during per-counterparty pilots. In 4.0 this list MUST include all spend-committing operations the agent supports (create_media_buy, acquire_*, etc.). Every operation listed MUST also appear in `supported_for`; see `x-adcp-validation`.
+     * AdCP protocol operation names (e.g., 'create_media_buy') for which this agent rejects an unsigned request with request_signature_required unless an independently valid configured fallback authenticator succeeds. A transport-specific rename of an operation is not a valid entry (MCP tools and the AdCP A2A profile use the operation name verbatim, so those names coincide with it) — verifiers MUST NOT accept operation names that are not defined by the AdCP protocol spec. Over MCP the verifier matches the tools/call params.name; over A2A it matches the skill of the sole DataPart of the message (SendMessage, SendStreamingMessage, message/send, message/stream, and the HTTP+JSON and gRPC equivalents). The A2A profile uses the AdCP operation name verbatim as skill, so that is the same name space. A request that does not resolve to exactly one operation is rejected with request_body_malformed; see docs/building/by-layer/L1/security.mdx#operation-resolution-over-a2a. JSON-RPC protocol method names like `tasks/cancel` belong in `protocol_methods_required_for`, not here. Empty in 3.0 by default; sellers populate selectively during per-counterparty pilots. In 4.0 this list MUST include all spend-committing operations the agent supports (create_media_buy, acquire_*, etc.). Every operation listed MUST also appear in `supported_for`; see `x-adcp-validation`.
      */
     required_for?: string[];
     /**
@@ -33948,7 +33971,7 @@ export interface GetAdCPCapabilitiesResponse {
      */
     per_principal_key_isolation?: boolean;
     /**
-     * Map of signing-key surface/purpose → publishing origin, so counterparties can verify origin separation (e.g., governance keys served from a separate origin than transport/webhook keys) at onboarding. Absent means the operator has not declared a separation scheme; receivers SHOULD assume shared-origin. Every entry listed MUST have a corresponding signing posture declared elsewhere — `request_signing` requires non-empty `request_signing.supported_for`/`required_for`/`protocol_methods_supported_for`/`protocol_methods_required_for`; `webhook_signing` requires `webhook_signing.supported === true` and names the webhook delivery surface, not a required live `adcp_use: "webhook-signing"` key purpose — otherwise the consistency check at signature-verification time has nothing to anchor against. See `x-adcp-validation` and docs/building/implementation/security.mdx §Origin separation.
+     * Map of signing-key surface/purpose → publishing origin, so counterparties can verify origin separation (e.g., governance keys served from a separate origin than transport/webhook keys) at onboarding. Absent means the operator has not declared a separation scheme; receivers SHOULD assume shared-origin. Every entry listed MUST have a corresponding signing posture declared elsewhere — `request_signing` requires non-empty `request_signing.supported_for`/`required_for`/`protocol_methods_supported_for`/`protocol_methods_required_for`; `webhook_signing` requires `webhook_signing.supported === true` and names the webhook delivery surface, not a required live `adcp_use: "webhook-signing"` key purpose — otherwise the consistency check at signature-verification time has nothing to anchor against. See `x-adcp-validation` and docs/building/by-layer/L1/security.mdx §Origin separation.
      */
     key_origins?: {
       /**
@@ -35510,16 +35533,12 @@ export interface FailedPrincipalRead {
  */
 export interface ListAccountChangesRequest {
   /**
-   * Release-precision AdCP version. Flattened here so emitted MCP tool input schemas remain plain root objects for clients that reject top-level combinators.
-   * @pattern ^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?)?$
+   * Release-precision AdCP version (VERSION.RELEASE, e.g. "3.0", "3.1", "3.1-beta"). On a request: the buyer's release pin — the seller validates against its supported_versions and returns VERSION_UNSUPPORTED on cross-major mismatch, or downshifts to the highest supported release within the same major. On a response: the release the seller actually served — clients SHOULD validate the response against that release's schema, not against their pin. Patches are not negotiated; surface them as build_version on capabilities for operational visibility. When omitted, falls back to adcp_major_version (deprecated) or server default. Buyers SHOULD emit both adcp_version and adcp_major_version through 3.x to remain compatible with sellers that only read the legacy field. NORMALIZATION: SDKs that read full-semver values from bundle metadata (e.g. ComplianceIndex.published_version = "3.1.0-beta.1") MUST normalize to release-precision ("3.1-beta.1") before emitting on the wire — meta-field values are NOT valid wire values.
    */
   adcp_version?: string;
   /**
    * @deprecated
-   * Deprecated major-only version pin retained through 3.x.
-   * @minimum 1
-   * @maximum 99
-   * @format int
+   * DEPRECATED in favor of adcp_version (release-precision string). Servers MUST continue to honor this field through 3.x. Removed in 4.0. Original semantics: the AdCP major version the buyer's payloads conform to. Sellers validate against their supported major_versions and return VERSION_UNSUPPORTED if unsupported. When omitted, the seller assumes its highest supported version.
    */
   adcp_major_version?: number;
   account: AccountReference;
@@ -36278,7 +36297,7 @@ export interface SyncAccountsSuccess {
    */
   accounts: {
     /**
-     * Seller-assigned account identifier. Use this in subsequent create_media_buy and other account-scoped operations when the seller's account model uses account_id references. For buyer-declared accounts, this may be echoed as the seller's internal handle, but the seller MUST continue accepting the natural-key AccountRef for subsequent calls.
+     * Seller-assigned account identifier. Use this in subsequent create_media_buy and other account-scoped operations when the seller's account model uses account_id references. For buyer-declared accounts, this may be echoed as the seller's internal handle for correlation and support, but the seller MUST continue accepting the natural-key AccountRef for subsequent calls. Buyers keep sending the natural key and MUST NOT assume the seller accepts the echoed account_id as an AccountRef.
      */
     account_id?: string;
     account?: AccountReference;

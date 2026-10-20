@@ -4,6 +4,7 @@ const { describe, test } = require('node:test');
 process.env.NODE_ENV = 'test';
 
 const {
+  REPORTING_MANAGED_DELIVERY_COMPOSITION_V1,
   createReliableReportingService,
   runReliableReportingServiceConformanceV1,
 } = require('../../dist/lib/reporting/service/index.js');
@@ -284,6 +285,57 @@ describe('ReliableReportingService', () => {
     );
   });
 
+  test('legacyRevisionReader serves revisions the SDK ledger does not hold and never shadows SDK revisions', async () => {
+    const legacyCalls = [];
+    const legacyResponse = { reporting_rows: [{ source: 'legacy' }] };
+    const calls = [];
+    const { service, store } = serviceFixture({
+      adapters: { fixture: adapter(calls) },
+      legacyRevisionReader: async (request, context) => {
+        legacyCalls.push({ request, context });
+        return request.reporting_revision_id === 'rrev_legacy' && context.account.id === 'account-a'
+          ? legacyResponse
+          : null;
+      },
+    });
+    const now = new Date();
+    const boundary = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    const anchor = new Date(boundary - 86_400_000).toISOString();
+    const input = configuration();
+    input.schedule.anchor = anchor;
+    const installed = await service.installConfiguration(input, { account: { id: 'account-a', ctx_metadata: {} } });
+    store.configurations.get(installed.configurationId).installedAt = anchor;
+    await service.runCycle({ deploymentWide: true, maxObligations: 1, maxWorkerIterations: 1 });
+    const obligation = (await store.listObligations('account-a'))[0];
+    const revision = (await store.listRevisions(obligation.reporting_obligation_id))[0];
+
+    const context = { account: { id: 'account-a' } };
+    const sdk = await service.platform.getMediaBuyDelivery(
+      { reporting_revision_id: revision.reporting_revision_id },
+      context
+    );
+    assert.equal(sdk.reporting_revision.reporting_revision_id, revision.reporting_revision_id);
+    assert.equal(legacyCalls.length, 0);
+
+    assert.equal(
+      await service.platform.getMediaBuyDelivery({ reporting_revision_id: 'rrev_legacy' }, context),
+      legacyResponse
+    );
+    assert.equal(legacyCalls.length, 1);
+    await assert.rejects(
+      service.platform.getMediaBuyDelivery({ reporting_revision_id: 'rrev_legacy' }, { account: { id: 'account-b' } }),
+      error => error.code === 'REFERENCE_NOT_FOUND'
+    );
+    // account-b asking for account-a's SDK revision is offered to legacy, which scopes it away.
+    await assert.rejects(
+      service.platform.getMediaBuyDelivery(
+        { reporting_revision_id: revision.reporting_revision_id },
+        { account: { id: 'account-b' } }
+      ),
+      error => error.code === 'REFERENCE_NOT_FOUND'
+    );
+  });
+
   test('plans, produces, and serves one exact revision through the installed service', async () => {
     const calls = [];
     const reportingAdapter = adapter(calls);
@@ -354,7 +406,7 @@ describe('ReliableReportingService', () => {
     for (const claim of ['managed_delivery', 'reconciled_billing', 'status_notification', 'ledger_notification']) {
       assert.equal(service.capabilities[claim], undefined);
     }
-    assert.deepEqual(service.setup.migrations.length, 1);
+    assert.deepEqual(service.setup.migrations, [], 'the in-memory store has nothing to install');
 
     const platform = service.install({
       capabilities: { specialisms: [], config: {} },
@@ -706,9 +758,21 @@ describe('ReliableReportingService', () => {
             resolveCurrency: () => 'USD',
             resolveCoverage: account => ({ constituents: [authorizedConstituent(account.id)] }),
           }),
-        /createPostgresReliableReportingProductionService/
+        /createPostgresReliableReportingProductionService from @adcp\/reporting-storage\/service/
       );
     }
+
+    // The composition token is the composer's assertion that a managed-delivery runtime serves the offering. It
+    // must name the service's own store: a copied `true`, or some other store, does not lift the refusal.
+    const managed = adapter();
+    managed.deliveryOffering.method = {};
+    const withToken = value =>
+      serviceFixture({
+        adapters: { fixture: managed },
+        [REPORTING_MANAGED_DELIVERY_COMPOSITION_V1]: value,
+      });
+    assert.throws(() => withToken(true), /createPostgresReliableReportingProductionService/);
+    assert.throws(() => withToken(new MemoryLedgerStore()), /createPostgresReliableReportingProductionService/);
 
     const malformed = adapter();
     malformed.deliveryOffering.schedule.alignment = 'invented';
@@ -4245,5 +4309,113 @@ describe('ReliableReportingService', () => {
     assert.equal(service.running, true);
     await service.stop();
     assert.match(String(errors[0]), /must return an array/);
+  });
+});
+
+describe('ReliableReportingService maintenance hook', () => {
+  // The SDK does not know what maintenance a store needs; `@adcp/reporting-storage` supplies the
+  // PostgreSQL one. These tests pin the contract the service enforces around any factory.
+  const run = async () => [{ task: 'fake task', status: 'completed', result: { swept: 0 } }];
+
+  test('takes a factory, built once at construction with the commitments the service advertises', () => {
+    const contexts = [];
+    const { service, store } = serviceFixture({
+      maintenance: context => {
+        contexts.push(context);
+        return { intervalMilliseconds: 60_000, run };
+      },
+    });
+    assert.equal(contexts.length, 1);
+    assert.equal(contexts[0].store, store);
+    assert.equal(contexts[0].statusRetentionDays, redactedReportingSourceOfferingV1.retentionDays);
+    assert.equal(contexts[0].automatedRecoveryWindowSeconds, 86_400);
+    assert.equal(service.setup.component, 'reliable-reporting-core');
+  });
+
+  test('fails construction, not the first pass, on a factory that throws or a malformed one', () => {
+    assert.throws(
+      () =>
+        serviceFixture({
+          maintenance: () => {
+            throw new RangeError('this store cannot be maintained');
+          },
+        }),
+      /this store cannot be maintained/
+    );
+    assert.throws(() => serviceFixture({ maintenance: { retention: { enabled: true } } }), /must be a factory/);
+    assert.throws(() => serviceFixture({ maintenance: () => undefined }), /maintenance factory must return/);
+    assert.throws(
+      () => serviceFixture({ maintenance: () => ({ intervalMilliseconds: 0, run }) }),
+      /maintenance factory must return/
+    );
+    assert.throws(
+      () => serviceFixture({ maintenance: () => ({ intervalMilliseconds: 1_000 }) }),
+      /maintenance factory must return/
+    );
+  });
+
+  test('runMaintenance requires the option and hands the signal to the pass', async () => {
+    await assert.rejects(() => serviceFixture().service.runMaintenance(), /requires the maintenance option/);
+    const inputs = [];
+    const { service } = serviceFixture({
+      maintenance: () => ({
+        intervalMilliseconds: 60_000,
+        run: async input => {
+          inputs.push(input);
+          return run();
+        },
+      }),
+    });
+    const controller = new AbortController();
+    const results = await service.runMaintenance({ signal: controller.signal });
+    assert.deepEqual(
+      results.map(result => result.task),
+      ['fake task']
+    );
+    assert.equal(inputs[0].signal, controller.signal);
+    controller.abort();
+    await assert.rejects(() => service.runMaintenance({ signal: controller.signal }), { name: 'AbortError' });
+  });
+
+  test('the scheduler runs it on the first pass and reports a failed pass to onError without stopping', async () => {
+    const calls = [];
+    const errors = [];
+    const { service } = serviceFixture({
+      maintenance: () => ({
+        intervalMilliseconds: 3_600_000,
+        run: async input => {
+          calls.push(input);
+          if (calls.length === 1) throw new Error('maintenance pass failed');
+          return run();
+        },
+      }),
+    });
+    // Every scheduler pass resolves its roster, so the roster calls count the passes without any sleep.
+    let rosterCalls = 0;
+    service.start({
+      accountIds: () => {
+        rosterCalls += 1;
+        return [];
+      },
+      intervalMilliseconds: 1,
+      onError: error => void errors.push(error),
+    });
+    const deadline = Date.now() + 5_000;
+    while ((errors.length === 0 || rosterCalls < 4) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    assert.ok(rosterCalls >= 4, 'the producer loop kept running after the failed maintenance pass');
+    assert.equal(service.running, true);
+    await service.stop();
+    // The interval is an hour, so the later passes did not run maintenance again.
+    assert.equal(calls.length, 1);
+    assert.match(String(errors[0]), /maintenance pass failed/);
+  });
+
+  test('surfaces the store migrations as setup.migrations', () => {
+    const store = new MemoryLedgerStore();
+    store.migrations = Object.freeze(['-- create the ledger']);
+    assert.deepEqual(serviceFixture({ store }).service.setup.migrations, ['-- create the ledger']);
+    assert.deepEqual(serviceFixture().service.setup.migrations, []);
   });
 });
