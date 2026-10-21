@@ -465,6 +465,10 @@ export type {
   InputHandlerResponse,
   ConversationContext,
   TaskOptions,
+  TrackTaskRequest,
+  TrackedTask,
+  SubmittedContinuation,
+  TaskInfo,
   WebhookToolPredicate,
   WebhookUrlTemplate,
   TaskResult,
@@ -535,6 +539,7 @@ export {
   targetDeclaresLegacyGovernanceAwareness,
   validateGovernancePlan,
   verifyGovernanceAuthorization,
+  verifyHistoricalGovernanceContext,
   createGovernanceAgentJwksResolver,
   REGULATED_HUMAN_REVIEW_CATEGORIES,
   ANNEX_III_POLICY_IDS,
@@ -656,6 +661,8 @@ export type {
   PlanBudget,
   ReallocationAutonomy,
   VerifyGovernanceAuthorizationOptions,
+  VerifyHistoricalGovernanceContextOptions,
+  HistoricalGovernanceContextResult,
   GovernanceBuyerIdentity,
 } from './governance';
 

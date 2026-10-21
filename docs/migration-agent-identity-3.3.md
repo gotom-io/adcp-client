@@ -155,12 +155,14 @@ parameter is a Token (WBA section 5.2.1), and the verifier accepts
 type, which leaves no member to resolve (403).
 
 `SignatureDirectoryResolver` derives the directory from the covered canonical
-origin. Directories must be signed (WBA Appendix B.1): it validates a
-possession signature for every key the profile can use, covering
-`"@authority";req` and `content-digest`, and the exact body digest before
-caching keys. It ignores keys the profile cannot use, such as a P-256 key, and
-any signature they made (RFC 7517 section 5). An unsigned directory, one
-with no usable key, or one that publishes private key material for any key,
+origin. Directories must be signed (WBA Appendix B.1): it uses each Ed25519
+key that has a valid possession signature, covering `"@authority";req` and
+`content-digest`, and validates the exact body digest before caching keys. It
+ignores every other key and any signature it made: a key the profile cannot
+use, such as a P-256 key, a key it cannot import, such as an Ed25519 key with
+no `x` (RFC 7517 section 5), and a key without a valid signature (WBA Appendix
+B.1; directory draft section 5). An unsigned directory, one with no validly
+signed Ed25519 key, or one that publishes private key material for any key,
 usable or not, is a discovery failure. Its audit proof retains the signed body and
 headers. Verification requires this resolver so context-free JWKS adapters cannot
 attribute a key to an arbitrary origin. Discovery uses HTTPS, DNS pinning, no redirects, a 256 KiB cap, a
@@ -359,7 +361,12 @@ operator) to the signer's operator, or a two-link chain through the account
 operator, is accepted. The
 intersection must cover the actual brand IDs, countries, scope, signer-origin
 narrowing and temporal window. A restrictive published grant cannot be
-superseded by seller fallback. A trust 200 disables brand.json authority;
+superseded by seller fallback. A grant's `grantee` must be a registrable domain
+under the pinned PSL snapshot (`alice.github.io` is one; `github.io` and
+`media.agency.com` are not). A grant whose `grantee` is not one covers no claim
+and does not block seller fallback, but its scopes still count for
+`exclusive_grants`. `createTrustRecord` and `adcp identity trust-validate` refuse
+such grantees. A trust 200 disables brand.json authority;
 authoritative absence alone permits explicit legacy policy. An established
 identity lacking a grant gets `PERMISSION_DENIED` with
 `{ scope: 'agent', reason: 'grant_absent' }`. No account or live buy is changed.
@@ -368,11 +375,56 @@ included) never falls back to brand.json `authorized_operators[]`, and it is
 not a grant removal: spend gets a retryable `SERVICE_UNAVAILABLE`.
 
 Origin key revocations use `/.well-known/governance-revocations.json`, signed
-with `typ: adcp-gov-revocation+jws`, as ratified R3 specifies. This origin key
-list does not migrate governance-context, designated-task response or rights
-JWS discovery: those retain the RFC chain in 3.3. Polling fails closed, revoked
+with `typ: adcp-gov-revocation+jws`, as ratified R3 specifies. The same list
+revokes the keys a WBA identity signs its JWS artifacts with (see
+[JWS artifacts](#jws-artifacts)). Polling fails closed, revoked
 keys remain revoked forever, `keyCompromise` cannot be weakened, and the earliest
 `invalidity_date` is retained. Revocation never pauses or cancels committed buys.
+
+### JWS artifacts
+
+Governance contexts, designated-task responses and rights attestations from a
+WBA identity are signed with keys from that identity's key directory (R4 as
+amended by adcontextprotocol/adcp#8299). `O` is the canonical origin of the
+signing agent's URL: `iss` for a governance context, `agent_url` for a
+designated-task response, `rights_agent.url` for a rights attestation. Pass it
+from your own context, never from the unverified token.
+
+- `selectJwsArtifactProfile(agentUrl, trust)` derives the trust record from
+  `O`. When it lists `O`, the artifact is verified on the WBA path; when the
+  operator has not published a record, or the record does not list `O`, it
+  stays on the 3.2 profile. A trust-record fetch failure throws
+  `JwsArtifactError` (`jws_key_unavailable`): it is never absence and never
+  selects 3.2. A 404/410 from an operator that once served a record is an
+  outage too, but the evaluator remembers that 200 only in process unless you
+  give it durable `authorityHistory` (`createIdentity33StateStores`). Public,
+  multi-replica and serverless verifiers must, as for grants.
+- `verifyWebBotAuthJwsArtifact(token, origin, { typ, directory, revocation })`
+  requires the `typ` the surface accepts, `alg` `EdDSA` and a `kid` equal to the
+  key's JWK thumbprint, applies no `use`/`key_ops`/`adcp_use` check, and checks
+  `O`'s revocation list. Purpose separation is by origin, so one key at `O` may
+  sign every artifact `O` issues and `typ` tells them apart. `revocation` is
+  required; pass `false` only if you check the returned `kid` yourself. It
+  verifies key and signature only; the surface keeps its own claim checks.
+- `verifyGovernanceAuthorization({ ..., webBotAuth: { trust, directory,
+  revocation } })` applies the rule to governance contexts. Every other check is
+  unchanged, including the `buyerIdentity` cross-check that `iss` is the buyer's
+  governance agent; only the key source moves. `revocation` is required, and an
+  origin that serves no list fails closed, since a governance context
+  authorizes spend. Outages (trust record, directory, revocation list) set
+  `retryable: true` on the failure. Without `webBotAuth` the verifier is 3.2
+  only, as before.
+- `verifyHistoricalGovernanceContext({ token, expectedIssuer, webBotAuth: {
+  ..., archive } })` verifies a retained governance context for audit. A key
+  rotated out of the directory is read from the governance key archive at `O`
+  (`/.well-known/jwks-archive.json`, `GovernanceKeyArchiveResolver`), on the
+  same `EdDSA` and thumbprint rules. A revoked key still verifies here: the
+  result reports `revocation: 'revoked'` and the stored R9 detail (`reason`,
+  `invalidity_date`) for the audit to weigh. Expiry, audience, replay and the
+  request binding are not checked.
+
+The SDK has no designated-task response or rights-attestation verifier of its
+own; a verifier for either uses the two primitives above.
 
 Permanent revocation storage reserves separate bounded capacity for audited bound
 origins and anonymous/self-service origins, so first-contact traffic cannot exhaust the bound
@@ -402,18 +454,19 @@ released schemas:
 
 | PR | Pinned head | Surface |
 | --- | --- | --- |
-| [7894](https://github.com/adcontextprotocol/adcp/pull/7894) | `e59294701d733b0ea2a004a2f0c091c8eccdcaae` | WBA wire profile (`wba-profile.mdx`), profile selectors, directory and request vectors |
+| [7894](https://github.com/adcontextprotocol/adcp/pull/7894) | `9f472d63900b99efcd9ed05b5d0bb75552c3b9d6` | WBA wire profile (`wba-profile.mdx`), profile selectors |
 | [8121](https://github.com/adcontextprotocol/adcp/pull/8121) | `f5973ac0267b1b94d714c55fc4e3ad8fc2511350` | Origin identity and key-free trust v1 |
 | [8162](https://github.com/adcontextprotocol/adcp/pull/8162) | `5c9914c5c382cc32f3d2ad7842942e548c414705` | Ratified identity, coexistence, revocation |
 | [8168](https://github.com/adcontextprotocol/adcp/pull/8168) | `45540941dfd61e80ab8a463f780cb147c82a32f0` | Relationship and principal response arms |
-| [8169](https://github.com/adcontextprotocol/adcp/pull/8169) | `3ce6a14d7afaa71fa78ddf2223ed0421e01205ae` | Grants, trust schema, grant_absent |
+| [8169](https://github.com/adcontextprotocol/adcp/pull/8169) | `3ce6a14d7afaa71fa78ddf2223ed0421e01205ae` | Grants, trust schema, grant_absent; the registrable-domain `grantee` rule and its schema description from `eabe46048530c08a34e6eee6e4d15d7848e01c57` |
 | [8170](https://github.com/adcontextprotocol/adcp/pull/8170) | `8d3591e70e9a717c7fdfb513360a796fba24ca9a` | Onboarding additions only; its old trust key fields are excluded |
 | [8177](https://github.com/adcontextprotocol/adcp/pull/8177) | `b663f8e4235fe4276c73fb9bac6db491b2252bbf` | Reporting authentication omission |
+| [8298](https://github.com/adcontextprotocol/adcp/pull/8298) | `f44785a5b65db93988f30ad3d23ba5849f1a1d5e` | WBA interop harness, directory and request vectors |
 
-The vectors in `test/fixtures/wba-profile/` are byte-identical to #7894 at that
-head (see `PINNED.json`). Every vendored request and directory vector is
-graded, and the interop harness (adcontextprotocol/adcp#8298) grades
-`scenarios.json`.
+The vectors in `test/fixtures/wba-profile/` are byte-identical to #8298 at that
+head (see `PINNED.json`), which carries the #7894 profile and vectors. Every
+vendored request and directory vector is graded, and the interop harness
+(adcontextprotocol/adcp#8298) grades `scenarios.json`.
 
 Verification runs in Cloudflare's `http-message-sig` (signature base, coverage,
 window, algorithm and cryptographic checks); the SDK adds the profile rules in
@@ -484,9 +537,9 @@ so verification can run in a CDN or middleware in front of the AdCP server.
   Cloudflare's `web-bot-auth`; they already used signed directories and are
   unchanged.
 #7894 drops the governance-token checks and the `governance/` vectors from the
-WBA profile. Governance moves to the AdCP layer under a separate R4 erratum,
-which moves JWS artifacts, governance included, to the identity's WBA key
-directory in 3.3. This change leaves the SDK's governance code as it is.
+WBA profile. Governance moves to the AdCP layer under a separate R4 erratum
+(adcontextprotocol/adcp#8299), which moves JWS artifacts, governance included,
+to the identity's WBA key directory in 3.3; see [JWS artifacts](#jws-artifacts).
 The buyer default onboarding field is `profiles.adcp.onboarding`, matching the
 schema; the design's `record_profiles` wording names the schema definition.
 
