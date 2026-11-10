@@ -171,7 +171,12 @@ async function startAgent({ tools = SELLER_TOOLS, protocols = ['media_buy'], adc
           name === 'get_adcp_capabilities'
             ? (capabilities ?? {
                 supported_protocols: protocols,
-                adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], ...adcpExtra },
+                adcp: {
+                  major_versions: [3],
+                  supported_versions: ['3.1', '3.2'],
+                  idempotency: { supported: false },
+                  ...adcpExtra,
+                },
               })
             : (RESPONSES[name] ?? {});
         return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
@@ -436,7 +441,7 @@ describe(
 // 2. Version scoping, pinned
 // ────────────────────────────────────────────────────────────
 
-const LEGACY_CACHE = path.join(__dirname, '..', '..', 'compliance', 'cache', '3.1.29');
+const LEGACY_CACHE = path.join(__dirname, '..', '..', 'compliance', 'cache', '3.1.30');
 const LEGACY_STORYBOARD = path.join(
   __dirname,
   '..',
@@ -463,7 +468,7 @@ describe('cache-backed suites actually run', () => {
     );
     assert.ok(
       legacyAvailable,
-      'compliance/cache/3.1.29 (or the legacy fixture) is missing in CI; the version-scoping ' +
+      'compliance/cache/3.1.30 (or the legacy fixture) is missing in CI; the version-scoping ' +
         'suite would have skipped silently. Run `npm run sync-schemas:all`.'
     );
   });
@@ -477,7 +482,7 @@ describe('version scoping', { skip: !legacyAvailable }, () => {
       supported_versions: ['3.1', '3.2', '3.2.1'],
       major_versions: [3],
     };
-    for (const version of ['3.1.29', ADCP_VERSION]) {
+    for (const version of ['3.1.30', ADCP_VERSION]) {
       const resolved = resolveStoryboardsForCapabilities(caps, {
         complianceVersion: version,
         complianceDir: path.join('compliance', 'cache', version),
@@ -490,7 +495,7 @@ describe('version scoping', { skip: !legacyAvailable }, () => {
     }
   });
 
-  test('no AdCP 3.1.29 capability-gated scenario is neutralized', () => {
+  test('no AdCP 3.1.30 capability-gated scenario is neutralized', () => {
     // Enumerated rather than three fixed ids, so the guard cannot rot if
     // upstream renames one. 33 of these flipped partial -> passing before the
     // version gate landed.
@@ -501,8 +506,8 @@ describe('version scoping', { skip: !legacyAvailable }, () => {
       major_versions: [3],
     };
     const resolved = resolveStoryboardsForCapabilities(caps, {
-      complianceVersion: '3.1.29',
-      complianceDir: path.join('compliance', 'cache', '3.1.29'),
+      complianceVersion: '3.1.30',
+      complianceDir: path.join('compliance', 'cache', '3.1.30'),
     });
     const gated = resolved.storyboards.filter(sb => {
       const predicates = [
@@ -513,9 +518,9 @@ describe('version scoping', { skip: !legacyAvailable }, () => {
         predicates.length > 0 && !predicates.some(predicate => String(predicate.path).startsWith('compliance_testing'))
       );
     });
-    assert.ok(gated.length > 0, 'the 3.1.29 bundle must still contain capability-gated scenarios');
+    assert.ok(gated.length > 0, 'the 3.1.30 bundle must still contain capability-gated scenarios');
     for (const storyboard of gated) {
-      assert.equal(storyboard.adcp_version, '3.1.29', `${storyboard.id} carries the loader-stamped version`);
+      assert.equal(storyboard.adcp_version, '3.1.30', `${storyboard.id} carries the loader-stamped version`);
       assert.equal(
         rollupOf([storyboard, 'seller'], [capabilityUnsupportedResult(storyboard.id), passingStub('seller')]),
         'partial',
@@ -537,7 +542,7 @@ describe('version scoping', { skip: !legacyAvailable }, () => {
       const result = await runStoryboard(seller.url, storyboard, {
         ...RUN_OPTIONS,
         skip_controller_seeding: true,
-        adcpVersion: '3.1.29',
+        adcpVersion: '3.1.30',
       });
       // Unchanged from before this PR: the governance row is an actionable
       // `missing_tool` skip and the seller's own steps all execute and pass.
@@ -1046,9 +1051,11 @@ describe('real AdCP 3.2 bundle aggregates', { skip: !scenariosAvailable }, () =>
     }
   });
 
-  test('the cache census behind the scope claim holds: 180 gated files, 14 compliance_testing', () => {
+  test('the cache census behind the scope claim holds: 184 gated files, 14 compliance_testing', () => {
     // File-level census, which is what the changeset's "160 of 174" claimed at rc.7. The 3.2.3 bundle adds advanced-delivery
     // reporting gates in both domain/protocol copies: 166 of 180 are eligible.
+    // The 3.2.6 change-rights and revenue-share scenarios add four gated
+    // domain/protocol files without controller gates: 170 of 184 are eligible.
     // Distinct storyboard ids are fewer, because the same scenario is carried
     // in more than one bundle directory — both numbers are asserted so the
     // claim cannot drift silently in either direction.
@@ -1095,9 +1102,9 @@ describe('real AdCP 3.2 bundle aggregates', { skip: !scenariosAvailable }, () =>
       if (segments.includes('compliance_testing')) controllerGatedFiles.push(file);
     }
 
-    assert.equal(gatedFiles.length, 180, 'root capability-gated file census drifted');
+    assert.equal(gatedFiles.length, 184, 'root capability-gated file census drifted');
     assert.equal(controllerGatedFiles.length, 14, 'compliance_testing-gated file census drifted');
-    assert.equal(gatedFiles.length - controllerGatedFiles.length, 166, 'eligible census drifted');
+    assert.equal(gatedFiles.length - controllerGatedFiles.length, 170, 'eligible census drifted');
 
     // Normalization, not prefix matching: padded case and a nested namespace
     // are both recognised and both keep capping.
@@ -1236,8 +1243,8 @@ describe('executed: an unmet runtime requirement keeps its provenance in routed 
     tools: ['get_products'],
     capabilities: {
       supported_protocols: ['media_buy'],
-      adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
-      account: { require_operator_auth: true },
+      adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
+      account: { supported_billing: ['operator'], require_operator_auth: true },
       // No `request_signing` block: the agent did not opt in.
     },
   };
@@ -1256,7 +1263,7 @@ describe('executed: an unmet runtime requirement keeps its provenance in routed 
       tools: ['get_products'],
       capabilities: {
         supported_protocols: ['media_buy'],
-        adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
+        adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
       },
     });
     try {
@@ -1311,7 +1318,7 @@ describe('executed: an unmet runtime requirement keeps its provenance in routed 
         tools,
         capabilities: {
           supported_protocols: ['media_buy'],
-          adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
+          adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
           ...extraCapabilities,
         },
       });
@@ -1435,8 +1442,8 @@ describe('executed: the multi_agent gate never pre-empts discovery or another ga
       tools: ['get_products'],
       capabilities: {
         supported_protocols: ['media_buy'],
-        adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
-        account: { require_operator_auth: true },
+        adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
+        account: { supported_billing: ['operator'], require_operator_auth: true },
       },
     });
     try {
@@ -1607,8 +1614,8 @@ describe('requirement reporting is identical routed and non-routed', () => {
     // no request signing, and is the only tenant in the routed map.
     const AGENT_CAPS = {
       supported_protocols: ['media_buy'],
-      adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
-      account: { require_operator_auth: true },
+      adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
+      account: { supported_billing: ['operator'], require_operator_auth: true },
     };
     const agent = await startAgent({ tools: ['get_products'], capabilities: AGENT_CAPS });
     // Exactly what `comply()` hands `runStoryboard`: the discovered profile
@@ -1713,12 +1720,12 @@ describe('routing errors name the agents that advertise an unclaimed tool', () =
 
 const CONTROLLER_CAPS = {
   supported_protocols: ['media_buy'],
-  adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
+  adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
   compliance_testing: { scenarios: ['seed_product'] },
 };
 const SIGNALS_CAPS = {
   supported_protocols: ['signals'],
-  adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
+  adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
 };
 
 function controllerStoryboard(steps) {
@@ -1976,7 +1983,7 @@ describe('executed: routed `controller` answers from the route that owns the sta
       tools: ['get_products'],
       capabilities: {
         supported_protocols: ['media_buy'],
-        adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
+        adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
       },
     });
     for (const [label, peerOptsIn, expectSkipped] of [
@@ -1987,7 +1994,7 @@ describe('executed: routed `controller` answers from the route that owns the sta
         tools: ['get_products', 'comply_test_controller'],
         capabilities: {
           ...CONTROLLER_CAPS,
-          ...(peerOptsIn && { account: { require_operator_auth: true } }),
+          ...(peerOptsIn && { account: { supported_billing: ['operator'], require_operator_auth: true } }),
         },
       });
       try {
@@ -2106,7 +2113,7 @@ describe('executed: routed `controller` answers from the route that owns the sta
           tools: ['get_products'],
           capabilities: {
             supported_protocols: ['media_buy'],
-            adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'] },
+            adcp: { major_versions: [3], supported_versions: ['3.1', '3.2'], idempotency: { supported: false } },
           },
         },
         'tok-ctl': { tools: ['get_products', 'comply_test_controller'], capabilities: CONTROLLER_CAPS },

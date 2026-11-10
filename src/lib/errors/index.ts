@@ -745,11 +745,75 @@ export class ResponseTooLargeError extends ADCPError {
   ) {
     super(
       contentLengthHeader !== undefined
-        ? `Response body declared ${contentLengthHeader} bytes, exceeds maxResponseBytes cap of ${limit} (${url})`
-        : `Response body exceeded maxResponseBytes cap of ${limit} after reading ${bytesRead} bytes (${url})`
+        ? `Response body declared ${contentLengthHeader} bytes, exceeds response size cap of ${limit} (${url}). Raise transport.maxResponseBytes per client or per call to allow larger responses.`
+        : `Response body exceeded response size cap of ${limit} after reading ${bytesRead} bytes (${url}). Raise transport.maxResponseBytes per client or per call to allow larger responses.`
     );
     this.details = { limit, bytesRead, url, contentLengthHeader };
   }
+}
+
+/**
+ * Error thrown when an agent rate-limits the SDK's endpoint discovery: a
+ * probe answered HTTP 429, or HTTP 503 with a `Retry-After` header.
+ *
+ * Discovery stops at the first such probe instead of trying the remaining
+ * candidate URLs, which would only spend more of the seller's request budget.
+ * The rate limit says nothing about whether `agent_uri` is correct.
+ *
+ * Recovery: `transient`. Wait `retryAfterMs` (when the agent sent
+ * `Retry-After`) and retry.
+ */
+export class AgentRateLimitedError extends ADCPError {
+  readonly code = 'RATE_LIMITED';
+  /** The probed URL, without credentials, query or fragment. */
+  readonly agentUrl: string;
+  /** `Retry-After` as the agent sent it. Set only when it is valid delta-seconds or an HTTP-date. */
+  readonly retryAfter?: string;
+  /** Delay from `Retry-After`, in milliseconds. */
+  readonly retryAfterMs?: number;
+
+  constructor(
+    agentUrl: string,
+    public readonly status: number,
+    retryAfter?: string,
+    cause?: unknown
+  ) {
+    const safeAgentUrl = sanitizeAgentUrlForError(agentUrl);
+    const retryAfterMs = parseRetryAfterMs(retryAfter);
+    const validRetryAfter = retryAfterMs === undefined ? undefined : retryAfter?.trim();
+    const retryHint =
+      retryAfterMs === undefined
+        ? 'No usable Retry-After header; back off before retrying.'
+        : `Retry-After: ${validRetryAfter} (${Math.ceil(retryAfterMs / 1000)}s).`;
+    super(
+      `Agent rate limited MCP endpoint discovery: HTTP ${status} from ${safeAgentUrl}. ${retryHint} ` +
+        `Discovery stopped at this probe to avoid spending more of the agent's request budget; ` +
+        `this does not indicate a wrong agent_uri.`
+    );
+    this.agentUrl = safeAgentUrl;
+    if (retryAfterMs !== undefined) {
+      this.retryAfter = validRetryAfter;
+      this.retryAfterMs = retryAfterMs;
+    }
+    this.details = {
+      agentUrl: safeAgentUrl,
+      status,
+      ...(retryAfterMs !== undefined && { retryAfter: validRetryAfter, retryAfterMs }),
+    };
+    if (cause !== undefined) {
+      Object.defineProperty(this, 'cause', { value: cause, enumerable: false, configurable: true });
+    }
+  }
+}
+
+function parseRetryAfterMs(value: string | undefined): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (/^\d{1,10}$/.test(trimmed)) return Number(trimmed) * 1000;
+  // IMF-fixdate (RFC 9110 §5.6.7). Anything looser is not echoed into messages.
+  if (!/^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(trimmed)) return undefined;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
 }
 
 /**
@@ -1089,4 +1153,41 @@ export function extractErrorInfo(error: unknown): {
   return {
     message: String(error),
   };
+}
+
+/**
+ * Prepared fixture state was refused by the host authorizer.
+ *
+ * An authorization failure is an ACCESS-CONTROL error, not a grading
+ * outcome, so the refused caller gets this and no `StoryboardResult` —
+ * not a partial one, not a redacted one. It carries the machine refusal
+ * code and nothing else: no fixture identities, no `seller_ids`, no
+ * captures, no binding values, no request/response records, and no
+ * results from steps that ran before the grant was revoked.
+ *
+ * The complete, unredacted record — including the synthesized
+ * `prepared_fixtures_authorization` check, `fixture_resolutions` with
+ * `seller_ids`, and exact request/response records — is handed to the
+ * host's `prepared_fixtures_audit_sink` before this is thrown. Where no
+ * sink is configured the record is simply not produced to anyone.
+ *
+ * Hosted entry points should surface this as a 403-style denial.
+ */
+export class PreparedFixturesDeniedError extends ADCPError {
+  readonly code = 'PREPARED_FIXTURES_DENIED';
+
+  constructor(
+    /**
+     * Machine refusal code: `authorizer_required` | `untrusted_state` |
+     * `contract_version_mismatch` | `authorizer_denied` |
+     * `binding_mismatch` | `unauthorized_metadata`.
+     */
+    public readonly refusalCode: string
+  ) {
+    super(`prepared fixture state was refused by the configured authorizer (${refusalCode})`);
+    // Deliberately the code alone. Anything derived from the prepared
+    // graph — including which binding field differed — belongs in the
+    // audit record, not in an error the refused caller can read.
+    this.details = { refusal_code: refusalCode };
+  }
 }

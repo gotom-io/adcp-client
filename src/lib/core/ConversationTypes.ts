@@ -188,6 +188,16 @@ export interface TaskOptions {
    * @internal
    */
   wireAdcpVersion?: string;
+  /** SDK-selected release for result metadata only; never changes wire overrides or validation. @internal */
+  selectedAdcpVersion?: string;
+  /**
+   * INTERNAL — AdCP release negotiated with the seller for this operation.
+   * Responses are validated against this release before being converted up
+   * to the client's release. Set by `SingleAgentClient`; not an adopter knob.
+   *
+   * @internal
+   */
+  negotiatedAdcpVersion?: string;
   /**
    * INTERNAL — compatibility-coordinator version-envelope mode for this operation.
    *
@@ -306,6 +316,8 @@ export interface TaskOptions {
  * Internal task state for tracking execution
  */
 export interface TaskState {
+  /** Trusted selected release retained when request options are released. */
+  wireAdcpVersion?: string;
   /** Unique task identifier */
   taskId: string;
   /** Seller work handle, distinct from the local operation id. */
@@ -342,6 +354,8 @@ export interface TaskState {
   serverVersion?: 'v2' | 'v3';
   /** True when seller-version detection used the SDK's compatibility heuristic. */
   serverVersionSynthetic?: boolean;
+  /** @internal Explicit discovery served release retained for refinement response validation. */
+  refinementServedVersion?: string;
   /**
    * Idempotency key for this task, when the tool is mutating. Tracked on
    * state so internal retries reuse the same key (the whole point of the
@@ -601,6 +615,19 @@ export interface TaskResultMetadata {
    * configuration pin, when detecting same-major downshift.
    */
   adcpVersion?: string;
+  /**
+   * Older AdCP release negotiated with the seller for this call. Present only
+   * when it differs from the client's release: the request was converted down
+   * to it and the response converted back up (see `debug_logs` for every
+   * field the conversion removed or moved).
+   */
+  negotiatedAdcpVersion?: string;
+  /**
+   * Trusted SDK-selected wire release, when negotiation or an explicit wire
+   * override established it. Unlike adcpVersion, this is not a seller echo.
+   * Present even when negotiation selects the client's current release.
+   */
+  wireAdcpVersion?: string;
   /** Seller wire generation used for this request after capability discovery. */
   serverVersion?: 'v2' | 'v3';
   /** True when {@link serverVersion} came from the SDK's synthetic fallback. */
@@ -722,7 +749,8 @@ export interface TaskResultFailure<T> extends TaskResultBase<T> {
    * `IdempotencyExpiredError`. Lets callers write
    * `if (result.errorInstance instanceof IdempotencyConflictError)` instead of
    * switching on `adcpError.code` strings. Absent for codes without a typed
-   * mapping.
+   * mapping. Also preserves validated NeedsAuthorizationError metadata from
+   * MCP authentication challenges for interactive authorization flows.
    */
   errorInstance?: import('../errors').ADCPError;
   /** Correlation ID from the error response context, for tracing across agents */

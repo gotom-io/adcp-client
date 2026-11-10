@@ -110,7 +110,36 @@ import { assertPublishProtocolArtifacts } from './check-publish-protocol-artifac
 // 20,452,069 bytes packed in CI. Allow about 28 KB of compressor variance for
 // this additive surface; all unpacked, file-count, schema and declaration
 // budgets stay fixed.
-const MAX_PACKED_TARBALL_BYTES = 20_480_000;
+// The collection fixture foundation adds four published files — the
+// `PreparedFixturesDeniedError` surface and the grown `testing/storyboard`
+// modules, whose reviewed rationale for the authority binding and the
+// typed-denial contract ships as JSDoc in the `.d.ts`. Measured on the
+// merged tree at 20,483,097 bytes across 6,394 files. Allow about 36 KB of
+// compressor variance; unpacked, file-count, schema and declaration
+// budgets stay fixed.
+// Cross-release translation (adcp-client#3370) adds the version-negotiation,
+// schema-projection and translation modules, the 3.1 adapters and the
+// account-reduction helpers. Measured in CI at 20,533,600 bytes on the rebased
+// tree; allow about 40 KB of compressor variance and the follow-up adapter
+// module set. Unpacked, file-count, schema and declaration budgets stay fixed.
+// MCP principal partitions add four runtime/declaration artifacts and explicit
+// native-task routing/signing context declarations. CI measures 20,581,610
+// packed bytes; retain about 43 KB of compressor variance for this additive
+// surface. All unpacked, file-count, schema and declaration limits stay fixed.
+// SDK 16.6 adds the standalone delivery receiver, strict canonical delivery Zod
+// schema, targeting-key/enum exports, validated account snapshots and bounded
+// AJV compilation. Published 16.5 is 20,601,337 packed bytes; this reviewed
+// candidate measures 20,781,701 (+180,364). The generated canonical delivery
+// validator accounts for most growth; protocol/compliance corpora are unchanged.
+// Retain about 68 KB of compressor variance. All other limits stay fixed.
+// Maintained AdCP 3.1.32 adoption adds the signed 295-file compliance corpus.
+// Measured with a real `npm pack` on both sides: base 60c97b7 is 20,846,957
+// packed bytes and this candidate is 21,175,720 — a real difference of 328,763.
+// The immediate base headroom was only 3,043 bytes, so the signed corpus could
+// not fit under the previous cap. Retain 74,280 bytes of candidate compressor
+// margin, comparable to the 68,299 nominal margin of the preceding entry.
+// Unpacked, schema, declaration and facade budgets stay exact.
+const MAX_PACKED_TARBALL_BYTES = 21_250_000;
 const MAX_UNPACKED_PACKAGE_BYTES = 120 * 1024 * 1024;
 // AdCP 3.2.0-beta.10 adds the account-change schema family. The seller reporting
 // ledger adds ten public module artifacts. AdCP 3.2.0-rc.2 replaced the preview
@@ -210,6 +239,7 @@ const MAX_UNPACKED_PACKAGE_BYTES = 120 * 1024 * 1024;
 // Operation resolution over A2A and the grader's A2A vector module add two
 // internal dual-format runtime/declaration module sets (+8 files).
 const MAX_PACKED_FILE_COUNT =
+  4 + // Shared MCP schema validator (CJS, ESM, and both declaration formats).
   6_135 +
   34 +
   4 +
@@ -272,7 +302,8 @@ const MAX_PACKED_FILE_COUNT =
   2 + // The maintained bundle replacement adds the hosted-grader kit and compact macro-bearing URL schema.
   13 + // Property-list identifier, server, and certification modules (three dual-format sets) and adoption guide.
   4 + // Property-list reference probe (one dual-format runtime/declaration module set).
-  5; // Creative build probe: one dual-format runtime/declaration module (+4) and one guide (+1).
+  5 + // Creative build probe: one dual-format runtime/declaration module (+4) and one guide (+1).
+  295; // Maintained AdCP 3.1.32: exactly 295 signed compliance files (pack 6,503 -> 6,798), preserving the prior 79-entry headroom.
 const MAX_BUNDLED_SCHEMA_BYTES = 1280 * 1024;
 const MAX_CJS_SCHEMA_DECLARATION_BYTES = 45 * 1024 * 1024;
 const MAX_ESM_SCHEMA_FACADE_BYTES = 1024;

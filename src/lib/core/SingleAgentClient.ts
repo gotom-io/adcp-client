@@ -1,3 +1,8 @@
+import type * as ToolTypes from '../types/tools.generated';
+import type * as CoreTypes from '../types/core.generated';
+import { shouldReuseMCPConnection, withMCPConnectionPolicy } from '../protocols/mcp-connection-policy';
+import { withMCPConnectionScope } from '../protocols/mcp-scope';
+import { hasUnsignedCapabilityBootstrap } from '../signing/protocol-methods';
 import { normalizeGetProductsResponse } from '../utils/pricing-adapter';
 import { normalizeMediaBuyResponse } from '../utils/creative-adapter';
 import { normalizeFormatsResponse } from '../utils/format-renders';
@@ -20,7 +25,28 @@ import {
 import { createHash, randomUUID, scryptSync } from 'node:crypto';
 const SKIP_PRODUCT_CACHE = Symbol('adcp.skipProductCache');
 const SKIP_ACCOUNT_REGISTRY_OBSERVATION = Symbol('adcp.skipAccountRegistryObservation');
+const NONTERMINAL_TASK_RESULT_STATUSES = new Set<string>([
+  'submitted',
+  'working',
+  'input-required',
+  'auth-required',
+  'deferred',
+] satisfies TaskResult<unknown>['status'][]);
+
+function isNonterminalTaskResult(result: unknown): boolean {
+  return (
+    result !== null &&
+    typeof result === 'object' &&
+    'success' in result &&
+    result.success === true &&
+    'status' in result &&
+    typeof result.status === 'string' &&
+    NONTERMINAL_TASK_RESULT_STATUSES.has(result.status)
+  );
+}
+
 import type { AccountReference, AgentConfig } from '../types';
+import { accountKeySites, naturalAccountKey, reducedFields, valueAt, withReducedKeyAt } from './account-reduction';
 import { ADCP_ENVELOPE_FIELDS } from '../types/adcp';
 import { parseAdcpMajorVersion, toReleasePrecisionVersion, type AdcpVersion } from '../version';
 import {
@@ -31,8 +57,22 @@ import {
   resolveAdcpVersion,
 } from '../utils/adcp-version-config';
 import { beta6ReportingRequestIssue, type Beta6DeliveryRequestIssue } from '../media-buy/reporting-version';
-import { getVersionAdapter, resolveAdapterKey } from '../adapters/version';
-import { isExternalSchemaRootActive, schemaAllowsTopLevelField } from '../validation/schema-loader';
+import {
+  convertRequest,
+  convertResponse,
+  getVersionAdapter,
+  isNegotiationFailure,
+  negotiateAdcpRelease,
+  releaseDefinesTool,
+  resolveAdapterKey,
+  type AccountIdentityDowngrade,
+  type NegotiatedAdcpRelease,
+} from '../adapters/version';
+import {
+  isExternalSchemaRootActive,
+  schemaAllowsTopLevelField,
+  toReleasePrecisionWire,
+} from '../validation/schema-loader';
 import type {
   GetProductsRequest,
   GetProductsResponse,
@@ -147,6 +187,7 @@ import { getSignedRequestRejection } from '../protocols/signedRequestRejection';
 import { withAmbientIdentityHeaders } from '../protocols/mcp-call-context';
 import { ProtocolClient, normalizeTransportOptions } from '../protocols';
 import {
+  AgentRateLimitedError,
   AuthenticationCredentialsRejectedError,
   AuthenticationRequiredError,
   ConfigurationError,
@@ -287,6 +328,7 @@ import {
 } from './account-resolution';
 
 import { normalizeRequestParams } from '../utils/request-normalizer';
+import { getCreativeDeliveryDiagnostics } from '../v2/projection/legacy-metadata';
 import { globalAsyncLocalStorage } from '../utils/global-async-local-storage';
 import { validateUserAgent } from '../utils/validate-user-agent';
 import { resolveWebhookUrl, selectWebhookTemplate } from './webhook-url';
@@ -682,6 +724,8 @@ interface DeferredClientFinalizationContext {
   readonly canonical: boolean;
   readonly serverVersion?: 'v2' | 'v3';
   readonly serverVersionSynthetic?: boolean;
+  /** Older release negotiated for the call; responses are converted up from it. */
+  readonly negotiatedAdcpVersion?: string;
   readonly productPolicyRequest: Readonly<Record<string, unknown>>;
   readonly projectionCatalogs?: readonly ProjectionCatalogSnapshot[];
   readonly routingSnapshot?: CanonicalCreativeRoutingSnapshot;
@@ -709,12 +753,14 @@ function isDeferredClientFinalizationContext(value: unknown): value is DeferredC
     !Array.isArray(context.productPolicyRequest) &&
     (context.serverVersion === undefined || context.serverVersion === 'v2' || context.serverVersion === 'v3') &&
     (context.serverVersionSynthetic === undefined || typeof context.serverVersionSynthetic === 'boolean') &&
+    (context.negotiatedAdcpVersion === undefined || typeof context.negotiatedAdcpVersion === 'string') &&
     (context.projectionCatalogs === undefined || Array.isArray(context.projectionCatalogs)) &&
     (context.handlerName === undefined || typeof context.handlerName === 'string') &&
     (context.skipStatusHandlers === undefined || typeof context.skipStatusHandlers === 'boolean')
   );
 }
 
+const MAX_REMEMBERED_NEGOTIATED_RELEASES = 1024;
 const CANONICAL_PACKAGE_ROUTE_TASKS = new Set(['create_media_buy', 'update_media_buy', 'get_media_buys']);
 const canonicalCreativeRoutingSnapshots = new WeakSet<object>();
 
@@ -1136,6 +1182,8 @@ function assertRawMethodForGovernedPayload(taskType: string, options?: TaskOptio
   }
 }
 
+// Historical custom-task restrictions stay intentionally partial: newly typed
+// tools must retain their existing executeCustomTask workarounds.
 const PRIMARY_ADCP_TASK_NAMES = {
   get_products: true,
   list_products: true,
@@ -1183,18 +1231,16 @@ const PRIMARY_ADCP_TASK_NAMES = {
   sync_principal: true,
   context_match: true,
   identity_match: true,
-} satisfies Record<AdcpTaskName, true>;
+} satisfies Partial<Record<AdcpTaskName, true>>;
 
+// Preserve the existing custom-task escape hatch for tools newly given typed methods.
 const STANDARD_ADCP_TASK_NAMES = new Set<string>([
   ...Object.keys(PRIMARY_ADCP_TASK_NAMES),
   'list_creative_formats',
   'list_transformers',
   'preview_creative',
   'build_creative',
-  // These standard protocol tools still carry legacy creative `format_id`
-  // identity through artifacts, manifests, standards, or rights constraints.
-  // They are available only through explicitly named *Legacy APIs until a
-  // lossless canonical projection exists.
+  // Wire-level creative and content tools also have typed primary methods.
   'list_content_standards',
   'get_content_standards',
   'create_content_standards',
@@ -1665,6 +1711,29 @@ export interface SingleAgentClientConfig extends ConversationConfig {
   validateFeatures?: boolean;
   /** Require release compatibility and the declared idempotency replay TTL before mutations. */
   requireV3ForMutations?: boolean;
+  /**
+   * What to do when a request reaches a seller on an older AdCP release and
+   * its account key uses fields that release cannot express. AdCP 3.2 added
+   * `operator_unit`, `currency` and `timezone` to the account natural key and
+   * `countries` to brand references; a 3.1 seller's key has none of them.
+   *
+   * - `'refuse'` (default): fail the call before it is sent with
+   *   `ProtocolFeatureUnsupportedError`.
+   * - `'reduce'`: send the older key when that is unambiguous, and refuse when
+   *   it would merge accounts. Each reduced key is claimed for the one buyer
+   *   key it came from (a key sent unreduced claims itself), and a second
+   *   buyer key that would reach the same seller account fails with
+   *   `account_identity_collision` before sending, so no two buyer accounts
+   *   share one seller account. Each reduction is reported in `debug_logs` as
+   *   an `account_identity_reduced` entry. Requires `accountStorage` with
+   *   `compareAndSet`, so the claims hold across instances and restarts.
+   *
+   * The rule is proposed for the spec as adcontextprotocol/adcp DR-0032
+   * (#8373); the default may change to `'reduce'` once it is ratified.
+   *
+   * @default 'refuse'
+   */
+  accountIdentityDowngrade?: AccountIdentityDowngrade;
   /**
    * Runtime schema validation options
    */
@@ -2305,6 +2374,8 @@ export class SingleAgentClient {
   private cachedCapabilities?: AdcpCapabilities; // Cache detected server capabilities
   private runAgentInfo?: Awaited<ReturnType<SingleAgentClient['getAgentInfo']>>;
   private cachedToolSchemas?: Map<string, Record<string, unknown>>; // inputSchema.properties per tool name
+  /** Release negotiated per operation, for converting webhook completions up. */
+  private readonly negotiatedReleaseByOperation = new Map<string, string>();
   private primedCapabilitiesExpiresAt?: number; // Freshness bound for application-owned evidence only
   private capabilityEvidenceScopeKey = randomUUID();
   private capabilityEvidenceAuthMaterial?: string;
@@ -2384,6 +2455,18 @@ export class SingleAgentClient {
     this.resolvedAdcpVersion = resolveAdcpVersion(
       config.adcpVersion ?? (config.experimentalIdentity33 ? '3.3' : undefined)
     );
+    if (config.accountIdentityDowngrade === 'reduce' && typeof config.accountStorage?.compareAndSet !== 'function') {
+      // The no-merge guarantee is a claim on a reduced key that every
+      // instance of this buyer must see; without an atomic store, two
+      // instances (or a restart) can each claim a different buyer key for
+      // the same seller account.
+      throw new ConfigurationError(
+        "accountIdentityDowngrade: 'reduce' requires accountStorage with compareAndSet. Reduced account keys are " +
+          'claimed in that storage so that no two buyer accounts reach one seller account, across instances and ' +
+          "restarts. Configure durable accountStorage that implements compareAndSet, or use 'refuse'.",
+        'accountIdentityDowngrade'
+      );
+    }
     this.webhookRegistrationStore = config.webhookRegistrationStore ?? new InMemoryWebhookRegistrationStore();
     this.webhookReplayStore = config.webhookVerification?.replayStore ?? new InMemoryReplayStore();
     this.webhookRevocationStore = config.webhookVerification?.revocationStore ?? new InMemoryRevocationStore();
@@ -2474,6 +2557,25 @@ export class SingleAgentClient {
       ...(config.wireAdcpVersion !== undefined && { wireAdcpVersion: config.wireAdcpVersion }),
       ...(config.versionEnvelope !== undefined && { versionEnvelope: config.versionEnvelope }),
       transport: config.transport,
+      resolveTaskStatusTool: async (pollAgent, options) => {
+        const client =
+          pollAgent.id === this.normalizedAgent.id
+            ? this
+            : new SingleAgentClient(pollAgent, {
+                adcpVersion: this.resolvedAdcpVersion,
+                wireAdcpVersion: this.config.wireAdcpVersion,
+                versionEnvelope: this.config.versionEnvelope,
+                userAgent: this.config.userAgent,
+                discoveryCache: this.config.discoveryCache,
+                onTransportActivity: this.config.onTransportActivity,
+                transport: options.transport,
+              });
+        return (await client.advertisesTool('get_task_status', options))
+          ? 'get_task_status'
+          : pollAgent.protocol === 'mcp'
+            ? 'tasks_get'
+            : 'tasks/get';
+      },
     });
 
     // Create async handler if handlers are provided
@@ -3220,8 +3322,14 @@ export class SingleAgentClient {
     return this.executor.trackTask<T>(agent, snapshot);
   }
 
-  /** Poll through the same discovered/canonical protocol endpoint used for dispatch. @internal */
-  async getTaskStatus(
+  /** Execute the typed AdCP get_task_status tool, including its result and error fields. */
+  getTaskStatus(
+    params: ToolTypes.GetTaskStatusRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetTaskStatusResponse>>;
+  /** Poll one task and map its status to TaskInfo. Preserved for existing callers. */
+  getTaskStatus(
     taskId: string,
     transport?: import('../protocols').TransportOptions,
     signal?: AbortSignal,
@@ -3229,7 +3337,27 @@ export class SingleAgentClient {
       wireAdcpVersion?: string;
       versionEnvelope?: import('../protocols').VersionEnvelopeMode;
     }
-  ): Promise<TaskInfo> {
+  ): Promise<TaskInfo>;
+  async getTaskStatus(
+    taskIdOrParams: string | ToolTypes.GetTaskStatusRequest,
+    transportOrHandler?: import('../protocols').TransportOptions | InputHandler,
+    signalOrOptions?: AbortSignal | TaskOptions,
+    wireOptions?: {
+      wireAdcpVersion?: string;
+      versionEnvelope?: import('../protocols').VersionEnvelopeMode;
+    }
+  ): Promise<TaskInfo | TaskResult<ToolTypes.GetTaskStatusResponse>> {
+    if (typeof taskIdOrParams !== 'string') {
+      return this.executeTaskUnprojected<ToolTypes.GetTaskStatusResponse>(
+        'get_task_status',
+        taskIdOrParams,
+        transportOrHandler as InputHandler | undefined,
+        signalOrOptions as TaskOptions | undefined
+      );
+    }
+    const taskId = taskIdOrParams;
+    const transport = transportOrHandler as import('../protocols').TransportOptions | undefined;
+    const signal = signalOrOptions as AbortSignal | undefined;
     // Transport options define the outbound trust boundary. Own them before
     // endpoint discovery yields so caller mutation cannot change the fetch or
     // private-address policy between discovery and tasks/get.
@@ -3511,6 +3639,25 @@ export class SingleAgentClient {
     return this.config.wireAdcpVersion ?? this.resolvedAdcpVersion;
   }
 
+  /** @internal Read only current, auth-scoped actual discovery evidence; never fetch. */
+  getCachedServedAdcpVersion(options?: ReadRequestOptions): string | undefined {
+    this.synchronizeCapabilityEvidenceAuthorizationScope();
+    if (this.usesScopedDiscoveryTransport(options)) return undefined;
+    if (this.primedCapabilitiesExpiresAt !== undefined && this.primedCapabilitiesExpiresAt <= Date.now())
+      return undefined;
+    if (this.config.discoveryCache && this.cachedCapabilities) {
+      const key = this.sharedDiscoveryKey(options);
+      if (
+        this.sharedEvidenceKey !== key ||
+        (key !== undefined &&
+          this.sharedEvidenceEpoch !== undefined &&
+          this.sharedEvidenceEpoch !== this.sharedInvalidationEpoch(key))
+      )
+        return undefined;
+    }
+    return this.cachedCapabilities?._synthetic === false ? this.cachedCapabilities.servedVersion : undefined;
+  }
+
   /**
    * Ensure MCP endpoint is discovered (lazy initialization)
    *
@@ -3519,6 +3666,12 @@ export class SingleAgentClient {
    * Also computes the canonical base URL by stripping /mcp suffix.
    */
   private async ensureEndpointDiscovered(options?: ReadRequestOptions): Promise<AgentConfig> {
+    return withMCPConnectionPolicy(normalizeTransportOptions(options?.transport ?? this.config.transport), () =>
+      this.ensureEndpointDiscoveredWithConnectionPolicy(options)
+    );
+  }
+
+  private async ensureEndpointDiscoveredWithConnectionPolicy(options?: ReadRequestOptions): Promise<AgentConfig> {
     throwIfAborted(options?.signal);
     if (this.config._reuseConfiguredDiscovery?.()) this.synchronizeCapabilityEvidenceAuthorizationScope();
     const needsDiscovery = this.normalizedAgent._needsDiscovery;
@@ -3851,12 +4004,24 @@ export class SingleAgentClient {
    * - A validated MCP protected-resource metadata chain yields NeedsAuthorizationError
    * - Otherwise AuthenticationRequiredError carries the advertised challenge
    *
+   * Rate limiting (429, or 503 with Retry-After) stops probing at that URL and
+   * throws AgentRateLimitedError carrying the status and Retry-After.
+   *
    * Note: This is async and called lazily on first agent interaction
    */
   private async discoverMCPEndpoint(providedUri: string, options?: ReadRequestOptions): Promise<string> {
+    return withMCPConnectionPolicy(normalizeTransportOptions(options?.transport ?? this.config.transport), () =>
+      this.discoverMCPEndpointWithConnectionPolicy(providedUri, options)
+    );
+  }
+
+  private async discoverMCPEndpointWithConnectionPolicy(
+    providedUri: string,
+    options?: ReadRequestOptions
+  ): Promise<string> {
     throwIfAborted(options?.signal);
-    const { connectMCPWithFallback } = await import('../protocols/mcp');
-    const { probeModernMCPConnection } = await import('../protocols/mcp-modern');
+    const { connectMCPWithFallback, withScopedLegacyConnection } = await import('../protocols/mcp');
+    const { probeModernMCPConnection, retryAfterOf } = await import('../protocols/mcp-modern');
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
     const usesScopedFetch = this.usesScopedDiscoveryTransport(options);
     const endpointEpoch = this.discoveryEpochSnapshot(options);
@@ -3882,6 +4047,8 @@ export class SingleAgentClient {
     type EndpointTestResult = {
       success: boolean;
       status?: number;
+      /** `Retry-After` from a 429/503 probe response, when the agent sent it. */
+      retryAfter?: string;
       error?: unknown;
     };
 
@@ -3904,19 +4071,35 @@ export class SingleAgentClient {
 
         // The v2 Streamable HTTP probe could not connect. Preserve the
         // established v1 Streamable→SSE fallback for old SSE-only agents.
-        const client = await connectMCPWithFallback(
-          new URL(url),
-          authHeaders,
-          [],
-          'endpoint discovery',
-          transport?.trustedFetchFn,
+        const shared = await withScopedLegacyConnection(
           {
+            agentUrl: url,
+            authToken,
+            customHeaders: agentHeaders,
+            authProvider,
             signal: options?.signal,
             requestTimeoutMs: transport?.requestTimeoutMs,
+            fetchFn: transport?.trustedFetchFn,
             allowPrivateIp: transport?.allowPrivateIp,
-          }
+          },
+          'endpoint discovery',
+          async () => undefined
         );
-        await client.close();
+        if (!shared) {
+          const client = await connectMCPWithFallback(
+            new URL(url),
+            authHeaders,
+            [],
+            'endpoint discovery',
+            transport?.trustedFetchFn,
+            {
+              signal: options?.signal,
+              requestTimeoutMs: transport?.requestTimeoutMs,
+              allowPrivateIp: transport?.allowPrivateIp,
+            }
+          );
+          await client.close();
+        }
         if (mayRetain()) {
           this.discoveredMcpEra = 'legacy';
           this.discoveredMcpEraAt = Date.now();
@@ -3936,7 +4119,8 @@ export class SingleAgentClient {
           (errObj?.status as number | undefined) ||
           ((errObj?.response as Record<string, unknown>)?.status as number | undefined) ||
           ((errObj?.cause as Record<string, unknown>)?.status as number | undefined);
-        return { success: false, status, error };
+        const retryAfter = retryAfterOf(error);
+        return { success: false, status, ...(retryAfter !== undefined && { retryAfter }), error };
       }
     };
 
@@ -3974,6 +4158,13 @@ export class SingleAgentClient {
       if (result.success) {
         firstWorkingUrl = url;
         break;
+      }
+
+      // The agent is throttling us (adcp-client#3442). Probing the remaining
+      // candidates would only spend more of its request budget, and the rate
+      // limit says nothing about whether this path is the MCP endpoint.
+      if (result.status === 429 || (result.status === 503 && result.retryAfter !== undefined)) {
+        throw new AgentRateLimitedError(url, result.status, result.retryAfter, result.error);
       }
 
       if (result.status === 401) {
@@ -4315,6 +4506,25 @@ export class SingleAgentClient {
         };
       }
     }
+    let artifactPayloadValidator: ((payload: unknown) => boolean) | undefined;
+    if (registration?.deliveryKind === 'artifact') {
+      try {
+        const loader = require('../validation/schema-loader') as typeof import('../validation/schema-loader');
+        artifactPayloadValidator = loader.getSchemaValidatorByRef(
+          'content-standards/artifact-webhook-payload.json',
+          this.resolvedAdcpVersion
+        );
+        if (!artifactPayloadValidator) throw new ConfigurationError('Bundled artifact webhook schema is unavailable.');
+      } catch (cause) {
+        // Receiver configuration must not consume a valid delivery's replay nonce.
+        return {
+          ok: false,
+          code: 'webhook_verification_unavailable',
+          message: 'Artifact webhook schema configuration is unavailable.',
+          cause,
+        };
+      }
+    }
     if (registration?.mode === 'rfc9421') {
       const { verifyWebBotAuth, selectSignatureProfile, WebBotAuthError, WebBotAuthUnavailableError } =
         loadWebBotAuth();
@@ -4520,7 +4730,9 @@ export class SingleAgentClient {
       const schemaRef = isReport
         ? 'media-buy/media-buy-delivery-webhook-result.json'
         : 'content-standards/artifact-webhook-payload.json';
-      const validator = loader.getSchemaValidatorByRef(schemaRef, this.resolvedAdcpVersion);
+      const validator = isReport
+        ? loader.getSchemaValidatorByRef(schemaRef, this.resolvedAdcpVersion)
+        : artifactPayloadValidator;
       const envelopeValidator = isReport
         ? loader.getSchemaValidatorByRef('core/mcp-webhook-payload.json', this.resolvedAdcpVersion)
         : undefined;
@@ -4821,7 +5033,11 @@ export class SingleAgentClient {
     let externalStatus: ExternalTaskStatusResult | undefined;
     let forgetPolicyState = false;
     try {
-      const canonicalResult = this.canonicalizeWebhookCreativeResult(metadata, parsed.result, canonicalCreativeTask);
+      const canonicalResult = this.canonicalizeWebhookCreativeResult(
+        metadata,
+        this.convertWebhookResultToClientRelease(parsed),
+        canonicalCreativeTask
+      );
       const dedupResult = canonicalResult as AdCPAsyncResponseData | undefined;
       const dedupMetadata = { ...metadata };
       let webhookResult = dedupResult;
@@ -5477,11 +5693,34 @@ export class SingleAgentClient {
     }).ok;
   }
 
-  /**
-   * Execute task and call appropriate handler on completion
-   *
-   * Adapts requests for maintained AdCP 3 releases and normalizes product responses.
-   */
+  /** One task owns discovery and dispatch sessions unless the caller already owns reuse. */
+  private withConnectionScope<T>(
+    options: ReadRequestOptions | undefined,
+    run: () => Promise<T>,
+    preserveSessionOnResult?: (result: unknown) => boolean
+  ): Promise<T> {
+    const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
+    return withMCPConnectionPolicy(transport, () =>
+      shouldReuseMCPConnection(transport?.trustedFetchFn !== undefined)
+        ? run()
+        : withMCPConnectionScope(run, {
+            signal: options?.signal,
+            preserveOnInterruption: true,
+            preserveSessionOnResult,
+          })
+    );
+  }
+
+  private withTaskConnectionScope<T, O extends TaskOptions = TaskOptions>(
+    options: O | undefined,
+    run: Parameters<typeof withTaskDeadline<T, O>>[1]
+  ): Promise<T> {
+    return withTaskDeadline(options, effective =>
+      this.withConnectionScope(effective, () => run(effective), isNonterminalTaskResult)
+    );
+  }
+
+  /** Execute a task, adapt maintained AdCP 3 releases, and call the completion handler. */
   private async executeAndHandle<T>(
     taskType: string,
     handlerName: keyof AsyncHandlerConfig,
@@ -5493,11 +5732,12 @@ export class SingleAgentClient {
     canonicalRequest?: unknown,
     projectionCatalogs?: readonly ProjectionCatalogSnapshot[]
   ): Promise<TaskResult<T>> {
+    const projectionDrifts = getCreativeDeliveryDiagnostics(params);
     const requestParamsSnapshot = structuredClone(params);
     const canonicalRequestSnapshot = canonicalRequest === undefined ? undefined : structuredClone(canonicalRequest);
     const deferredProjectionCatalogs = projectionCatalogs ? structuredClone(projectionCatalogs) : undefined;
     const taskOptionsSnapshot = snapshotTaskOptions(options);
-    return withTaskDeadline(taskOptionsSnapshot, effectiveOptions =>
+    return this.withTaskConnectionScope(taskOptionsSnapshot, effectiveOptions =>
       this.executeAndHandleWithinDeadline(
         taskType,
         handlerName,
@@ -5507,7 +5747,8 @@ export class SingleAgentClient {
         transformCompletedResponse,
         legacyFormatConverter,
         canonicalRequestSnapshot,
-        deferredProjectionCatalogs
+        deferredProjectionCatalogs,
+        projectionDrifts
       )
     );
   }
@@ -5521,7 +5762,8 @@ export class SingleAgentClient {
     transformCompletedResponse?: (data: T) => T,
     legacyFormatConverter?: LegacyFormatConverter,
     canonicalRequest?: unknown,
-    projectionCatalogs?: readonly ProjectionCatalogSnapshot[]
+    projectionCatalogs?: readonly ProjectionCatalogSnapshot[],
+    projectionDrifts: ReturnType<typeof getCreativeDeliveryDiagnostics> = []
   ): Promise<TaskResult<T>> {
     throwIfAborted(options?.signal);
     const canonicalCreativeInvocation =
@@ -5606,25 +5848,29 @@ export class SingleAgentClient {
     };
     const serverVersion = await this.detectServerVersion(detectionOptions);
     throwIfAborted(options?.signal);
+    const negotiatedRelease = this.negotiateCallRelease(capabilityDiscoveryContext.capabilities, options);
+    this.assertToolAvailableAtRelease(taskType, negotiatedRelease, capabilityDiscoveryContext.toolSchemas);
     this.assertRequestSupportedByTargetVersion(
       taskType,
       normalizedParams,
       capabilityDiscoveryContext.capabilities,
       canonicalCreativeInvocation,
-      serverVersion
+      serverVersion,
+      negotiatedRelease
     );
-    const { options: effectiveOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
+    const { options: webhookOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
       taskType,
       options,
       capabilityDiscoveryContext.capabilities
     );
+    const effectiveOptions = this.withNegotiatedRelease(webhookOptions, negotiatedRelease);
     const inputSchemaStripLogs: any[] = [];
     if (options?.preserveGovernedPayload && serverVersion !== 'v3') {
       throw new ConfigurationError(
         'Governed storyboard requests require a v3 seller to preserve the approved payload.'
       );
     }
-    const { params: adaptedParams, driftLogs: adaptDriftLogs } = options?.preserveGovernedPayload
+    const { params: convertedParams, driftLogs: adaptDriftLogs } = options?.preserveGovernedPayload
       ? { params: normalizedParams, driftLogs: [] }
       : this.adaptRequest(
           taskType,
@@ -5632,10 +5878,41 @@ export class SingleAgentClient {
           serverVersion,
           inputSchemaStripLogs,
           capabilityDiscoveryContext.toolSchemas,
-          capabilityDiscoveryContext.capabilities
+          capabilityDiscoveryContext.capabilities,
+          negotiatedRelease
         );
+    const adaptedParams = options?.preserveGovernedPayload
+      ? convertedParams
+      : await this.reconcileAccountKeyReductions(
+          taskType,
+          normalizedParams,
+          convertedParams,
+          negotiatedRelease,
+          adaptDriftLogs
+        );
+    if (
+      negotiatedRelease?.downgraded &&
+      !options?.skipIdempotencyAutoInject &&
+      !options?.skipAccountValidation &&
+      !options?.skipRequestValidation
+    ) {
+      // Validate the converted request against the release on the wire. The
+      // same three flags gate the pre-conversion check above: compliance
+      // vectors that skip idempotency-key injection or account validation send
+      // a deliberately invalid request, which this check would reject before
+      // the seller can grade it.
+      this.executor.validateRequest(taskType, adaptedParams, inputSchemaStripLogs, negotiatedRelease.version);
+    }
 
-    const adaptationLogs: any[] = [...adaptDriftLogs];
+    const adaptationLogs: any[] = [
+      ...projectionDrifts.map(drift => ({
+        ...drift,
+        taskName: taskType,
+        clientVersion: this.resolvedAdcpVersion,
+        timestamp: new Date().toISOString(),
+      })),
+      ...adaptDriftLogs,
+    ];
     if (webhookDriftLog) adaptationLogs.push(webhookDriftLog);
 
     const canonicalInputHandler = this.canonicalCreativeInputHandler(
@@ -5655,6 +5932,7 @@ export class SingleAgentClient {
       ...(capabilityDiscoveryContext.capabilities?._synthetic !== undefined && {
         serverVersionSynthetic: capabilityDiscoveryContext.capabilities._synthetic,
       }),
+      ...(negotiatedRelease?.downgraded && { negotiatedAdcpVersion: negotiatedRelease.version }),
       productPolicyRequest: productPolicyRequestSnapshot(normalizedParams),
       accountRegistry: this.accountRegistryContext(taskType, normalizedParams, effectiveOptions),
       ...(projectionCatalogs !== undefined && { projectionCatalogs }),
@@ -5744,6 +6022,21 @@ export class SingleAgentClient {
           serverVersionSynthetic: context.serverVersionSynthetic,
         }),
       };
+    }
+    if (context.negotiatedAdcpVersion !== undefined) {
+      result.metadata = { ...result.metadata, negotiatedAdcpVersion: context.negotiatedAdcpVersion };
+      if (result.metadata.taskId) this.rememberNegotiatedRelease(result.metadata.taskId, context.negotiatedAdcpVersion);
+      if (result.success && result.data) {
+        const converted = this.convertResponseToClientRelease(
+          context.taskType,
+          result.data,
+          context.negotiatedAdcpVersion
+        );
+        result.data = converted.data as T;
+        if (converted.driftLogs.length > 0) {
+          result.debug_logs = [...(result.debug_logs ?? []), ...converted.driftLogs];
+        }
+      }
     }
     const completionHandlerAlreadyPublished = hasCompletionHandlerAlreadyPublished(result);
     const settlementAcknowledger = (
@@ -7006,6 +7299,311 @@ export class SingleAgentClient {
     };
   }
 
+  private get accountIdentityDowngrade(): AccountIdentityDowngrade {
+    return this.config.accountIdentityDowngrade ?? 'refuse';
+  }
+
+  /**
+   * Negotiate the AdCP release to speak with this seller for one call: the
+   * highest release both sides support. Returns `undefined` when the call
+   * keeps its configured wire version: an explicit `wireAdcpVersion`
+   * override, a governed payload that must reach the seller byte-for-byte,
+   * the identity 3.3 experiment, or no authoritative seller release
+   * (synthetic capabilities, no release in common, or no release metadata at
+   * all: AdCP 3.1 does not require `supported_versions`, so its absence does
+   * not prove a 3.0 seller, and such sellers keep the 3.0 request adapters).
+   */
+  private negotiateCallRelease(
+    capabilities: AdcpCapabilities | undefined,
+    options: TaskOptions | undefined
+  ): NegotiatedAdcpRelease | undefined {
+    if (this.config.wireAdcpVersion !== undefined || options?.wireAdcpVersion !== undefined) return undefined;
+    if (options?.preserveGovernedPayload || this.config.experimentalIdentity33) return undefined;
+    const negotiated = negotiateAdcpRelease(this.resolvedAdcpVersion, capabilities);
+    if (!negotiated || isNegotiationFailure(negotiated) || negotiated.source === 'legacy_v3') return undefined;
+    return negotiated;
+  }
+
+  /**
+   * Per-call options carrying the negotiated release to the executor, which
+   * stamps it on the version envelope and validates the response against it.
+   */
+  private withNegotiatedRelease<O extends TaskOptions | undefined>(
+    options: O,
+    negotiated: NegotiatedAdcpRelease | undefined
+  ): O {
+    if (!negotiated) return options;
+    return {
+      ...(options ?? {}),
+      selectedAdcpVersion: negotiated.version,
+      ...(negotiated.downgraded && {
+        wireAdcpVersion: negotiated.version,
+        negotiatedAdcpVersion: negotiated.version,
+      }),
+    } as O;
+  }
+
+  /**
+   * Refuse a tool the negotiated release does not define (a 3.2-only task
+   * sent to a 3.1 seller) with a typed error instead of a seller-side schema
+   * or unknown-tool failure. Sellers that list the tool anyway are called.
+   */
+  private assertToolAvailableAtRelease(
+    taskType: string,
+    negotiated: NegotiatedAdcpRelease | undefined,
+    toolSchemas: ToolSchemaMap | undefined
+  ): void {
+    if (!negotiated?.downgraded) return;
+    // A caller-supplied schema root may cover only part of a release.
+    if (isExternalSchemaRootActive(negotiated.version)) return;
+    if (releaseDefinesTool(taskType, negotiated.version)) return;
+    if (!releaseDefinesTool(taskType, this.resolvedAdcpVersion)) return;
+    if ((toolSchemas ?? this.cachedToolSchemas)?.has(taskType)) return;
+    const suggestion =
+      `Call a task AdCP ${negotiated.version} defines, or reach this seller once it supports ` +
+      `AdCP ${toReleasePrecisionWire(this.resolvedAdcpVersion)}.`;
+    throw new ProtocolFeatureUnsupportedError([taskType], [], this.agent.agent_uri, {
+      message:
+        `${taskType} is not defined in AdCP ${negotiated.version}, the newest release this seller supports. ` +
+        `No request was sent. ${suggestion}`,
+      suggestion,
+      details: {
+        feature: taskType,
+        required_version: toReleasePrecisionWire(this.resolvedAdcpVersion),
+        capability_path: 'adcp.supported_versions',
+        current_version: negotiated.version,
+        tool: taskType,
+      },
+    });
+  }
+
+  /**
+   * Account-key bookkeeping for `accountIdentityDowngrade: 'reduce'`.
+   *
+   * Converting down to an older seller release: claim each reduced key for
+   * the buyer key it came from, and refuse the request when the reduced key
+   * (or an unreduced key the request sends as is) already belongs to a
+   * different buyer key. Without this, two buyer accounts would silently
+   * share one seller account, with merged settings, spend and reads.
+   *
+   * Seller on the client's release: a buyer key that earlier reached this
+   * seller reduced is still addressed by its reduced key, which is the key
+   * the seller's account has, until the caller moves the account to the full
+   * key and calls `client.accounts.clearReduction(key)`.
+   *
+   * Runs only once the account registry is in use or under `'reduce'`.
+   */
+  private async reconcileAccountKeyReductions(
+    taskType: string,
+    original: unknown,
+    adapted: any,
+    negotiated: NegotiatedAdcpRelease | undefined,
+    driftLogs: Record<string, unknown>[]
+  ): Promise<any> {
+    if (this.accountIdentityDowngrade !== 'reduce' && !this._accounts) return adapted;
+    const sites = accountKeySites(original);
+    if (sites.length === 0) return adapted;
+    const registry = this.getAccountRegistry();
+    if (negotiated?.downgraded) {
+      // Under 'refuse' nothing was reduced, so there is nothing to claim.
+      if (this.accountIdentityDowngrade !== 'reduce') return adapted;
+      const claims = sites.flatMap(site => {
+        const reduced = naturalAccountKey(valueAt(adapted, site.path));
+        return reduced ? [{ site, account: site.key, reduced, adcpVersion: negotiated.version }] : [];
+      });
+      const conflict = await registry.claimReductions(claims);
+      if (conflict) {
+        this.throwAccountKeyCollision(taskType, claims[conflict.index]!.site.path, conflict.owner, negotiated.version);
+      }
+      return adapted;
+    }
+    let rewritten = adapted;
+    const pending: Array<{ path: string; fields: string[]; adcpVersion: string }> = [];
+    for (const site of sites) {
+      const reduction = await registry.reductionFor(site.key);
+      if (!reduction) continue;
+      rewritten = withReducedKeyAt(rewritten, site.path, reduction.account);
+      pending.push({
+        path: site.path.join('.'),
+        fields: reducedFields(site.key, reduction.account),
+        adcpVersion: reduction.adcpVersion,
+      });
+    }
+    if (pending.length > 0) {
+      const inPlace = pending.every(entry => entry.fields.every(field => field === 'operator_unit'));
+      driftLogs.push({
+        type: 'account_identity_migration_pending',
+        message:
+          `${taskType}: addressed ${pending.map(entry => entry.path).join(', ')} by the reduced account key ` +
+          `this seller has, without ${[...new Set(pending.flatMap(entry => entry.fields))].join(', ')}. ` +
+          (inPlace
+            ? 'Rekey the account in place with a sync_accounts settings update (account, operator_identity, revision), '
+            : 'currency, timezone and brand.countries cannot change on an existing account, so open a new account ' +
+              'under the full key (and decide which key keeps the existing history), ') +
+          'then call client.accounts.clearReduction(key).',
+        accounts: pending,
+        taskName: taskType,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    return rewritten;
+  }
+
+  private throwAccountKeyCollision(
+    taskType: string,
+    path: ReadonlyArray<string | number>,
+    owner: AccountReference,
+    negotiatedVersion: string
+  ): never {
+    const field = path.join('.');
+    const suggestion =
+      `Reach this seller with one of the two account keys, address the account by account_id, or wait until ` +
+      `the seller supports the release that tells them apart.`;
+    throw new ProtocolFeatureUnsupportedError([`${taskType}.${field}`], [], this.agent.agent_uri, {
+      message:
+        `${taskType} ${field} would reach the same seller account as another of this buyer's account keys: ` +
+        `AdCP ${negotiatedVersion} cannot tell them apart. No request was sent. ${suggestion}`,
+      field,
+      suggestion,
+      details: {
+        feature: `${taskType}.${field}`,
+        reason: 'account_identity_collision',
+        current_version: negotiatedVersion,
+        tool: taskType,
+        field,
+        conflicting_account: owner,
+      },
+    });
+  }
+
+  private throwFieldsUnsupportedAtRelease(
+    taskType: string,
+    fields: ReadonlyArray<{ path: string; introducedIn: string }>,
+    negotiatedVersion: string
+  ): never {
+    const [first] = fields;
+    const paths = fields.map(field => field.path);
+    const accountMove = paths.some(path => /(?:^|\.)(?:operator_identity|revision)$/.test(path));
+    const suggestion = accountMove
+      ? `AdCP ${negotiatedVersion} cannot rekey an account or hand it to another operator (operator_identity, ` +
+        `revision). Make the move once the seller supports AdCP ${first!.introducedIn}; until then the account ` +
+        'keeps its current key and operator.'
+      : `Remove ${paths.join(', ')} for this seller, or reach it once it supports AdCP ${first!.introducedIn}. ` +
+        'Sending the request without them would change what the seller does.';
+    throw new ProtocolFeatureUnsupportedError(
+      paths.map(path => `${taskType}.${path}`),
+      [],
+      this.agent.agent_uri,
+      {
+        message:
+          `${taskType} ${paths.join(', ')} ${paths.length === 1 ? 'requires' : 'require'} AdCP ${first!.introducedIn}; ` +
+          `this seller supports AdCP ${negotiatedVersion}. No request was sent. ${suggestion}`,
+        field: first!.path,
+        suggestion,
+        details: {
+          feature: `${taskType}.${first!.path}`,
+          required_version: first!.introducedIn,
+          capability_path: 'adcp.supported_versions',
+          current_version: negotiatedVersion,
+          tool: taskType,
+          field: first!.path,
+          fields: paths,
+        },
+      }
+    );
+  }
+
+  private throwAccountIdentityUnsupported(
+    taskType: string,
+    fields: ReadonlyArray<{ path: string; introducedIn: string }>,
+    negotiatedVersion: string
+  ): never {
+    const [first] = fields;
+    const paths = fields.map(field => field.path);
+    const suggestion =
+      "Set accountIdentityDowngrade: 'reduce' to send the older account key (allowed while no other buyer key " +
+      `reaches the same seller account without ${paths.join(', ')}), or remove those fields for this seller.`;
+    throw new ProtocolFeatureUnsupportedError(
+      paths.map(path => `${taskType}.${path}`),
+      [],
+      this.agent.agent_uri,
+      {
+        message:
+          `${taskType} ${paths.join(', ')} ${paths.length === 1 ? 'is' : 'are'} part of the AdCP ${first!.introducedIn} ` +
+          `account key, which AdCP ${negotiatedVersion} cannot express. No request was sent. ${suggestion}`,
+        field: first!.path,
+        suggestion,
+        details: {
+          feature: `${taskType}.${first!.path}`,
+          required_version: first!.introducedIn,
+          capability_path: 'adcp.supported_versions',
+          current_version: negotiatedVersion,
+          tool: taskType,
+          field: first!.path,
+          fields: paths,
+        },
+      }
+    );
+  }
+
+  private rememberNegotiatedRelease(operationId: string, version: string): void {
+    this.negotiatedReleaseByOperation.delete(operationId);
+    this.negotiatedReleaseByOperation.set(operationId, version);
+    if (this.negotiatedReleaseByOperation.size > MAX_REMEMBERED_NEGOTIATED_RELEASES) {
+      const oldest = this.negotiatedReleaseByOperation.keys().next().value;
+      if (oldest !== undefined) this.negotiatedReleaseByOperation.delete(oldest);
+    }
+  }
+
+  /**
+   * Webhook completions bypass task finalization, so convert their result up
+   * here. The seller's own `adcp_version` names the release it served; an
+   * AdCP 3.0 seller sends none, so fall back to the release this client
+   * negotiated for the operation.
+   */
+  private convertWebhookResultToClientRelease(parsed: WebhookParseSuccess): unknown {
+    const served = [parsed.result, parsed.envelope]
+      .map(value =>
+        value && typeof value === 'object' && typeof (value as { adcp_version?: unknown }).adcp_version === 'string'
+          ? (value as { adcp_version: string }).adcp_version
+          : undefined
+      )
+      .find(version => version !== undefined);
+    const release = served ?? this.negotiatedReleaseByOperation.get(parsed.metadata.operationId);
+    if (release === undefined || parsed.result === undefined || parsed.result === null) return parsed.result;
+    return convertResponse(parsed.metadata.taskType, parsed.result, {
+      fromVersion: release,
+      toVersion: this.resolvedAdcpVersion,
+    }).data;
+  }
+
+  /**
+   * Convert a response served at the negotiated release up to the client's
+   * release. Returns drift entries for each conversion applied.
+   */
+  private convertResponseToClientRelease(
+    taskType: string,
+    data: unknown,
+    negotiatedVersion: string | undefined
+  ): { data: unknown; driftLogs: Record<string, unknown>[] } {
+    if (negotiatedVersion === undefined || data === undefined || data === null) return { data, driftLogs: [] };
+    const translation = convertResponse(taskType, data, {
+      fromVersion: negotiatedVersion,
+      toVersion: this.resolvedAdcpVersion,
+    });
+    const timestamp = new Date().toISOString();
+    return {
+      data: translation.data,
+      driftLogs: translation.drifts.map(drift => ({
+        ...drift,
+        taskName: taskType,
+        clientVersion: this.resolvedAdcpVersion,
+        targetVersion: negotiatedVersion,
+        timestamp,
+      })),
+    };
+  }
+
   /**
    * Adapt a request for the detected server wire version and the seller's
    * AdCP protocol version. Applies protocol-version adapters (e.g. stripping
@@ -7021,7 +7619,8 @@ export class SingleAgentClient {
     serverVersion: string,
     debugLogs?: any[],
     perCallToolSchemas?: ToolSchemaMap,
-    perCallCapabilities?: AdcpCapabilities
+    perCallCapabilities?: AdcpCapabilities,
+    negotiated?: NegotiatedAdcpRelease
   ): { params: any; driftLogs: Record<string, unknown>[] } {
     if (serverVersion !== 'v3') {
       throw new VersionUnsupportedError(taskType, 'version', 'v2', this.agent.agent_uri);
@@ -7119,15 +7718,44 @@ export class SingleAgentClient {
       adapted = filtered;
     }
 
-    // Protocol version adaptation: strip fields not accepted by the target
-    // AdCP version. `resolveAdapterKey` returns the effective target version
-    // based on the client pin and the seller's advertised caps; adapters live
-    // in `src/lib/adapters/version/<target>/`.
+    // Protocol version adaptation. With a negotiated older release, convert
+    // the request down every minor step to it, removing and reporting what
+    // the release cannot express. Without one (synthetic capabilities),
+    // `resolveAdapterKey` falls back to the 3.0 adapters when the seller does
+    // not advertise 3.1. Adapters live in `src/lib/adapters/version/<target>/`.
+    if (negotiated?.downgraded) {
+      const translation = convertRequest(taskType, adapted, {
+        fromVersion: this.resolvedAdcpVersion,
+        toVersion: negotiated.version,
+        accountIdentity: this.accountIdentityDowngrade,
+      });
+      if (translation.identityFields.length > 0 && this.accountIdentityDowngrade === 'refuse') {
+        this.throwAccountIdentityUnsupported(taskType, translation.identityFields, negotiated.version);
+      }
+      if (translation.refusedFields.length > 0) {
+        this.throwFieldsUnsupportedAtRelease(taskType, translation.refusedFields, negotiated.version);
+      }
+      const timestamp = new Date().toISOString();
+      for (const drift of translation.drifts) {
+        driftLogs.push({
+          ...drift,
+          taskName: taskType,
+          clientVersion: this.resolvedAdcpVersion,
+          targetVersion: negotiated.version,
+          timestamp,
+        });
+      }
+      return { params: translation.params, driftLogs };
+    }
+
     const adapterKey = resolveAdapterKey(this.resolvedAdcpVersion, perCallCapabilities ?? this.cachedCapabilities);
     if (adapterKey) {
       const versionAdapter = getVersionAdapter(adapterKey, taskType);
-      if (versionAdapter) {
-        const result = versionAdapter.adaptRequest(adapted);
+      const adaptRequest = negotiated
+        ? versionAdapter?.adaptRequest
+        : (versionAdapter?.adaptUnnegotiatedRequest ?? versionAdapter?.adaptRequest);
+      if (adaptRequest) {
+        const result = adaptRequest(adapted);
         adapted = result.params;
         if (result.drift) {
           driftLogs.push({
@@ -7197,7 +7825,7 @@ export class SingleAgentClient {
       legacyFormatConverter,
       projectionCatalogs ?? this.config.projectionCatalogs
     );
-    return withTaskDeadline(snapshotTaskOptions(taskOptions), async effectiveOptions => {
+    return this.withTaskConnectionScope(snapshotTaskOptions(taskOptions), async effectiveOptions => {
       this.assertRequestSupportedByConfiguredVersion('get_products', params, effectiveOptions);
       let request = await this.applyAccountPolicy('get_products', params, effectiveOptions);
       const legacyAccountId = (request as { account_id?: unknown }).account_id;
@@ -7256,6 +7884,7 @@ export class SingleAgentClient {
       const account = canonicalAccountRoutingSnapshot(accountReference);
       const cache =
         !effectiveOptions.skipRequestValidation &&
+        !this.usesScopedDiscoveryTransport(effectiveOptions) &&
         !effectiveOptions.preserveGovernedPayload &&
         !inputHandler &&
         !request.push_notification_config &&
@@ -7469,7 +8098,7 @@ export class SingleAgentClient {
       ...snapshotTaskOptions(options),
       ...(projectionCatalogs !== undefined && { projectionCatalogs }),
     };
-    return withTaskDeadline(snapshottedOptions, effectiveOptions =>
+    return this.withTaskConnectionScope(snapshottedOptions, effectiveOptions =>
       this.createMediaBuyWithinDeadline(requestSnapshot, inputHandler, effectiveOptions)
     );
   }
@@ -7708,7 +8337,7 @@ export class SingleAgentClient {
       ...snapshotTaskOptions(options),
       ...(projectionCatalogs !== undefined && { projectionCatalogs }),
     };
-    return withTaskDeadline(snapshottedOptions, effectiveOptions =>
+    return this.withTaskConnectionScope(snapshottedOptions, effectiveOptions =>
       this.updateMediaBuyWithinDeadline(requestSnapshot, inputHandler, effectiveOptions)
     );
   }
@@ -7814,7 +8443,7 @@ export class SingleAgentClient {
       ...(projectionCatalogs !== undefined && { projectionCatalogs }),
       ...(creativeFormatProjection !== undefined && { creativeFormatProjection }),
     };
-    return withTaskDeadline(snapshottedOptions, effectiveOptions =>
+    return this.withTaskConnectionScope(snapshottedOptions, effectiveOptions =>
       this.syncCreativesWithinDeadline(requestSnapshot, inputHandler, effectiveOptions)
     );
   }
@@ -8412,6 +9041,9 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: TaskOptions & { agent?: AgentConfig }
   ): Promise<TaskResult<SyncPlansResponse>> {
+    if (!options?.agent && !this.config.governance?.campaign?.agent) {
+      return this.executeTaskUnprojected<SyncPlansResponse>('sync_plans', params, inputHandler, options);
+    }
     const agent = options?.agent ?? this.getGovernanceAgent();
     // Pre-send schema check on the unadapted shape, mirroring the public-task
     // executeTask path. Without this call, governance/protocol entry points
@@ -8428,17 +9060,40 @@ export class SingleAgentClient {
    * Uses the governance agent from config.governance.campaign.agent by default.
    * Pass an explicit agent via options.agent to override.
    */
-  async getPlanAuditLogs(
+  getPlanAuditLogs(
     params: GetPlanAuditLogsRequest,
     options?: TaskOptions & { agent?: AgentConfig }
+  ): Promise<TaskResult<GetPlanAuditLogsResponse>>;
+  getPlanAuditLogs(
+    params: GetPlanAuditLogsRequest,
+    inputHandler: InputHandler | undefined,
+    options?: TaskOptions & { agent?: AgentConfig }
+  ): Promise<TaskResult<GetPlanAuditLogsResponse>>;
+  async getPlanAuditLogs(
+    params: GetPlanAuditLogsRequest,
+    inputHandlerOrOptions?: InputHandler | (TaskOptions & { agent?: AgentConfig }),
+    taskOptions?: TaskOptions & { agent?: AgentConfig }
   ): Promise<TaskResult<GetPlanAuditLogsResponse>> {
+    const inputHandler = typeof inputHandlerOrOptions === 'function' ? inputHandlerOrOptions : undefined;
+    const options =
+      inputHandlerOrOptions === undefined || typeof inputHandlerOrOptions === 'function'
+        ? taskOptions
+        : inputHandlerOrOptions;
+    if (!options?.agent && !this.config.governance?.campaign?.agent) {
+      return this.executeTaskUnprojected<GetPlanAuditLogsResponse>(
+        'get_plan_audit_logs',
+        params,
+        inputHandler,
+        options
+      );
+    }
     const agent = options?.agent ?? this.getGovernanceAgent();
     this.executor.validateRequest('get_plan_audit_logs', params);
     return this.executor.executeTask<GetPlanAuditLogsResponse>(
       agent,
       'get_plan_audit_logs',
       params,
-      undefined,
+      inputHandler,
       options
     );
   }
@@ -8486,6 +9141,600 @@ export class SingleAgentClient {
     return agent;
   }
 
+  private async advertisesTool(taskName: string, options?: ReadRequestOptions): Promise<boolean> {
+    const context: CapabilityDiscoveryContext = {};
+    const capabilities = await this.getCapabilities({
+      ...options,
+      [CAPABILITY_DISCOVERY_CONTEXT]: context,
+    } as InternalReadRequestOptions);
+    return capabilities.discoveredTools?.includes(taskName) === true || context.toolSchemas?.has(taskName) === true;
+  }
+
+  /** Accept a committed proposal to create or amend a media buy, or apply a negotiated cancellation. */
+  async acceptProposal(
+    params: MutatingRequestInput<ToolTypes.AcceptProposalRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.AcceptProposalResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.AcceptProposalResponse>(
+      'accept_proposal',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP acquire_rights tool. */
+  async acquireRights(
+    params: MutatingRequestInput<CoreTypes.AcquireRightsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.AcquireRightsResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.AcquireRightsResponse>(
+      'acquire_rights',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Generate, transform, refine, retrieve, or adapt creative manifests for advertised creative capabilities. */
+  async buildCreative(
+    params: MutatingRequestInput<ToolTypes.BuildCreativeRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.BuildCreativeResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.BuildCreativeResponse>(
+      'build_creative',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Create a media buy directly from published seller products and record its accepted commercial snapshot. */
+  async buyProducts(
+    params: MutatingRequestInput<ToolTypes.BuyProductsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.BuyProductsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.BuyProductsResponse>('buy_products', params, inputHandler, options);
+  }
+
+  /** Execute the AdCP calibrate_content tool. */
+  async calibrateContent(
+    params: MutatingRequestInput<ToolTypes.CalibrateContentRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.CalibrateContentResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.CalibrateContentResponse>(
+      'calibrate_content',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP check_governance tool. */
+  async checkGovernance(
+    params: ToolTypes.CheckGovernanceRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.CheckGovernanceResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.CheckGovernanceResponse>(
+      'check_governance',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Control a seller compliance scenario. Intended for conformance testing. */
+  async complyTestController(
+    params: ToolTypes.ComplyTestControllerRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ComplyTestControllerResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ComplyTestControllerResponse>(
+      'comply_test_controller',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Rename, pause, resume, cancel, or adjust delivery controls within accepted proposal change rights. */
+  async controlMediaBuy(
+    params: MutatingRequestInput<ToolTypes.ControlMediaBuyRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ControlMediaBuyResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ControlMediaBuyResponse>(
+      'control_media_buy',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP create_collection_list tool. */
+  async createCollectionList(
+    params: MutatingRequestInput<ToolTypes.CreateCollectionListRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.CreateCollectionListResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.CreateCollectionListResponse>(
+      'create_collection_list',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP create_content_standards tool. */
+  async createContentStandards(
+    params: MutatingRequestInput<ToolTypes.CreateContentStandardsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.CreateContentStandardsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.CreateContentStandardsResponse>(
+      'create_content_standards',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Terminally decline one or more proposals and record the buyer's reason. */
+  async declineProposals(
+    params: MutatingRequestInput<ToolTypes.DeclineProposalsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.DeclineProposalsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.DeclineProposalsResponse>(
+      'decline_proposals',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP delete_collection_list tool. */
+  async deleteCollectionList(
+    params: MutatingRequestInput<ToolTypes.DeleteCollectionListRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.DeleteCollectionListResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.DeleteCollectionListResponse>(
+      'delete_collection_list',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Retrieve spend, credit or balance status, and invoice history for an operator-billed account. */
+  async getAccountFinancials(
+    params: ToolTypes.GetAccountFinancialsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetAccountFinancialsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.GetAccountFinancialsResponse>(
+      'get_account_financials',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP get_brand_identity tool. */
+  async getBrandIdentity(
+    params: CoreTypes.GetBrandIdentityRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.GetBrandIdentityResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.GetBrandIdentityResponse>(
+      'get_brand_identity',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP get_collection_list tool. */
+  async getCollectionList(
+    params: ToolTypes.GetCollectionListRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetCollectionListResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.GetCollectionListResponse>(
+      'get_collection_list',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP get_content_standards tool. */
+  async getContentStandards(
+    params: ToolTypes.GetContentStandardsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetContentStandardsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.GetContentStandardsResponse>(
+      'get_content_standards',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Evaluate a creative manifest and return scored safety, content, quality, and governance features. */
+  async getCreativeFeatures(
+    params: ToolTypes.GetCreativeFeaturesRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetCreativeFeaturesResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.GetCreativeFeaturesResponse>(
+      'get_creative_features',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP get_media_buy_artifacts tool. */
+  async getMediaBuyArtifacts(
+    params: ToolTypes.GetMediaBuyArtifactsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetMediaBuyArtifactsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.GetMediaBuyArtifactsResponse>(
+      'get_media_buy_artifacts',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Check reporting health, enumerate expected periods and all retained revisions, or resolve one exact reporting revision. */
+  async getReportingStatus(
+    params: ToolTypes.GetReportingStatusRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.GetReportingStatusResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.GetReportingStatusResponse>(
+      'get_reporting_status',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP get_rights tool. */
+  async getRights(
+    params: CoreTypes.GetRightsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.GetRightsResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.GetRightsResponse>('get_rights', params, inputHandler, options);
+  }
+
+  /** Execute the AdCP list_collection_lists tool. */
+  async listCollectionLists(
+    params: ToolTypes.ListCollectionListsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ListCollectionListsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ListCollectionListsResponse>(
+      'list_collection_lists',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP list_content_standards tool. */
+  async listContentStandards(
+    params: ToolTypes.ListContentStandardsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ListContentStandardsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ListContentStandardsResponse>(
+      'list_content_standards',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP list_creative_formats tool. */
+  async listCreativeFormats(
+    params: ToolTypes.ListCreativeFormatsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ListCreativeFormatsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ListCreativeFormatsResponse>(
+      'list_creative_formats',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Discover account-scoped creative transformers and their selectable configuration options. */
+  async listTransformers(
+    params: ToolTypes.ListTransformersRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ListTransformersResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ListTransformersResponse>(
+      'list_transformers',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Log batches of marketing events against a configured event source for measurement and attribution. */
+  async logEvent(
+    params: MutatingRequestInput<ToolTypes.LogEventRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.LogEventResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.LogEventResponse>('log_event', params, inputHandler, options);
+  }
+
+  /** Revise draft proposals, finalize them into committed, inventory-held snapshots, or extend a committed hold. */
+  async refineProposals(
+    params: TaskRequestFor<'refine_proposals'>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<TaskResponseTypeMap['refine_proposals']>> {
+    return this.executeTask('refine_proposals', params, inputHandler, options);
+  }
+
+  /** Execute the AdCP report_plan_adjustment tool. */
+  async reportPlanAdjustment(
+    params: MutatingRequestInput<ToolTypes.ReportPlanAdjustmentRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ReportPlanAdjustmentResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ReportPlanAdjustmentResponse>(
+      'report_plan_adjustment',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP report_plan_outcome tool. */
+  async reportPlanOutcome(
+    params: MutatingRequestInput<ToolTypes.ReportPlanOutcomeRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ReportPlanOutcomeResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ReportPlanOutcomeResponse>(
+      'report_plan_outcome',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Report vendor-service consumption and final measurements for revenue tracking and billing reconciliation. */
+  async reportUsage(
+    params: MutatingRequestInput<ToolTypes.ReportUsageRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ReportUsageResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ReportUsageResponse>('report_usage', params, inputHandler, options);
+  }
+
+  /** Ask a seller to create one or more draft media-plan proposals from a campaign brief. */
+  async requestProposals(
+    params: MutatingRequestInput<ToolTypes.RequestProposalsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.RequestProposalsResponse>> {
+    return this.executeTask('request_proposals', params, inputHandler, options);
+  }
+
+  /** Execute the AdCP search_brands tool. */
+  async searchBrands(
+    params: CoreTypes.SearchBrandsRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.SearchBrandsResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.SearchBrandsResponse>('search_brands', params, inputHandler, options);
+  }
+
+  /** Register, replace, pause, or clear caller-scoped webhooks for agent-level notifications. */
+  async syncAgentNotificationConfigs(
+    params: MutatingRequestInput<ToolTypes.SyncAgentNotificationConfigsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.SyncAgentNotificationConfigsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.SyncAgentNotificationConfigsResponse>(
+      'sync_agent_notification_configs',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** List or synchronize buyer-managed account catalog feeds, suppress or restore specific items, and read current availability state. */
+  async syncCatalogs(
+    params: MutatingRequestInput<ToolTypes.SyncCatalogsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.SyncCatalogsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.SyncCatalogsResponse>('sync_catalogs', params, inputHandler, options);
+  }
+
+  /** List or synchronize account event sources with upsert and optional replacement semantics. */
+  async syncEventSources(
+    params: MutatingRequestInput<ToolTypes.SyncEventSourcesRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.SyncEventSourcesResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.SyncEventSourcesResponse>(
+      'sync_event_sources',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Bind or replace the governance agent used for approval across specific advertiser accounts. */
+  async syncGovernance(
+    params: MutatingRequestInput<ToolTypes.SyncGovernanceRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.SyncGovernanceResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.SyncGovernanceResponse>(
+      'sync_governance',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Record a consumer's independently verified reporting totals and destination evidence in the seller ledger. */
+  async syncReportingReceipts(
+    params: MutatingRequestInput<ToolTypes.SyncReportingReceiptsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.SyncReportingReceiptsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.SyncReportingReceiptsResponse>(
+      'sync_reporting_receipts',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Tell a seller whether expected reporting was received, omitted, missing, unreadable, or contradictory. */
+  async syncReportingStatus(
+    params: MutatingRequestInput<ToolTypes.SyncReportingStatusRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.SyncReportingStatusResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.SyncReportingStatusResponse>(
+      'sync_reporting_status',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP update_collection_list tool. */
+  async updateCollectionList(
+    params: MutatingRequestInput<ToolTypes.UpdateCollectionListRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.UpdateCollectionListResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.UpdateCollectionListResponse>(
+      'update_collection_list',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP update_content_standards tool. */
+  async updateContentStandards(
+    params: MutatingRequestInput<ToolTypes.UpdateContentStandardsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.UpdateContentStandardsResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.UpdateContentStandardsResponse>(
+      'update_content_standards',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP update_rights tool. */
+  async updateRights(
+    params: MutatingRequestInput<CoreTypes.UpdateRightsRequest>,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.UpdateRightsResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.UpdateRightsResponse>('update_rights', params, inputHandler, options);
+  }
+
+  /** Execute the AdCP validate_content_delivery tool. */
+  async validateContentDelivery(
+    params: ToolTypes.ValidateContentDeliveryRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ValidateContentDeliveryResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ValidateContentDeliveryResponse>(
+      'validate_content_delivery',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Preflight a creative manifest against canonical formats, products, third-party formats, or agent capabilities. */
+  async validateInput(
+    params: ToolTypes.ValidateInputRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ValidateInputResponse>> {
+    return this.executeTaskUnprojected<ToolTypes.ValidateInputResponse>(
+      'validate_input',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP validate_property_delivery tool. */
+  async validatePropertyDelivery(
+    params: CoreTypes.ValidatePropertyDeliveryRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.ValidatePropertyDeliveryResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.ValidatePropertyDeliveryResponse>(
+      'validate_property_delivery',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP verify_brand_claim tool. */
+  async verifyBrandClaim(
+    params: CoreTypes.VerifyBrandClaimRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.VerifyBrandClaimResponse>> {
+    return this.executeTaskUnprojected<CoreTypes.VerifyBrandClaimResponse>(
+      'verify_brand_claim',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
+  /** Execute the AdCP verify_brand_claims tool. */
+  async verifyBrandClaims(
+    params: CoreTypes.VerifyBrandClaimsRequestBulk,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<CoreTypes.VerifyBrandClaimsResponseBulk>> {
+    return this.executeTaskUnprojected<CoreTypes.VerifyBrandClaimsResponseBulk>(
+      'verify_brand_claims',
+      params,
+      inputHandler,
+      options
+    );
+  }
+
   // ====== PROTOCOL TASKS ======
 
   /**
@@ -8500,7 +9749,7 @@ export class SingleAgentClient {
     inputHandler?: InputHandler,
     options?: TaskOptions
   ): Promise<TaskResult<GetAdCPCapabilitiesResponse>> {
-    return withTaskDeadline(snapshotTaskOptions(options), effectiveOptions =>
+    return this.withTaskConnectionScope(snapshotTaskOptions(options), effectiveOptions =>
       this.getAdcpCapabilitiesWithinDeadline(params, inputHandler, effectiveOptions)
     );
   }
@@ -8649,7 +9898,7 @@ export class SingleAgentClient {
     /** @internal Allows the AgentClient wrapper to retain nested task session ids. */
     onTaskResult?: (result: TaskResult<unknown>) => void
   ): Promise<AccountReference | ResolveAccountResult> {
-    return withTaskDeadline(snapshotTaskOptions(options), async effectiveOptions => {
+    return this.withTaskConnectionScope(snapshotTaskOptions(options), async effectiveOptions => {
       const capabilities = await this.getCapabilities(effectiveOptions);
       if (capabilities._synthetic || !capabilities.account) {
         throw new AccountRequiredError(
@@ -9196,7 +10445,7 @@ export class SingleAgentClient {
     taskName: K,
     params: TaskRequestFor<K>,
     inputHandler?: InputHandler,
-    options?: TaskOptions
+    options?: TaskOptions & { agent?: K extends 'sync_plans' | 'get_plan_audit_logs' ? AgentConfig : never }
   ): Promise<TaskResult<TaskResponseTypeMap[K]>>;
   async executeTask(
     taskName: string,
@@ -9235,6 +10484,12 @@ export class SingleAgentClient {
         return this.getMediaBuyDelivery(params as GetMediaBuyDeliveryRequest, inputHandler, options);
       case 'get_creative_delivery':
         return this.getCreativeDelivery(params as GetCreativeDeliveryRequest, inputHandler, options);
+      case 'preview_creative':
+        return this.previewCreative(params as CanonicalPreviewCreativeRequest, inputHandler, options);
+      case 'sync_plans':
+        return this.syncPlans(params as MutatingRequestInput<SyncPlansRequest>, inputHandler, options);
+      case 'get_plan_audit_logs':
+        return this.getPlanAuditLogs(params as GetPlanAuditLogsRequest, inputHandler, options);
       case 'get_principal':
         return this.getPrincipal(params as GetPrincipalRequest, inputHandler, options);
       case 'sync_principal':
@@ -9292,7 +10547,7 @@ export class SingleAgentClient {
   ): Promise<TaskResult<T>> {
     const requestParamsSnapshot = structuredClone(params);
     const taskOptionsSnapshot = snapshotTaskOptions(options);
-    return withTaskDeadline(taskOptionsSnapshot, async effectiveOptions => {
+    return this.withTaskConnectionScope(taskOptionsSnapshot, async effectiveOptions => {
       const result = await this.executeTaskUnprojectedWithinDeadline<T>(
         taskName,
         requestParamsSnapshot,
@@ -9358,25 +10613,38 @@ export class SingleAgentClient {
       const serverVersion = await this.detectServerVersion(detectionOptions);
       detectedServerVersion = serverVersion;
       detectedServerVersionSynthetic = capabilityDiscoveryContext.capabilities?._synthetic;
+      if (
+        (taskName === 'sync_plans' || taskName === 'get_plan_audit_logs') &&
+        capabilityDiscoveryContext.capabilities?.discoveredTools?.includes(taskName) !== true &&
+        capabilityDiscoveryContext.toolSchemas?.has(taskName) !== true
+      ) {
+        throw new ConfigurationError(
+          `No governance agent configured and this agent does not advertise ${taskName}. Pass options.agent or configure governance.campaign.agent.`
+        );
+      }
+      const negotiatedRelease = this.negotiateCallRelease(capabilityDiscoveryContext.capabilities, options);
+      this.assertToolAvailableAtRelease(taskName, negotiatedRelease, capabilityDiscoveryContext.toolSchemas);
       this.assertRequestSupportedByTargetVersion(
         taskName,
         normalizedParams,
         capabilityDiscoveryContext.capabilities,
         false,
-        serverVersion
+        serverVersion,
+        negotiatedRelease
       );
-      const { options: effectiveOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
+      const { options: webhookOptions, driftLog: webhookDriftLog } = this.suppressPre31DiscoveryWebhook(
         taskName,
         options,
         capabilityDiscoveryContext.capabilities
       );
+      const effectiveOptions = this.withNegotiatedRelease(webhookOptions, negotiatedRelease);
       const inputSchemaStripLogs: any[] = [];
       if (options?.preserveGovernedPayload && serverVersion !== 'v3') {
         throw new ConfigurationError(
           'Governed storyboard requests require a v3 seller to preserve the approved payload.'
         );
       }
-      const { params: adaptedParams, driftLogs: adaptDriftLogs } = options?.preserveGovernedPayload
+      const { params: convertedParams, driftLogs: adaptDriftLogs } = options?.preserveGovernedPayload
         ? { params: normalizedParams, driftLogs: [] }
         : this.adaptRequest(
             taskName,
@@ -9384,8 +10652,28 @@ export class SingleAgentClient {
             serverVersion,
             inputSchemaStripLogs,
             capabilityDiscoveryContext.toolSchemas,
-            capabilityDiscoveryContext.capabilities
+            capabilityDiscoveryContext.capabilities,
+            negotiatedRelease
           );
+      const adaptedParams = options?.preserveGovernedPayload
+        ? convertedParams
+        : await this.reconcileAccountKeyReductions(
+            taskName,
+            normalizedParams,
+            convertedParams,
+            negotiatedRelease,
+            adaptDriftLogs
+          );
+      if (
+        negotiatedRelease?.downgraded &&
+        !options?.skipIdempotencyAutoInject &&
+        !options?.skipAccountValidation &&
+        !options?.skipRequestValidation
+      ) {
+        // Gated like the pre-conversion check: see the matching comment in
+        // executeAndHandleWithinDeadline.
+        this.executor.validateRequest(taskName, adaptedParams, inputSchemaStripLogs, negotiatedRelease.version);
+      }
 
       const adaptationLogs: any[] = [...adaptDriftLogs];
       if (webhookDriftLog) adaptationLogs.push(webhookDriftLog);
@@ -9399,6 +10687,7 @@ export class SingleAgentClient {
         ...(capabilityDiscoveryContext.capabilities?._synthetic !== undefined && {
           serverVersionSynthetic: capabilityDiscoveryContext.capabilities._synthetic,
         }),
+        ...(negotiatedRelease?.downgraded && { negotiatedAdcpVersion: negotiatedRelease.version }),
         productPolicyRequest: productPolicyRequestSnapshot(normalizedParams),
         accountRegistry: this.accountRegistryContext(taskName, normalizedParams, effectiveOptions),
         ...(effectiveOptions?.taskId !== undefined && { optionTaskId: effectiveOptions.taskId }),
@@ -9795,7 +11084,22 @@ export class SingleAgentClient {
    * });
    * ```
    */
-  async listTasks(): Promise<TaskInfo[]> {
+  /** Query the seller's typed AdCP list_tasks tool. Pass {} for an unfiltered query. */
+  listTasks(
+    params: ToolTypes.ListTasksRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskResult<ToolTypes.ListTasksResponse>>;
+  /** List local tasks only. Pass {} to query the seller's list_tasks tool. */
+  listTasks(): Promise<TaskInfo[]>;
+  async listTasks(
+    params?: ToolTypes.ListTasksRequest,
+    inputHandler?: InputHandler,
+    options?: TaskOptions
+  ): Promise<TaskInfo[] | TaskResult<ToolTypes.ListTasksResponse>> {
+    if (params !== undefined) {
+      return this.executeTaskUnprojected<ToolTypes.ListTasksResponse>('list_tasks', params, inputHandler, options);
+    }
     const tasks = await this.executor.getTaskList(this.agent.id);
     return tasks.map(task =>
       assertNativeRequestProposalsTask(
@@ -9976,6 +11280,21 @@ export class SingleAgentClient {
       parameters?: string[];
     }>;
   }> {
+    return this.withConnectionScope(options, () => this.getAgentInfoWithConnectionPolicy(options));
+  }
+
+  private async getAgentInfoWithConnectionPolicy(options?: ReadRequestOptions): Promise<{
+    name: string;
+    description?: string;
+    protocol: 'mcp' | 'a2a';
+    url: string;
+    tools: Array<{
+      name: string;
+      description?: string;
+      inputSchema?: Record<string, unknown>;
+      parameters?: string[];
+    }>;
+  }> {
     throwIfAborted(options?.signal);
     const reuse = this.config._reuseConfiguredDiscovery?.() && !this.usesScopedDiscoveryTransport(options);
     if (!reuse) return this.getAgentInfoLive(options);
@@ -10102,7 +11421,7 @@ export class SingleAgentClient {
       }
 
       const modernTools =
-        !transport?.trustedFetchFn &&
+        !this.usesScopedDiscoveryTransport(options) &&
         this.discoveredMcpEra === 'legacy' &&
         Date.now() - this.discoveredMcpEraAt < 5 * 60 * 1000
           ? ({ handled: false } as const)
@@ -10287,6 +11606,10 @@ export class SingleAgentClient {
    * ```
    */
   async getCapabilities(options?: ReadRequestOptions): Promise<AdcpCapabilities> {
+    return this.withConnectionScope(options, () => this.getCapabilitiesWithConnectionPolicy(options));
+  }
+
+  private async getCapabilitiesWithConnectionPolicy(options?: ReadRequestOptions): Promise<AdcpCapabilities> {
     throwIfAborted(options?.signal);
     this.synchronizeCapabilityEvidenceAuthorizationScope();
     const discoveryContext = (options as InternalReadRequestOptions | undefined)?.[CAPABILITY_DISCOVERY_CONTEXT];
@@ -10679,6 +12002,7 @@ export class SingleAgentClient {
     const effectiveAgent = this.normalizedAgent;
     return canonicalizeJson({
       authToken: effectiveAgent.auth_token ?? null,
+      connectionPartition: this.config.transport?.connectionPartition ?? null,
       headers: effectiveAgent.headers ?? null,
       oauthTokens: effectiveAgent.oauth_tokens ?? null,
       oauthClient: effectiveAgent.oauth_client ?? null,
@@ -10713,8 +12037,9 @@ export class SingleAgentClient {
   /** A comply() run owns its configured fetch; per-call transport changes still discover separately. */
   private usesScopedDiscoveryTransport(options?: ReadRequestOptions): boolean {
     const transport = normalizeTransportOptions(options?.transport ?? this.config.transport);
-    if (!this.config._reuseConfiguredDiscovery?.()) return transport?.trustedFetchFn !== undefined;
     const configured = normalizeTransportOptions(this.config.transport);
+    if (transport?.connectionPartition !== configured?.connectionPartition) return true;
+    if (!this.config._reuseConfiguredDiscovery?.()) return transport?.trustedFetchFn !== undefined;
     return (
       transport?.trustedFetchFn !== configured?.trustedFetchFn ||
       transport?.allowPrivateIp !== configured?.allowPrivateIp ||
@@ -10889,6 +12214,8 @@ export class SingleAgentClient {
       kid: (provider ? provider.keyid : (signing as { kid?: string }).kid) ?? null,
       alg: (provider ? provider.algorithm : (signing as { alg?: string }).alg) ?? null,
       alwaysSign: signing.always_sign ?? null,
+      alwaysSignProtocolMethods: signing.always_sign_protocol_methods ?? null,
+      unsignedCapabilityBootstrap: hasUnsignedCapabilityBootstrap(signing),
       signSupported: signing.sign_supported ?? null,
     };
   }
@@ -10909,6 +12236,7 @@ export class SingleAgentClient {
       adcpVersion: this.resolvedAdcpVersion,
       wireAdcpVersion: this.config.wireAdcpVersion,
       authIdentity: config.authIdentity,
+      connectionPartition: transport?.connectionPartition,
       credentialKind: this.discoveryCredentialKind(),
       headers: withAmbientIdentityHeaders(this.normalizedAgent.headers),
       signing: this.discoverySigningFingerprint(),
@@ -11578,9 +12906,13 @@ export class SingleAgentClient {
     params: unknown,
     capabilities: AdcpCapabilities | undefined,
     canonicalCreativeInvocation = false,
-    serverVersion?: 'v2' | 'v3'
+    serverVersion?: 'v2' | 'v3',
+    negotiated?: NegotiatedAdcpRelease
   ): void {
-    if (taskName === 'sync_accounts') {
+    // Under 'reduce', a negotiated older release converts the account key
+    // down (and reports it) instead of refusing it here.
+    const reducesAccountIdentity = this.accountIdentityDowngrade === 'reduce' && negotiated?.downgraded === true;
+    if (taskName === 'sync_accounts' && !reducesAccountIdentity) {
       const advertisedVersions = capabilities?.supportedVersions ?? [];
       const servedVersion = capabilities?.servedVersion ?? capabilities?._raw?.adcp_version;
       // The selected release takes precedence over the seller's broader
@@ -11818,9 +13150,16 @@ export class SingleAgentClient {
     // Fall back to the deprecated integer `major_versions` for legacy 3.0
     // sellers. Pre-release pins match exactly per spec — `'3.1.0-beta.1'`
     // matches only against another `'3.1.0-beta.1'`, not `'3.1'`.
+    //
+    // A seller on an older release of the same major is compatible: requests
+    // are converted down to the highest release both sides support. Only a
+    // seller with no release on or below the client's line is refused.
     const supportedVersions = capabilities.supportedVersions;
     if (supportedVersions !== undefined && supportedVersions.length > 0) {
-      if (!isAdcpVersionSupported(this.resolvedAdcpVersion, supportedVersions)) {
+      if (
+        !isAdcpVersionSupported(this.resolvedAdcpVersion, supportedVersions) &&
+        this.negotiateCallRelease(capabilities, options as TaskOptions | undefined) === undefined
+      ) {
         throw new VersionUnsupportedError(taskType, 'version', capabilities.version, this.agent.agent_uri);
       }
     } else {

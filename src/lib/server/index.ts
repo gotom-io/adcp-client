@@ -192,6 +192,7 @@ export type {
 
 export {
   MEDIA_BUY_TRANSITIONS,
+  getMediaBuyTransitions,
   CREATIVE_ASSET_TRANSITIONS,
   isLegalMediaBuyTransition,
   isLegalCreativeTransition,
@@ -383,6 +384,7 @@ export type {
   AdcpCapabilitiesConfig,
   AdcpCapabilitiesOverrides,
   AdcpToolVersionRange,
+  AdcpVersionTranslationEvent,
   AdcpCustomToolConfig as LegacyAdcpCustomToolConfig,
   AdcpCustomToolHandler as LegacyAdcpCustomToolHandler,
   AdcpCustomToolHandlerExtra as LegacyAdcpCustomToolHandlerExtra,

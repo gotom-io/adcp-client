@@ -9,8 +9,9 @@ dist-tag:
 
 | Tag | SDK line | AdCP line | Published from |
 |---|---|---|---|
-| `latest` | 16.x | 3.2 | `main` |
-| `adcp-3.2` | 16.x | 3.2 (current line) | `main`; moved manually after each release (see below) |
+| `latest` | 16.x | 3.2 | `16.x` |
+| `adcp-3.2` | 16.x | 3.2 (stable line) | `16.x`; moved manually after each release (see below) |
+| `beta` | 17.x beta | 3.3 beta | `main`, in Changesets pre-mode |
 | `adcp-3.1` | 13.x | 3.1 (maintenance line) | `13.x` branch, with `ADCP_NPM_TAG=adcp-3.1` |
 | `adcp-3.0` | 7.11.x | 3.0 | 7.x maintenance releases, with `ADCP_NPM_TAG=adcp-3.0` |
 
@@ -26,8 +27,8 @@ names because it parses them as semver ranges.
 
 ## Release Automation
 
-The release workflow publishes with `npm publish --tag latest` via
-`npm run release`. `latest` intentionally tracks the default stable SDK release,
+The release workflow runs on `main` and `16.x`. SDK 16 releases publish with `npm publish --tag latest` via
+`npm run release`; `main` publishes SDK 17 prereleases under `beta` while Changesets pre-mode is active. `latest` intentionally tracks the default stable SDK release,
 not a branch name.
 
 Set `ADCP_NPM_TAG` only when intentionally publishing a maintenance or alternate
@@ -41,7 +42,7 @@ is a separate registry operation and is not covered by OIDC. Emergency retags ca
 still be repaired manually with `npm dist-tag add`, but normal releases should
 not need a registry token.
 
-The current-line tag is the one exception. A release from `main` publishes with
+The current-line tag is the one exception. A stable release from `16.x` publishes with
 `latest`, so OIDC cannot also move `adcp-3.2`. After each stable AdCP 3.2 SDK release, a
 maintainer with registry access moves it by hand:
 
@@ -59,7 +60,7 @@ accidentally.
 
 ## SDK 16 and SDK 17 release boundary
 
-SDK 16 is the stable AdCP 3.2 line (`ADCP_VERSION=3.2.5`). Exit Changesets pre-mode and run `npm run version` to produce its GA versions, lockfile, changelogs and generated documentation. Merge and verify the stable npm publication before entering another prerelease cycle.
+SDK 16 is the stable AdCP 3.2 line (`ADCP_VERSION=3.2.7`). Exit Changesets pre-mode and run `npm run version` to produce its GA versions, lockfile, changelogs and generated documentation. Merge and verify the stable npm publication before entering another prerelease cycle.
 
 SDK 17 beta adopts the published AdCP 3.3 beta protocol bundle. Its release preparation enters Changesets pre-mode with `npx changeset pre enter beta` and adds a major SDK changeset. Sync the exact published protocol beta, regenerate its types and schemas, and validate the integration before publishing. Keep `latest` on SDK 16 throughout the SDK 17 beta cycle, and maintain SDK 16 fixes from a stable branch with `ADCP_NPM_TAG=latest`.
 
@@ -118,11 +119,18 @@ package is merged if you can; if it has merged already, the same steps work and 
    npm whoami
    ```
 
-3. Publish once, from your machine, under a throwaway tag. Provenance is off because it needs the GitHub OIDC
-   identity. The package's `prepublishOnly` cleans, rebuilds and re-checks it. Try `npm publish ... --dry-run` first: if
-   npm complains that provenance needs a CI identity (the package's `publishConfig.provenance: true` can outrank the
-   environment variable), remove that one line from `packages/reporting-storage/package.json` in your working tree for
-   the manual publish and do not commit the change.
+3. Publish once, from your machine, under a throwaway tag. Provenance needs the GitHub OIDC identity, so it has to
+   be off for this publish. The package's `publishConfig.provenance: true` outranks `NPM_CONFIG_PROVENANCE=false`, and
+   a real publish with it fails with `EUSAGE Automatic provenance generation not supported for provider: null`.
+   `--dry-run` skips provenance and passes either way, so it cannot tell you whether the line is still there. Remove
+   the line from your working tree before publishing, and do not commit the change:
+
+   ```bash
+   node -e 'const f="packages/reporting-storage/package.json",fs=require("fs"),p=JSON.parse(fs.readFileSync(f));
+     delete p.publishConfig.provenance; fs.writeFileSync(f, JSON.stringify(p, null, 2) + "\n")'
+   ```
+
+   The package's `prepublishOnly` cleans, rebuilds and re-checks it. Then publish:
 
    ```bash
    NPM_CONFIG_PROVENANCE=false npm publish \
@@ -132,7 +140,8 @@ package is merged if you can; if it has merged already, the same steps work and 
    ```
 
    This publishes the version in `packages/reporting-storage/package.json` (`0.0.0` until the release PR bumps it to
-   `0.1.0-beta.0`). Then keep an install of the placeholder from becoming the default:
+   `0.1.0-beta.0`). Restore the line with `git checkout -- packages/reporting-storage/package.json`. Then keep an
+   install of the placeholder from becoming the default:
 
    ```bash
    npm dist-tag ls @adcp/reporting-storage
@@ -167,3 +176,5 @@ hold-back), and adopters have no `@adcp/reporting-storage` to move to until it i
 release PR, and treat them as a checklist item on it.
 
 The same steps bootstrap any future workspace package: swap the name, and use the OIDC settings above.
+
+The `16.x` maintenance branch starts at `505ddc9e` (SDK 16.5.0 plus the pending creative-review changeset). Its release PRs target `16.x`, run the same CI and reference-seller checks, and publish only after the release PR is merged.

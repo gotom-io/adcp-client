@@ -1,9 +1,13 @@
 # AdCP Type Summary
 
-> Generated at: 2026-10-20
-> @adcp/sdk v16.1.0
+> Generated at: 2026-11-05
+> @adcp/sdk v16.7.0
 
 Curated reference of the types that matter for using the AdCP client. For full generated types see `src/lib/types/tools.generated.ts` and `src/lib/types/core.generated.ts`.
+
+## Prepared Storyboard Authorization
+
+Import `PrepareStoryboardFixturesOptions`, `PreparedFixturesPreparationAuthorizer`, and `PreparedFixturesPreparationLookup` from `@adcp/sdk/testing`. `prepareStoryboardFixtures` alone accepts `prepared_fixtures_preparation_authorizer`, asked once before seller contact with `{ gate: 'prepare', current }` and no stored binding. `PreparedFixturesAuthorizer` and its required `PreparedFixturesLookup.binding` remain reuse-only through `prepared_fixtures_authorizer` on run/pass/step lookups. A preparation grant never authorizes reuse. See [collection fixture foundation](guides/COLLECTION-FIXTURE-FOUNDATION.md).
 
 ## Buyer Reliable Reporting
 
@@ -49,6 +53,11 @@ interface A2ALegacyCompatOptions {
 }
 
 interface TransportOptions {
+  // Local principal partition; never sent on the wire. Enables MCP process reuse.
+  connectionPartition?: string;
+  // Explicit opt-in when all unpartitioned callers share one principal.
+  // Otherwise unscoped MCP calls close their session after the operation.
+  connectionReuse?: 'process';
   // Defaults to 4 MiB (DEFAULT_MAX_RESPONSE_BYTES); only 0 opts out
   // (Infinity / negatives fall back to the default).
   // SSE is bounded per event plus `maxResponseBytes * 2` cumulative per call.
@@ -3026,6 +3035,8 @@ await reporting.stop();
 ```
 
 Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free `sourceScope`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply `account`, `sourceScope`, `sourceTimezone`, `contract`, `currency`, `constituents`, or `mediaBuyIds`; `mediaBuyIds` is derived from `resolveCoverage`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires `platform.accounts.upsert`, which owns the advertised `sync_accounts` configuration path.
+
+Source offering `applicability` keeps required `productIds: string[]`; opt into `products: { kind: 'host_attested' }` with an empty `productIds` array. Host attestation supports products created per buy: trusted `resolveCoverage` must authorize each product for the selected offering using its `reporting_capabilities.reporting_delivery_offering_ids`. Constituent kinds, product bindings, and frozen coverage remain enforced. SDK 16.5.0+ is required to read the new variants; existing declaration hashes are unchanged. See `docs/guides/REPORTING-SOURCE-EXECUTOR.md`.
 
 For complete seller production assembly, use async `createPostgresReliableReportingProductionService` from `@adcp/reporting-storage/service`. It owns the PostgreSQL Core/Managed stores, receipts, all three reporting notifications, webhook activity, migrations, probes, recovery, and capability publication. Supply `activity.tenantScopeForAccount`; Reconciled Billing offerings also require a trusted `obligatedConsumers` roster. Its scheduler and `recoverOnce` require explicit `deploymentWide: true` because recovery scans the whole namespace. See `docs/guides/REPORTING-LEDGER.md` and `docs/guides/REPORTING-OPERATIONS.md`.
 

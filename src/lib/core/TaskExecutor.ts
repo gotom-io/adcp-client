@@ -1,4 +1,9 @@
+import { withMCPConnectionPolicy } from '../protocols/mcp-connection-policy';
 import { VersionUnsupportedError } from '../errors';
+import {
+  NeedsAuthorizationError,
+  hasValidatedMcpAuthorizationRequirements,
+} from '../auth/oauth/authorization-required';
 import { deliveryWebhookRegistrationId } from './webhook-registration';
 import { isAdcpVersionAtLeast } from '../utils/adcp-version-config';
 function validateIdentity33Payload(
@@ -21,6 +26,16 @@ import {
   type PreparedProtocolToolCall,
 } from '../protocols';
 import { listMCPTasks } from '../protocols/mcp-tasks';
+import { ensureClientCredentialsTokens, getAgentStorage } from '../auth/oauth';
+import { getNonInteractiveOAuthProvider, shareNonInteractiveOAuthProvider } from '../auth/oauth/provider-cache';
+import { isLikelyPrivateUrl } from '../net/address-guards';
+import { assertSigningPolicy } from '../signing/protocol-methods';
+import {
+  buildAgentSigningContext,
+  CAPABILITY_OP,
+  ensureCapabilityLoaded,
+  signingContextStorage,
+} from '../signing/client';
 import { withPreparedProtocolToolCall } from '../protocols/prepared-call-context';
 import { getAuthToken } from '../auth';
 import { getSignedRequestRejection } from '../protocols/signedRequestRejection';
@@ -36,7 +51,10 @@ import {
 } from '../validation/client-hooks';
 import { formatIssues } from '../validation/schema-validator';
 import { withServedValidationVersion } from '../validation/schema-loader';
-import { ADCP_VERSION } from '../version';
+import { ADCP_VERSION, toReleasePrecisionVersion } from '../version';
+import { applicableRefinementServedVersion } from '../negotiation/version';
+import { selectRefinementSchemaVersion } from '../negotiation/verification';
+import type { ProposalVerificationIssue } from '../negotiation/types';
 import { unwrapProtocolResponse, isAdcpOperationSuccess } from '../utils/response-unwrapper';
 import { extractAdcpErrorInfo, extractCorrelationId } from '../utils/error-extraction';
 import { generateIdempotencyKey, requestUsesIdempotency, redactIdempotencyKeyInArgs } from '../utils/idempotency';
@@ -509,7 +527,7 @@ function assertGovernedPayloadHasNoCallbackCredentials(
  * unwrap it before the spec-shape mapping so the SDK stays
  * compatible with both surfaces during the transition.
  */
-function mapTasksGetResponseToTaskInfo(payload: unknown): TaskInfo {
+function mapTasksGetResponseToTaskInfo(payload: unknown, adcpVersion?: string): TaskInfo {
   if (payload == null || typeof payload !== 'object') {
     return { taskId: '', status: 'unknown', taskType: 'unknown', createdAt: Date.now(), updatedAt: Date.now() };
   }
@@ -557,6 +575,7 @@ function mapTasksGetResponseToTaskInfo(payload: unknown): TaskInfo {
       flat.result != null && typeof flat.result === 'object' && !Array.isArray(flat.result)
         ? normalizeLegacyMediaBuyStatusForReturn(flat.result as Record<string, unknown>, {
             toolName: taskInfo.taskType,
+            adcpVersion,
           })
         : flat.result;
   }
@@ -669,6 +688,8 @@ interface TaskStatusPollResult {
   task: TaskInfo;
   rawResponse: Record<string, unknown>;
 }
+
+type AdcpTaskStatusTool = 'get_task_status' | 'tasks_get' | 'tasks/get';
 
 class TaskBindingMismatchError extends Error {
   constructor(
@@ -1050,6 +1071,11 @@ export class TaskExecutor {
        * dispatches. Per-call options can override individual fields.
        */
       transport?: import('../protocols').TransportOptions;
+      /** Resolve the advertised AdCP work-status tool using the client's scoped discovery evidence. */
+      resolveTaskStatusTool?: (
+        agent: AgentConfig,
+        options: { transport?: import('../protocols').TransportOptions; signal?: AbortSignal }
+      ) => Promise<AdcpTaskStatusTool>;
     } = {}
   ) {
     if (
@@ -1203,7 +1229,13 @@ export class TaskExecutor {
    * adaptation runs, so the validator sees the same object the caller wrote.
    * Throws in strict, logs to `debugLogs` in warn, no-ops in off.
    */
-  validateRequest(taskName: string, params: unknown, debugLogs?: any[]): void {
+  validateRequest(taskName: string, params: unknown, debugLogs?: any[], adcpVersion?: string): void {
+    if (adcpVersion !== undefined) {
+      // A request converted down to a negotiated release is checked against
+      // that release's schema, the one the seller validates.
+      validateOutgoingRequest(taskName, params, this.requestValidationMode, debugLogs, adcpVersion);
+      return;
+    }
     if (this.config.experimentalIdentity33?.() && this.requestValidationMode !== 'off') {
       const outcome = validateIdentity33Payload(taskName, 'request', params, this.config.adcpVersion);
       if (!outcome.valid) {
@@ -1246,6 +1278,8 @@ export class TaskExecutor {
       status: args.status,
     };
     const taskState = this.activeTasks.get(args.taskId);
+    const wireAdcpVersion = taskState?.wireAdcpVersion ?? this.config.wireAdcpVersion;
+    if (wireAdcpVersion !== undefined) meta.wireAdcpVersion = wireAdcpVersion;
     if (taskState?.serverVersion !== undefined) meta.serverVersion = taskState.serverVersion;
     if (taskState?.serverVersionSynthetic !== undefined) {
       meta.serverVersionSynthetic = taskState.serverVersionSynthetic;
@@ -1396,6 +1430,7 @@ export class TaskExecutor {
     // Register task in active tasks
     const taskState: TaskState = {
       taskId,
+      wireAdcpVersion: wireAdcpVersion ?? options.negotiatedAdcpVersion ?? options.selectedAdcpVersion,
       taskName,
       params,
       status: 'pending',
@@ -1407,6 +1442,15 @@ export class TaskExecutor {
       agent: { id: agent.id, name: agent.name, protocol: agent.protocol },
       serverVersion: effectiveServerVersion,
       serverVersionSynthetic: targetCapabilities?._synthetic ?? serverVersion === undefined,
+      ...(taskName === 'refine_proposals' &&
+        targetCapabilities?._synthetic === false && {
+          refinementServedVersion: applicableRefinementServedVersion(
+            targetCapabilities.servedVersion,
+            params?.adcp_version ??
+              toReleasePrecisionVersion(wireAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION),
+            toReleasePrecisionVersion(this.config.wireAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION)
+          ),
+        }),
       idempotencyKey,
     };
     this.activeTasks.set(taskId, taskState);
@@ -1769,7 +1813,7 @@ export class TaskExecutor {
       throwIfAborted(postDispatchOptions.signal);
 
       // Emit protocol_response activity
-      const respStatus = this.responseParser.getStatus(response) as string | undefined;
+      const respStatus = this.responseParser.getStatus(response, taskName) as string | undefined;
       taskState.serverTaskId = this.responseParser.getTaskId(response);
       await this.config.onActivity?.({
         type: 'protocol_response',
@@ -1812,7 +1856,8 @@ export class TaskExecutor {
         dispatchSettlement?.persistPausedContinuation ?? true,
         effectiveServerVersion,
         deferredClientContext,
-        dispatchSettlement?.requireDeferredSettlementResumeAuthorization === true
+        dispatchSettlement?.requireDeferredSettlementResumeAuthorization === true,
+        taskState.refinementServedVersion
       );
       throwIfAborted(postDispatchOptions.signal);
 
@@ -2005,9 +2050,10 @@ export class TaskExecutor {
     persistPausedContinuation = true,
     serverVersion: 'v2' | 'v3' = 'v3',
     deferredClientContext?: unknown,
-    requireDeferredSettlementResumeAuthorization = false
+    requireDeferredSettlementResumeAuthorization = false,
+    refinementServedVersion?: string
   ): Promise<TaskResult<T>> {
-    const status = this.responseParser.getStatus(response) as ADCPStatus;
+    const status = this.responseParser.getStatus(response, taskName) as ADCPStatus;
     const serverTaskId = this.responseParser.getTaskId(response);
     const task = this.activeTasks.get(taskId);
     if (task && serverTaskId) task.serverTaskId = serverTaskId;
@@ -2015,16 +2061,35 @@ export class TaskExecutor {
     switch (status) {
       case ADCP_STATUS.COMPLETED:
         // Task completed immediately
-        const completedData = this.extractResponseData(response, debugLogs, taskName, serverVersion);
+        const completedData = this.extractResponseData(
+          response,
+          debugLogs,
+          taskName,
+          serverVersion,
+          options.negotiatedAdcpVersion
+        );
         // Ordinary calls retain the historical behavior of publishing seller
         // completion before optional governance postflight work. A committed
         // compatibility mutation defers this until durable settlement.
         if (!deferTerminalTaskStatus) this.updateTaskStatus(taskId, 'completed', completedData);
 
-        const operationSuccess = this.isOperationSuccess(completedData, taskName, serverVersion);
+        const operationSuccess = this.isOperationSuccess(
+          completedData,
+          taskName,
+          serverVersion,
+          options.negotiatedAdcpVersion
+        );
 
         // Validate response against AdCP schema - validate extracted data, not protocol wrapper
-        const validationResult = this.validateResponseSchema(completedData, taskName, debugLogs, serverVersion);
+        const validationResult = this.validateResponseSchema(
+          completedData,
+          taskName,
+          debugLogs,
+          serverVersion,
+          params,
+          refinementServedVersion,
+          options.negotiatedAdcpVersion
+        );
 
         // In strict mode, schema validation failures cause task to fail
         const finalSuccess = operationSuccess && validationResult.valid;
@@ -2123,13 +2188,20 @@ export class TaskExecutor {
           persistPausedContinuation,
           serverVersion,
           deferredClientContext,
-          requireDeferredSettlementResumeAuthorization
+          requireDeferredSettlementResumeAuthorization,
+          refinementServedVersion
         );
 
       case ADCP_STATUS.FAILED:
       case ADCP_STATUS.REJECTED:
       case ADCP_STATUS.CANCELED: {
-        const failedData = this.extractResponseData(response, debugLogs, taskName, serverVersion);
+        const failedData = this.extractResponseData(
+          response,
+          debugLogs,
+          taskName,
+          serverVersion,
+          options.negotiatedAdcpVersion
+        );
         // Raw/in-process protocol clients may wrap the tool payload under
         // `data` while carrying the task lifecycle status at the top level.
         // The generic unwrapper intentionally preserves that wrapper, so
@@ -2184,15 +2256,34 @@ export class TaskExecutor {
 
       default:
         // Unknown status - treat as completed if we have data
-        const defaultData = this.extractResponseData(response, debugLogs, taskName, serverVersion);
+        const defaultData = this.extractResponseData(
+          response,
+          debugLogs,
+          taskName,
+          serverVersion,
+          options.negotiatedAdcpVersion
+        );
         if (
           defaultData &&
           (defaultData !== response || response.structuredContent || response.result || response.data)
         ) {
-          const defaultSuccess = this.isOperationSuccess(defaultData, taskName, serverVersion);
+          const defaultSuccess = this.isOperationSuccess(
+            defaultData,
+            taskName,
+            serverVersion,
+            options.negotiatedAdcpVersion
+          );
 
           // Validate response against AdCP schema - validate extracted data, not protocol wrapper
-          const defaultValidation = this.validateResponseSchema(defaultData, taskName, debugLogs, serverVersion);
+          const defaultValidation = this.validateResponseSchema(
+            defaultData,
+            taskName,
+            debugLogs,
+            serverVersion,
+            params,
+            refinementServedVersion,
+            options.negotiatedAdcpVersion
+          );
 
           // In strict mode, schema validation failures cause task to fail
           const defaultFinalSuccess = defaultSuccess && defaultValidation.valid;
@@ -2250,7 +2341,13 @@ export class TaskExecutor {
    *
    * @internal Exposed for testing purposes
    */
-  public extractResponseData(response: any, debugLogs?: any[], toolName?: string, serverVersion?: 'v2' | 'v3'): any {
+  public extractResponseData(
+    response: any,
+    debugLogs?: any[],
+    toolName?: string,
+    serverVersion?: 'v2' | 'v3',
+    negotiatedAdcpVersion?: string
+  ): any {
     // MCP error responses (isError: true) flow through here — the response unwrapper
     // extracts structured data (adcp_error, context, ext) from structuredContent or text
 
@@ -2317,7 +2414,7 @@ export class TaskExecutor {
       // Now unwrap the response
       const unwrapped = unwrapProtocolResponse(response, toolName, undefined, {
         filterInvalidProducts: this.config.filterInvalidProducts,
-        responseAdcpVersion: this.effectiveResponseAdcpVersion(serverVersion),
+        responseAdcpVersion: this.effectiveResponseAdcpVersion(serverVersion, negotiatedAdcpVersion),
       });
 
       // Log successful extraction with result details
@@ -2357,8 +2454,17 @@ export class TaskExecutor {
    * Check if extracted response data represents a successful operation.
    * Handles singular `error`, plural `errors` (AdCP schema), and `success: false`.
    */
-  private isOperationSuccess(data: any, taskName?: string, serverVersion?: 'v2' | 'v3'): boolean {
-    return isAdcpOperationSuccess(data, taskName, this.effectiveResponseAdcpVersion(serverVersion));
+  private isOperationSuccess(
+    data: any,
+    taskName?: string,
+    serverVersion?: 'v2' | 'v3',
+    negotiatedAdcpVersion?: string
+  ): boolean {
+    return isAdcpOperationSuccess(
+      data,
+      taskName,
+      this.effectiveResponseAdcpVersion(serverVersion, negotiatedAdcpVersion)
+    );
   }
 
   /**
@@ -2418,7 +2524,13 @@ export class TaskExecutor {
     serverVersion: 'v2' | 'v3' = 'v3'
   ): Promise<TaskResult<T>> {
     // Extract any data that came with the working response
-    const partialData = this.extractResponseData(initialResponse, debugLogs, taskName, serverVersion);
+    const partialData = this.extractResponseData(
+      initialResponse,
+      debugLogs,
+      taskName,
+      serverVersion,
+      options.negotiatedAdcpVersion
+    );
     const metadata = this.buildMetadata({
       taskId,
       taskName,
@@ -2457,7 +2569,13 @@ export class TaskExecutor {
     serverVersion: 'v2' | 'v3' = 'v3'
   ): Promise<TaskResult<T>> {
     // Extract any data that came with the submitted response
-    const partialData = this.extractResponseData(response, debugLogs, taskName, serverVersion);
+    const partialData = this.extractResponseData(
+      response,
+      debugLogs,
+      taskName,
+      serverVersion,
+      options.negotiatedAdcpVersion
+    );
 
     let webhookUrl = response.webhookUrl;
 
@@ -3044,7 +3162,8 @@ export class TaskExecutor {
     persistPausedContinuation = true,
     serverVersion: 'v2' | 'v3' = 'v3',
     deferredClientContext?: unknown,
-    requireDeferredSettlementResumeAuthorization = false
+    requireDeferredSettlementResumeAuthorization = false,
+    refinementServedVersion?: string
   ): Promise<TaskResult<T>> {
     const inputRequest = this.responseParser.parseInputRequest(response);
     const serverContextId = this.responseParser.getContextId(response) ?? response.contextId;
@@ -3059,7 +3178,13 @@ export class TaskExecutor {
     // continuation. In either case, return the nonresumable pause without
     // invoking a handler or inventing a continuation call.
     if (agent.protocol === 'mcp' || !a2aTaskId) {
-      const partialData = this.extractResponseData(response, debugLogs, taskName, serverVersion);
+      const partialData = this.extractResponseData(
+        response,
+        debugLogs,
+        taskName,
+        serverVersion,
+        options.negotiatedAdcpVersion
+      );
       const metadata = this.buildMetadata({
         taskId,
         taskName,
@@ -3084,7 +3209,13 @@ export class TaskExecutor {
     // state so callers can collect input or refresh credentials themselves.
     if (!inputHandler) {
       // Extract any data that came with the response (some agents include partial results)
-      const partialData = this.extractResponseData(response, debugLogs, taskName, serverVersion);
+      const partialData = this.extractResponseData(
+        response,
+        debugLogs,
+        taskName,
+        serverVersion,
+        options.negotiatedAdcpVersion
+      );
       const metadata = this.buildMetadata({
         taskId,
         taskName,
@@ -3116,8 +3247,12 @@ export class TaskExecutor {
           a2aTaskId,
           serverVersion,
           ...(options.wireAdcpVersion !== undefined && { wireAdcpVersion: options.wireAdcpVersion }),
+          ...(options.negotiatedAdcpVersion !== undefined && {
+            negotiatedAdcpVersion: options.negotiatedAdcpVersion,
+          }),
           ...(options.versionEnvelope !== undefined && { versionEnvelope: options.versionEnvelope }),
           serverVersionSynthetic: this.activeTasks.get(taskId)?.serverVersionSynthetic,
+          ...(refinementServedVersion !== undefined && { refinementServedVersion }),
           agentId: agent.id,
           taskName,
           params: durableDeferredSnapshot(params),
@@ -3185,7 +3320,8 @@ export class TaskExecutor {
           persistPausedContinuation,
           serverVersion,
           deferredClientContext,
-          requireDeferredSettlementResumeAuthorization
+          requireDeferredSettlementResumeAuthorization,
+          refinementServedVersion
         );
       };
       const deferred: DeferredContinuation<T> = {
@@ -3278,8 +3414,12 @@ export class TaskExecutor {
           a2aTaskId,
           serverVersion,
           ...(options.wireAdcpVersion !== undefined && { wireAdcpVersion: options.wireAdcpVersion }),
+          ...(options.negotiatedAdcpVersion !== undefined && {
+            negotiatedAdcpVersion: options.negotiatedAdcpVersion,
+          }),
           ...(options.versionEnvelope !== undefined && { versionEnvelope: options.versionEnvelope }),
           serverVersionSynthetic: this.activeTasks.get(taskId)?.serverVersionSynthetic,
+          ...(refinementServedVersion !== undefined && { refinementServedVersion }),
           agentId: agent.id,
           taskName,
           params: durableDeferredSnapshot(params),
@@ -3354,7 +3494,8 @@ export class TaskExecutor {
           persistPausedContinuation,
           serverVersion,
           deferredClientContext,
-          requireDeferredSettlementResumeAuthorization
+          requireDeferredSettlementResumeAuthorization,
+          refinementServedVersion
         );
       };
       const deferred: DeferredContinuation<T> = {
@@ -3408,7 +3549,8 @@ export class TaskExecutor {
       persistPausedContinuation,
       serverVersion,
       deferredClientContext,
-      requireDeferredSettlementResumeAuthorization
+      requireDeferredSettlementResumeAuthorization,
+      refinementServedVersion
     );
   }
 
@@ -3419,24 +3561,87 @@ export class TaskExecutor {
     agent: AgentConfig,
     transport?: import('../protocols').TransportOptions
   ): Promise<TaskInfo[]> {
-    // Try MCP Tasks protocol method first
+    const credentialOwner = agent;
+    // Native task methods need the same signer/capability scope as tool calls.
     if (agent.protocol === 'mcp') {
-      const authToken = getAuthToken(agent);
+      // Own routing, signing and scalar configuration across discovery awaits.
+      agent = { ...agent, ...(agent.headers && { headers: { ...agent.headers } }) };
+      const version = this.config.wireAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION;
+      let signingContext = buildAgentSigningContext(agent, { adcpVersion: version });
+      if (signingContext) agent = { ...agent, request_signing: signingContext.signing };
+      const syncTokens = () => {
+        agent.oauth_tokens = credentialOwner.oauth_tokens;
+      };
       try {
-        return await listMCPTasks(agent.agent_uri, authToken, undefined, {
-          transport: transport ?? this.config.transport,
-          onTransportActivity: this.config.onTransportActivity,
-          transportActivityContext: {
-            agentId: agent.id,
-          },
-        });
+        // Keep the host's agent identity for refresh coalescing and persistence.
+        if (credentialOwner.oauth_client_credentials) {
+          await ensureClientCredentialsTokens(credentialOwner, {
+            storage: getAgentStorage(credentialOwner),
+            allowPrivateIp: transport?.allowPrivateIp ?? isLikelyPrivateUrl(agent.agent_uri),
+            fetch: transport?.trustedFetchFn,
+          });
+          syncTokens();
+        } else if (credentialOwner.oauth_tokens) {
+          getNonInteractiveOAuthProvider(credentialOwner, {
+            agentHint: credentialOwner.id,
+            storage: getAgentStorage(credentialOwner),
+            allowHttp: isLikelyPrivateUrl(credentialOwner.agent_uri),
+          });
+          shareNonInteractiveOAuthProvider(credentialOwner, agent);
+        }
+        signingContext = buildAgentSigningContext(agent, { adcpVersion: version });
+        if (signingContext) {
+          // A refresh during OAuth discovery changes the authenticated scope.
+          // Rediscover under the new token rather than relabel old evidence.
+          for (let attempt = 0; attempt < 2; attempt++) {
+            await ensureCapabilityLoaded(agent, signingContext, async args => {
+              const previousOwnerTokens = credentialOwner.oauth_tokens;
+              const previousRequestTokens = agent.oauth_tokens;
+              try {
+                return await ProtocolClient.callTool(agent, CAPABILITY_OP, args, {
+                  serverVersion: this.lastKnownServerVersion,
+                  adcpVersion: this.config.adcpVersion,
+                  wireAdcpVersion: this.config.wireAdcpVersion,
+                  versionEnvelope: this.config.versionEnvelope,
+                  transport: transport ?? this.config.transport,
+                  onTransportActivity: this.config.onTransportActivity,
+                });
+              } finally {
+                if (
+                  credentialOwner.oauth_tokens === previousOwnerTokens &&
+                  agent.oauth_tokens !== previousRequestTokens
+                ) {
+                  credentialOwner.oauth_tokens = agent.oauth_tokens;
+                } else {
+                  syncTokens();
+                }
+              }
+            });
+            syncTokens(); // Joined discovery may have refreshed the shared owner.
+            const current = buildAgentSigningContext(agent, { adcpVersion: version })!;
+            if (current.capabilityCacheKey === signingContext.capabilityCacheKey) break;
+            signingContext.invalidate();
+            if (attempt === 1)
+              throw new ConfigurationError('Task-list authorization changed during discovery; retry the call');
+            signingContext = current;
+          }
+        }
+        return await signingContextStorage.run(signingContext, () =>
+          listMCPTasks(agent.agent_uri, getAuthToken(agent), undefined, {
+            signingContext,
+            headers: agent.headers,
+            transport: transport ?? this.config.transport,
+            onTransportActivity: this.config.onTransportActivity,
+            transportActivityContext: { agentId: agent.id },
+          })
+        );
       } catch (err) {
-        if (is401Error(err)) throw err;
-        // Fall through to tool call if protocol method is not supported
+        if (is401Error(err) || err instanceof ConfigurationError || err instanceof TypeError) throw err;
+        // Fall through to tool call if protocol method is not supported.
       }
     }
     const response = (await ProtocolClient.callTool(
-      agent,
+      credentialOwner,
       'tasks/list',
       {},
       {
@@ -3455,17 +3660,31 @@ export class TaskExecutor {
    * Task tracking methods (PR #78)
    */
   async listTasks(agent: AgentConfig, transport?: import('../protocols').TransportOptions): Promise<TaskInfo[]> {
-    const transportSnapshot = snapshotTransportOptions(transport ?? this.config.transport);
-    try {
-      return await this.listTasksForAgent(agent, transportSnapshot);
-    } catch {
-      // Static message only — CodeQL's taint analysis treats `error` and
-      // every property of it as sensitive once it originates from an
-      // operation that touched `agent.oauth_client_credentials`. Surfaces
-      // the failure occurred; full detail is available via DEBUG=adcp:*.
-      console.warn('Failed to list tasks (see DEBUG=adcp:* logs for detail)');
-      return [];
+    return withMCPConnectionPolicy(transport ?? this.config.transport, async () => {
+      if (agent.request_signing) assertSigningPolicy(agent.request_signing);
+      const transportSnapshot = snapshotTransportOptions(transport ?? this.config.transport);
+      try {
+        return await this.listTasksForAgent(agent, transportSnapshot);
+      } catch {
+        // Static message only — CodeQL's taint analysis treats `error` and
+        // every property of it as sensitive once it originates from an
+        // operation that touched `agent.oauth_client_credentials`. Surfaces
+        // the failure occurred; full detail is available via DEBUG=adcp:*.
+        console.warn('Failed to list tasks (see DEBUG=adcp:* logs for detail)');
+        return [];
+      }
+    });
+  }
+
+  private async resolveTaskStatusTool(
+    agent: AgentConfig,
+    transport?: import('../protocols').TransportOptions,
+    signal?: AbortSignal
+  ): Promise<AdcpTaskStatusTool> {
+    if (this.config.resolveTaskStatusTool) {
+      return this.config.resolveTaskStatusTool(agent, { transport: transport ?? this.config.transport, signal });
     }
+    return agent.protocol === 'mcp' ? 'tasks_get' : 'tasks/get';
   }
 
   private async getTaskStatusWithRawResponse(
@@ -3477,12 +3696,11 @@ export class TaskExecutor {
     serverVersion?: 'v2' | 'v3',
     wireAdcpVersion?: string,
     versionEnvelope?: import('../protocols').VersionEnvelopeMode,
-    operationId?: string
+    operationId?: string,
+    pollingTool?: AdcpTaskStatusTool
   ): Promise<TaskStatusPollResult> {
-    // AdCP `tasks/get` is the cross-protocol work-status interface
-    // (`schemas/cache/<v>/bundled/core/tasks-get-{request,response}.json`).
-    // MCP tool names cannot contain `/`, so MCP servers advertise the
-    // SDK-owned `tasks_get` alias; A2A continues to use the spec slash name.
+    // Prefer the advertised AdCP `get_task_status` tool. Older sellers use
+    // `tasks_get` over MCP or `tasks/get` over A2A; all share the same envelope.
     //
     // The previous implementation tried MCP's `experimental.tasks.getTask`
     // first for MCP agents and fell through to the AdCP tool path on
@@ -3490,9 +3708,7 @@ export class TaskExecutor {
     // lifecycle (MCP analog of A2A `Task.state`) — not AdCP work
     // lifecycle. For submitted-arm polling we need work status; the
     // two interfaces are not substitutes, so we always use the AdCP
-    // tool here. MCP sellers that haven't registered `tasks_get` as
-    // an AdCP tool will surface a tool-not-found error rather than
-    // silently polling the wrong lifecycle.
+    // tool here, never the native MCP transport-task endpoint.
     //
     // The request param is `task_id` (snake_case per AdCP 3.0); the
     // response is the spec's flat shape, mapped to `TaskInfo` via
@@ -3505,7 +3721,8 @@ export class TaskExecutor {
     // sellers ignore the unknown request field; the response mapper
     // falls back to the informal `additionalProperties` passthrough
     // for those.
-    const toolName = agent.protocol === 'mcp' ? 'tasks_get' : 'tasks/get';
+    const toolName = pollingTool ?? (await this.resolveTaskStatusTool(agent, transport, signal));
+    throwIfAborted(signal);
     const response = (await ProtocolClient.callTool(
       agent,
       toolName,
@@ -3537,7 +3754,13 @@ export class TaskExecutor {
     // mapper handles the AdCP-spec flat shape, the legacy
     // `{ task: ... }` nested wrapper, and MCP `structuredContent` /
     // A2A latest structured DataPart envelopes.
-    const task = mapTasksGetResponseToTaskInfo(response);
+    // The release this poll was sent at decides whether a bare `completed`
+    // in an un-echoed result is task status or a 3.0 lifecycle value.
+    const resultAdcpVersion =
+      (versionEnvelope ?? this.config.versionEnvelope) === 'major-only'
+        ? '3.0'
+        : (wireAdcpVersion ?? this.config.wireAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION);
+    const task = mapTasksGetResponseToTaskInfo(response, resultAdcpVersion);
     if (!task.taskId || task.taskId !== taskId) {
       throw new TaskBindingMismatchError(
         'tasks/get returned a task identity that does not match the requested task.',
@@ -3600,6 +3823,9 @@ export class TaskExecutor {
     }
     const pollStartTime = Date.now();
     const correlationId = metadataTaskId ?? taskId;
+    // Keep discovery local to this observation session and its transport/auth scope.
+    // Cross-agent polling must not construct and rediscover a client on every tick.
+    let pollingTool: AdcpTaskStatusTool | undefined;
     const withServerTaskId = (metadata: TaskResultMetadata): TaskResultMetadata => ({
       ...metadata,
       serverTaskId: taskId,
@@ -3638,7 +3864,8 @@ export class TaskExecutor {
               a2aCancellationTaskId,
               cancelTransport?.trustedFetchFn,
               cancelTransport?.allowPrivateIp,
-              cancelTransport?.legacyCompat
+              cancelTransport?.legacyCompat,
+              wireAdcpVersion ?? this.config.wireAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION
             ).catch(() => {
               /* see SECURITY note above */
             });
@@ -3672,6 +3899,7 @@ export class TaskExecutor {
       let status: TaskInfo;
       let rawResponse: Record<string, unknown> | undefined;
       try {
+        pollingTool ??= await this.resolveTaskStatusTool(agent, transportSnapshot, signal);
         const pollResult = await this.getTaskStatusWithRawResponse(
           agent,
           taskId,
@@ -3681,7 +3909,8 @@ export class TaskExecutor {
           serverVersion,
           wireAdcpVersion,
           versionEnvelope,
-          metadataTaskId
+          metadataTaskId,
+          pollingTool
         );
         status = pollResult.task;
         rawResponse = pollResult.rawResponse;
@@ -3750,7 +3979,12 @@ export class TaskExecutor {
       }
 
       if (status.status === ADCP_STATUS.COMPLETED) {
-        const pollSuccess = this.isOperationSuccess(status.result, status.taskType, serverVersion);
+        const pollSuccess = this.isOperationSuccess(
+          status.result,
+          status.taskType,
+          serverVersion,
+          metadataTaskId ? this.activeTasks.get(metadataTaskId)?.options.negotiatedAdcpVersion : undefined
+        );
 
         if (pollSuccess) {
           return markAuthoritativePolledTerminal(
@@ -4498,6 +4732,7 @@ export class TaskExecutor {
         state.messages,
         {
           ...(state.wireAdcpVersion !== undefined && { wireAdcpVersion: state.wireAdcpVersion }),
+          ...(state.negotiatedAdcpVersion !== undefined && { negotiatedAdcpVersion: state.negotiatedAdcpVersion }),
           ...(state.versionEnvelope !== undefined && { versionEnvelope: state.versionEnvelope }),
         },
         [],
@@ -4747,6 +4982,7 @@ export class TaskExecutor {
         undefined, // No handler for deferred tasks - input was provided by human
         {
           ...(state.wireAdcpVersion !== undefined && { wireAdcpVersion: state.wireAdcpVersion }),
+          ...(state.negotiatedAdcpVersion !== undefined && { negotiatedAdcpVersion: state.negotiatedAdcpVersion }),
           ...(state.versionEnvelope !== undefined && { versionEnvelope: state.versionEnvelope }),
         },
         [],
@@ -4755,7 +4991,8 @@ export class TaskExecutor {
         false,
         state.serverVersion,
         state.clientContext,
-        state.settlementResumeAuthorizationRequired === true
+        state.settlementResumeAuthorizationRequired === true,
+        state.refinementServedVersion
       );
       resumed = attachDeferredServerVersion(resumed, state);
       const observedResumedServerTaskId = resumed.metadata.serverTaskId;
@@ -4791,7 +5028,11 @@ export class TaskExecutor {
               : {}),
           a2aTaskId: nextA2ATaskId,
           serverVersion: state.serverVersion,
+          ...(state.refinementServedVersion !== undefined && {
+            refinementServedVersion: state.refinementServedVersion,
+          }),
           ...(state.wireAdcpVersion !== undefined && { wireAdcpVersion: state.wireAdcpVersion }),
+          ...(state.negotiatedAdcpVersion !== undefined && { negotiatedAdcpVersion: state.negotiatedAdcpVersion }),
           ...(state.versionEnvelope !== undefined && { versionEnvelope: state.versionEnvelope }),
           ...(state.serverVersionSynthetic !== undefined && {
             serverVersionSynthetic: state.serverVersionSynthetic,
@@ -5880,7 +6121,8 @@ export class TaskExecutor {
     persistPausedContinuation = true,
     serverVersion: 'v2' | 'v3' = 'v3',
     deferredClientContext?: unknown,
-    requireDeferredSettlementResumeAuthorization = false
+    requireDeferredSettlementResumeAuthorization = false,
+    refinementServedVersion?: string
   ): Promise<TaskResult<T>> {
     // This is also the direct same-process continuation when durable storage
     // is absent. Snapshot before the first await so nested caller-owned input
@@ -5957,7 +6199,8 @@ export class TaskExecutor {
       persistPausedContinuation,
       serverVersion,
       deferredClientContext,
-      requireDeferredSettlementResumeAuthorization
+      requireDeferredSettlementResumeAuthorization,
+      refinementServedVersion
     );
   }
 
@@ -5986,7 +6229,12 @@ export class TaskExecutor {
       status: 'failed' as const,
       error: error.message || String(error),
       adcpError: adcpErrorInfo,
-      errorInstance: getSignedRequestRejection(error) ?? this.buildErrorInstance(taskId, adcpErrorInfo),
+      errorInstance:
+        getSignedRequestRejection(error) ??
+        (error instanceof NeedsAuthorizationError &&
+        hasValidatedMcpAuthorizationRequirements(error.requirements, agent.agent_uri)
+          ? error
+          : this.buildErrorInstance(taskId, adcpErrorInfo)),
       correlationId,
       metadata: this.buildMetadata({
         taskId,
@@ -6222,14 +6470,19 @@ export class TaskExecutor {
     response: any,
     taskName: string,
     debugLogs: any[],
-    serverVersion?: 'v2' | 'v3'
+    serverVersion?: 'v2' | 'v3',
+    requestParams?: { adcp_version?: unknown },
+    refinementServedVersion?: string,
+    negotiatedAdcpVersion?: string
   ): { valid: boolean; errors: string[] } {
     const mode = this.responseValidationMode;
     const logViolations = this.config.logSchemaViolations !== false;
 
     try {
+      // A negotiated release is the release on the wire; validate the seller's
+      // payload against it before the client converts it up.
       const pinnedValidationVersion =
-        this.responseAdcpVersionForValidation() ?? this.config.adcpVersion ?? ADCP_VERSION;
+        this.responseAdcpVersionForValidation() ?? negotiatedAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION;
       // Capabilities are negotiated before any pin applies: a 3.0 pin (or a
       // major-only envelope) is served the seller's highest release in the
       // major, echoed in `adcp_version`. Validate against that release, as the
@@ -6242,6 +6495,48 @@ export class TaskExecutor {
         return withServedValidationVersion(response, pinnedValidationVersion, validationVersion =>
           this.validateResponseSchemaAgainst(response, taskName, debugLogs, mode, logViolations, validationVersion)
         );
+      }
+      if (taskName === 'refine_proposals' && mode !== 'off') {
+        const ceiling =
+          requestParams?.adcp_version ??
+          toReleasePrecisionVersion(this.config.wireAdcpVersion ?? pinnedValidationVersion);
+        const issues: ProposalVerificationIssue[] = [];
+        const selected = selectRefinementSchemaVersion(
+          ceiling,
+          response,
+          {
+            adcpVersion: pinnedValidationVersion,
+            servedAdcpVersion: applicableRefinementServedVersion(refinementServedVersion, ceiling),
+          },
+          issues
+        );
+        if (!selected) {
+          const errors = issues.map(issue => `${issue.path}: ${issue.message}`);
+          if (logViolations) {
+            debugLogs.push({
+              timestamp: new Date().toISOString(),
+              type: mode === 'strict' ? 'error' : 'warning',
+              message: `Schema validation ${mode === 'strict' ? 'failed' : 'warning'} for ${taskName}: ${errors.join('; ')}`,
+              errors,
+              issues,
+              schemaVersion: pinnedValidationVersion,
+              mode,
+            });
+            if (mode === 'warn') {
+              console.warn(
+                `Schema validation failed for ${taskName} against AdCP ${pinnedValidationVersion} (non-blocking):`,
+                errors
+              );
+            } else {
+              console.error(
+                `Schema validation failed for ${taskName} against AdCP ${pinnedValidationVersion}:`,
+                errors
+              );
+            }
+          }
+          return { valid: mode !== 'strict', errors: mode === 'strict' ? errors : [] };
+        }
+        return this.validateResponseSchemaAgainst(response, taskName, debugLogs, mode, logViolations, selected);
       }
       return this.validateResponseSchemaAgainst(
         response,
@@ -6321,8 +6616,8 @@ export class TaskExecutor {
     return undefined;
   }
 
-  private effectiveResponseAdcpVersion(serverVersion?: 'v2' | 'v3'): string {
-    return this.responseAdcpVersionForValidation() ?? this.config.adcpVersion ?? ADCP_VERSION;
+  private effectiveResponseAdcpVersion(serverVersion?: 'v2' | 'v3', negotiatedAdcpVersion?: string): string {
+    return this.responseAdcpVersionForValidation() ?? negotiatedAdcpVersion ?? this.config.adcpVersion ?? ADCP_VERSION;
   }
 
   /**

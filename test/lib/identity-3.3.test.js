@@ -60,7 +60,7 @@ test('every vendored WBA vector is graded', () => {
   assert.deepEqual(directories.sort(), ['negative', 'positive']);
   assert.ok(vectorFiles('positive').length > 0 && vectorFiles('negative').length > 0);
   assert.equal(PINNED.excluded, undefined);
-  assert.equal(PINNED.sha, 'f44785a5b65db93988f30ad3d23ba5849f1a1d5e');
+  assert.equal(PINNED.sha, 'b3461a2ea279971b930b3d4d8d23ae56210a987b');
 });
 async function preloadReplay(v, replayStore) {
   for (const entry of v.test_harness_state?.replay_cache_entries ?? [])
@@ -575,11 +575,23 @@ test('sandbox open binding without access context and existing RFC principal bot
   await clean.syncOpen(claim.signerOrigin);
   await assert.rejects(clean.authorizeBound(claim.signerOrigin));
 });
-test('published narrowing denies even nonexclusive seller fallback and house record authority stays on the verified brand path', async () => {
+test('a grant that does not cover the claim never narrows nonexclusive seller discretion, and house record authority stays on the verified brand path', async () => {
   const records = baseRecords();
   records['brand.com'].exclusive_grants = false;
   records['brand.com'].grants[0].countries = ['CA'];
   let fallback = 0;
+  const discretion = await identity.authorizeDemandGrant(claim, {
+    evaluator: evaluator(records).trust,
+    now: () => now,
+    sellerAuthorization: async () => {
+      fallback++;
+      return true;
+    },
+  });
+  assert.equal(discretion.source, 'seller');
+  assert.equal(fallback, 1);
+  records['brand.com'].exclusive_grants = true;
+  fallback = 0;
   await assert.rejects(
     identity.authorizeDemandGrant(claim, {
       evaluator: evaluator(records).trust,
@@ -588,7 +600,8 @@ test('published narrowing denies even nonexclusive seller fallback and house rec
         fallback++;
         return true;
       },
-    })
+    }),
+    e => e.details?.reason === 'grant_absent'
   );
   assert.equal(fallback, 0);
   records['house.com'] = { grants: [grant('agency.com', { profiles: { adcp: { brands: ['child'] } } })] };

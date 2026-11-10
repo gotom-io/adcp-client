@@ -1,8 +1,10 @@
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
+import { compactSchemaForValidation } from '../validation/compact-schema';
 import type { TaskResult } from '../core/ConversationTypes';
 import type { ConformanceToolName, OracleVerdict } from './types';
 import { loadResponseSchema, type ConformanceSchemaOptions } from './schemaLoader';
+import { injectLegacyEnvelopeStatus, isLegacy30xPayload } from '../utils/envelope-status-compat';
 
 export interface OracleInput {
   tool: ConformanceToolName;
@@ -84,7 +86,7 @@ const FS_PATH_SIGNATURES = [/\/Users\/[^ "']+/, /\/home\/[^ "']+/, /[A-Z]:\\\\Us
 let cachedAjv: Ajv | null = null;
 function getAjv(): Ajv {
   if (cachedAjv) return cachedAjv;
-  const ajv = new Ajv({ allErrors: true, strict: false, validateFormats: true });
+  const ajv = new Ajv({ inlineRefs: false, allErrors: true, strict: false, validateFormats: true });
   addFormats(ajv);
   cachedAjv = ajv;
   return ajv;
@@ -101,7 +103,7 @@ function responseValidator(tool: ConformanceToolName, options?: ConformanceSchem
   const cached = compiledValidators.get(cacheKey);
   if (cached) return cached;
   const schema = loadResponseSchema(tool, options);
-  const validator = getAjv().compile(schema);
+  const validator = getAjv().compile(compactSchemaForValidation(schema));
   compiledValidators.set(cacheKey, validator);
   return validator;
 }
@@ -175,8 +177,20 @@ export function evaluate(input: OracleInput): OracleOutput {
   }
 
   const validate = responseValidator(tool, schemas);
-  const payloadForValidation = responsePayloadForValidation(result);
-  if (!validate(payloadForValidation)) {
+  const data = result.data as Record<string, unknown>;
+  // Keep the established 3.0 status-optional compatibility path only for an
+  // explicit legacy release. Unversioned/current responses must satisfy their
+  // schema as returned. The shared shim excludes status-free compact tools.
+  const payload =
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    data.status === undefined &&
+    typeof data.adcp_version === 'string' &&
+    isLegacy30xPayload(data)
+      ? injectLegacyEnvelopeStatus(data, { toolName: tool })
+      : result.data;
+  if (!validate(payload)) {
     const errors = (validate.errors ?? []).slice(0, 3).map(formatAjvError);
     invariantFailures.push(`response schema mismatch: ${errors.join('; ')}`);
     return { verdict: 'invalid', invariantFailures };
@@ -186,12 +200,6 @@ export function evaluate(input: OracleInput): OracleOutput {
     verdict: invariantFailures.length === 0 ? 'accepted' : 'invalid',
     invariantFailures,
   };
-}
-
-function responsePayloadForValidation(result: TaskResult<unknown>): unknown {
-  if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) return result.data;
-  const data = result.data as Record<string, unknown>;
-  return data.status === undefined ? { status: result.status, ...data } : data;
 }
 
 /**

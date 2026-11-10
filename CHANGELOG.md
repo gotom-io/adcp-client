@@ -1,5 +1,380 @@
 # Changelog
 
+## 16.7.0
+
+### Minor Changes
+
+- 63d61dc: Add native field_excludes negative membership checks and the intrinsic
+  field_excludes_runner requirement. Inspect every wildcard terminal without the
+  10,000-value collection cap so large catalogs cannot hide a prohibited value.
+  Empty results and additional matching products remain valid. Reject malformed
+  paths and unresolved comparator references instead of silently proving absence.
+
+### Patch Changes
+
+- ff87222: Reduce cold MCP output-schema compilation and validation memory by factoring large remote schemas into small referenced validators. Preserve seller constraints, reference scopes, formats, and protocol dialects. Add required regression checks for generated function size and repeated output validation, and reduce discovery's peak-memory budget to 512 MiB.
+- 60c97b7: Preserve an already-resolved account brand on list/status-account requests, and ship the published `comply_test_controller` schemas in the packaged bundle.
+
+  **Storyboard brand invariant (`list_accounts`, `comply_test_controller` scenario `force_account_status`)**
+
+  The storyboard brand invariant overwrote `account.brand` on every natural-key account reference with the run's brand. For requests whose `account` _is_ the subject of the operation, that brand is half of a composite natural key rather than the run's session scope: overwriting it kept the resolved `operator` and produced a schema-valid reference to an account nobody provisioned. Those two operations now keep an explicitly supplied `account.brand` and only ever add the run brand to a reference that carries none.
+
+  The preservation check uses `Object.hasOwn`, matching the sibling sandbox gate in `src/lib/server/account-mode.ts`, so an inherited `Object.prototype.brand` cannot make this branch preserve a brand the request never carried. That is the only claim: the enclosing natural-key test is pre-existing and still uses `in`, so this is not prototype hardening for the whole function. Malformed brand values are passed through to validation rather than substituted. A _missing_ `operator` is still scaffolded, as it has been since #1419 — it is now derived from the preserved brand's domain rather than the run brand's, which is the point of the repair, not an exception to it.
+
+  Deliberately bounded: this covers `list_accounts` and `force_account_status` only. `request_account` keeps its existing run-brand behavior, and other account-subject tools — including the supported financial and change-feed operations — are unchanged and still affected. This is not a general account-subject exemption. The `{account_id}` arm of `AccountReference` stays closed, ID-only references, omitted accounts, unfiltered listing and the existing wholesale `get_products` / `get_signals` exceptions all behave as before.
+
+  **Packaged `compliance/` schemas**
+
+  `compliance/` was excluded from the published bundle wholesale, so `getSchemaValidatorByRef('compliance/comply-test-controller-*.json', version)` returned `undefined` against an installed package even though every supported release publishes both documents, and `schemaAllowsTopLevelField` failed open for the tool. The build now copies the controller request and response plus the siblings they `$ref`, transitively and byte-for-byte, from the selected published cache. Only absolute or root-relative same-version refs within the same `compliance/` directory are followed, and each resolved path is re-checked for containment before it is read. Nothing is fetched or generated.
+
+  Per-version consequences, from the retained published caches:
+  - **3.0.25** — 2 files. The controller request declares neither `account` nor a top-level `brand`, and the response composes no protocol envelope, so no sandbox-account carrier or task-status requirement applies.
+  - **3.1.30** — 2 files. The request requires the sandbox `account` assertion; the response composes the version envelope and then the protocol envelope, and that protocol envelope requires `status`.
+  - **3.2.8** — 4 files. Same request and response requirements as 3.1.30, plus `task-completion-data.json` and the `get-creative-features-completion.json` it references. Without those two AJV cannot compile the controller validator at all.
+
+  Three consequences are visible without any agent change. `getSchemaValidatorByRef('compliance/comply-test-controller-request.json', version)` and its `-response` counterpart now return a validator against an installed package, as do `getValidator('comply_test_controller', 'request', version)` and `getValidator('comply_test_controller', 'sync', version)` — `'sync'` is the terminal response variant, and `getValidator(..., 'response', ...)` is not a legal `Direction` and returns `undefined`. The documents were previously absent and every such lookup returned `undefined`. Declared-field gating now has a schema to consult, so the runner stops adding an undeclared root `brand` to controller requests and the controller `account` stays canonical on the releases that declare it — 3.1.30 and 3.2.8 declare `account`, 3.0.25 declares neither `account` nor a root `brand`. And the selected release's response JSON Schema validation actually runs for this tool, so a controller that was already nonconformant can newly fail a conformance step. The request schema resolves too, so `validateRequest` now actually checks controller requests — new log noise at the `'warn'` default, hard failures for anyone running `validation: { requests: 'strict' }` — and, since that schema declares no root `brand`, a run-scoped root `brand` that previously rode along by fail-open is now suppressed. That is not a new wire contract: `status` was already required through the 3.1.30 and 3.2.8 protocol envelopes and is not required by 3.0.25. `src/lib/testing/client.ts` defaults `validation.responses` to `strict`, so testing-surface runs see this first; the ordinary client surface warns separately, and the generated Zod projection check is a separate layer that is unchanged. `docs/development/WIRE-VERSION-COMPAT.md` records the per-release file counts and points at the existing temporary legacy escape hatch in `docs/guides/VALIDATE-YOUR-AGENT.md`.
+
+  Seeding the copy set from the entry points keeps it minimal by construction, but it trims nothing today: on all three retained caches the reachable closure is the entire `compliance/` directory. The filter is forward-looking, not presently selective. A bare-relative `"./x.json"` ref would not be followed; none exists in any published cache, and the per-version compile assertion in the new packaging test is the net for either case.
+
+  Existing bundle behavior is otherwise untouched: highest-patch collapsing, the retained MCP media-buy role projection, `tmp/` and `bundled/` exclusion, compact bundles and prior compatibility handling all stay as they were.
+
+- 63d61dc: Scope automatic product and pricing-option fixtures to the account used by the
+  storyboard's effective public requests, retaining complete natural identity or an
+  opaque account reference across ordinary, routed and fixture-resolution seeds.
+  Resolve run-brand overrides, context inputs, provisioning account aliases and
+  later timezone enrichment consistently; refuse ambiguous or unresolved account
+  scope. Independent account provisioning seeds retain their existing targets.
+  Include operator unit, currency and timezone in the server's natural-account seed
+  cache scope so one account cannot reuse another account's fixture cache entries.
+
+  Preserve provenance creative_policy.accepted_verifiers agent URLs when stripping
+  legacy creative-format identity, including URLs shared with a format provider.
+
+  Preserve complete account identity through the platform controller wrapper and
+  refuse catalog auto-seeds without a resolved account instead of reporting a
+  successful fixture write after dropping it.
+
+  Preserve the optional open controller account carrier at MCP ingress so full
+  identity reaches per-request store factories without rejecting valid AdCP 3.0
+  requests. AdCP 3.1 callers still supply their required sandbox assertion.
+
+- 63d61dc: Preserve the authored create_media_buy brand when the storyboard runner has no
+  explicit run-brand override. The fixture-aware buyer enricher previously replaced
+  that brand with test.example even when the account correctly named the fixture's
+  advertiser, causing strict sellers to refuse an otherwise valid auction buy.
+  An explicit run-brand option continues to override the request and account together.
+- 49c7f16: Reuse compiled MCP output-schema validators across tool listings and connections with a content-keyed LRU capped at 256 entries and 64 MiB of serialized schemas per MCP era. Preserve legacy and modern JSON Schema validation behavior, isolate schemas with conflicting `$id` values, and release compiler caches on eviction. Schemas exceeding the byte budget still validate but are not cached; generated validator code contributes additional memory beyond the schema-byte allowance.
+
+  Add reproducible performance comparisons using real AdCP schemas, with CI guards for repeated compilation, event-loop stalls, peak RSS, retained heap, and compiler retention after LRU eviction. Reports include an uncached reproduction and a hidden-cache memory-leak negative control.
+
+- 63d61dc: Synchronize the registry OpenAPI snapshot and generated response types with the
+  official additive brand entry field. Keep existing brand_manifest semantics and
+  relationship authorization unchanged.
+- 63d61dc: For canonical creatives with known package declarations sent to legacy sellers,
+  choose a legacy format identity shared by every compatible package instead of selecting from their
+  union. Preserve SDK 16's canonical kinds and wire mappings; explicit assignments
+  still require a compatible reference in every assigned package, with owner,
+  option and dimension constraints retained. Unscoped or unmapped selectors and
+  explicit legacy creative identities retain SDK 16's existing projection route.
+- d4883a3: Validate storyboard webhook payloads against the run's selected AdCP release and report the exact resolved schema version. A 3.0 run now grades its webhook result against the 3.0 contract, while incoming webhook version claims cannot change the selected validator. Runs without a version pin keep the SDK default.
+- 6553bfa: Adopt the maintained AdCP 3.1.32 compliance corpus alongside the existing 3.1.30 and 3.0.25 corpora.
+
+  `sync-schemas:all`, `schemas:ensure` and the published-artifact validator now treat 3.1.32 as a maintained side bundle. It is synced through the ordinary signature-required route from the official origin, with no mirror, trust or custom-bundle override, and the validator requires it in the packed inventory the same way it already requires 3.1.30 and 3.0.25.
+
+  Added alongside, not instead of. `compliance/cache/3.1.30/` keeps its exact bytes and stays packaged, so a run pinned with `--compliance-version 3.1.30` still resolves the fixtures it pinned.
+
+  One asymmetry is worth stating plainly, because the two caches behave differently. Schema bundles collapse by minor: `copy-schemas-to-dist.ts` ships the highest patch per minor, so `dist/lib/schemas-data/3.1/` resolves to 3.1.32 and the packaged 3.1 _schema_ directory no longer carries 3.1.30 bytes. Compliance corpora do not collapse — both patch directories ship with their own bytes. Retaining the 3.1.30 source cache is a promise about compliance fixtures, not about the schema alias.
+
+  Comparing the two releases' schema trees, they differ only in release identifiers and generated timestamps; no structural validation-rule changes were found between them.
+
+  `COMPATIBLE_ADCP_VERSIONS` describes accepted wire versions, not the inventory of packaged compliance corpora. This package ships corpora for 3.0.25, 3.1.30, 3.1.32 and 3.2.8; it does not include an exact 3.1.31 compliance cache.
+
+  Not strictly additive for storyboard coverage. Four unique storyboards (eight mirrored copies) are inert on this SDK under 3.1.32 because they declare the `collect_product_pages_runner` requirement, which SDK 16 does not implement. Two of them — `media_buy_seller/canonical_formats` and `pricing_currency_filter` — carry no requirement in 3.1.30 and do run there, so pinning 3.1.32 instead loses that coverage; they report `requirement_unmet` and skip rather than failing silently. The other two, `canonical_custom_formats` and `canonical_experimental_formats`, are new in 3.1.32 and inert for the same reason, so they are not lost coverage. Nothing was relaxed to make them pass.
+
+  The primary pin is unchanged at AdCP 3.2.8, with its skills, codegen provenance and `latest` pointer untouched; a side sync never repins the primary. `LAST_3_1_GA_PATCH` advances from 30 to 32 so the generated compatibility enumeration covers the new patch.
+
+- 7e7d903: Keep runner-local assertions, probes, accountless controller capability discovery and
+  format-only validation requests from inventing a second catalog account through run-brand defaults.
+  Rate-limit trip assertions still contribute the account of their actual nested
+  seller request, and conflicting authored or default buyer accounts continue to fail
+  before catalog seeding. Preserve frozen AdCP 3.0 storyboards without changing
+  their contents or the SDK's protocol/cache pins.
+
+  Use the run's selected AdCP schema for brand/account field presence checks,
+  so legacy format discovery does not acquire the primary version's scoped
+  account. Preserve the controller builder's actual sandbox default when checking
+  mutating-controller account ambiguity on legacy versions.
+
+## 16.6.1
+
+### Patch Changes
+
+- d7b1c13: Package the signed auction-only seller compliance fixes from AdCP 3.2.8, including the corrected 3.1.30 maintenance bundle. Shared lifecycle and measurement-rejection scenarios accept auction CPM offers, and stale-cache checks use the advertised controller scenario and a consistently scoped warm cache.
+- b2b5130: Construct bids for every discovered auction CPM package in a storyboard buy, preserving authored bids, fixed-price offers, and bidding policies. Add explicit `enrich_request: true` opt-in for schema-valid semantic rejection probes so measurement-term rejection is tested with a valid auction request while malformed-input probes retain their authored payloads.
+
+  Preserve the requested deterministic stale-cache age when forwarding `force_upstream_unavailable` to a test-controller store, including zero, and reject invalid ages before invoking the store.
+
+- d7b1c13: Validate canonical response version metadata in open conformance response schemas while preserving root extensions, authored version restrictions, and nested object constraints.
+- 1209a4a: Upgrade the MCP Node adapter to 2.1.1 to include upstream request-body and JSON-RPC batch bounds (GHSA-f897-62hf-6gxq), while retaining compatibility with the SDK's existing MCP server dependency.
+
+## 16.6.0
+
+### Minor Changes
+
+- 76a97b5: Expose every manifest tool through typed AgentClient and SingleAgentClient methods and executeTask request/response maps. Add non-deprecated methods and usable public request/response types for supported creative, content-standards, and rights tools while keeping their Legacy aliases. Typed getTaskStatus({ task_id }) and listTasks({}) overloads query the seller without changing existing string-status and local-task-list APIs. Preserve existing executeCustomTask workarounds for newly typed tools.
+
+  Direct SingleAgentClient governance methods use a configured governance agent, or require the client's own agent to advertise the requested governance tool. Generic preview_creative execution follows the canonical preview method; callers requiring raw named-format payloads can use previewCreativeLegacy().
+
+- 505ddc9: Add version-aware media-buy lifecycle validation for AdCP 3.3 creative review. `getMediaBuyTransitions(adcpVersion)` and the optional version argument on the existing transition helpers permit `pending_start` to return to `pending_creatives` when seller review creates buyer work before activation. Older releases retain their existing graph, and active, paused, and terminal-state protections remain unchanged. The storyboard `status.monotonic` invariant uses the same release-specific graph, honoring the seller's response version before the requested pin, including nested media-buy reads.
+
+  Support `update_creative_start_policy` as an operational action in buyer preflight and seller action projection, with explicit live seller authority and exact package scope rather than a fabricated commercial change term. Require the 3.3 contract, preserve independent `sync_creatives` routing, and consume the startup field's task and update bindings from schema generation without changing the SDK's default AdCP pin.
+
+- 6a065de: Align `authorizeDemandGrant` with the one delegation-chain rule (adcontextprotocol/adcp#8473, an erratum to ratified R6), and run its cross-SDK vectors.
+  - **Implicit authority:** `account.operator` and the signer's operator only need to each be the brand or its house. A brand-operated account with the house's own agent signing (or the reverse) is implicit; before, both had to equal the same domain.
+  - **Chains:** at most two grants from the house's record to the signer's operator, every grant covering the claim, with `account.operator` the brand, the house, or the first grant's grantee. Brand- and house-operated accounts can now use a two-grant chain, and the brand's own record can supply the second grant. When several candidate chains exist, an unreadable intermediary record is an outage only if no other chain authorizes.
+  - **Exclusivity:** `exclusive_grants: true` on the house's record makes `grants[]` the complete list whatever the scope, so an uncovered claim is `grant_absent` and `sellerAuthorization` is never called. This reverses the per-scope reading shipped in 16.5.0. Without it, an uncovered claim is at the seller's discretion, and a grant that does not cover the claim no longer narrows that discretion.
+
+  `test/lib/identity-3.3-delegation-chain-vectors.test.js` runs all 48 vectors from `static/test-vectors/delegation-chains.json` (vendored, pinned in `test/fixtures/delegation-chains/PINNED.json`).
+
+- 6a065de: Backport stable SDK adoption fixes without changing the AdCP 3.2.7 pin or legacy HTML projection. Preserve media-buy lifecycle status for AdCP 3.0 buyers and select account-change response validation from negotiated release metadata or an explicit fallback. Add the signature-agnostic, release-aware `parseMediaBuyDeliveryWebhook`, readable schema-ref validators, a shared delivery-body type/schema, canonical AssetVariant exports and shallow schema typing with reachable asset minItems validation, and frozen targeting-key lists.
+
+  Preserve safe account identity fields through `accounts.upsert` response projection. SDK 16 retains the existing `SyncAccountsResultRow` interface and its required legacy fields for source compatibility. When `account` is present, the framework emits it as the 3.2 identity anchor and omits flat brand/operator; 3.0/3.1 responses retain the flat identity. Destination billing staging data, bank details, and framework auth metadata remain private; nested identity objects are validated and detached before output/replay caching. SDK 17 provides the modern account-only result union.
+
+  Restore strict `by_package` validation for webhook result rows while retaining existing stable polling schema tolerance. The new shared body type follows that existing stable poll output shape. No global nonempty-array/daypart type tightening or SDK17 HTML-kind remapping is included.
+
+  Restore protocol-authored minItems only in the schema graph reachable from `AssetVariantSchema`, including macro declarations and catalog selections. Empty arrays in those fields already violate the published canonical types. A shallow canonical output annotation fixes TypeScript 5.9/7 assignability without global nonempty-array or daypart changes; the union options helper remains available.
+
+  The asset graph includes shared catalog, provenance, inline-markup, tag/redirect and tracker schemas, so their direct Zod consumers also reject the same protocol-invalid empty arrays (including catalog/provenance fields in other payloads). Existing wire JSON Schema validation already rejects these values. Per-branch union helpers and the typed input contract are retained.
+
+### Patch Changes
+
+- b581184: Avoid multi-megabyte generated JSON Schema validator functions and the associated Node24/V8 Maglev memory spikes (#3457). Compile available authored modular tool graphs with separate referenced validators, retain response-envelope relaxation and bundled-only custom-root support, and factor large self-contained conformance schemas into private local definitions before compiling. Public schema documents and compact archive serialization remain unchanged. AJV construction sites now retain referenced validator functions instead of inlining them.
+
+  Together with cached compliance storyboard lookups, this also reduces the cold validation cost reported in #3455 without changing process-wide V8 settings.
+
+  Validation diagnostics retain AJV's original function-relative `schemaPath` spelling; private origin IDs stay internal. Runtime schema paths may change with compiler factoring and are diagnostic details, not stable selectors into the public bundled document. `schemaId` records the effective rejecting resource where available, including embedded IDs; unavailable origin metadata falls back conservatively to the compiled tool root. Required-field pointers escape slashes and tildes per RFC 6901.
+
+- 3fce7fd: Fix canonical-format storyboard grading to resolve every supplied format selector route independently before applying precedence (#3454). Co-present product references, legacy format IDs and direct canonical selectors must select identical product-option sets; unresolved or conflicting secondary routes now correctly satisfy authored negative cases instead of being ignored.
+- c472e33: Cache a bounded storyboard index per resolved compliance/schema authority (#3455). Warm `getComplianceStoryboardById` calls no longer read and parse every YAML in the bundle. List and id lookups return detached storyboards with trusted loader provenance preserved; replacing the bundle index invalidates its cache.
+- 2e1cc79: Prepare artifact-delivery webhook validators before signature verification. Missing or ambiguous schema configuration returns `webhook_verification_unavailable` without consuming a valid signature nonce, so correcting configuration permits retrying the original signed bytes. Preserve existing creative-conversion advisories when transferring diagnostics onto an already projected object.
+- 76a97b5: Use the advertised `get_task_status` tool for all SDK task polling, including submitted continuations and persisted task tracking. Preserve `tasks_get` (MCP) and `tasks/get` (A2A) for sellers that do not advertise the protocol tool.
+
+  Resolve the tool once per polling session and preserve the existing supported-seller request-signing rule for the new polling name on both MCP and A2A.
+
+- 60a774a: Convert creative pixel trackers for AdCP 3.0 delivery and explicit legacy URL tracker slots. Preserve tracker URLs, report lossy event or JavaScript conversions, and refuse slot collisions.
+- 2d87d2d: Select among multiple legacy image, hosted video and audio formats using unambiguous primary media dimensions or duration when explicit creative parameters supply no constraints. Read seller option constraints for opaque legacy IDs while preserving single-reference scaling and exact duration matching.
+- 6a065de: Legacy creative projection failures (`ADCP_CREATIVE_FORMAT_PROJECTION_FAILED`) now identify incompatible creative kinds and unmatched rendered sizes. Ambiguous sized refs suggest `format_parameters.width`/`height`. Error codes and selection behaviour are unchanged; only the message text differs.
+- 827d64c: Report rate limiting during MCP endpoint discovery instead of a wrong-path error. When a probe answers HTTP 429, or 503 with `Retry-After`, discovery stops at that URL and throws the new `AgentRateLimitedError` (`code: 'RATE_LIMITED'`) with the status, the probed URL, and `retryAfter` / `retryAfterMs` when the agent sent a well-formed `Retry-After`. It no longer probes the remaining candidate URLs, which only spent more of the seller's request budget, and no longer adds the "agent_uri does not include the MCP endpoint path" hint. Other discovery failures, 401 handling, and successful discovery are unchanged.
+- 6a065de: Persist buy and package creation context in `createMediaBuyStore` and backfill missing resource context on `get_media_buys`. Preserve opaque null values, empty objects and creation context through targeting updates without replacing seller echoes or the read request's context.
+- 8c83ac9: Stop fabricating `media_buy_status` from the task status when a 3.1+ seller omits the optional response `adcp_version` echo (adcp-client#3432). A conformant seller may answer `create_media_buy` or `update_media_buy` with `{ status: 'completed', media_buy_id, ... }`. From AdCP 3.1, that top-level `status` is the task envelope status. The SDK used to treat any un-echoed response as possibly 3.0, so it copied `completed`, `rejected` or `canceled` into `media_buy_status`. Buyers then saw a buy reported as finished, and the storyboard `status.monotonic` invariant rejected a legal create → `active` readback (the symptom from #3395).
+
+  The response helpers now use the release the request was sent at (the buyer's `adcpVersion` pin, the release negotiated from it, or the SDK default) when the payload carries no version echo. This applies to the buyer client, `tasks/get` results, the AdCP 3.1 response adapter, response validation and the storyboard runner. `LegacyEnvelopeStatusOptions` and `extractContext` accept an optional `adcpVersion` for this.
+
+  Behaviour change for adopters: on a 3.1+ exchange, an un-echoed `status: 'completed' | 'rejected' | 'canceled'` is returned as sent, with no `media_buy_status` added. Read the media-buy lifecycle from `media_buy_status` when the seller sends it.
+
+  Unchanged:
+  - A 3.0 exchange (pinned or negotiated) still moves a lifecycle sent in `status` into `media_buy_status`.
+  - An explicit `adcp_version` or `adcp_major_version` echo from the seller still takes precedence over the requested release.
+  - Unambiguous lifecycle values such as `active` keep the existing legacy move.
+
+- c5398af: Keep accepted seller work alive when an implicit MCP task scope returns a successful nonterminal result (`submitted`, `working`, `input-required`, `auth-required`, or `deferred`). Close the local client and remove scoped cache entries without issuing a destructive session DELETE. Completed tasks and explicit caller-owned workflow scopes retain their normal session termination policy; credential and connection partitions are unchanged.
+- ba31d1f: Convert repeatable pixel-tracker arrays when an explicit legacy format requires a URL tracker slot, including already named slots. Preserve every tracker and report lossy conversion diagnostics at each array index. Keep mixed roles and partially convertible arrays unchanged rather than forcing them into one slot.
+- 2001fbb: Expose the trusted SDK-selected release as optional `TaskResult.metadata.wireAdcpVersion`, including same-release negotiation without changing request stamps or validation overrides. Account-change drains validate against that known wire contract before considering the seller's echo; a custom reader's explicit validation pin also takes precedence over an unverified echo. An older echo cannot relax 3.3 changed-path requirements when negotiation or an explicit wire override established the release. Sellers without authoritative release metadata retain the existing echo/client fallback.
+
+## 16.5.0
+
+### Minor Changes
+
+- a31d162: Keep universal support documents without phases out of executable compliance bundles. Malformed or unreadable coverage remains visible as untested with warnings. Lifecycle invariants now record eligibility only for tasks their extractors can observe; empty lifecycle observations still keep coverage partial. Read proposal lifecycle state from the published `proposals[].proposal_status` fields so real illegal transitions are detected. Optional-only storyboards pass only with real executed passing coverage and no failed phases except moot alternatives with a successful contributing peer.
+
+  Preserve storyboard-wide assertion failures in the failure list with a whole-storyboard rerun command. Add `incomplete_storyboards` to the versioned summary artifact for false zero-step verdicts that have no failed step, keeping incomplete coverage distinct from seller failures in JSON, text, and Markdown.
+
+  Observe persistent notifications on the subscriber URL from successful registration, retain trigger time boundaries, and match positive flat payload selectors exactly. Conflicting selectors and flat payload selectors on negative assertions now reject invalid authoring. Ordinary positive assertions cannot reuse an already observed physical delivery or logical retry; explicit delivery-count and retry assertions retain their full evidence. Runner-owned assertion and probe tasks now retain failed-prerequisite classification after a stateful failure instead of pretending the seller omitted a tool.
+
+- 4f5d366: Add optional authorization for fresh fixture preparation before seller contact (#3389).
+
+  `prepareStoryboardFixtures` accepts `PrepareStoryboardFixturesOptions.prepared_fixtures_preparation_authorizer`. Its new `PreparedFixturesPreparationLookup` carries `gate: 'prepare'` and the SDK-computed proposed `current` scope, with no fabricated stored binding, reference, or seller profile. The callback runs exactly once before client creation, initialization, discovery, controller activity, or catalog reads. Only literal `authorized: true` grants; other decisions throw `PreparedFixturesDeniedError('authorizer_denied')` with zero seller contact and private canonical audit evidence. Authorized dispatch detaches mutable account, brand, credential, route, and storyboard data across awaits; runtime transport and OAuth storage keep their host-owned identity. Scope drift refuses with `binding_mismatch` before fixture calls after discovery and before state can be minted.
+
+  This is additive on SDK 16: `PreparedFixturesLookup.binding` remains required, its gate union is unchanged, and `prepared_fixtures_authorizer` remains exclusively the every-lookup reuse hook. Supplying only that existing hook to preparation retains legacy behavior and does not authorize preparation. Hosts requiring the fresh gate must explicitly adopt the new option. A preparation grant never replaces later reuse authorization.
+
+  The preparation-only option is rejected before contact on run, step, and compliance entry points. Existing integrations that omit it retain their behavior. Host refusal details are not echoed at the preparation gate; audit sink failures never grant access.
+
+- 6c281d9: Add `transport.connectionPartition` to isolate MCP session reuse by a caller-owned principal without sending that value to the seller. The partition separates modern, legacy, and OAuth sessions, endpoint discovery, shared discovery, and signing-policy evidence. It also separates principals inside a workflow connection scope.
+
+  Unscoped MCP calls now own and close one-shot sessions by default, restoring isolation when callers share a seller credential and identify their customer only in tool arguments. To keep process-wide reuse, configure a stable nonempty partition or explicitly set `transport.connectionReuse: 'process'` for a single-principal caller. Explicit connection scopes retain workflow reuse. Injected fetch implementations remain one-shot outside a scope. Repeat the partition when replacing a constructor's transport with per-call options.
+
+  The public low-level MCP tool and native task helpers also detach from any enclosing caller policy and accept explicit partition/reuse settings. Calls such as unscoped seller-side `checkGovernance()` now own one-shot sessions. Product-cache reads and writes are bypassed when a per-call transport changes the configured principal.
+
+  Native task follow-ups accept explicit routing headers and signing context, detach inherited signing identities, and supply the official MCP SDK result schema when reading task results.
+
+- 3d53212: Allow reporting source offerings to declare `applicability: { productIds: [], products: { kind: 'host_attested' }, constituentKinds }` for products created per brief or buy. Trusted host coverage resolution remains responsible for per-product eligibility and account authorization; constituent kinds and product bindings remain enforced. Existing `applicability.productIds` declarations retain their validation, required array type, and capability hashes. Buyer declarations cannot supply applicability fields, and an adapter's executor cannot broaden a declared product allowlist.
+- 1dcd427: Automatically sign JSON-RPC protocol methods according to the seller's separate `protocol_methods_required_for`, `protocol_methods_warn_for`, and (with `sign_supported`) `protocol_methods_supported_for` lists. Add `always_sign_protocol_methods` for exact slash-path/PascalCase pilot overrides with inline or provider-backed keys, including before discovery. Preserve the separate AdCP-operation namespace and reject ambiguous method bodies before dispatch when protocol-method policy applies.
+
+  Sign compatibility `tasks_get` MCP and `tasks/get` A2A skill polls when the seller declares support for the buyer's signing profile, with fresh nonces, existing transport authentication, and version-appropriate body binding. A configured but invalid signing identity can now fail these polls instead of relying on unsigned bearer fallback. Best-effort A2A cancellation uses the shared signer, active AdCP wire pin, and Web Bot Auth advertisement gate. A Web Bot Auth cancellation is abandoned when cached profile support is unavailable.
+
+  Native SDK task listing now primes signing capabilities and retains configured authentication/routing headers. Partition transport, discovery, and testing-client reuse by signing overrides so cached wrappers retain the correct policy. Preserve unsigned functional-compliance bootstrap discovery by refusing A2A invocation-method overrides that would sign it.
+
+  Reject malformed signing flags before dispatch instead of silently downgrading to unsigned requests. Preserve the functional runner's unsigned capability-bootstrap policy even when cached protocol-method coverage includes all A2A messages.
+
+- 7b181ff: Enforce the AdCP nonce alphabet and 16-byte minimum in request and RFC 9421 webhook verification. Reject invalid nonces before key resolution or replay insertion. After authenticating a frame and its body digest, record its nonce before rejecting malformed JSON, so repeated malformed frames stop at replay detection without repeating cryptographic verification. Malformed request bodies now report checklist step 14 instead of step 11. The shared body check refuses invalid UTF-8 and leading BOMs to avoid parser disagreements. Webhook verification now reports `webhook_body_malformed` at checklist step 14. Preserve operation-resolution prechecks, unsigned-request policy, and rejection of invalid signatures or digests before replay insertion.
+
+  Signers overriding `nonce` must supply at least 16 random bytes encoded as unpadded Base64URL; padded or standard-alphabet Base64 now produces `*_signature_params_incomplete`. Consumers handling `WebhookSignatureErrorCode` exhaustively must add `webhook_body_malformed`.
+
+- 8c97223: Preserve native capability-discovery failures before storyboard applicability gates, including redacted protocol evidence and validated OAuth metadata. Reused failed evidence cannot become a healthy profile or seed a signing downgrade; subsequent discovery passes can recover. Schema-invalid successes remain available to ungated diagnostic storyboards, with schema notices, while explicit and implicit capability-gated execution now fails before inferring absence from malformed data. Invalid public profile tools are rejected before contact; valid legacy object-shaped tool entries remain supported. Storyboards containing sync_accounts, OAuth metadata, request-signing, or creative-build gates now stop at discovery_failed when capability evidence is schema-invalid. A rejected capability call also stops native comply storyboards before execution, except explicit capability diagnostics and the trusted auth-degraded security baseline.
+
+  Restart wholesale fixture enumeration when its scope, feed version, or pricing version changes. Discard every candidate and capture from the abandoned walk before selecting a new graph. Retries are bounded to three restarts and the existing cumulative page limit; continuous churn reports a runner-owned bounded-observation not_applicable gap instead of seller failure or a complete no-match. Preserve terminal schema, transport, and malformed-pagination failures.
+
+  Echo the authored context_key on collection set comparisons, including every failure branch, without changing the comparison verdict.
+
+  Preserve validated MCP NeedsAuthorizationError instances on core TaskResult.errorInstance, so SDK callers and native discovery retain interactive OAuth requirements after transport authentication failures.
+
+### Patch Changes
+
+- eaaa07f: Make response-size errors name `transport.maxResponseBytes` and explain how to raise it on the client or call for large legitimate reads. Keep the existing 4 MiB default and document a 64 MiB configuration for catalog, signal, media-buy, and delivery readers.
+- 47934c6: Adopt the signed AdCP 3.2.7 schema and compliance bundle, including evaluator off-list rejection coverage and the 3.2.6 stabilization changes below. Relative to 3.2.6, the 3.2.7 refresh adds no wire-schema shapes and preserves maintained AdCP 3.0/3.1 compatibility. Extend the reviewed commercial-term annotation snapshot to the identical 3.2.7 contract and refresh canonical storyboard provenance to the immutable 3.2.7 release.
+
+  Evaluator off-list rejection phases are now required when an agent advertises evaluator support. A wrong acceptance or observed off-list outbound call fails conformance; an unavailable valid build fixture produces a `fixture_unsatisfied` coverage gap with no executed security credit. Hosts can provision valid inputs through `test_kit.creative_build_probes`.
+
+  CLI migration: this SDK packages the exact AdCP 3.2.7 compliance corpus. Update explicit `--compliance-version 3.2.5` or `3.2.6` flags to `3.2.7`; runs that need historical fixture bytes must retain the SDK version that packages that corpus. Maintained AdCP 3.1 and 3.0 corpora remain included.
+
+  Resolve property and collection lists from standard MCP structured or JSON text responses, preserving upstream AdCP errors. Keep task completion separate from media-buy lifecycle observations in storyboard checks. Stop injecting task status into current, unversioned, and status-free compact responses during conformance validation, while retaining explicitly declared AdCP 3.0 compatibility. Admit canonical version metadata in closed response schemas without relaxing other fields.
+
+  Prepare build tooling for exact AdCP 3.3 beta and release-candidate pins without advertising 3.3 support from stable SDK 16.
+
+  When grading AdCP 3.0 sellers, select the matching AdCP 3.0 schema version so their status-optional responses are evaluated against that release.
+
+- 5a0a03f: Fix canonical format matching when a buyer's direct selector omits the product's `asset_source`, `buyer_asset_acceptance`, `composition_model`, `slots`, or `ssl_required`. These declarations remain on the product and do not need to be repeated to select it; omission does not supply defaults or assert contrary policy. Explicit conflicts still fail matching, and dimensions, duration, encoding limits, and unknown product constraints remain enforced.
+
+  This fixes the published AdCP 3.2.6 canonical_formats positive selector in storyboard validation and the shared canonical_format_satisfies fixture-discovery predicate. The same rule applies when legacy format IDs are projected for canonical matching. Seller rejection of a compatible selector remains a failure. Requests, product declarations, creative-manifest validation, and seed data are preserved.
+
+- e678796: Fix `authorizeDemandGrant` applying `exclusive_grants: true` to every scope. The rule is that `grants[]` is exhaustive only for the scopes it names (adcontextprotocol/adcp L2 "Grants in trust records": Absence). A claim in a scope that no grant in the record names, including any claim against an exclusive record with no grants, now stays at the seller's discretion through `sellerAuthorization`, as it does for a nonexclusive record. A scope that any grant names (including through `adcp:all` or `*`, and including grants whose grantee is not a registrable domain) is still exhaustive: an uncovered claim in it is refused with `grant_absent` and `sellerAuthorization` is not called.
+
+  Previously, a house that published only exclusive governance grants also blocked media-buying claims that the seller had authorized through its own onboarding. Matching grants, legacy `authorized_operators` handling, and fetch-failure behavior are unchanged.
+
+- ba711f1: Storyboard runner: stop sending `bid_price` to fixed-price options. The `create_media_buy` request builder added a floor-based `bid_price` to any `cpm` option the fixture didn't bid on, including options carrying `fixed_price`, so a fixed-price CPM seller was sent a bid it should never receive. It now adds a bid only for a `cpm` option without `fixed_price`. It judges the option the package actually sends, not just the discovery pick. And it adds none when the request or the first package carries `bidding`, which AdCP 3.2 sellers must reject alongside a legacy `bid_price` (`AMBIGUOUS_BIDDING_POLICY`). Pricing-option selection now prefers options with `fixed_price` instead of matching `pricing_model` against `cpm` and the non-existent `flat`.
+- acddab4: Preserve producer evidence when prepared fixture discovery fails (#3385).
+
+  Authorized full and standalone reuse now retain fixture-handle resolutions and a `fixture_preparation` diagnostic phase with the producer's errors and actual exchanges. The historical phase is outside graded `phases`, preserving consumer and JUnit failure counts. Protected captures are stripped from its public contexts; denied callers still receive only `PreparedFixturesDeniedError`, while the private audit sink retains failed producer evidence.
+
+  Discovery failures identify the attempted task and configured transport. SDK connection errors are never represented as seller responses, protocol rejections remain protocol failures, and malformed seller pages retain a schema diagnostic against the actual received payload before SDK projection. The terminal failed page is retained even beyond the bounded successful-page evidence history. Captured text payloads redact credential fields.
+
+- 7dca440: Preserve compact Product format intersections when converting generated schemas to OpenAPI with Zod 4.6 and later. Annotate the shared constraints to avoid duplicating them across every format branch, and require Zod 4.6.6 or later for development (locked to 4.6.7) to resolve its high-severity collection-validation advisory. The published peer range remains compatible with older Zod 4 consumers.
+
+  Generate a direct Zod namespace import so browser bundles can remove unused exports with patched Zod versions, keeping single-schema imports within the existing bundle-size limits.
+
+- 7dca440: Accept RFC 3339 date-times with numeric UTC offsets in generated AdCP task/core Zod schemas, matching the AdCP JSON Schema format validation. This includes Python UTC timestamps ending in `+00:00` and fractional seconds with offsets. Validation now follows the existing `ajv-formats` date-time predicate, which also accepts lowercase separators, space separators, and leap seconds.
+- 7d272f9: Implicit demand-grant authority now extends to the brand's house (adcp L2 §Grants in trust records, adcp#8169). `authorizeDemandGrant` returns `source: 'implicit'` when the account operator and the signer's operator share a registrable domain with the brand's domain or with the house `resolveBrandHouse` returns, so a house operating its own child brand no longer needs a grant to itself. A house that the brand names but that does not list the brand back resolves to `undefined` and still needs a grant. An uncoded throw from `resolveBrandHouse` is now a `TrustRecordUnavailableError` (`SERVICE_UNAVAILABLE`) instead of an uncoded error, so an outage is never `grant_absent`; an `IdentityAuthorizationError` or `AdcpError` it throws keeps its code.
+- a008b4e: Sync the generated registry types with the published registry OpenAPI: a refused prepared-fixture request now types its `PREPARED_FIXTURES_DENIED` error body. Also patches vulnerable transitive dependencies (`body-parser`, `fast-uri`, `ip-address`, `undici`) in the lockfile; no dependency ranges change.
+- 7f7de7c: Refresh the registry OpenAPI snapshot and generated types with the optional vendor-authored display name for measurement metrics. Use `name` for display when present; `metric_id` remains the identifier for joining, keying, and deduplication.
+- 80cec20: Keep every exported Zod schema compact when rendered to JSON Schema or OpenAPI on Zod 4.6. Zod 4.6 rewrites an intersection with a union (`A & (X | Y)`) as `(A & X) | (A & Y)`, copying `A` into every branch. The Product format declaration was already annotated to prevent this; inline union operands of every generated intersection now carry a description too, which brings the total rendered size of all exported schemas back to within 0.1% of Zod 4.4.3 (e.g. `PlacementSchema` 339 KB → 167 KB, `ProductSchema` 917 KB → 727 KB, postal-area schemas about 3.4× smaller). Validation is unchanged.
+
+## 16.4.0
+
+### Minor Changes
+
+- 90f41eb: The client now negotiates an AdCP release with each seller and converts between it and the client's own release, so application code builds requests and reads responses in one shape (adcp-client#3370, adcontextprotocol/adcp#8373).
+  - **Negotiation.** Each call picks the highest release both sides support from the seller's `supported_versions` (falling back to the release the seller served on discovery). A seller with neither keeps the previous behavior, since AdCP 3.1 does not require `supported_versions`. A seller on the client's minor line sees no change. The negotiated release goes on the wire as `adcp_version` and is reported as `result.metadata.negotiatedAdcpVersion` when older than the client's.
+  - **Requests convert down, one minor at a time.** 3.2 → 3.1 → 3.0, chained for larger gaps. Each step runs hand-written adapters for moved fields (3.2 package and media-buy `bidding.bid_amount` becomes 3.1 package `bid_price`), then removes whatever the older release's schema cannot express. The converted request is validated against the negotiated release.
+  - **Reads drop, mutations refuse.** On a read, a field the seller's release cannot express is removed and reported. On a mutation, only labels and hints are removed (`name`, `opportunity`, `governance_context`, `pacing`, top-level `brand.countries`, creative rotation fields). Any other lost field (a budget cap, a targeting exclusion, a `max_bid` / `cost_per` / `roas` bidding mode, `assignment_operations`, and every field of an `update_media_buy`) fails the call with `ProtocolFeatureUnsupportedError` before sending, since the seller would otherwise do something different from what was asked.
+  - **Responses convert up** through each step's adapters, and are validated against the negotiated release before converting.
+  - **Every removed field is reported** in `debug_logs` as a `version_downgrade_fields_dropped` entry (with JSON paths, `fromVersion` and `toVersion`); moves are reported as `bidding_moved_to_bid_price` and similar.
+  - **Account keys.** AdCP 3.2 added `operator_unit`, `currency` and `timezone` to the account natural key, and `countries` to the brand inside it. New option `accountIdentityDowngrade`: `'refuse'` (default) fails the call with `ProtocolFeatureUnsupportedError` before sending. This now covers every account reference (`account`, `accounts[]`, `filters.accounts[]`), not only `sync_accounts`. `'reduce'` sends the older key when that is unambiguous and refuses when it would merge accounts (below), reporting each reduction as `account_identity_reduced`. It requires `accountStorage` with `compareAndSet` and fails at construction otherwise. The rule is proposed for the spec as adcontextprotocol/adcp DR-0032; the default may change once it is ratified.
+  - **Reduced accounts stay one-to-one.** Under `'reduce'`, the account registry records in `accountStorage` which reduced key each buyer key reached the seller with; a key sent unreduced claims itself. Claims are checked for the whole request before any is written. A second buyer key that would land on the same seller account, in either order, fails with `ProtocolFeatureUnsupportedError` (`details.reason: 'account_identity_collision'`) before sending, so two buyer accounts never share settings, spend or reads. `sync_accounts` and `accounts.ensure()` match the seller's reduced rows back to the buyer key, so `accountPolicy: 'auto' | 'strict'` works with reduced accounts.
+  - **Account moves after a seller upgrade.** When the seller reaches the client's release, a buyer key that was reduced is still sent under its reduced key (the key the seller's account has), and each call reports `account_identity_migration_pending`. An `operator_unit`-only reduction can be rekeyed in place with a `sync_accounts` settings update (`account`, `operator_identity`, `revision`); `currency`, `timezone` and `brand.countries` cannot change on an existing account, so those need a new account under the full key. Call the new `client.accounts.clearReduction(key)` once the account has moved. A 3.2 account move (`operator_identity` / `revision`) sent to an older seller is refused with an explanation.
+  - **Newer-only tasks.** A task the negotiated release does not define (for example `list_account_changes` to a 3.1 seller) fails with `ProtocolFeatureUnsupportedError` instead of reaching the seller, unless the seller lists the tool anyway.
+  - **`requireV3ForMutations`** now accepts a seller on an older release of the client's major instead of requiring the client's own release in `supported_versions`. A seller with no release on or below the client's line is still refused.
+  - **Async completions** carry the negotiated release: polled, resumed and durably deferred results are validated against it, and webhook results are converted up from the seller's `adcp_version` (or the release negotiated for the operation).
+  - **Behavior changes for older sellers.** A client pinned to 3.1 calling a seller that declares only 3.0 now converts through the 3.1 → 3.0 projection and validates as 3.0, where only the 3.0 adapters ran before. Because the release is negotiated per call from cached capabilities, a capability refresh between an attempt and a retry with the same `idempotency_key` can change the payload shape and draw `IDEMPOTENCY_CONFLICT`.
+  - An explicit `wireAdcpVersion` (client config or per call) turns negotiation off for that client or call, as do the media-buy lifecycle facade (which negotiates itself), governed storyboard payloads and the identity 3.3 experiment.
+  - Adding the next version pair (3.3 ↔ 3.2) needs hand-written adapters only for renames and moves; see `docs/development/WIRE-VERSION-COMPAT.md`.
+
+  The server side is described in the `server-version-translation` changeset.
+
+- 90f41eb: `createAdcpServer` (and `createAdcpServerFromPlatform`) now converts between the server's AdCP release and an older buyer's, so handlers are written against one release (adcp-client#3370, adcontextprotocol/adcp#8373).
+  - **Responses convert down.** When the served release is older than the server's `adcpVersion`, the handler's response is converted down one minor at a time before response validation. Each step runs hand-written adapters (for 3.1, the root `currency` on `get_media_buy_delivery` is filled from a shared per-buy currency), then removes what the older release's response schema cannot express. Removed and moved fields are logged at `info` with their JSON paths. Responses that already have the older shape, such as those from handlers that branch on `ctx.servedAdcpVersion` today, pass through unchanged.
+  - **Requests convert up** through each step's `upgradeRequest` adapters before the handler runs. No 3.0 → 3.1 or 3.1 → 3.2 request rule is needed yet: older requests remain valid in the newer shape. `ctx.servedAdcpVersion` still reports the served release.
+  - **What stays the same.** `get_adcp_capabilities` keeps its own per-release projection. Error envelopes, custom tools, task tools and the identity 3.3 experiment are not converted.
+  - **Behavior change.** A buyer that sends only `adcp_major_version` is served the oldest advertised release, so with default settings it now receives 3.0-shaped responses, where the handler's output used to go out unchanged.
+
+- b96b581: Follow-ups to AdCP version translation (adcp-client#3370):
+  - **Server visibility.** New `createAdcpServer({ onVersionTranslation })` callback, called each time the framework converts a request up from, or a response down to, an older buyer's release. Each event gives the tool, direction, both releases, and every removed or moved field with its JSON path. A throwing callback is logged and ignored. The `AdcpVersionTranslationEvent` type is exported from `@adcp/sdk/server`.
+  - **`get_task_status` results** are now converted down by their `task_type` for a buyer polling on an older release, as synchronous responses already were.
+  - **`sync_creatives` to a 3.1 seller.** `assignment_operations` made up only of `assign` operations is rewritten as 3.1 `assignments`, appended after any `assignments` the request already carries, with `validation_mode: 'strict'` unless the caller set a mode. This keeps 3.2's all-or-nothing behavior. `unassign` and `replace` have no 3.1 form and are still refused before sending.
+  - **`report_plan_outcome` to a 3.1 seller** is still refused rather than moved. 3.2 `cumulative_spend` is lifetime spend for the governed action, while 3.1 `spend` is spend in the reporting period, and the client cannot tell when the two coincide.
+
+### Patch Changes
+
+- 4d3092c: Generate separately routed media-buy actions without inventing update_media_buy field bindings, while retaining binding checks for mutation actions. Derive commercial change-right action names from the pinned schema's explicit exclusions so operational issue reporting remains outside negotiated terms. The default AdCP pin remains unchanged.
+
+  Keep existing mutation helpers compatible with separately routed action metadata and explicit elapsed-clock declarations. Reports remain outside commercial change-right assessment.
+
+## 16.3.0
+
+### Minor Changes
+
+- 37d3087: Collection fixture foundation for storyboard runs: qualify a real collection-bearing product before deterministic selection, capture the selected product / scoped price / collection witnesses from the same graph, protect those captures, and make fixture preparation reusable across the full and standalone runners.
+
+  Five additions. Four behaviour changes land with them, all small and all deliberate — "additive" would be the wrong word, and `minor` is the right bump because none breaks a published API:
+  1. a `context` default, step `context_outputs` key, or `not_applicable_if[].context_keys` entry starting with `__adcp_fixture_`, or named `__proto__` / `constructor` / `prototype`, now fails at **load** (rename it);
+  2. parent-product selection now skips a candidate that cannot satisfy a dependent discover-only pricing spec, so graphs that previously stranded resolve and a different product can win;
+  3. `fixture_unsatisfied` is now a canonical `RunnerSkipReason`, not a detailed reason mapped down to `not_applicable` — which is what `runner-output-contract.yaml` lists, and it keeps a fixture coverage gap out of the same bucket as a genuine applicability gate;
+  4. caller-supplied `context` / `context_provenance` / `response_derived_not_applicable_context_keys` carrying a reserved or prototype-sensitive key is now a graded `unauthorized_metadata` verdict from `runStoryboard`, `runStoryboardStep` **and** `prepareStoryboardFixtures`, where the first and last previously threw.
+
+  Two no-match diagnostics were also rewritten, so anything matching on their prose will need updating. Full adopter guide, including what this deliberately does **not** solve: [`docs/guides/COLLECTION-FIXTURE-FOUNDATION.md`](https://github.com/adcontextprotocol/adcp-client/blob/main/docs/guides/COLLECTION-FIXTURE-FOUNDATION.md).
+  - **`collection_selection_satisfies`** — a bounded fixture match operator. `collection_targeting: fixed` accepts literal `false` **or** the schema's omitted-false default; `selectable` requires literal `true`. `minimum_pairs: 1 | 2` keeps default materialization and strict-subset selection qualifying independently. `require_cross_publisher_collection` qualifies the declared cross-publisher carriage relation across every selector. Qualification runs before deterministic ordering, so a nonqualifying earlier product cannot conceal a later qualifying one.
+  - **Declaration-local `context_outputs` on `fixture_resolution`** — `path:` resolves against the selected entity snapshot, `witness:` binds a bounded derived capture from the same evaluation, and `snapshot: selected_entity` captures the whole pinned entity so an optional commercial field (`fixed_price`, `min_spend_per_package`) can be legally absent without failing preparation or being gated behind a `present` predicate that would suppress a supporting seller. Nothing is defaulted and an explicit `0` is captured as `0`. Captures publish only after the whole graph resolves.
+  - **A protected `__adcp_fixture_` context namespace** with one atomic write funnel for values, deletions, provenance and unavailable-output metadata. Committed values are deep-cloned, deep-frozen and handed out as detached clones.
+  - **`prepareStoryboardFixtures()`** — immutable prepared state both `runStoryboard` and `runStoryboardStep` accept via `prepared_fixtures`, so standalone and hosted step callers stop transmitting literal authored handles. Authority is re-checked on every lookup through `prepared_fixtures_authorizer`, which is **required for any reuse** (`withPreparedFixtures(state, authorizer)` pairs them atomically so you cannot omit it): omitting it fails closed with zero seller calls, for direct in-process state exactly as for an opaque reference. Every reference-shaped refusal answers in one uniform sentence — a message that varied with whether the reference resolved would be an existence oracle over the host's store. A malformed decision is never read as consent: authorization requires literally `{ authorized: true }`, and a callback that throws, rejects, returns `undefined`, or whose `authorized` getter throws refuses with zero seller calls and without echoing the host's error text. The lookup carries the effective scope — the account identity read from the same source discovery uses (so two accounts sharing a brand but differing by operator, unit or `account_id` differ), the step's own authored request account as `request_account_scope` when it overrides the context account, and a credential fingerprint folding in both the step's `auth` directive and the run's `test_kit.auth` (so an unchanged directive whose `from_test_kit` resolution changed still changes the fingerprint). Caller-supplied `context`, `context_provenance` and `response_derived_not_applicable_context_keys` carrying a reserved or prototype-sensitive key are refused as a graded `unauthorized_metadata` verdict — identically from `runStoryboard` and `runStoryboardStep`, where the full runner previously threw.
+  - **`collection_set_equals_context`** — exact set comparison over atomic `(publisher_domain, collection_id)` pairs, through the same normalizer the predicate and witnesses use.
+
+  **One load-time rejection for existing storyboards:** a `context` default, step `context_outputs` key, or `not_applicable_if[].context_keys` entry starting with `__adcp_fixture_`, or named `__proto__` / `constructor` / `prototype`, now fails at load. Rename it; nothing else about ordinary context semantics changes. To find out whether you are affected:
+
+  ```bash
+  grep -rnE '__adcp_fixture_|__proto__|constructor|prototype' your-storyboards/
+  ```
+
+  and check the hits that are `context:` keys, `context_outputs[].key`, or `not_applicable_if[].context_keys` entries.
+
+  If you `try/catch` around `runStoryboard` or `prepareStoryboardFixtures` for this case, switch to checking for an `unauthorized_metadata` verdict — both now grade rather than throw.
+
+  **Output evidence on the new failure kinds.** `runner-output-contract.yaml` makes `request`, `response`, `schema_id` and `schema_url` required on a failing validation, with null reserved for pre-wire failures and for checks that apply no response schema. `collection_set_equals_context` now carries `schema_id: null` / `schema_url: null` on every failing arm, and `fixture_capture_unbuildable` carries the real `get_products` (or `comply_test_controller`) exchange that produced the entity whose capture could not be built — a post-wire failure must not read as "no exchange happened". When discovery paginated, the recorded exchange is the page that actually carried the pinned product.
+
+  **Refusal projection redacts, it does not delete.** When a prepared-state lookup is refused mid-run, the already-exchanged request records keep `transport`, `operation` and `payload`; only the values that came from the `__adcp_fixture_` namespace are replaced, with the contract's existing `[redacted]` marker. This covers the copies nested in `validations[].request.payload` as well as `step.request`, so the pinned identity cannot survive one level down. The prior authored failure keeps its check, status and description, and ordinary response evidence is untouched. `next.sample_request` is dropped rather than redacted: a preview records no exchange, so there is nothing to attest.
+
+  **A refused prepared-state lookup now THROWS instead of returning a report.** An authorization failure is an access-control error, not a grading outcome, so `runStoryboard` and `runStoryboardStep` throw `PreparedFixturesDeniedError` (exported from `@adcp/sdk` and `@adcp/sdk/testing`) carrying `refusalCode` and nothing else — no grading result, partial or redacted, and therefore no fixture identities, `seller_ids`, captures, binding values, request/response records, or earlier-step results. Hosted routes should map it to a 403. **If you `await runStoryboard(...)` with `prepared_fixtures` and branch on `result.overall_passed`, you now need a `catch`.**
+
+  The complete, unredacted record goes to the new `prepared_fixtures_audit_sink` option first — an authorized scope inside your trust boundary. It keeps the synthesized `prepared_fixtures_authorization` check (with explicit `request: null`, `response: null`, `json_pointer: null`, `duration_ms: 0`), `fixture_resolutions` with `seller_ids`, and exact request/response records for every step that ran. Configure no sink and the record is produced to nobody. This replaces the earlier `[redacted]` projection of refused runs, which is gone: nothing in the SDK redacts on the refusal path, and no marker may stand in for required evidence. `ValidationResult.request` / `.response` widen to `| null` to carry the explicit pre-wire nulls.
+
+  **A prepared state is now bound to the route it was pinned against.** `agent_urls` is sorted and `agent_route_fingerprint` sorts by key, both deliberately order-insensitive — so two runs whose `agents` maps differed only in insertion order produced byte-identical bindings, while preparation (which contacts exactly one agent) had read a different seller's catalog for each. The new `fixture_agent_url` binding field refuses that reuse. `runStoryboardStep` also labels its lookup `gate: 'step'` rather than falling through to the `'pass'` default, so a host applying a finer per-step check gets it on the entry point this feature exists for.
+
+  **Merge dependency:** six new names are not yet in the published AdCP contracts — `collection_selection_satisfies` and `fixture_resolution[].context_outputs` in `storyboard-schema.yaml`; `collection_set_equals_context` in `runner-output-contract.yaml`'s `authored_check_kinds`; and the runner-synthesized `fixture_capture_unbuildable`, `protected_context_violation` and `prepared_fixtures_authorization` in its closed synthesized-check list. A companion `adcontextprotocol/adcp` amendment is required before any published storyboard can use them. The declarations fail load on a runner without this contract, which is the safe downgrade; a new validator name alone would be silently graded `not_applicable`.
+
+  Vocabulary was settled with the AdCP catalog owner before this landed (`collection_targeting` rather than `mode`, which collides with the wire's `collection_selection.mode`; `require_cross_publisher_collection` / `cross_publisher_relation` rather than "owner", which pulls toward beneficial ownership; `declared_selectors`; `undeclared_collection_id_selectors` / `undeclared_publisher_domain_selectors`). No compatibility aliases exist for the earlier provisional spellings — the operand and capture grammars are closed, so an obsolete spelling fails load rather than acquiring a different meaning.
+
+  **Note on timing:** main exited changesets pre-mode and reached 16.0.0 GA while this was in review, so these names land as GA surface under semver rather than under a `beta` tag. That is why the vocabulary was settled first.
+
+- d809c7e: Support public proposal refinement on AdCP 3.3 while preserving AdCP 3.2 and wire-only envelope overrides. Treat the requested version as a ceiling, accept supported lower served contracts, and validate nested proposals/change terms with the selected served bundle. Reject upward, malformed or unsupported echoes and missing selected schemas while retaining digest, lineage, hold and atomic-finalize checks.
+
+  The public request version type now includes explicit 3.3 release pins. Code reading it into an Adcp32Version variable must narrow the returned value first; Adcp32Version itself is retained unchanged.
+
+  Server typed error responses now use the active external schema root, preserving errors[] details and required discriminators for AdCP candidate bundles. Scoped and re-registered roots have isolated, loader-epoch-cached error-arm inventories, including raw schema roots, without stale misses or changes to the installed 3.2 inventory. Explicit discovery served-version evidence cross-checks compatible task ceilings, preventing a contradictory lower echo from selecting an older schema while allowing explicitly lowered request ceilings and omitted discovery echoes. Strict response validation selects the same served contract before financial verification, retaining explicit discovery evidence across durable continuation.
+
+## 16.2.0
+
+### Minor Changes
+
+- cb511c5: Experimental AdCP 3.3 identity: JWS artifacts from a Web Bot Auth identity are verified with a key from that identity's key directory (`specs/agent-identity-3-3.md` R4, as amended by adcontextprotocol/adcp#8299).
+  - **Selection.** `selectJwsArtifactProfile(agentUrl, trust)` (from `@adcp/sdk/identity-3.3`) derives the trust record from the signing agent's origin `O`. When the record lists `O`, the artifact is verified on the WBA path, never under the 3.2 profile. An issuer whose operator has not published a record, or whose record does not list `O`, stays on the 3.2 profile. A trust-record fetch failure throws `JwsArtifactError` with `jws_key_unavailable`. It is never absence and never selects 3.2. Give the `TrustEvaluator` durable `authorityHistory` so that a 404 after a 200 stays an outage across restarts and replicas.
+  - **Key rules.** `verifyWebBotAuthJwsArtifact(token, origin, { typ, directory, revocation })` checks four things: the `typ` the surface accepts, `alg` `EdDSA`, a `kid` equal to the key's JWK thumbprint, and revocation against `O`'s list. It applies no `use`, `key_ops` or `adcp_use` check. `revocation` is required, or `false` when the caller checks revocation itself. It runs on Cloudflare workerd.
+  - **Governance contexts.** `verifyGovernanceAuthorization` takes an optional `webBotAuth: { trust, directory, revocation }`. With it, a listed issuer's token is verified on its key directory, and an origin that serves no revocation list fails closed. Every other check is unchanged, including the `buyerIdentity` cross-check that `iss` is the buyer's governance agent. Without it, the verifier is 3.2 only, as before. A failure caused by an outage now sets `retryable: true`.
+  - **History.** `verifyHistoricalGovernanceContext` verifies a retained governance context for audit. When a key has been rotated out of the directory, it reads that key from the governance key archive at `O` (`/.well-known/jwks-archive.json`) through the new `GovernanceKeyArchiveResolver`. A revoked key still verifies there, and the result reports the revocation and its R9 detail. `OriginRevocationResolver.detail()` returns that detail.
+  - The SDK has no designated-task response or rights-attestation verifier yet. A verifier for either calls `selectJwsArtifactProfile` with `agent_url` or `rights_agent.url`, then `verifyWebBotAuthJwsArtifact`.
+
+### Patch Changes
+
+- ec10d20: Patch MCP SDK dependencies for newly published advisories: `@modelcontextprotocol/server` and `@modelcontextprotocol/client` move from 2.2.0 to 2.3.1. The dev-only transitives `launch-editor` (via `@changesets/cli`) and `markdown-it` (via `typedoc`) are pinned to patched releases through `overrides`, and `hono` is refreshed to 4.13.13 in the lockfile. `npm audit --audit-level=high` is clean again.
+- cb837ec: Refresh generated registry API types to match the published OpenAPI schema: the advisory AdCP 4.0 readiness report on agent compliance (`v4_readiness`, `V4ReadinessCheck`) and the `sales-fixed-rate` specialism.
+
 ## 16.1.0
 
 ### Minor Changes

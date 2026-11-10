@@ -9,6 +9,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'fs';
+import { parse as parseYaml } from 'yaml';
 import { basename, dirname, join, resolve } from 'path';
 import { loadStoryboardFile } from './loader';
 import { ADCP_VERSION } from '../../version';
@@ -16,7 +17,8 @@ import { ADCPError } from '../../errors';
 import { isAdcpVersionSupported } from '../../utils/adcp-version-config';
 import { hasSchemaBundle, resolveBundleKey } from '../../validation/schema-loader';
 import { synthesizeRequestSigningSteps } from './request-signing/synthesize';
-import { markStoryboardComplianceRoot } from './provenance';
+import { invalidateRequestSigningVectorCache } from './request-signing/vector-loader';
+import { markStoryboardComplianceRoot, trustedStoryboardComplianceRoot } from './provenance';
 import type { RunnerSelectionResult, Storyboard } from './types';
 
 /**
@@ -572,10 +574,41 @@ function annotateStoryboardVersion(
   );
 }
 
+/** Support documents in the universal index are not executable bundles. */
+function isUniversalMetadataFile(path: string): boolean {
+  try {
+    const source = readFileSync(path, 'utf8');
+    const document: unknown = parseYaml(source);
+    // The published storyboard-schema guide consists entirely of comments.
+    // Keep genuinely empty or malformed files visible as missing coverage.
+    if (document === null && /^\s*#/m.test(source) && source.split(/\r?\n/).every(line => /^\s*(?:#.*)?$/.test(line)))
+      return true;
+    if (!document || typeof document !== 'object' || Array.isArray(document)) {
+      console.warn(
+        `[compliance] Universal file ${basename(path)} is not a storyboard mapping; retaining it for assessment.`
+      );
+      return false;
+    }
+    if (Object.hasOwn(document, 'phases') && !Array.isArray((document as Record<string, unknown>).phases)) {
+      console.warn(`[compliance] Universal file ${basename(path)} has invalid phases; retaining it for assessment.`);
+    }
+    if (!Object.hasOwn(document, 'phases') && ['agent', 'caller', 'steps'].some(key => Object.hasOwn(document, key))) {
+      console.warn(`[compliance] Universal file ${basename(path)} is missing phases; retaining it for assessment.`);
+      return false;
+    }
+    return !Object.hasOwn(document, 'phases');
+  } catch {
+    // An unreadable or malformed file is missing coverage, not metadata.
+    console.warn(`[compliance] Unable to classify universal file ${basename(path)}; retaining it for assessment.`);
+    return false;
+  }
+}
+
 function safeLoadUniversal(path: string): Storyboard[] {
   try {
     return [loadStoryboardFile(path)];
   } catch {
+    console.warn(`[compliance] Unable to load universal storyboard ${basename(path)}; retaining an untested bundle.`);
     return [];
   }
 }
@@ -631,6 +664,7 @@ export function listBundles(options: ResolveOptions = {}): BundleRef[] {
   const bundles: BundleRef[] = [];
 
   for (const name of index.universal) {
+    if (isUniversalMetadataFile(join(dir, 'universal', `${name}.yaml`))) continue;
     bundles.push({
       kind: 'universal',
       id: name,
@@ -658,29 +692,84 @@ export function listBundles(options: ResolveOptions = {}): BundleRef[] {
   return bundles;
 }
 
-/** List every storyboard the cache can produce, across all bundles. */
-export function listAllComplianceStoryboards(options: ResolveOptions = {}): Storyboard[] {
-  const seen = new Set<string>();
-  const storyboards: Storyboard[] = [];
-  for (const ref of listBundles(options)) {
-    for (const sb of loadBundleStoryboards(ref)) {
-      if (seen.has(sb.id)) continue;
-      seen.add(sb.id);
-      storyboards.push(sb);
-    }
-  }
-  return storyboards;
+// Published versioned bundles are immutable. Keep a bounded per-authority
+// index, and return detached records so caller edits cannot poison later runs.
+const STORYBOARD_INDEX_CACHE_LIMIT = 8;
+const storyboardIndexes = new Map<string, ReadonlyMap<string, Storyboard>>();
+
+/** Custom authoring roots can change without their published index changing. */
+function customComplianceInventory(dir: string): string {
+  if (!existsSync(dir)) return 'missing'; // Keep the loader's actionable missing-cache diagnostic.
+  const entries: unknown[] = [];
+  const visitedDirectories = new Set<string>();
+  const visit = (file: string, relative: string): void => {
+    const stat = statSync(file, { bigint: true });
+    entries.push([relative, String(stat.mtimeNs), String(stat.ctimeNs), String(stat.size), String(stat.ino)]);
+    if (!stat.isDirectory()) return;
+    const identity = `${stat.dev}:${stat.ino}`;
+    if (visitedDirectories.has(identity)) return;
+    visitedDirectories.add(identity);
+    for (const child of readdirSync(file).sort()) visit(join(file, child), `${relative}/${child}`);
+  };
+  visit(dir, '');
+  return JSON.stringify(entries);
 }
 
-/**
- * Find a storyboard by its internal `id` (the YAML's `id:` field).
- * Scans every bundle in the cache. Returns undefined if no match.
- */
-export function getComplianceStoryboardById(id: string, options: ResolveOptions = {}): Storyboard | undefined {
-  for (const sb of listAllComplianceStoryboards(options)) {
-    if (sb.id === id) return sb;
+function complianceStoryboardIndex(options: ResolveOptions): ReadonlyMap<string, Storyboard> {
+  const dir = resolve(getComplianceCacheDir(options));
+  const indexPath = join(dir, 'index.json');
+  const stamp = existsSync(indexPath) ? statSync(indexPath) : undefined;
+  const schemaRoot = getConfiguredSchemaRoot(options);
+  // Published package roots are immutable during a process lifetime. Authoring
+  // overrides include YAML, nested scenarios and signing synthesis fixtures;
+  // stat-only inventory checks avoid reparsing any unchanged warm bundle.
+  const customRoot = Boolean(getConfiguredComplianceDir(options));
+  const inventory = customRoot ? customComplianceInventory(dir) : null;
+  const key = JSON.stringify([
+    dir,
+    options.version ?? ADCP_VERSION,
+    schemaRoot ? resolve(schemaRoot) : null,
+    options.hostedStableLineAlias ?? null,
+    stamp?.mtimeMs ?? null,
+    stamp?.size ?? null,
+    inventory,
+  ]);
+  const cached = storyboardIndexes.get(key);
+  if (cached) {
+    storyboardIndexes.delete(key);
+    storyboardIndexes.set(key, cached);
+    return cached;
   }
-  return undefined;
+  if (customRoot) invalidateRequestSigningVectorCache(dir);
+  const indexed = new Map<string, Storyboard>();
+  for (const ref of listBundles({ ...options, complianceDir: dir })) {
+    for (const storyboard of loadBundleStoryboards(ref)) {
+      if (!indexed.has(storyboard.id)) indexed.set(storyboard.id, storyboard);
+    }
+  }
+  storyboardIndexes.set(key, indexed);
+  while (storyboardIndexes.size > STORYBOARD_INDEX_CACHE_LIMIT) {
+    const oldest = storyboardIndexes.keys().next().value;
+    if (oldest !== undefined) storyboardIndexes.delete(oldest);
+  }
+  return indexed;
+}
+
+function cloneComplianceStoryboard(storyboard: Storyboard): Storyboard {
+  const copy = structuredClone(storyboard);
+  const trustedRoot = trustedStoryboardComplianceRoot(storyboard);
+  return trustedRoot ? markStoryboardComplianceRoot(copy, trustedRoot) : copy;
+}
+
+/** List every storyboard the selected immutable bundle can produce, as detached records. */
+export function listAllComplianceStoryboards(options: ResolveOptions = {}): Storyboard[] {
+  return [...complianceStoryboardIndex(options).values()].map(cloneComplianceStoryboard);
+}
+
+/** Find a storyboard by its internal YAML id without reparsing a warm bundle. */
+export function getComplianceStoryboardById(id: string, options: ResolveOptions = {}): Storyboard | undefined {
+  const storyboard = complianceStoryboardIndex(options).get(id);
+  return storyboard ? cloneComplianceStoryboard(storyboard) : undefined;
 }
 
 /** Find a bundle by its directory/file id (`media-buy`, `sales-guaranteed`, `capability-discovery`). */
@@ -842,6 +931,7 @@ export function resolveStoryboardsForCapabilities(
   };
 
   for (const name of index.universal) {
+    if (isUniversalMetadataFile(join(cacheDir, 'universal', `${name}.yaml`))) continue;
     push({
       kind: 'universal',
       id: name,

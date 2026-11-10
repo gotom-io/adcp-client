@@ -11,6 +11,67 @@ const {
   runStoryboardStep,
 } = require('../../dist/lib/testing');
 const { withExternalSchemaRoot } = require('../../dist/lib/validation/schema-loader');
+const { ADCP_VERSION } = require('../../dist/lib/version');
+
+function publishedEvaluatorStoryboard() {
+  return parseStoryboard(
+    fs.readFileSync(
+      path.join(__dirname, '../../compliance/cache', ADCP_VERSION, 'protocols/creative/scenarios/evaluator_auth.yaml'),
+      'utf8'
+    )
+  );
+}
+
+for (const stepId of ['reject_unaccepted_agent_url', 'reject_unaccepted_feature_agent']) {
+  for (const outbound of [false, true]) {
+    test(`published evaluator rejection ${stepId} requires zero off-list calls: ${outbound}`, async () => {
+      const calls = [];
+      const opts = options(creative(route('build', ['build'])), []);
+      opts.adcpVersion = ADCP_VERSION;
+      opts._controllerCapabilities = { detected: true, scenarios: ['query_upstream_traffic'] };
+      let recorded = [];
+      const client = createTestClient('https://agent.example/mcp', 'mcp', opts);
+      client.resetContext = () => {};
+      client.executeTask = async (task, request) => {
+        if (task === 'comply_test_controller') {
+          assert.equal(request.scenario, 'query_upstream_traffic');
+          return { success: true, data: { success: true, attestation_mode: 'raw', recorded_calls: recorded } };
+        }
+        assert.equal(task, 'build_creative');
+        assert.equal(request.target_capability_id, 'build');
+        assert.deepEqual(request.creative_manifest, { format_kind: 'image', assets: {} });
+        calls.push(request);
+        const url = request.evaluator.feature_agent?.agent_url ?? request.evaluator.agent_url;
+        recorded = outbound ? [{ timestamp: new Date().toISOString(), endpoint: `POST ${url}`, url }] : [];
+        return { success: false, data: { errors: [{ code: 'EVALUATOR_AGENT_NOT_ACCEPTED', message: 'Rejected' }] } };
+      };
+      client.buildCreativeLegacy = request => client.executeTask('build_creative', request);
+      opts._client = client;
+      const result = await runStoryboardStep('https://agent.example/mcp', publishedEvaluatorStoryboard(), stepId, opts);
+      assert.equal(calls.length, 1);
+      assert.equal(result.passed, !outbound, JSON.stringify(result.validations));
+      const traffic = result.validations.find(validation => validation.check === 'upstream_traffic');
+      assert.ok(traffic, 'the published traffic assertion must run');
+      assert.equal(traffic.passed, !outbound);
+    });
+  }
+}
+
+test('published evaluator storyboard gives missing fixtures zero executed security coverage', async () => {
+  const calls = [];
+  const result = await runStoryboard(
+    'https://agent.example/mcp',
+    publishedEvaluatorStoryboard(),
+    options(
+      { supports_evaluator: true, supports_transformation: true, supported_formats: [route('build', ['build'])] },
+      calls
+    )
+  );
+  assert.equal(result.passed_count, 0);
+  assert.equal(result.failed_count, 0);
+  assert.equal(result.coverage_gaps[0].reason, 'fixture_unsatisfied');
+  assert.deepEqual(calls, []);
+});
 
 function missingCatalogSchemaRoot(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'creative-probe-missing-catalog-'));
@@ -535,13 +596,13 @@ test('selected 3.1 catalog/selector contract accepts explicit provisioned Format
       { supports_transformation: true, supported_formats: [entry] },
       spec,
       kit,
-      '3.1.29'
+      '3.1.30'
     );
     assert.equal(result.status, 'resolved');
     assert.deepEqual(result.formatId, legacyTarget);
     assert.deepEqual(result.context.evaluator_build_target_format_id, legacyTarget);
     assert.equal(result.context.evaluator_build_capability_id, undefined);
-    assert.equal(resolveCreativeBuildProbe(creative(entry), spec, undefined, '3.1.29').status, 'unsatisfied');
+    assert.equal(resolveCreativeBuildProbe(creative(entry), spec, undefined, '3.1.30').status, 'unsatisfied');
   }
 });
 test('3.1 open-enum unknown route is preserved while later known provisioned route executes', () => {
@@ -551,10 +612,10 @@ test('3.1 open-enum unknown route is preserved while later known provisioned rou
   };
   const before = structuredClone(caps);
   const kit = { creative_build_probes: [{ ...recipe, input: { ...recipe.input, target_format_id: legacyTarget } }] };
-  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.29').status, 'resolved');
+  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.30').status, 'resolved');
   assert.deepEqual(caps, before);
   assert.equal(
-    resolveCreativeBuildProbe({ ...caps, supported_formats: [caps.supported_formats[0]] }, spec, kit, '3.1.29').status,
+    resolveCreativeBuildProbe({ ...caps, supported_formats: [caps.supported_formats[0]] }, spec, kit, '3.1.30').status,
     'unsatisfied'
   );
 });
@@ -636,12 +697,12 @@ test('legacy recipes honor explicit no-projection and named-format pairing decla
   const r = route('build');
   const caps = { supports_transformation: true, supported_formats: [r] };
   r.format.canonical_formats_only = true;
-  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.29').status, 'unsatisfied');
+  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.30').status, 'unsatisfied');
   delete r.format.canonical_formats_only;
   r.format.v1_format_ref = [{ ...legacyTarget, id: 'different_provisioned_format' }];
-  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.29').status, 'unsatisfied');
+  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.30').status, 'unsatisfied');
   r.format.v1_format_ref = [{ ...legacyTarget, agent_url: 'https://FORMATS.example:443/' }];
-  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.29').status, 'resolved');
+  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.30').status, 'resolved');
 });
 for (const standalone of [false, true])
   test(`legacy full/standalone binding clears opposite selector: ${standalone}`, async () => {
@@ -654,7 +715,7 @@ for (const standalone of [false, true])
         creative_build_probes: [{ ...recipe, input: { ...recipe.input, target_format_id: legacyTarget } }],
       }
     );
-    opts.adcpVersion = '3.1.29';
+    opts.adcpVersion = '3.1.30';
     opts.context.evaluator_build_capability_id = 'stale-canonical-route';
     opts._client.executeTask = async (task, input) => {
       calls.push(input);
@@ -683,7 +744,7 @@ test('3.1 unknown-kind tolerance does not suppress unrelated declared catalog er
     supported_formats: [{ capability_id: 123, format: { format_kind: 'future_kind', params: {} } }, route('build')],
   };
   const kit = { creative_build_probes: [{ ...recipe, input: { ...recipe.input, target_format_id: legacyTarget } }] };
-  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.29').status, 'failed');
+  assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.30').status, 'failed');
 });
 
 test('legacy explicit pairing cannot equate two URLs rejected by the authoritative canonicalizer', () => {
@@ -695,7 +756,7 @@ test('legacy explicit pairing cannot equate two URLs rejected by the authoritati
       { supports_transformation: true, supported_formats: [r] },
       spec,
       { creative_build_probes: [{ ...recipe, input: { ...recipe.input, target_format_id: id } }] },
-      '3.1.29'
+      '3.1.30'
     ).status,
     'unsatisfied'
   );
@@ -706,7 +767,7 @@ test('3.1 undeclared extension fields do not acquire newer producer requirements
   r.format.technical_requirements_complete = 'extension-value';
   const kit = { creative_build_probes: [{ ...recipe, input: { ...recipe.input, target_format_id: legacyTarget } }] };
   assert.equal(
-    resolveCreativeBuildProbe({ supports_transformation: true, supported_formats: [r] }, spec, kit, '3.1.29').status,
+    resolveCreativeBuildProbe({ supports_transformation: true, supported_formats: [r] }, spec, kit, '3.1.30').status,
     'resolved'
   );
 });
@@ -746,7 +807,7 @@ test('legacy density defaults agree in both directions only where selected schem
     const kit = { creative_build_probes: [{ ...recipe, input: { ...recipe.input, target_format_id: target } }] };
     assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.2.5').status, expected);
     // The older schema assigns no semantics to this extension.
-    assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.29').status, 'resolved');
+    assert.equal(resolveCreativeBuildProbe(caps, spec, kit, '3.1.30').status, 'resolved');
   }
 });
 
@@ -755,17 +816,19 @@ test('unsupported legacy canonical kinds name the actual schema bundle in the fi
     creative(route('future', undefined, 'audio_vast')),
     spec,
     undefined,
-    '3.1.29'
+    '3.1.30'
   );
   assert.equal(result.status, 'unsatisfied');
-  assert.match(result.detail, /unvalidated kind.*3.1.29.*audio_vast/);
+  // The probe requests 3.1.30; the 3.1 bundle serves 3.1.32, and the diagnostic
+  // names the bundle it actually validated against rather than the request.
+  assert.match(result.detail, /unvalidated kind.*3\.1\.32.*audio_vast/);
 });
 
 test('unknown-kind diagnostics escape producer controls and bound display without changing the catalog', () => {
   const kind = '\x1b[31mspoof\nrow\r\t\u009b\u2028\u2029' + 'x'.repeat(10000);
   const caps = creative(route('future', undefined, kind));
   const original = structuredClone(caps);
-  const result = resolveCreativeBuildProbe(caps, spec, undefined, '3.1.29');
+  const result = resolveCreativeBuildProbe(caps, spec, undefined, '3.1.30');
   assert.equal(result.status, 'unsatisfied');
   assert.doesNotMatch(result.detail, /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
   assert.ok(result.detail.includes('\\u001b'));

@@ -12,6 +12,7 @@ import {
   createTestClient,
   getOrCreateClientResolution,
   getOrDiscoverProfile,
+  describeProfileDiscoveryFailure,
   seedTestClientSigningCapability,
   seedAuthRejectedTestClientProfile,
   withTestClientScope,
@@ -23,10 +24,14 @@ import {
   collectCapabilityNotices,
   runStoryboard,
   storyboardCapabilityGateUnmet,
+  storyboardRequiresCapabilityEvidence,
+  storyboardAllowsCapabilityDiagnostic,
   storyboardCapabilityPredicates,
 } from '../storyboard/runner';
 import { applyNativeA2AComplianceTransportOptions } from '../storyboard/native-a2a-compliance';
 import { validateTestKit } from '../storyboard/test-kit';
+import { isProtectedContextKey } from '../storyboard/protected-context';
+import { assertNoPreparationAuthorizer } from '../storyboard/prepared-fixtures';
 import { checkAccountDiscoveryGate, isAccountBearingSpecialism } from './spec-conformance';
 
 // Side-effect import: registers default assertion stubs for invariant ids that
@@ -763,6 +768,7 @@ export type ComplyStoryboardRouting = ComplyStoryboardRoute | ComplyStoryboardSk
  * when an agent declares a specialism whose bundle isn't in the local cache.
  */
 export async function comply(agentUrl: string, options: ComplyOptions = {}): Promise<ComplianceResult> {
+  assertNoPreparationAuthorizer(options);
   if ('platform_type' in options) {
     throw new Error(
       'comply() no longer accepts platform_type. Agent selection is now driven by ' +
@@ -779,6 +785,32 @@ export async function comply(agentUrl: string, options: ComplyOptions = {}): Pro
     throw new Error(
       `Refusing to run compliance against a non-HTTPS URL: ${agentUrl}. ` +
         `Production agents MUST terminate TLS. Pass { allow_http: true } (or --allow-http) for local development.`
+    );
+  }
+  // `prepared_fixtures` is NOT a comply option and is refused outright,
+  // before any seller contact.
+  //
+  // It is absent from `ComplyOptions`, so no typed caller can pass it — but
+  // `runOptions` is built by spreading the caller's object, so an untyped
+  // one rode through to `runStoryboard` and was half-honoured: comply
+  // selects storyboards from its OWN capability discovery, which happens
+  // before any storyboard (and therefore any binding digest) exists, so the
+  // gate could only fire afterwards. That made the "zero seller calls"
+  // contract false for this path.
+  //
+  // Reuse is per-storyboard by construction — the binding pins a storyboard
+  // digest — and comply is a bundle orchestrator that picks the set at
+  // runtime. Rather than bolt on a weaker gate that authorizes against a
+  // scope comply cannot yet describe, refuse and name the entry points that
+  // do support reuse.
+  const forced = options as ComplyOptions & { prepared_fixtures?: unknown };
+  if (forced.prepared_fixtures !== undefined) {
+    throw new Error(
+      'comply() does not accept prepared_fixtures. Prepared state binds one storyboard digest, and comply ' +
+        'selects its storyboard set from capability discovery at runtime — so there is no scope to authorize ' +
+        'against before the agent is contacted. Call prepareStoryboardFixtures() and pass the state to ' +
+        'runStoryboard() or runStoryboardStep() per storyboard instead. ' +
+        'See docs/guides/COLLECTION-FIXTURE-FOUNDATION.md section 4.'
     );
   }
   return withTestClientScope(() =>
@@ -1648,6 +1680,15 @@ async function runComplyStoryboard(
   } else {
     runOptions = { ...runOptions, _profile: undefined, agentTools: undefined };
   }
+  if (
+    describeProfileDiscoveryFailure(
+      discovered.profile,
+      storyboardRequiresCapabilityEvidence(storyboard),
+      storyboardAllowsCapabilityDiagnostic(storyboard)
+    )
+  ) {
+    return runStoryboard(agentUrl, storyboard, { ...runOptions, _profile: discovered.profile });
+  }
   // Applicability comes before routing: a storyboard whose root capability
   // predicate the agent under test does not satisfy keeps the runner's
   // `not_applicable` verdict (no network call), so a hook skip can never turn
@@ -1869,10 +1910,24 @@ function buildRoutedStoryboardRun(
   const leak = testKitCredentialLeak(storyboard, agentUnderTestKeys);
   if (leak) return { refused: `${selected.id} cannot be routed: ${leak}` };
 
+  // Route JSON is another untrusted caller input: a route entry naming a
+  // reserved `__adcp_fixture_` key would be importing fixture-preparation
+  // authority from routing configuration. Reject it here, where the route
+  // can be named, rather than letting the runner reject an anonymous merge.
   const context =
     runOptions.context !== undefined || route.context !== undefined
       ? { ...runOptions.context, ...route.context }
       : undefined;
+  if (context !== undefined) {
+    const reserved = Object.keys(context).filter(
+      key => isProtectedContextKey(key) || key === '__proto__' || key === 'constructor' || key === 'prototype'
+    );
+    if (reserved.length > 0) {
+      return {
+        refused: `${selected.id} cannot be routed: route context declares reserved or prototype-sensitive key(s) ${reserved.join(', ')}; prepared state cannot be imported from route JSON`,
+      };
+    }
+  }
   const options: StoryboardRunOptions = {
     ...runOptions,
     agents: isolated,
@@ -2158,17 +2213,15 @@ export function extractFailures(
     // the loop above intentionally ignores skips. Preserve those gating
     // failures from the storyboard assertion surface instead of dropping them.
     for (const { assertion, owningStep } of collectDetachedAssertionFailures(result)) {
-      if (!owningStep) continue;
-
       failures.push({
         track,
         storyboard_id: result.storyboard_id,
-        step_id: owningStep.step_id,
-        step_title: owningStep.title,
-        task: owningStep.task,
+        step_id: owningStep?.step_id ?? `${result.storyboard_id}/storyboard`,
+        step_title: owningStep?.title ?? sb?.title ?? result.storyboard_id,
+        task: owningStep?.task ?? 'storyboard',
         error: assertion.error ?? assertion.description,
-        expected: findStoryboardStepExpected(sb, owningStep.step_id),
-        fix_command: buildFixCommand(agentRef, result.storyboard_id, owningStep.step_id, fixOptions),
+        expected: owningStep ? findStoryboardStepExpected(sb, owningStep.step_id) : undefined,
+        fix_command: buildFixCommand(agentRef, result.storyboard_id, owningStep?.step_id, fixOptions),
         validation: {
           check: 'assertion',
           description: `${assertion.assertion_id}: ${assertion.description}`,
@@ -2192,7 +2245,7 @@ function findStoryboardStepExpected(storyboard: Storyboard | undefined, stepId: 
 function buildFixCommand(
   agentRef: string,
   storyboardId: string,
-  stepId: string,
+  stepId: string | undefined,
   options: {
     complianceVersion?: string;
     complianceDir?: string;
@@ -2201,7 +2254,10 @@ function buildFixCommand(
     testKitPath?: string;
   }
 ): string {
-  const parts = ['adcp', 'storyboard', 'step', agentRef, storyboardId, stepId, '--json'];
+  const parts =
+    stepId === undefined
+      ? ['adcp', 'storyboard', 'run', agentRef, storyboardId, '--json']
+      : ['adcp', 'storyboard', 'step', agentRef, storyboardId, stepId, '--json'];
   if (options.complianceVersion) parts.push('--compliance-version', options.complianceVersion);
   if (options.complianceDir) parts.push('--compliance-dir', options.complianceDir);
   if (options.schemaRoot) parts.push('--schema-root', options.schemaRoot);
@@ -2394,7 +2450,7 @@ async function complyImpl(agentUrl: string, options: ComplyOptions): Promise<Com
           severity: 'error',
           message:
             `get_adcp_capabilities is advertised but the call failed. ` +
-            `Only universal storyboards ran — domain and specialism bundles were skipped. ` +
+            `Universal diagnostics were selected; failed discovery does not establish domain or specialism support. ` +
             `Agent-reported error: ${fenceAgentText(profile.capabilities_probe_error)}`,
           evidence: { agent_reported_error: profile.capabilities_probe_error },
           source: { kind: 'profile', code: 'capabilities-probe-failed' },

@@ -113,6 +113,13 @@ An explicit external `schemaRoot` always remains authoritative.
 The CLI equivalent is `--no-strict-response-schema-validation`; reserve it for
 temporary legacy compatibility harnesses rather than routine compliance runs.
 
+The packaged `comply_test_controller` request and response schemas make this
+concrete for that tool: once they resolve from an installed package, the
+selected release's response JSON Schema validation runs, so a controller that
+was already nonconformant can newly fail a step without any agent change. See
+[Packaged `comply_test_controller` schemas](https://github.com/adcontextprotocol/adcp-client/blob/16.x/docs/development/WIRE-VERSION-COMPAT.md#packaged-comply_test_controller-schemas)
+for the per-release file counts and declared-field consequences.
+
 **Flags you'll actually use:**
 
 - `--tracks <a,b,c>` — limit to named tracks (e.g., `core,products,security_baseline`)
@@ -288,6 +295,41 @@ Either way, subsequent runs reuse the cached tokens (auto-refresh on expiry via 
 
 **Output:** JSON with `tracks[].status` (`passed`/`failed`/`skipped`), `steps[]` with diagnostics, and validations per step.
 
+### Account-scoped fixtures and negative membership
+
+Automatic `seed_product` and `seed_pricing_option` calls use the complete account
+reference used by the storyboard: `context.account`, otherwise the single resolved
+account in its effective sample requests or single-account provisioning request,
+otherwise a single sandbox account fixture. Request overrides, context inputs, and
+the run brand use the same account rules as public requests. Account provisioning
+seeds retain their independent targets; only product and pricing seeds need a
+shared catalog scope. Natural
+keys retain brand countries, operator, operator unit, currency, and timezone. Opaque
+`account_id` references stay opaque. A storyboard that uses several accounts must
+provide an explicit `context.account` for its seeds; unresolved or ambiguous scope
+fails setup rather than seeding a different default account. This is account
+scoping, not a sandbox reset: fixtures for the same account may still coexist.
+
+For product-filter checks, exclude a known negative control rather than assuming
+only one product can match. A validation entry can use:
+
+```yaml
+check: field_excludes
+path: products[*].product_id
+value: filter_negative_control
+description: The seeded display control is absent from an OLV result
+```
+
+Declare `requires: [field_excludes_runner]` at the storyboard root (alongside
+`controller` when needed). Supporting SDKs satisfy this intrinsic requirement;
+older SDKs skip the scenario before seeding instead of silently ignoring an unknown
+check. The matcher has the same scalar, deep-subset, and `allowed_values` semantics
+as `field_contains`, inverted over **every** resolved terminal. Empty arrays pass;
+additional matching products are allowed. Failed checks report the prohibited
+terminal in the `actual` array and `expected.excludes` while preserving the
+seller's response. Diagnostic evidence is bounded to the matching terminal;
+absence is checked across the complete result.
+
 ### `adcp fuzz` — property-based schema fuzzing
 
 Generates schema-valid requests, calls your agent, checks every response under the two-path oracle (schema-valid success *or* well-formed AdCP error envelope with uppercase reason code). Anything else — 500, stack traces, lowercase error codes, token leaks — fails.
@@ -429,6 +471,8 @@ npx @adcp/sdk@15.9 storyboard run \
 The `deterministic_testing` universal storyboard — plus rejection-branch and delivery-reporting sub-scenarios across several specialisms — requires your agent to expose `comply_test_controller`. Without it, the grader records `controller_detected: false` and skips or fails every step that needs a forced state transition, simulated delivery, or seeded error condition.
 
 **Use `createComplyController`** — adapter-based scaffold that handles dispatch, param validation, typed error envelopes, and re-seed idempotency for you:
+
+On AdCP 3.1+ the runner validates every controller response against the selected release's schema, and the protocol envelope requires `status`; 3.0.25 composes no such envelope and has no `status` requirement. The request schema is enforced too — 3.1.30 and 3.2.8 require the sandbox `account` assertion, 3.0.25 declares no `account` at all.
 
 ```typescript
 import { createComplyController, TestControllerError } from '@adcp/sdk/testing';
@@ -796,6 +840,7 @@ Hints also land in machine-readable output:
 | `Error: MCP session probe could not run: …` | Not an authentication result at all: a wire version this SDK does not implement, a response shape the official MCP client rejects, or an exchange that never completed. Nothing was learned about your credentials; fix the named protocol problem and re-run |
 | `extraction.note` reads `MCP session probe graded <tool> at <stage>` | Which protected tool the verdict rests on, and where the agent decided (`initialize` for session-boundary auth, `tools/call` for per-operation auth). The verdict is evidence that the mechanism is enforced **at that tool** — it is not a claim that every tool enforces auth |
 | `storyboard run` reports `Agent requires OAuth` / exits without running | Save tokens once with `adcp --save-auth <alias> <url> --oauth`, or pass `--oauth` to `storyboard run` to complete auth inline |
+| A `comply_test_controller` step newly fails `response_schema` after an SDK upgrade | The controller response schemas now ship with the package, so the selected release's strict validation actually runs for this tool. On AdCP 3.1+ the protocol envelope requires `status`; 3.0.25 has no such requirement. Not a new wire contract — see [Packaged `comply_test_controller` schemas](https://github.com/adcontextprotocol/adcp-client/blob/16.x/docs/development/WIRE-VERSION-COMPAT.md#packaged-comply_test_controller-schemas). Temporary migration unblock only: `--no-strict-response-schema-validation` |
 | `storyboard run` prints `💡 Hint: Rejected …` below an error | Catalog inconsistency between the two tools — see [§ Reading hint lines](#reading--hint-lines-context-value-rejections) above |
 | `fuzz` reports `500` status with stack trace | Validate inputs and return `adcpError('REFERENCE_NOT_FOUND', ...)` instead |
 | `fuzz` reports `response_shape_mismatch` | Response drifted from schema — regen with `npm run sync-schemas` + check your handler |
@@ -840,3 +885,9 @@ Random seed on nightly broadens the surface; fixed seed on per-PR keeps reproduc
 For creative evaluator security fixtures, see
 [Creative evaluator build probes](CREATIVE-BUILD-PROBE.md) for valid route/input
 preparation, provisioned legacy selectors and explicit coverage gaps.
+
+SDK 16 controller registration preserves an optional open account carrier for
+AdCP 3.0 compatibility. AdCP 3.1 callers must include `account: { sandbox: true,
+...identity }` under their wire contract. Public opaque AccountRefs remain
+`{account_id}`; the controller carrier adds the sandbox assertion. Resolve the
+supplied identity against trusted sandbox account state before writing fixtures.
