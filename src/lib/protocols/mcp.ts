@@ -1,3 +1,9 @@
+import {
+  mcpConnectionPartitionKey,
+  shouldReuseMCPConnection,
+  withMCPConnectionPolicy,
+  type MCPConnectionPolicy,
+} from './mcp-connection-policy';
 // Official MCP client implementation using HTTP streaming transport with SSE fallback
 import { Client as MCPClient } from '@modelcontextprotocol/sdk/client/index.js';
 import {
@@ -29,11 +35,13 @@ import {
 import { closeModernMCPConnections, tryCallModernMCPTool } from './mcp-modern';
 import {
   currentMCPConnectionScopeKey,
+  markMCPConnectionScopeInterrupted,
   isMCPConnectionScopeCacheKeyActive,
   registerMCPConnectionScopeCleanup,
   registerMCPConnectionScopePending,
 } from './mcp-scope';
 import { terminateSessionBestEffort } from './session-termination';
+import { sharedLegacyJsonSchemaValidator } from './mcp-schema-validator';
 import {
   applyMCPCallHeaders,
   isCorrelationHeader,
@@ -165,6 +173,8 @@ function connectionCacheKey(
   // `maxResponseBytes: 0` call leave the session's listener unwrapped for
   // every later caller (adcp-client#3253).
   parts.push(responseSizeCapCacheKey());
+  const partitionKey = mcpConnectionPartitionKey();
+  if (partitionKey) parts.push(`partition:${partitionKey}`);
   const scopeKey = currentMCPConnectionScopeKey();
   if (scopeKey) parts.push(scopeKey);
   return parts.join('::');
@@ -339,10 +349,10 @@ async function getOrCreateConnection(
           throw new Error(`MCP ${label} completed after connection teardown`);
         }
         connectionCache.set(cacheKey, client);
-        registerMCPConnectionScopeCleanup('legacy', cacheKey, async () => {
+        registerMCPConnectionScopeCleanup('legacy', cacheKey, async terminateSession => {
           if (connectionCache.get(cacheKey) !== client) return;
           connectionCache.delete(cacheKey);
-          await closeMCPClient(client);
+          await closeMCPClient(client, terminateSession);
         });
         evictLeastRecentlyUsed();
         return client;
@@ -393,6 +403,8 @@ function oauthConnectionCacheKey(
   if (headersKey) parts.push(`headers:${headersKey}`);
   if (fetchFn) parts.push(`fetch:${getTransportFetchFnDisambiguator(fetchFn)}`);
   if (allowPrivateIp !== undefined) parts.push(`allow-private-ip:${allowPrivateIp}`);
+  const partitionKey = mcpConnectionPartitionKey();
+  if (partitionKey) parts.push(`partition:${partitionKey}`);
   const scopeKey = currentMCPConnectionScopeKey();
   if (scopeKey) parts.push(scopeKey);
   return parts.join('::');
@@ -441,10 +453,10 @@ async function getOrCreateOAuthConnection(
           throw new Error('OAuth MCP connection completed after connection teardown');
         }
         oauthConnectionCache.set(cacheKey, client);
-        registerMCPConnectionScopeCleanup('oauth', cacheKey, async () => {
+        registerMCPConnectionScopeCleanup('oauth', cacheKey, async terminateSession => {
           if (oauthConnectionCache.get(cacheKey) !== client) return;
           oauthConnectionCache.delete(cacheKey);
-          await closeMCPClient(client);
+          await closeMCPClient(client, terminateSession);
         });
         evictLeastRecentlyUsedOAuth();
         return client;
@@ -499,15 +511,17 @@ async function withCachedOAuthConnectionImpl<T>(
   // caller-owned scope it keeps its own one-shot session. Signal, deadline and
   // correlation headers only bound the call and never force a new session.
   const guardedConnection = options.fetchFn !== undefined;
-  if (guardedConnection && currentMCPConnectionScopeKey() === undefined) {
+  if (!shouldReuseMCPConnection(guardedConnection)) {
     const { client } = await connectMCP(options);
-    let succeeded = false;
+    let terminateSession = true;
     try {
       const result = await runCallPhase(options.signal, () => fn(client));
-      succeeded = true;
       return result;
+    } catch (error) {
+      terminateSession = !isAbortOrTimeoutError(error);
+      throw error;
     } finally {
-      await closeMCPClient(client, succeeded).catch(() => {});
+      await closeMCPClient(client, terminateSession).catch(() => {});
     }
   }
 
@@ -536,7 +550,10 @@ async function withCachedOAuthConnectionImpl<T>(
     // An abort or timeout is scoped to the request that carried it (its HTTP
     // request is cancelled through the call context), so the shared session
     // stays available to other callers.
-    if (isAbortOrTimeoutError(error)) throw error;
+    if (isAbortOrTimeoutError(error)) {
+      markMCPConnectionScopeInterrupted();
+      throw error;
+    }
 
     if (is401Error(error)) {
       options.debugLogs.push({
@@ -600,17 +617,19 @@ async function withCachedConnectionImpl<T>(
   // caller-owned scope it keeps its own one-shot session. Signal, deadline and
   // correlation headers only bound the call and never force a new session.
   const guardedConnection = transportFetch !== undefined;
-  if (guardedConnection && currentMCPConnectionScopeKey() === undefined) {
+  if (!shouldReuseMCPConnection(guardedConnection)) {
     const client = await connectMCPWithFallback(baseUrl, authHeaders, debugLogs, label, transportFetch, requestOptions);
-    let succeeded = false;
+    let terminateSession = true;
     try {
       const result = await withAbortSignal([requestOptions.signal], undefined, () =>
         runCallPhase(requestOptions.signal, () => fn(client))
       );
-      succeeded = true;
       return result;
+    } catch (error) {
+      terminateSession = !isAbortOrTimeoutError(error);
+      throw error;
     } finally {
-      await closeMCPClient(client, succeeded).catch(() => {});
+      await closeMCPClient(client, terminateSession).catch(() => {});
     }
   }
 
@@ -646,7 +665,10 @@ async function withCachedConnectionImpl<T>(
     // An abort or timeout is scoped to the request that carried it: its HTTP
     // request is cancelled through the call context, and the shared session
     // stays available to other callers.
-    if (isAbortOrTimeoutError(error)) throw error;
+    if (isAbortOrTimeoutError(error)) {
+      markMCPConnectionScopeInterrupted();
+      throw error;
+    }
 
     // Auth errors won't be fixed by reconnecting — fail fast
     if (is401Error(error)) {
@@ -685,7 +707,7 @@ export async function withScopedLegacyConnection<T>(
   label: string,
   fn: (client: MCPClient) => Promise<T>
 ): Promise<{ value: T } | undefined> {
-  if (currentMCPConnectionScopeKey() === undefined) return undefined;
+  if (!shouldReuseMCPConnection(options.fetchFn !== undefined)) return undefined;
   const debugLogs = options.debugLogs ?? [];
   if (options.authProvider) {
     return {
@@ -746,7 +768,7 @@ function httpStatusOf(error: unknown, depth = 0): number | undefined {
 /**
  * Options for MCP tool calls with OAuth support
  */
-export interface MCPCallOptions {
+export interface MCPCallOptions extends MCPConnectionPolicy {
   /** Agent URL */
   agentUrl: string;
   /** Tool name to call */
@@ -870,7 +892,10 @@ async function connectMCPWithFallbackImpl(
   let failedClient: MCPClient | undefined;
 
   try {
-    const client = new MCPClient({ name: 'AdCP-Client', version: '1.0.0' });
+    const client = new MCPClient(
+      { name: 'AdCP-Client', version: '1.0.0' },
+      { jsonSchemaValidator: sharedLegacyJsonSchemaValidator }
+    );
     failedClient = client;
     debugLogs.push({
       type: 'info',
@@ -922,7 +947,10 @@ async function connectMCPWithFallbackImpl(
         message: `MCP: Transient connect error (${errorClass}) detected, retrying StreamableHTTP for ${label}`,
         timestamp: new Date().toISOString(),
       });
-      const retryClient = new MCPClient({ name: 'AdCP-Client', version: '1.0.0' });
+      const retryClient = new MCPClient(
+        { name: 'AdCP-Client', version: '1.0.0' },
+        { jsonSchemaValidator: sharedLegacyJsonSchemaValidator }
+      );
       try {
         const retryTransport = new StreamableHTTPClientTransport(url, transportOptions);
         await retryClient.connect(retryTransport, mcpRequestOptions);
@@ -976,7 +1004,10 @@ async function connectMCPWithFallbackImpl(
       message: `MCP: Falling back to SSE transport for ${label}`,
       timestamp: new Date().toISOString(),
     });
-    const client = new MCPClient({ name: 'AdCP-Client', version: '1.0.0' });
+    const client = new MCPClient(
+      { name: 'AdCP-Client', version: '1.0.0' },
+      { jsonSchemaValidator: sharedLegacyJsonSchemaValidator }
+    );
     try {
       await client.connect(
         new SSEClientTransport(url, {
@@ -1013,7 +1044,34 @@ export async function callMCPTool(
   customHeaders?: Record<string, string>,
   signingContext?: AgentSigningContext,
   transportFetch?: typeof fetch,
-  requestOptions?: { signal?: AbortSignal; requestTimeoutMs?: number; allowPrivateIp?: boolean }
+  requestOptions?: MCPConnectionPolicy & { signal?: AbortSignal; requestTimeoutMs?: number; allowPrivateIp?: boolean }
+): Promise<unknown> {
+  return withMCPConnectionPolicy(requestOptions, () =>
+    callMCPToolInContext(
+      agentUrl,
+      toolName,
+      args,
+      authToken,
+      debugLogs,
+      customHeaders,
+      signingContext,
+      transportFetch,
+      requestOptions
+    )
+  );
+}
+
+/** @internal Dispatch within an SDK-owned connection-policy boundary. */
+export async function callMCPToolInContext(
+  agentUrl: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  authToken?: string,
+  debugLogs: DebugLogEntry[] = [],
+  customHeaders?: Record<string, string>,
+  signingContext?: AgentSigningContext,
+  transportFetch?: typeof fetch,
+  requestOptions?: MCPConnectionPolicy & { signal?: AbortSignal; requestTimeoutMs?: number; allowPrivateIp?: boolean }
 ): Promise<unknown> {
   debugLogs.push({
     type: 'info',
@@ -1229,10 +1287,10 @@ export async function connectMCP(options: {
     authMethod: authProvider ? 'oauth' : authToken ? 'token' : 'none',
   });
 
-  const mcpClient = new MCPClient({
-    name: 'AdCP-Client',
-    version: '1.0.0',
-  });
+  const mcpClient = new MCPClient(
+    { name: 'AdCP-Client', version: '1.0.0' },
+    { jsonSchemaValidator: sharedLegacyJsonSchemaValidator }
+  );
 
   // Build transport options
   const transportOptions: StreamableHTTPClientTransportOptions = {};
@@ -1408,6 +1466,11 @@ export async function connectMCP(options: {
  * @throws UnauthorizedError if OAuth is required (with transport attached)
  */
 export async function callMCPToolWithOAuth(options: MCPCallOptions): Promise<unknown> {
+  return withMCPConnectionPolicy(options, () => callMCPToolWithOAuthInContext(options));
+}
+
+/** @internal Dispatch within an SDK-owned connection-policy boundary. */
+export async function callMCPToolWithOAuthInContext(options: MCPCallOptions): Promise<unknown> {
   const {
     agentUrl,
     toolName,
@@ -1430,11 +1493,21 @@ export async function callMCPToolWithOAuth(options: MCPCallOptions): Promise<unk
 
   // If no OAuth provider, use the legacy function
   if (!authProvider) {
-    return callMCPTool(agentUrl, toolName, args, authToken, debugLogs, customHeaders, signingContext, fetchFn, {
-      signal,
-      requestTimeoutMs,
-      allowPrivateIp,
-    });
+    return callMCPToolInContext(
+      agentUrl,
+      toolName,
+      args,
+      authToken,
+      debugLogs,
+      customHeaders,
+      signingContext,
+      fetchFn,
+      {
+        signal,
+        requestTimeoutMs,
+        allowPrivateIp,
+      }
+    );
   }
 
   const modernAttempt = await tryCallModernMCPTool(agentUrl, toolName, args, undefined, debugLogs, customHeaders, {
@@ -1450,6 +1523,7 @@ export async function callMCPToolWithOAuth(options: MCPCallOptions): Promise<unk
     debugLogs.push({
       type: modernAttempt.response?.isError ? 'error' : 'success',
       message: `MCP: Tool ${toolName} response received`,
+      response: modernAttempt.response,
       timestamp: new Date().toISOString(),
     });
     return modernAttempt.response;
@@ -1480,6 +1554,7 @@ export async function callMCPToolWithOAuth(options: MCPCallOptions): Promise<unk
       debugLogs.push({
         type: response?.isError ? 'error' : 'success',
         message: `MCP: Tool ${toolName} response received`,
+        response,
         timestamp: new Date().toISOString(),
       });
 

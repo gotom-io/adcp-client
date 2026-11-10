@@ -13,13 +13,19 @@
 import { randomUUID } from 'node:crypto';
 import type { StoryboardContext, ContextOutput, ContextInput, ContextProvenanceEntry } from './types';
 import { resolvePath, setPath } from './path';
+import { detachProtectedValue, isProtectedContextKey } from './protected-context';
 import { getAuthoritativeMediaBuyStatus } from '../../utils/media-buy-status';
 
 // ────────────────────────────────────────────────────────────
 // Context extraction: pull known IDs from task responses
 // ────────────────────────────────────────────────────────────
 
-type ContextExtractor = (data: unknown) => Record<string, unknown>;
+/**
+ * `adcpVersion` is the release the step was requested at. Media-buy mutation
+ * extractors use it to tell a 3.1+ task-envelope `status` from a 3.0
+ * lifecycle `status` when the response does not echo its version.
+ */
+type ContextExtractor = (data: unknown, adcpVersion?: string) => Record<string, unknown>;
 
 const PRODUCT_CONTEXT_KEYS = [
   'product',
@@ -48,13 +54,27 @@ function readMediaBuyStatus(record: Record<string, unknown> | undefined): unknow
   return getAuthoritativeMediaBuyStatus(record);
 }
 
-function readMediaBuyFields(data: unknown): { mediaBuyId?: unknown; status?: unknown } {
+function readMediaBuyFields(data: unknown, adcpVersion?: string): { mediaBuyId?: unknown; status?: unknown } {
   const outer = asRecord(data);
   const nested = asRecord(outer?.media_buy);
   return {
     mediaBuyId: nested?.media_buy_id ?? outer?.media_buy_id,
-    status: readMediaBuyStatus(nested) ?? readMediaBuyStatus(outer),
+    status: readMediaBuyStatus(nested) ?? readMediaBuyStatus(withRequestedVersion(outer, adcpVersion)),
   };
+}
+
+/**
+ * A create/update response's top-level `status` is the task envelope from
+ * AdCP 3.1. When the seller omits the optional version echo, read the payload
+ * at the requested release so a bare `completed` is not taken as a lifecycle.
+ */
+function withRequestedVersion(
+  record: Record<string, unknown> | undefined,
+  adcpVersion: string | undefined
+): Record<string, unknown> | undefined {
+  if (!record || !adcpVersion) return record;
+  if (typeof record.adcp_version === 'string' || typeof record.adcp_major_version === 'number') return record;
+  return { ...record, adcp_version: adcpVersion };
 }
 
 function readProposalFields(proposal: Record<string, unknown> | undefined): Record<string, unknown> {
@@ -198,16 +218,16 @@ export const CONTEXT_EXTRACTORS: Record<string, ContextExtractor> = {
     return readCompactMediaBuyFields(data);
   },
 
-  create_media_buy(data) {
-    const { mediaBuyId, status } = readMediaBuyFields(data);
+  create_media_buy(data, adcpVersion) {
+    const { mediaBuyId, status } = readMediaBuyFields(data, adcpVersion);
     const extracted: Record<string, unknown> = {};
     if (mediaBuyId) extracted.media_buy_id = mediaBuyId;
     if (status) extracted.media_buy_status = status;
     return extracted;
   },
 
-  update_media_buy(data) {
-    const { mediaBuyId, status } = readMediaBuyFields(data);
+  update_media_buy(data, adcpVersion) {
+    const { mediaBuyId, status } = readMediaBuyFields(data, adcpVersion);
     const extracted: Record<string, unknown> = {};
     if (mediaBuyId) extracted.media_buy_id = mediaBuyId;
     if (status) extracted.media_buy_status = status;
@@ -437,12 +457,17 @@ export const CONTEXT_EXTRACTORS: Record<string, ContextExtractor> = {
 
 /**
  * Extract context values from a task response.
+ *
+ * @param adcpVersion - Optional AdCP release the request was sent at. Used
+ *   only when the response does not echo `adcp_version`, to read a
+ *   create/update top-level `status` as the 3.1+ task status rather than a
+ *   3.0 media-buy lifecycle.
  */
-export function extractContext(taskName: string, data: unknown): Record<string, unknown> {
+export function extractContext(taskName: string, data: unknown, adcpVersion?: string): Record<string, unknown> {
   const extractor = CONTEXT_EXTRACTORS[taskName];
   if (!extractor) return {};
   try {
-    return extractor(data);
+    return extractor(data, adcpVersion);
   } catch {
     return {};
   }
@@ -473,7 +498,12 @@ const aliasCaches = new WeakMap<StoryboardContext, Record<string, string>>();
 function getAliasCache(context: StoryboardContext): Record<string, string> {
   let cache = aliasCaches.get(context);
   if (!cache) {
-    cache = {};
+    // Null-prototype: the alias grammar (`[A-Za-z0-9_.-]+`) admits
+    // `__proto__`, `constructor`, `toString` and every other
+    // `Object.prototype` member, so a plain `{}` would report them as
+    // already cached and hand back the inherited value — a function or
+    // the prototype object — where a UUID string is expected.
+    cache = Object.create(null) as Record<string, string>;
     aliasCaches.set(context, cache);
   }
   return cache;
@@ -565,14 +595,24 @@ function deepReplace(value: unknown, context: StoryboardContext, runnerVars?: Ru
     const ctxMatch = expanded.match(/^\$context\.(\w+)$/);
     if (ctxMatch?.[1]) {
       const key = ctxMatch[1];
-      return key in context ? context[key] : expanded;
+      // Own-key lookup only. `in` walks the prototype chain, so a polluted
+      // prototype could otherwise answer for a reserved key that was never
+      // committed.
+      if (!Object.hasOwn(context, key)) return expanded;
+      // Fixture-preparation snapshots are handed out as detached clones.
+      // Request builders legitimately mutate the objects they receive, and
+      // the canonical value is returned by reference everywhere else, so
+      // without this a mutated request could write back into the pinned
+      // snapshot it was built from. Ordinary keys keep their existing
+      // by-reference semantics unchanged.
+      return isProtectedContextKey(key) ? detachProtectedValue(context[key]) : context[key];
     }
     const genMatch = expanded.match(/^\$generate:(uuid_v4|opaque_id)(?:#([A-Za-z0-9_.-]+))?$/);
     if (genMatch) {
       const alias = genMatch[2];
       if (alias) {
         const cache = getAliasCache(context);
-        if (!(alias in cache)) cache[alias] = randomUUID();
+        if (!Object.hasOwn(cache, alias)) cache[alias] = randomUUID();
         return cache[alias];
       }
       return randomUUID();
@@ -701,8 +741,13 @@ export interface ContextWriteResult {
  * tagging it as a convention-based extraction. `response_path` is absent
  * for convention extractors — they're hardcoded functions, not YAML paths.
  */
-export function extractContextWithProvenance(taskName: string, data: unknown, stepId: string): ContextWriteResult {
-  const values = extractContext(taskName, data);
+export function extractContextWithProvenance(
+  taskName: string,
+  data: unknown,
+  stepId: string,
+  adcpVersion?: string
+): ContextWriteResult {
+  const values = extractContext(taskName, data, adcpVersion);
   const clearGroups = (() => {
     const response = asRecord(data);
     switch (taskName) {
@@ -782,7 +827,7 @@ export function applyContextOutputsWithProvenance(
       }
       const cache = getAliasCache(context);
       let value: string;
-      if (output.key in cache) {
+      if (Object.hasOwn(cache, output.key)) {
         value = cache[output.key]!;
       } else {
         value = randomUUID();
@@ -836,8 +881,16 @@ export function applyContextInputs(
 ): Record<string, unknown> {
   const result = structuredClone(request);
   for (const input of inputs) {
-    if (input.key in context) {
-      setPath(result, input.inject_at, context[input.key]);
+    // Own-key lookup, for the same reason as `$context.<key>` substitution.
+    if (Object.hasOwn(context, input.key)) {
+      // Same detachment rule as `$context.<key>` substitution: the request is
+      // a mutable working copy, so a protected snapshot must not be aliased
+      // into it.
+      setPath(
+        result,
+        input.inject_at,
+        isProtectedContextKey(input.key) ? detachProtectedValue(context[input.key]) : context[input.key]
+      );
     }
   }
   return result;

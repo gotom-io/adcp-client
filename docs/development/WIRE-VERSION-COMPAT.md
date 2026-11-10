@@ -14,21 +14,95 @@ SDK-hosted sellers must advertise only implemented AdCP 3 releases. Server start
 
 ## AdCP 3 compatibility
 
-The public API uses the primary pin. `src/lib/adapters/version/` holds version-specific request adaptation for maintained AdCP 3 releases. Seller capability evidence and release negotiation determine the effective target. Response validation uses the selected AdCP 3 release; capability discovery can validate against the seller-served release echoed in `adcp_version`.
+The public API uses the primary pin. Application code builds requests and reads responses in that release's shape, and the client translates for older sellers (adcp-client#3370):
+
+1. **Negotiate.** `negotiateAdcpRelease()` (`src/lib/adapters/version/negotiate.ts`) picks the highest release on or below the client's line from the seller's `supported_versions`. It falls back to the served `adcp_version`. A same-line match keeps the client's exact pin. Sellers with no release metadata (AdCP 3.1 does not require `supported_versions`), synthetic capabilities, an explicit `wireAdcpVersion`, governed payloads and the identity 3.3 experiment skip negotiation; the first two keep the 3.0 request adapters via `resolveAdapterKey`.
+2. **Convert the request down** one minor at a time (`translate.ts`). Each step runs the hand-written `adaptRequest` adapters registered under the older release's key (`version/3.1/` for 3.2 → 3.1, `version/3.0/` for 3.1 → 3.0), then `projectToolPayload()` (`schema-projection.ts`). The projection diffs the two releases' tool schemas and removes properties, enum values and union variants only the newer one defines. Fields neither release declares, and free-form maps, are left alone.
+3. **Guard account identity.** Removed account-key fields (`operator_unit`, `currency`, `timezone` and `brand.countries` on any account reference) are refused by default. `accountIdentityDowngrade: 'reduce'` sends the older key and reports `account_identity_reduced`. The account registry (which needs `accountStorage` with `compareAndSet`) binds each reduced key to one buyer key, with unreduced keys claiming themselves (`claimReductions`, all-or-nothing per request), refuses collisions in either order, keeps sending the reduced key after the seller upgrades (`account_identity_migration_pending`) and forgets it on `clearReduction` (`src/lib/core/account-reduction.ts`, `buyer-account-registry.ts`).
+4. **Validate** the converted request, and the response, against the negotiated release.
+5. **Convert the response up** through each step's `adaptResponse`. Upward steps never remove fields.
+
+Every change is a `debug_logs` drift entry with `fromVersion` / `toVersion`. Tasks the negotiated release does not define are refused with `ProtocolFeatureUnsupportedError` unless the seller lists them.
+
+To add a version pair (e.g. 3.3 ↔ 3.2), ship the older bundle, create `version/<older>/` with adapters for renames and moves only, and register it in `version/index.ts`. Additions need no code: the projection removes and reports them.
+
+On the server, `createAdcpServer` does the reverse. Handlers are written against the server's `adcpVersion`. When a buyer is served an older release, the request runs through each step's `upgradeRequest` adapters before the handler. The handler's response then runs through `downgradeResponse` adapters and the response-schema projection before it is validated against the served release (`downgradeResponse` / `upgradeRequest` in `src/lib/adapters/version/`, wired in the tool handler of `create-adcp-server.ts`). `get_adcp_capabilities` keeps its own projection. `get_task_status` results are converted by their `task_type`. Every conversion is reported to the `onVersionTranslation` callback.
+
+Capability discovery can validate against the seller-served release echoed in `adcp_version`.
 
 Established media-buy tools remain available for AdCP 3.0/3.1 sellers. Their compact-lifecycle projections and durable purchase continuations remain scoped to the negotiated AdCP 3 release. Creative-model v1/v2 projections under `src/lib/v2/projection/` are independent of AdCP protocol majors.
+
+### Primary media facts narrow legacy format choices
+
+When a seller offers several legacy references for an image, hosted video or hosted
+audio creative, projection can use the one primary asset's positive, finite width,
+height or duration to select a reference. Explicit creative `format_parameters`
+remain authoritative; media facts do not fill partially specified parameters.
+Multiple assets of the same media type remain ambiguous. A single legacy reference
+keeps its existing seller-scaling behavior.
+
+Reference and catalog constraints take precedence. Seller option `params` fill
+missing reference facts, including one fixed size in `sizes` or an exact duration.
+The selected wire reference is unchanged. Duration comparison remains exact.
+
+### Legacy creative trackers
+
+For AdCP 3.0 delivery, the request adapters convert renderer-fired `pixel_tracker`
+assets to URL trackers before schema projection. Impression and click events map
+to their legacy slots. Viewability variants, custom timing and JavaScript methods
+emit `PIXEL_TRACKER_LOSSY_DOWNGRADE` in the task debug logs. JavaScript URLs are
+requested as image pixels after this downgrade; their code does not execute.
+Competing assets are refused instead of overwriting a legacy slot.
+
+A call negotiated as 3.1 keeps its pixel trackers even if the seller also lists
+3.0 support. Missing or synthetic release metadata keeps the previous request
+adapter behavior; it does not establish permission to downgrade trackers.
+A caller-supplied format definition can explicitly require a legacy
+URL tracker slot; creative projection then converts and matches that slot together.
+Pure projection callers should surface `getCreativeDeliveryDiagnostics(projected)`
+from `@adcp/sdk/v2/projection`. These advisories remain outside the wire JSON.
 
 ## Bundled artifacts
 
 ```text
 schemas/cache/
-├── 3.2.5/       # primary SDK pin
-├── 3.1.29/      # maintained stable release
+├── 3.2.8/       # primary SDK pin
+├── 3.1.32/      # maintained stable release
+├── 3.1.30/      # maintained stable release (exact historical corpus)
 ├── 3.0.25/      # maintained stable release
 └── latest/      # symlink to the primary pin
 ```
 
 Run `npm run sync-schemas:all` to refresh the primary and maintained bundles. Run `npm run generate-types:all` to regenerate public types, then `npm run build:lib` to build and copy supported schemas into the package. `copy-schemas-to-dist.ts` excludes retired AdCP 2 caches even when present locally. `check-publish-protocol-artifacts.mjs` checks the published schema inventory and rejects retired type exports.
+
+The v16 primary pin is AdCP 3.2.8, including its signed schema and compliance bundles. It is unchanged by maintained 3.1 adoption: a side bundle never repins the primary, and `sync-schemas` leaves the primary skills and the `latest` pointer alone for any non-primary version. The patch refresh preserves the public request/response types and the existing pathways to AdCP 3.1 and 3.0.
+
+Compliance pins select exact fixture bytes, unlike same-minor wire schema aliases. Retain the matching historical SDK if a run requires an older corpus. The maintained 3.1.32, 3.1.30 and 3.0.25 corpora are all packaged.
+
+That distinction matters when two patches of the same minor are maintained together. `copy-schemas-to-dist.ts` groups source schema caches by minor and ships the highest patch, so `dist/lib/schemas-data/3.1/` resolves to 3.1.32 — the **schema** alias deliberately collapses. The **compliance** corpora do not: `compliance/cache/3.1.30/` and `compliance/cache/3.1.32/` both ship with their own exact bytes, so a run pinned with `--compliance-version 3.1.30` still gets the fixtures it pinned. Do not read the retained 3.1.30 source cache as a promise that the packaged **schema** directory keeps 3.1.30 bytes; it does not.
+
+Comparing the two releases' schema trees, they differ only in release identifiers and generated timestamps — no structural validation-rule changes were found between them. That is a statement about these two releases as they ship today, not a general guarantee about release selectors or `$id` values: a future patch could carry real schema changes, and the alias would still collapse to it.
+
+`COMPATIBLE_ADCP_VERSIONS` describes accepted wire versions, not the inventory of packaged compliance corpora. This package ships corpora for 3.0.25, 3.1.30, 3.1.32 and 3.2.8; it does not include an exact 3.1.31 compliance cache.
+
+Four storyboards are inert on SDK 16 under 3.1.32. `media_buy_seller/canonical_formats` and `pricing_currency_filter` are present in 3.1.30 with no requirement and run there; in 3.1.32 both declare the `collect_product_pages_runner` requirement, which this SDK does not implement, so they report `requirement_unmet` and skip. `canonical_custom_formats` and `canonical_experimental_formats` are new in 3.1.32 and inert for the same reason — they are not lost coverage, they never ran here. Four unique storyboards, eight mirrored copies across the `domains/` and `protocols/` trees. The requirement reporting is deliberately truthful rather than relaxed, and any future native qualification must disclose these gaps rather than claim full coverage.
+
+Build tooling also understands exact AdCP 3.3.0 `beta.N` and `rc.N` pins. Such a build retains maintained AdCP 3.0, 3.1, and 3.2 GA aliases through 3.2.7 while advertising only the selected prerelease, without a moving beta/RC-family alias. This prepares the v17 integration; the stable v16 compatibility list continues to advertise only AdCP 3.2 and earlier.
+
+Conformance validates current and unversioned response payloads without synthesizing task status. The existing status-optional compatibility shim applies only to explicitly declared AdCP 3.0 payloads, and never to status-free compact tools. Closed response schemas admit only the canonical version-envelope fields alongside their declared task fields; other root restrictions and nested-body constraints remain enforced.
+
+### Packaged `comply_test_controller` schemas
+
+The published `compliance/` controller documents ship inside each selected bundle: the request and response schemas plus the siblings they `$ref`, transitively. That is 2 compliance-local siblings for 3.0.25, 2 for 3.1.32, and 4 for 3.2.8 — the latter adds `task-completion-data.json` and the `get-creative-features-completion.json` it references, without which AJV cannot compile the controller validator at all. Files are copied byte-for-byte from the selected published cache; the rest of `compliance/` still stays out of the package. The counts are compliance-local only: a controller response also `$ref`s `core/` and `creative/` documents, which ship whole as before and are not affected by this filter.
+
+Three consequences are visible to adopters who did not change their agent:
+
+- **Controller validators resolve.** `getSchemaValidatorByRef('compliance/comply-test-controller-request.json', version)` and its `-response` counterpart now return a validator against an installed package, as do `getValidator('comply_test_controller', 'request', version)` and `getValidator('comply_test_controller', 'sync', version)`. Note the `Direction` argument: `'sync'` is the terminal response variant, and `getValidator(..., 'response', ...)` is not a legal direction — it returns `undefined`. Previously the documents were absent from the package, so lookups returned `undefined` and the checks that depend on them did not run for this tool.
+- **Declared-field gating has a schema to consult.** The runner stops adding an undeclared root `brand` to controller requests, and the controller `account` stays canonical on the releases that declare it. 3.1.32 and 3.2.8 declare `account`; 3.0.25 declares neither `account` nor a root `brand`.
+- **Selected-release response JSON Schema validation actually runs.** An existing nonconformant controller can therefore newly fail conformance steps with no agent change. This is not a new wire contract: `status` was already required through the 3.1.32 and 3.2.8 protocol envelopes, and is not required by 3.0.25.
+- **Request-side effects.** Because the request schema also resolves now, two further things change for this tool. `validateRequest` actually checks controller requests — at the `'warn'` default this is new log noise, but a run configured with `validation: { requests: 'strict' }` gets hard failures where it previously got silence. And because the request schema declares no root `brand`, declared-field gating now suppresses one: controller requests that previously carried a run-scoped root `brand` by fail-open no longer do. A seller that keys sandbox session state off `brand.domain` rather than the `account` it resolves should re-run its storyboards; `npm run compliance:fork-matrix` covers the bundled reference adapters. On a 3.0.25-pinned run the same canonical-schema fallback can strip `account` as well, since that release declares neither field — unless the agent's own tool input schema declares it. None of this is a new wire contract; it is the declared schema being consulted where it previously could not be.
+
+`src/lib/testing/client.ts` defaults `validation.responses` to `strict`, so testing-surface runs see these checks first; the ordinary client surface warns separately. The generated Zod projection check is a separate layer and is unchanged. For the temporary legacy escape hatch and its CLI equivalent, see [Validate your agent](../guides/VALIDATE-YOUR-AGENT.md) — reserve it for migration harnesses rather than routine compliance runs.
 
 ## Future major-version support
 

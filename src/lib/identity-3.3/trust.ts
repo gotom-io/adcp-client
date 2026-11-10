@@ -7,7 +7,7 @@ import { parseStrictJson } from '../signing/agent-resolver/strict-json';
 import { parse as parseDomain } from 'tldts';
 import schemas from './schemas.draft';
 import type { TrustRecord, TrustAgent, TrustGrant, AgentGrantDeniedDetails } from './types';
-const ajv = new Ajv({ strict: false, allErrors: false });
+const ajv = new Ajv({ inlineRefs: false, strict: false, allErrors: false });
 addFormats(ajv);
 for (const schema of schemas) ajv.addSchema(schema);
 export function validateIdentity33Schema(id: string, value: unknown): boolean {
@@ -408,13 +408,23 @@ export interface DemandGrantAuthorization {
 export interface DemandGrantOptions {
   evaluator: TrustEvaluator;
   now?: () => number;
-  /** Only evaluated for nonexclusive uncovered claims, never fetch failures. */
+  /** Only evaluated for uncovered claims against a record without `exclusive_grants: true`; never fetch failures. */
   sellerAuthorization?: (claim: DemandGrantClaim) => Promise<boolean>;
   /** Only for authoritative absence; never after a 200 or an exclusive record. */
   legacyAuthorization?: (claim: DemandGrantClaim) => Promise<boolean>;
-  /** Seller-verified brand identity resolution, including the house's child-brand ID. Never accept a buyer-selected authorizer. */
+  /**
+   * Seller-verified brand identity resolution, including the house's child-brand ID. Never accept a buyer-selected authorizer.
+   * Return the house brand.json's mutual-assertion model resolves (a house redirect, or a `house_domain` whose
+   * `brand_refs[]` lists the brand back), or `undefined` when it resolves none, including a house that does not
+   * list the brand back: the brand is then its own house. The house is both the authorizing record and, with the
+   * brand's domain, a domain under which authority is implicit. An uncoded throw is an outage
+   * (`TrustRecordUnavailableError`, `SERVICE_UNAVAILABLE`), never `grant_absent`; an `IdentityAuthorizationError` or
+   * `AdcpError` (any error with a string `code`) thrown by the resolver keeps its code.
+   */
   resolveBrandHouse?: (brand: DemandGrantClaim['brand']) => Promise<{ domain: string; brand_id: string } | undefined>;
 }
+/** Candidate intermediary records fetched in parallel for one authorization. */
+const INTERMEDIARY_FETCH_CONCURRENCY = 8;
 function grantsScope(grant: TrustGrant, scope: string): boolean {
   return grant.scopes.some(
     granted => granted === '*' || granted === scope || (granted === 'adcp:all' && scope.startsWith('adcp:'))
@@ -422,7 +432,10 @@ function grantsScope(grant: TrustGrant, scope: string): boolean {
 }
 function grantMatches(grant: TrustGrant, target: string, claim: DemandGrantClaim, now: number): boolean {
   // Exact match on a registrable grantee: never reduce a host grantee to its eTLD+1.
-  if (registrableGrantee(grant.grantee) !== target) return false;
+  return registrableGrantee(grant.grantee) === target && grantCovers(grant, claim, now);
+}
+/** Every covering condition but the grantee: scope, agents[] narrowing, brands, countries and window. */
+function grantCovers(grant: TrustGrant, claim: DemandGrantClaim, now: number): boolean {
   if (!grantsScope(grant, claim.scope)) return false;
   // An agents[] URL that does not parse lists no agent: the grant fails to
   // match on its own and never throws out of the evaluation of other grants.
@@ -443,7 +456,13 @@ function grantMatches(grant: TrustGrant, target: string, claim: DemandGrantClaim
   if (grant.valid_until && Date.parse(grant.valid_until) / 1000 <= now) return false;
   return true;
 }
-/** Always invoke before sync_accounts side effects and before spend. No account mutation. */
+/**
+ * Always invoke before sync_accounts side effects and before spend. No account mutation.
+ *
+ * Authority is implicit when `account.operator` and the signer's operator share a registrable domain with the
+ * brand's domain or with its house's (L2 Grants in trust records): an organization's own agents act for its
+ * child brands without a grant. Otherwise a grant chain from the house's record must reach the signer's operator.
+ */
 export async function authorizeDemandGrant(
   claim: DemandGrantClaim,
   options: DemandGrantOptions
@@ -468,9 +487,26 @@ export async function authorizeDemandGrant(
       : {}),
   });
   if (brand === operator && account === operator) return result('implicit', [brand]);
-  if (brand === operator && account !== operator) throw new IdentityAuthorizationError('grant_absent');
-  const house = await options.resolveBrandHouse?.(claim.brand);
+  let house: { domain: string; brand_id: string } | undefined;
+  try {
+    house = await options.resolveBrandHouse?.(claim.brand);
+  } catch (cause) {
+    // An unresolvable house is an outage, never grant_absent: the claim may be
+    // the house's own implicit authority, which a narrower fallback would deny.
+    // A coded error (IdentityAuthorizationError, AdcpError) is the
+    // integrator's deliberate answer and keeps its code.
+    if (
+      cause instanceof IdentityAuthorizationError ||
+      (cause instanceof Error && typeof (cause as { code?: unknown }).code === 'string')
+    )
+      throw cause;
+    unavailable(cause);
+  }
   const authoritativeBrand = house ? eTldPlusOne(house.domain) : brand;
+  // Implicit: account.operator and the signer's operator are each the brand or
+  // its house. The signer's record, already matched above, lists the agent.
+  const self = new Set([brand, authoritativeBrand]);
+  if (self.has(account) && self.has(operator)) return result('implicit', [...new Set([brand, account, operator])]);
   const grantClaim = house ? { ...claim, brand: { ...claim.brand, brand_id: house.brand_id } } : claim;
   // A grantor that once served a record and is now unreachable (404/410
   // included) is an outage, never a grant removal or a legacy fallback.
@@ -479,36 +515,49 @@ export async function authorizeDemandGrant(
     if (await options.legacyAuthorization?.(claim)) return result('legacy', [brand, account, operator]);
     throw new IdentityAuthorizationError('grant_absent');
   }
-  const first = (record.record.grants ?? []).filter(g => grantMatches(g, account, grantClaim, now));
-  if (account === operator && first.length) return result('trust', [brand, operator], [first[0]!]);
-  // A self-operated brand (brand is its own account.operator) may grant the
-  // signer's operator directly: account.operator is on the chain as the brand.
-  const selfOperated = account === brand || account === authoritativeBrand;
-  if (selfOperated && account !== operator) {
-    const direct = (record.record.grants ?? []).find(g => grantMatches(g, operator, grantClaim, now));
-    if (direct) return result('trust', [brand, operator], [direct]);
+  // The one delegation-chain rule (L2 Grants in trust records): at most two
+  // grants from the house's record to the signer's operator, every grant
+  // covering the claim, with account.operator the brand, its house, or the
+  // first grant's grantee.
+  const firsts: { grant: TrustGrant; grantee: string }[] = [];
+  for (const grant of record.record.grants ?? []) {
+    const grantee = registrableGrantee(grant.grantee);
+    if (grantee === undefined || !grantCovers(grant, grantClaim, now)) continue;
+    if (!self.has(account) && account !== grantee) continue;
+    if (grantee === operator) return result('trust', [brand, operator], [grant]);
+    firsts.push({ grant, grantee });
   }
-  if (account !== operator && account !== brand && first.length) {
-    const intermediary = await options.evaluator.get(account);
-    if (intermediary.status === 'present') {
-      const second = (intermediary.record.grants ?? []).find(g => grantMatches(g, operator, grantClaim, now));
-      if (second) return result('trust', [brand, account, operator], [first[0]!, second]);
-    }
-  }
-  // A grant to account.operator (or, self-operated, to the signer's operator)
-  // for this scope that did not match is published narrowing: it blocks the
-  // seller's discretion. A grant whose grantee is not a registrable domain
-  // covers no claim, so it does not count here; its scopes still count for
-  // exclusive_grants, which below refuses every uncovered claim.
-  const covered = (record.record.grants ?? []).some(g => {
-    const grantee = registrableGrantee(g.grantee);
-    return (
-      grantee !== undefined &&
-      (grantee === account || (selfOperated && grantee === operator)) &&
-      grantsScope(g, claim.scope)
+  // Each distinct intermediary record is fetched once, at most
+  // INTERMEDIARY_FETCH_CONCURRENCY at a time, so N candidate chains cost about
+  // ceil(N / concurrency) fetch timeouts rather than N.
+  const grantees = [...new Set(firsts.map(f => f.grantee))];
+  const records = new Map<string, Awaited<ReturnType<TrustEvaluator['get']>> | { failed: unknown }>();
+  for (let i = 0; i < grantees.length; i += INTERMEDIARY_FETCH_CONCURRENCY) {
+    const batch = grantees.slice(i, i + INTERMEDIARY_FETCH_CONCURRENCY);
+    const settled = await Promise.allSettled(batch.map(grantee => options.evaluator.get(grantee)));
+    settled.forEach((outcome, j) =>
+      records.set(batch[j]!, outcome.status === 'fulfilled' ? outcome.value : { failed: outcome.reason })
     );
-  });
-  if (!covered && !record.record.exclusive_grants && (await options.sellerAuthorization?.(claim)))
+  }
+  let outage: unknown;
+  for (const { grant: first, grantee } of firsts) {
+    const intermediary = records.get(grantee)!;
+    if ('failed' in intermediary) {
+      // Another chain may still authorize; an unreadable link is an outage
+      // only if none does.
+      outage ??= intermediary.failed;
+      continue;
+    }
+    if (intermediary.status !== 'present') continue;
+    const second = (intermediary.record.grants ?? []).find(g => grantMatches(g, operator, grantClaim, now));
+    if (second) return result('trust', [brand, grantee, operator], [first, second]);
+  }
+  if (outage !== undefined) throw outage;
+  // L2 Absence: exclusive_grants on the authorizing record makes grants[] the
+  // complete list, whatever the scope. Without it, an uncovered claim is at
+  // the seller's discretion, and a grant that does not cover the claim never
+  // narrows that discretion. Only this (the house's) record's flag counts.
+  if (record.record.exclusive_grants !== true && (await options.sellerAuthorization?.(claim)))
     return result('seller', [brand, account, operator]);
   throw new IdentityAuthorizationError('grant_absent');
 }

@@ -211,6 +211,7 @@ import {
   type ComplyControllerConfig,
 } from '../../../testing/comply-controller';
 import type { TestControllerBridge } from '../../test-controller-bridge';
+import { TestControllerError } from '../../test-controller';
 import { mergeSeedProduct } from '../../../testing/seed-merge';
 import {
   getSdkServer,
@@ -2436,10 +2437,10 @@ export interface CreateAdcpServerFromPlatformOptions<TAccount = unknown> extends
 
   /**
    * Opinionated media-buy store that satisfies the seller spec contract for
-   * `targeting_overlay` echo: persist `packages[].targeting_overlay` from
-   * `create_media_buy`, echo it on `get_media_buys`, deep-merge across
-   * `update_media_buy` without dropping prior `property_list` /
-   * `collection_list` references.
+   * creation context and targeting echo: persist buy/package `context` and
+   * `packages[].targeting_overlay` from `create_media_buy`, then fill missing
+   * fields on `get_media_buys`. Targeting updates preserve creation context
+   * and prior `property_list` / `collection_list` references.
    *
    * Wire to honor the
    * `schemas/cache/<v>/media-buy/get-media-buys-response.json` contract
@@ -2447,7 +2448,7 @@ export interface CreateAdcpServerFromPlatformOptions<TAccount = unknown> extends
    * `property-lists` / `collection-lists` MUST echo the persisted refs;
    * `mediaBuyStore` is the framework-side way to do it.
    *
-   * Backed by any `AdcpStateStore` — `InMemoryStateStore` for dev,
+   * Backed by any `AdcpStateStore`: `InMemoryStateStore` for dev,
    * `PostgresStateStore` for production. Failures are logged and swallowed
    * (auto-echo MUST NOT break a successful seller response).
    *
@@ -3748,7 +3749,10 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
                 'Verify the request envelope carries an account ref and the sandboxGate is configured correctly.',
               { product_id: params.product_id }
             );
-            return;
+            throw new TestControllerError(
+              'INVALID_PARAMS',
+              'seed_product requires a resolved sandbox account; no fixture was written'
+            );
           }
           autoSeedStoreFor(autoSeedStore, accountId).set(params.product_id, {
             ...params.fixture,
@@ -3766,7 +3770,10 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
                 'Verify the request envelope carries an account ref and the sandboxGate is configured correctly.',
               { product_id: params.product_id, pricing_option_id: params.pricing_option_id }
             );
-            return;
+            throw new TestControllerError(
+              'INVALID_PARAMS',
+              'seed_pricing_option requires a resolved sandbox account; no fixture was written'
+            );
           }
           const accountStore = autoSeedStoreFor(autoSeedStore, accountId);
           const existing = accountStore.get(params.product_id) as Record<string, unknown> | undefined;
@@ -3825,24 +3832,10 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
       // an MCP-side concern; A2A and other transports are wired separately.
       controller.register(server);
     } else {
-      // Permit a top-level `account` field on the wire so the gate can read
-      // the buyer's account ref. The canonical AdCP shape strips it (account
-      // routes through `context.account`), but adopters' storyboard fixtures
-      // commonly send it at the top level — `TOOL_INPUT_SHAPE`'s JSDoc in
-      // `src/lib/server/test-controller.ts` documents this extension as the
-      // supported escape hatch.
-      //
-      // Schema is the full canonical `AccountReference` per
-      // `schemas/cache/3.0.6/core/account-ref.json`: oneOf
-      //   { account_id }                       — explicit accounts
-      //   { brand, operator, sandbox? }        — implicit accounts
-      // Modeled here as a single object with all four fields optional so
-      // either arm passes; resolvers narrow on the shape at dispatch.
-      // `brand` content is `unknown()` because the inner `brand-ref.json`
-      // shape is itself a oneOf and resolvers (not the gate) validate it.
-      // Top-level `.strict()` still blocks unknown keys at the framework
-      // boundary so a buyer can't stuff `__proto__` / arbitrary payloads
-      // into adopters' resolvers.
+      // Preserve the controller's complete account identity through the
+      // platform wrapper's compatibility shape. Sandbox authorization below
+      // still comes from the trusted principal/target resolvers, never from
+      // buyer-supplied account fields.
       const gatedInputSchema = {
         ...controller.toolDefinition.inputSchema,
         account: z
@@ -3850,6 +3843,9 @@ export function createAdcpServerFromPlatform<P extends DecisioningPlatform<any, 
             account_id: z.string().min(1).optional(),
             brand: z.unknown().optional(),
             operator: z.string().optional(),
+            operator_unit: z.unknown().optional(),
+            currency: z.string().optional(),
+            timezone: z.string().optional(),
             sandbox: z.boolean().optional(),
           })
           .strict()
@@ -5890,7 +5886,7 @@ async function autoStoreResources(
 }
 
 /**
- * Persist `packages[].targeting_overlay` from a successful
+ * Persist creation context and `packages[].targeting_overlay` from a successful
  * `create_media_buy`. Called from the createMediaBuy projection so the
  * persistence applies to both the sync arm and the HITL completion arm
  * (the projection runs after the handoff fn resolves).
@@ -5898,7 +5894,7 @@ async function autoStoreResources(
  * Failures are logged + swallowed: a successful seller response must
  * never be turned into an error by the auto-echo plumbing.
  */
-async function persistTargetingOverlayFromCreate(
+async function persistMediaBuyFromCreate(
   store: MediaBuyStore | undefined,
   accountId: string | undefined,
   request: unknown,
@@ -5944,7 +5940,7 @@ async function persistTargetingOverlayFromUpdate(
 }
 
 /**
- * Backfill missing `packages[].targeting_overlay` on a `get_media_buys`
+ * Backfill missing creation context and targeting on a `get_media_buys`
  * response from the persisted store. Mutates the response. Packages the
  * seller already echoed are left alone.
  *
@@ -5952,7 +5948,7 @@ async function persistTargetingOverlayFromUpdate(
  * better than a hard error wiping out the seller's correctly-returned
  * media-buy data.
  */
-async function backfillTargetingOverlay(
+async function backfillMediaBuyState(
   store: MediaBuyStore | undefined,
   accountId: string | undefined,
   result: unknown,
@@ -7169,7 +7165,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
               },
               result,
               async r => {
-                await persistTargetingOverlayFromCreate(mediaBuyStore, reqCtx.account?.id, params, r, logger);
+                await persistMediaBuyFromCreate(mediaBuyStore, reqCtx.account?.id, params, r, logger);
                 return asSemanticServerResponseForWire(
                   r,
                   'create_media_buy',
@@ -7527,7 +7523,7 @@ function buildMediaBuyHandlers<P extends DecisioningPlatform<any, any>>(
                     canonicalFormatLegacyResolver,
                     responseWireMode
                   );
-            await backfillTargetingOverlay(mediaBuyStore, reqCtx.account?.id, wireResult, logger);
+            await backfillMediaBuyState(mediaBuyStore, reqCtx.account?.id, wireResult, logger);
             return wireResult;
           },
           r => r
@@ -9146,7 +9142,7 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
           if (policy.failedRows.size === 0) {
             return {
               ...(dryRun && { dry_run: true }),
-              accounts: rows.map(toWireSyncAccountRow),
+              accounts: rows.map(row => toWireSyncAccountRow(row, resolveCtx.servedAdcpVersion)),
             };
           }
           const combined: SyncAccountsResultRow[] = [];
@@ -9162,7 +9158,7 @@ function buildAccountHandlers<P extends DecisioningPlatform<any, any>>(
           }
           return {
             ...(dryRun && { dry_run: true }),
-            accounts: combined.map(toWireSyncAccountRow),
+            accounts: combined.map(row => toWireSyncAccountRow(row, resolveCtx.servedAdcpVersion)),
           };
         }
       );

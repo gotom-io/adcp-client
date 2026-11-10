@@ -1136,7 +1136,7 @@ function generateLlmsTxt(
       ln(`### ${trackLabel(track)}`);
       ln();
       for (const sb of sbs) {
-        ln(`**${sb.title}** — ${sb.summary}`);
+        ln(sb.summary ? `**${sb.title}** — ${sb.summary}` : `**${sb.title}**`);
         if (sb.flow) {
           ln(`Flow: \`${sb.flow}\``);
         }
@@ -1187,6 +1187,10 @@ function generateLlmsTxt(
 
   // --- Seeding fixtures (seller-side helpers) ---
   ln(`### Seeding fixtures for compliance (seller-side)`);
+  ln();
+  ln(
+    'Fresh fixture preparation can be gated with `prepareStoryboardFixtures(..., { prepared_fixtures_preparation_authorizer })`. It asks once before seller contact using a truthful proposed binding. The existing `prepared_fixtures_authorizer` remains reuse-only and is never called by preparation. The preparation-only option is rejected by run/step/comply; prepare explicitly before reusing state. See [collection fixture foundation](guides/COLLECTION-FIXTURE-FOUNDATION.md).'
+  );
   ln();
   ln(
     `Group A storyboards seed fixtures via \`comply_test_controller.seed_product\` (and the other \`seed_*\` scenarios) before calling the spec tool. Two SDK helpers bridge this:`
@@ -1348,6 +1352,7 @@ function generateLlmsTxt(
     ['Reliable Reporting production operations', 'guides/REPORTING-OPERATIONS.md'],
     ['Reliable Reporting stability policy (experimental storage package)', 'guides/REPORTING-STABILITY.md'],
     ['Validate your agent (5-command checklist)', 'guides/VALIDATE-YOUR-AGENT.md'],
+    ['Collection fixture foundation (storyboard fixtures)', 'guides/COLLECTION-FIXTURE-FOUNDATION.md'],
     ['Async patterns (polling, webhooks, deferred)', 'guides/ASYNC-DEVELOPER-GUIDE.md'],
     ['Async API reference', 'guides/ASYNC-API-REFERENCE.md'],
     ['Durable task settlement intents', 'guides/DURABLE-TASK-SETTLEMENT.md'],
@@ -1403,6 +1408,13 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln();
   ln(
     `Curated reference of the types that matter for using the AdCP client. For full generated types see \`src/lib/types/tools.generated.ts\` and \`src/lib/types/core.generated.ts\`.`
+  );
+  ln();
+
+  ln('## Prepared Storyboard Authorization');
+  ln();
+  ln(
+    "Import `PrepareStoryboardFixturesOptions`, `PreparedFixturesPreparationAuthorizer`, and `PreparedFixturesPreparationLookup` from `@adcp/sdk/testing`. `prepareStoryboardFixtures` alone accepts `prepared_fixtures_preparation_authorizer`, asked once before seller contact with `{ gate: 'prepare', current }` and no stored binding. `PreparedFixturesAuthorizer` and its required `PreparedFixturesLookup.binding` remain reuse-only through `prepared_fixtures_authorizer` on run/pass/step lookups. A preparation grant never authorizes reuse. See [collection fixture foundation](guides/COLLECTION-FIXTURE-FOUNDATION.md)."
   );
   ln();
 
@@ -1471,6 +1483,11 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln(`}`);
   ln();
   ln(`interface TransportOptions {`);
+  ln(`  // Local principal partition; never sent on the wire. Enables MCP process reuse.`);
+  ln(`  connectionPartition?: string;`);
+  ln(`  // Explicit opt-in when all unpartitioned callers share one principal.`);
+  ln(`  // Otherwise unscoped MCP calls close their session after the operation.`);
+  ln(`  connectionReuse?: 'process';`);
   ln(`  // Defaults to 4 MiB (DEFAULT_MAX_RESPONSE_BYTES); only 0 opts out`);
   ln(`  // (Infinity / negatives fall back to the default).`);
   ln(`  // SSE is bounded per event plus \`maxResponseBytes * 2\` cumulative per call.`);
@@ -2359,6 +2376,10 @@ function generateTypeSummary(index: SchemaIndex, tools: ToolInfo[]): string {
   ln();
   ln(
     `Account identity comes only from the framework-resolved context. Trusted host callbacks derive adapter routing, credential-free \`sourceScope\`, source timezone, currency, and the authorized constituent denominator. A declaration cannot supply \`account\`, \`sourceScope\`, \`sourceTimezone\`, \`contract\`, \`currency\`, \`constituents\`, or \`mediaBuyIds\`; \`mediaBuyIds\` is derived from \`resolveCoverage\`, so a buyer cannot name another buyer's media buys on a shared upstream network. Currency is frozen into configuration and obligation lineage. Capabilities are Core-only and derived from installed adapters and handlers; managed delivery, reconciled billing, receipts, webhook activity, and notifications are not advertised. Installation requires \`platform.accounts.upsert\`, which owns the advertised \`sync_accounts\` configuration path.`
+  );
+  ln();
+  ln(
+    `Source offering \`applicability\` keeps required \`productIds: string[]\`; opt into \`products: { kind: 'host_attested' }\` with an empty \`productIds\` array. Host attestation supports products created per buy: trusted \`resolveCoverage\` must authorize each product for the selected offering using its \`reporting_capabilities.reporting_delivery_offering_ids\`. Constituent kinds, product bindings, and frozen coverage remain enforced. SDK 16.5.0+ is required to read the new variants; existing declaration hashes are unchanged. See \`docs/guides/REPORTING-SOURCE-EXECUTOR.md\`.`
   );
   ln();
   ln(

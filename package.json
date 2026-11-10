@@ -1,6 +1,6 @@
 {
   "name": "@adcp/sdk",
-  "version": "16.1.0",
+  "version": "16.7.0",
   "description": "AdCP SDK — client, server, and compliance harnesses for the AdContext Protocol (MCP + A2A)",
   "workspaces": [
     ".",
@@ -557,8 +557,9 @@
     "!skills/*.previous/**/*",
     ".claude-plugin/**/*",
     "compliance/cache/3.0.25/**/*",
-    "compliance/cache/3.1.29/**/*",
-    "compliance/cache/3.2.5/**/*",
+    "compliance/cache/3.1.30/**/*",
+    "compliance/cache/3.1.32/**/*",
+    "compliance/cache/3.2.8/**/*",
     "ADCP_VERSION",
     "docs/README.md",
     "docs/TYPE-SUMMARY.md",
@@ -619,6 +620,8 @@
     "test:node:fast:shard": "node scripts/run-node-tests.mjs --group fast --shard-env",
     "test:node:slow": "node scripts/run-node-tests.mjs --group slow",
     "test:file": "node scripts/run-node-tests.mjs",
+    "test:performance": "node scripts/performance/run.mjs",
+    "perf:compare": "node scripts/performance/run.mjs --compare",
     "pretest:lib": "npm run build:lib",
     "test:lib": "npm run test:lib:fast && npm run test:lib:slow",
     "test:lib:fast": "node scripts/run-node-tests.mjs --scope lib --group fast",
@@ -639,13 +642,13 @@
     "test:protocol-comparison": "node test/utils/comprehensive-protocol-comparison.js",
     "test:status-report": "node test/utils/final-status-report.js",
     "sync-schemas": "tsx scripts/sync-schemas.ts",
-    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.1.29 && npm run sync-schemas -- 3.0.25",
+    "sync-schemas:all": "npm run sync-schemas && npm run sync-schemas -- 3.1.32 && npm run sync-schemas -- 3.1.30 && npm run sync-schemas -- 3.0.25",
     "sync:canonical-storyboard-fixtures": "tsx scripts/sync-canonical-storyboard-fixtures.ts --update",
     "check:canonical-storyboard-fixtures": "tsx scripts/sync-canonical-storyboard-fixtures.ts --check",
     "sync-registry-schemas": "tsx scripts/generate-registry-types.ts --sync",
     "schemas:ensure": "tsx scripts/schemas-ensure.ts",
     "schema-diff": "tsx scripts/schema-diff.ts",
-    "generate-types": "tsx scripts/generate-types.ts && tsx scripts/generate-enum-arrays.ts && tsx scripts/generate-inline-enum-arrays.ts && tsx scripts/generate-manifest-derived.ts && tsx scripts/generate-entity-hydration.ts && tsx scripts/generate-media-buy-update-fields.ts && tsx scripts/generate-media-buy-action-metadata.ts",
+    "generate-types": "tsx scripts/generate-types.ts && tsx scripts/generate-enum-arrays.ts && tsx scripts/generate-targeting-keys.ts && tsx scripts/generate-inline-enum-arrays.ts && tsx scripts/generate-manifest-derived.ts && tsx scripts/generate-entity-hydration.ts && tsx scripts/generate-media-buy-update-fields.ts && tsx scripts/generate-media-buy-action-metadata.ts",
     "generate-manifest-derived": "tsx scripts/generate-manifest-derived.ts",
     "generate-entity-hydration": "tsx scripts/generate-entity-hydration.ts",
     "generate-types:all": "npm run generate-types",
@@ -729,10 +732,10 @@
     "email": "bugs@adcontextprotocol.org"
   },
   "dependencies": {
-    "@modelcontextprotocol/client": "2.2.0",
+    "@modelcontextprotocol/client": "2.3.1",
     "@modelcontextprotocol/ext-apps": "2.0.0",
-    "@modelcontextprotocol/node": "2.0.0",
-    "@modelcontextprotocol/server": "2.2.0",
+    "@modelcontextprotocol/node": "2.1.1",
+    "@modelcontextprotocol/server": "2.3.1",
     "@types/ws": "^8.18.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
@@ -796,7 +799,7 @@
     "typescript-eslint": "^8.68.0",
     "web-bot-auth": "0.2.0",
     "workerd": "1.20260730.1",
-    "zod": "^4.4.3",
+    "zod": "^4.6.6",
     "zod-openapi": "^5.4.3"
   },
   "engines": {
@@ -814,9 +817,11 @@
     "@changesets/parse": {
       "js-yaml": "^3.15.2"
     },
-    "minimatch": "^10.2.1"
+    "minimatch": "^10.2.1",
+    "launch-editor": "^2.14.2",
+    "markdown-it": "^14.3.3"
   },
-  "adcp_version": "3.2.5",
+  "adcp_version": "3.2.8",
   "sideEffects": [
     "**/default-invariants.*"
   ]

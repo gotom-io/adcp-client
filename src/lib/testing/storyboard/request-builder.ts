@@ -29,6 +29,7 @@ import { resolveBrand, resolveAccount } from '../client';
 import type { TestOptions } from '../types';
 import type { StoryboardContext, StoryboardStep } from './types';
 import { injectContext, type RunnerVariables } from './context';
+import { isFixedPricing, type PricingOptionV3 } from '../../utils/pricing-adapter';
 
 type RequestEnricher = (
   step: StoryboardStep,
@@ -210,6 +211,7 @@ function isOperationScopedControllerScenario(scenario: unknown): boolean {
   return typeof scenario === 'string' && OPERATION_SCOPED_CONTROLLER_SCENARIOS.has(scenario);
 }
 
+/** An authored request account that OVERRIDES the context account. */
 function hasAuthoredAccountIdentity(account: unknown): account is Record<string, unknown> {
   if (account === null || typeof account !== 'object' || Array.isArray(account)) return false;
   const ref = account as Record<string, unknown>;
@@ -437,22 +439,36 @@ const REQUEST_ENRICHERS: Record<string, RequestEnricher> = {
         fixturePricingOptionId ?? pricingOption?.pricing_option_id ?? context.pricing_option_id ?? 'test-pricing',
     };
 
-    // Synthesize a bid_price for auction/cpm pricing only when the fixture
-    // didn't author one. Storyboards that test auction flows (e.g.
+    // Synthesize a bid_price only for an auction CPM option, and only when
+    // the fixture didn't author one. Storyboards that test auction flows (e.g.
     // sales-non-guaranteed) author explicit bid_prices the seller validates
     // against floor_price; discovery-synthesized values would silently
-    // override intentional bid-floor-boundary tests.
-    if (
-      baseSample.bid_price === undefined &&
-      (pricingOption?.pricing_model === 'auction' || pricingOption?.pricing_model === 'cpm')
-    ) {
-      const floor = Number(pricingOption?.floor_price) || 5;
-      firstPkg.bid_price = Math.round(floor * 1.5 * 100) / 100;
-    }
-
+    // override intentional bid-floor-boundary tests. The check runs against
+    // the option the package actually sends. An option carrying fixed_price is
+    // fixed pricing whatever its pricing_model, and bid_price applies only to
+    // auction options. Media-buy or package `bidding` must not be combined with
+    // a legacy bid_price (AMBIGUOUS_BIDDING_POLICY), so its presence also
+    // suppresses the bid.
     const additionalPkgs = samplePackages
       .slice(1)
       .map(p => injectContext({ ...p }, context) as Record<string, unknown>);
+    const packages = [firstPkg, ...additionalPkgs];
+    for (const pkg of packages) {
+      const sentPricingOption =
+        pkg === firstPkg && fixtureProductId === undefined && fixturePricingOptionId === undefined
+          ? pricingOption
+          : findPricingOption(context, pkg.product_id, pkg.pricing_option_id);
+      if (
+        pkg.bid_price === undefined &&
+        pkg.bidding === undefined &&
+        step.sample_request?.bidding === undefined &&
+        sentPricingOption?.pricing_model === 'cpm' &&
+        !isFixedPricing(sentPricingOption as PricingOptionV3)
+      ) {
+        const floor = Number(sentPricingOption.floor_price) || 5;
+        pkg.bid_price = Math.round(floor * 1.5 * 100) / 100;
+      }
+    }
 
     // Proposal-mode: when context carries a proposal_id (captured from
     // `proposals[0]` in a prior brief/refine/finalize step), forward it
@@ -517,10 +533,10 @@ const REQUEST_ENRICHERS: Record<string, RequestEnricher> = {
     return {
       ...fixtureBody,
       account: resolveMediaBuyAccount(fixtureBody.account, context.account, options),
-      brand: resolveBrand(options),
+      brand: fixtureBody.brand ?? resolveBrand(options),
       start_time: startTime,
       end_time: endTime,
-      packages: [firstPkg, ...additionalPkgs],
+      packages,
     };
   },
 
@@ -1232,6 +1248,7 @@ export function enrichRequest(
 }
 
 /** True iff a request enricher is registered for this task. */
+
 export function hasRequestEnricher(taskName: string): boolean {
   return taskName in REQUEST_ENRICHERS;
 }
@@ -1270,9 +1287,25 @@ function selectPricingOption(product: Record<string, unknown> | undefined): Reco
   const options = product.pricing_options as Array<Record<string, unknown>> | undefined;
   if (!options?.length) return undefined;
 
-  // Prefer fixed pricing (cpm, flat) over auction
-  const fixed = options.filter(o => o.pricing_model === 'cpm' || o.pricing_model === 'flat');
+  // Prefer fixed pricing over auction. fixed_price is the discriminant, not
+  // pricing_model: a cpm option without fixed_price is an auction option.
+  const fixed = options.filter(o => isFixedPricing(o as PricingOptionV3));
   return fixed[0] ?? options[0];
+}
+
+/**
+ * Look up the pricing option a package names among the discovered products.
+ * Returns undefined when the product or option was not discovered.
+ */
+function findPricingOption(
+  context: StoryboardContext,
+  productId: unknown,
+  pricingOptionId: unknown
+): Record<string, unknown> | undefined {
+  const products = context.products as Array<Record<string, unknown>> | undefined;
+  const product = products?.find(p => p.product_id === productId);
+  const options = product?.pricing_options as Array<Record<string, unknown>> | undefined;
+  return options?.find(o => o.pricing_option_id === pricingOptionId);
 }
 
 function selectFormat(context: StoryboardContext): Record<string, unknown> | undefined {

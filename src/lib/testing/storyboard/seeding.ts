@@ -25,17 +25,33 @@ import { resolveAccount, resolveBrand, validateResponseSchema, type TestClient }
 import { getValidator } from '../../validation/schema-loader';
 import { ADCP_VERSION } from '../../version';
 import { injectLegacyEnvelopeStatus } from '../../utils/envelope-status-compat';
+import { readExtractionPath, unwrapProtocolResponse } from '../../utils/response-unwrapper';
 import { callControllerRaw } from '../test-controller';
 import { executeStoryboardTask } from './task-map';
+import { getCapturesFromError, withRawResponseCapture, type RawHttpCapture } from '../../protocols/rawResponseCapture';
 import {
   buildFixtureResolutionSpecs,
   applyFixtureBindingsToRequest,
   FixtureBindingRegistry,
   matchesFixtureRequirements,
+  matchFixtureRequirementsWithWitness,
   type FixtureResolutionSpec,
 } from './fixture-resolution';
+import { readCollectionWitness, type CollectionSelectionWitness } from './collection-selection';
+import { resolvePath } from './path';
+import { injectContext, applyContextInputs } from './context';
+import { applyBrandInvariant } from './account-policy';
+import { isRunnerOwnedTask } from './runner-owned-task';
+import { redactSecrets } from '../../utils/redact-secrets';
+import { canonicalize } from '../../utils/jcs';
+import { redactDiscoveryEvidence as redactDiscoveryResponse } from '../discovery-evidence';
+import { redactCredentialPatterns } from '../../utils/redact-credential-patterns';
 import type {
+  ContextProvenanceEntry,
   FixtureResolutionAttempt,
+  RunnerExtractionRecord,
+  RunnerRequestRecord,
+  RunnerResponseRecord,
   FixtureResolutionRecord,
   Storyboard,
   StoryboardContext,
@@ -43,7 +59,201 @@ import type {
   StoryboardPhaseResult,
   StoryboardRunOptions,
   StoryboardStepResult,
+  StoryboardStep,
 } from './types';
+
+/** Prefer the owner identified by authored requests, explicit context or account fixtures. */
+function storyboardSeedScope(
+  storyboard: Storyboard,
+  context: StoryboardContext,
+  options: StoryboardRunOptions,
+  call: SeedCall
+): Record<string, unknown> {
+  if (call.scenario !== 'seed_product' && call.scenario !== 'seed_pricing_option') return {};
+  if (context.account !== undefined) {
+    if (!isPlainRecord(context.account) || /\$(?:context\.|generate:)/.test(JSON.stringify(context.account))) {
+      throw new Error('Automatic fixture seeding needs a resolved context.account reference');
+    }
+    if (context.account.sandbox === false) throw new Error('Automatic fixture seeding requires a sandbox account');
+    if (
+      typeof context.account.account_id !== 'string' &&
+      (options.brand || options.brand_manifest) &&
+      canonicalize(context.account.brand) !== canonicalize(resolveBrand(options))
+    ) {
+      throw new Error(
+        'Explicit fixture context.account conflicts with the run-scoped brand; choose one account identity'
+      );
+    }
+    return {
+      account: { ...context.account, sandbox: true },
+    };
+  }
+  const provisioningAliases = new Map<string, Record<string, unknown>>();
+  const provisioningAccounts: Record<string, unknown>[] = [];
+  for (const phase of storyboard.phases)
+    for (const step of phase.steps) {
+      if (step.task !== 'sync_accounts' || step.expect_error) continue;
+      const request = injectContext(step.sample_request ?? {}, context);
+      if (!Array.isArray(request.accounts) || request.accounts.length !== 1) continue;
+      const row = request.accounts[0];
+      if (!isPlainRecord(row) || !isPlainRecord(row.brand) || typeof row.operator !== 'string') continue;
+      const { brand, operator, operator_unit, currency, timezone, sandbox } = row;
+      const account = {
+        brand,
+        operator,
+        ...(operator_unit !== undefined && { operator_unit }),
+        ...(currency !== undefined && { currency }),
+        ...(timezone !== undefined && { timezone }),
+        ...(sandbox !== undefined && { sandbox }),
+      };
+      provisioningAccounts.push(account);
+      for (const output of step.context_outputs ?? []) {
+        if (output.path === 'accounts[0].account_id' && output.key) provisioningAliases.set(output.key, account);
+      }
+    }
+  const accounts = new Map<string, Record<string, unknown>>();
+  const resolvedScopes = new Set<string>();
+  const deferredScopes = new Set<string>();
+  const seedScopeSteps: StoryboardStep[] = [
+    ...storyboard.phases.flatMap(phase => phase.steps),
+    ...provisioningAccounts.map((account, index) => ({
+      id: `seed-scope-${index}`,
+      title: 'Seed scope from account provisioning',
+      task: 'sync_accounts',
+      sample_request: { account },
+    })),
+  ];
+  for (const authoredStep of seedScopeSteps) {
+    // The rate-limit assertion dispatches its nested seller request. Other
+    // runner operations have no seller envelope to enrich or use as scope.
+    const step =
+      authoredStep.task === 'expect_rate_limit_not_replayed' && authoredStep.rate_limit_trip
+        ? {
+            ...authoredStep,
+            task: authoredStep.rate_limit_trip.trip_target_task,
+            sample_request: authoredStep.rate_limit_trip.trip_target_sample_request,
+          }
+        : authoredStep;
+    if (isRunnerOwnedTask(step.task)) continue;
+    if (step.expect_error || step.omit_account) continue;
+    const source = options.request ?? step.sample_request ?? {};
+    if (JSON.stringify(source.account ?? {}).includes('$generate:')) {
+      throw new Error('Automatic fixture seeding needs an explicit resolved account for generated identities');
+    }
+    let request = injectContext(
+      {
+        ...(source.account !== undefined && { account: source.account }),
+        buying_mode: source.buying_mode,
+        discovery_mode: source.discovery_mode,
+        ...(step.task === 'validate_input' && { targets: source.targets }),
+        ...(step.task === 'comply_test_controller' && { scenario: source.scenario }),
+      },
+      context
+    );
+    if (step.context_inputs?.length) request = applyContextInputs(request, step.context_inputs, context);
+    // Controller capability discovery and format-only validation do not identify the
+    // catalog owner. Other real requests retain their runtime default account
+    // so a mixed default/authored namespace still fails before seed writes.
+    const formatOnlyValidation =
+      step.task === 'validate_input' &&
+      Array.isArray(request.targets) &&
+      request.targets.length > 0 &&
+      request.targets.every(
+        target =>
+          isPlainRecord(target) && ['canonical', 'third_party_format', 'capability'].includes(String(target.kind))
+      );
+    const controllerMetadata = step.task === 'comply_test_controller' && request.scenario === 'list_scenarios';
+    if (request.account === undefined && (controllerMetadata || formatOnlyValidation)) continue;
+    // The controller builder supplies a sandbox account even on legacy
+    // versions whose request schema omits that routing carrier. Mirror its
+    // default so real seed/force/simulate operations still expose ambiguity.
+    if (request.account === undefined && step.task === 'comply_test_controller') {
+      request.account = { ...resolveAccount(options), sandbox: true };
+    }
+    request = applyBrandInvariant(request, options, step.task, { omit_account: step.omit_account });
+    if (request.account === undefined) continue;
+    if (JSON.stringify(request.account).includes('$generate:')) {
+      throw new Error('Automatic fixture seeding needs an explicit resolved account for generated identities');
+    }
+    let injected: unknown = request.account;
+    if (isPlainRecord(injected) && typeof injected.account_id === 'string') {
+      const capture = /^\$context\.(\w+)$/.exec(injected.account_id)?.[1];
+      if (capture && provisioningAliases.has(capture)) injected = provisioningAliases.get(capture);
+    }
+    if (!isPlainRecord(injected)) throw new Error('Automatic fixture seeding needs a resolved account reference');
+    const account = { ...injected };
+    // Later requests may echo timezone/currency captured from provisioning.
+    // They can share an earlier resolved identity, but cannot establish a
+    // seed scope on their own while those optional dimensions are unknown.
+    let deferred = false;
+    for (const key of ['currency', 'timezone']) {
+      if (typeof account[key] === 'string' && /^\$context\./.test(account[key])) {
+        delete account[key];
+        deferred = true;
+      }
+    }
+    if (JSON.stringify(account).includes('$context.')) {
+      throw new Error('Automatic fixture seeding needs a resolved account reference');
+    }
+    // Controller samples often author only { sandbox: true }; that is
+    // routing metadata, not a second account identity.
+    const hasIdentity =
+      (typeof account.account_id === 'string' && account.account_id.length > 0) ||
+      (isPlainRecord(account.brand) &&
+        typeof account.brand.domain === 'string' &&
+        account.brand.domain.length > 0 &&
+        typeof account.operator === 'string' &&
+        account.operator.length > 0);
+    if (!hasIdentity) continue;
+    if (account.sandbox === false) throw new Error('Automatic fixture seeding requires a sandbox account');
+    const sandboxAccount: Record<string, unknown> = { ...account, sandbox: true };
+    const { currency: _currency, timezone: _timezone, ...identity } = sandboxAccount;
+    const key = canonicalize(identity);
+    (deferred ? deferredScopes : resolvedScopes).add(key);
+    const prior = accounts.get(key);
+    if (prior) {
+      for (const dimension of ['currency', 'timezone']) {
+        if (
+          prior[dimension] !== undefined &&
+          sandboxAccount[dimension] !== undefined &&
+          prior[dimension] !== sandboxAccount[dimension]
+        ) {
+          throw new Error(
+            'Automatic fixture seeding needs an explicit context.account when a storyboard uses multiple accounts'
+          );
+        }
+      }
+    }
+    accounts.set(key, { ...prior, ...sandboxAccount });
+  }
+  if ([...deferredScopes].some(key => !resolvedScopes.has(key))) {
+    throw new Error('Automatic fixture seeding needs a resolved account reference before later account enrichment');
+  }
+  if (accounts.size === 1) return { account: [...accounts.values()][0] };
+  if (accounts.size > 1) {
+    throw new Error(
+      'Automatic fixture seeding needs an explicit context.account when a storyboard uses multiple accounts'
+    );
+  }
+  const sandboxAccounts = (storyboard.fixtures?.accounts ?? []).flatMap(entry => {
+    const fixture = isPlainRecord(entry.fixture) ? entry.fixture : entry;
+    if (fixture.sandbox !== true || !isPlainRecord(fixture.brand) || typeof fixture.operator !== 'string') return [];
+    const { brand, operator, operator_unit, currency, timezone } = fixture;
+    return [
+      {
+        brand,
+        operator,
+        ...(operator_unit !== undefined && { operator_unit }),
+        ...(currency !== undefined && { currency }),
+        ...(timezone !== undefined && { timezone }),
+        sandbox: true,
+      },
+    ];
+  });
+  if (sandboxAccounts.length === 1) return { account: sandboxAccounts[0] };
+  if (sandboxAccounts.length > 1) throw new Error('Automatic fixture seeding needs an explicit context.account');
+  return {};
+}
 
 /** Synthetic phase id used in `StoryboardResult.phases[]` for the seed pass. */
 export const CONTROLLER_SEEDING_PHASE_ID = '__controller_seeding__';
@@ -298,10 +508,26 @@ export interface ControllerSeedingResult {
   seedUnsupported?: boolean;
   /** At least one declared strategy ladder exhausted without a binding. */
   fixtureUnsatisfied?: boolean;
+  /** Runner exhausted its bounded attempts to enumerate a stable feed. */
+  fixtureUnavailable?: string;
   /** Run-scoped bindings pinned for all subsequent storyboard phases. */
   bindings?: FixtureBindingRegistry;
   /** Machine-readable AdCP 3.2 resolution evidence. */
   resolutionRecords?: FixtureResolutionRecord[];
+  /**
+   * Declaration-local captures from the SAME selected graph, published only
+   * when every declared fixture resolved. The runner commits them through the
+   * protected-context funnel; they are never merged by plain assignment.
+   */
+  preparedCaptures?: PreparedFixtureCaptures;
+}
+
+/** Reserved-namespace values and provenance produced by fixture preparation. */
+export interface PreparedFixtureCaptures {
+  values: Record<string, unknown>;
+  provenance: Record<string, ContextProvenanceEntry>;
+  /** Per-handle witness retained for the entity that was actually selected. */
+  witnesses: Record<string, CollectionSelectionWitness>;
 }
 
 /**
@@ -392,7 +618,12 @@ export async function runControllerSeeding(
       try {
         const raw = await callControllerRaw(
           client,
-          { scenario: call.scenario, params: call.params, context: seedContext },
+          {
+            ...storyboardSeedScope(storyboard, context, options, call),
+            scenario: call.scenario,
+            params: call.params,
+            context: seedContext,
+          },
           options
         );
         const data = raw.data as { success?: boolean; error?: string; error_detail?: string } | undefined;
@@ -535,14 +766,62 @@ async function runRoutedControllerSeeding(
   };
 }
 
+/**
+ * One actual `get_products` exchange from the discovery ladder.
+ *
+ * `runner-output-contract.yaml` makes `request` and `response` required on
+ * a failing validation, with null reserved for pre-wire failures. A capture
+ * that cannot be built from a pinned entity is NOT pre-wire — the entity
+ * came off the wire — so the failing result has to carry the exchange that
+ * produced it rather than an explicit "no contact" null.
+ */
+interface DiscoveryExchange {
+  request: RunnerRequestRecord;
+  response: RunnerResponseRecord;
+}
+
 interface DiscoveryCatalog {
   products: Array<Record<string, unknown>>;
-  evidence: { page_count: number; product_count: number; cursors: string[] };
+  evidence: { page_count: number; product_count: number; cursors: string[]; restart_count?: number };
+  /** Per-page exchanges, in request order. */
+  exchanges: DiscoveryExchange[];
+  /** product_id → index into `exchanges`, so a failure cites ITS page. */
+  pageOfProduct: Map<string, number>;
+}
+
+/**
+ * The exchange that actually carried `productId`.
+ *
+ * Falls back to the final page when the id is unknown — a paginated run
+ * still records a real exchange, and `evidence.page_count` / `cursors`
+ * disclose that more pages existed.
+ */
+function discoveryExchangeFor(catalog: DiscoveryCatalog, productId: string | undefined): DiscoveryExchange | undefined {
+  const index = productId === undefined ? undefined : catalog.pageOfProduct.get(productId);
+  return catalog.exchanges[index ?? catalog.exchanges.length - 1];
 }
 
 type DiscoveryCatalogResult =
   | { ok: true; catalog: DiscoveryCatalog }
-  | { ok: false; error: string; evidence?: unknown };
+  | {
+      ok: false;
+      error: string;
+      evidence?: unknown;
+      /**
+       * The actual exchange that failed, so the producer step can record
+       * truthful wire evidence instead of nothing. `response` is null only
+       * when the transport threw and no response was ever received — never
+       * a stand-in for one we did not capture.
+       */
+      exchange?: {
+        request: RunnerRequestRecord;
+        response: RunnerResponseRecord | null;
+        extraction?: RunnerExtractionRecord;
+      };
+      /** AJV detail when the page parsed but failed its response schema. */
+      unavailable?: true;
+      schemaFailure?: { detail: string; schema_id: string; schema_url: string };
+    };
 
 /** AdCP 3.2 ordered per-handle seed/discover state machine. */
 async function runDeclaredFixtureResolution(
@@ -593,6 +872,37 @@ async function runDeclaredFixtureResolution(
   const claimedProducts = new Map<string, boolean>();
   const claimedPricingOptions = new Map<string, boolean>();
   const productStatuses = new Map<string, FixtureResolutionRecord['status']>();
+  // Declaration-local captures stay pending until the WHOLE graph resolves.
+  // Publishing early would expose a selected-product id from a graph whose
+  // scoped price later failed, and a step would build a request against an
+  // entity the run never actually pinned.
+  const pendingCaptures: Array<{
+    spec: FixtureResolutionSpec;
+    key: string;
+    value: unknown;
+    sourceTask: 'get_products' | 'comply_test_controller';
+  }> = [];
+  const retainedWitnesses = new Map<string, CollectionSelectionWitness>();
+  let captureFailure: string | undefined;
+  /**
+   * Per-handle capture-failure diagnostics.
+   *
+   * Keyed by handle, NOT run-global: the loop below does not stop at the
+   * first failing declaration, so a single shared pointer/exchange gave
+   * the second failing handle the FIRST handle's evidence while its
+   * `error` was its own. `json_pointer` must point at the field that
+   * failed on THIS declaration, and `request`/`response` must be the
+   * exchange that produced THIS entity.
+   *
+   * `pointer` is the RFC 6901 form of the capture path, when it had one.
+   * `exchange` is the real wire records: `fixture_capture_unbuildable` is
+   * a post-wire failure, so required_on_failure request/response must be
+   * the actual exchange, not the nulls reserved for a pre-wire refusal.
+   */
+  const captureFailures = new Map<string, { pointer?: string; exchange?: DiscoveryExchange }>();
+  // Set alongside `captureFailure` so the synthesized validation does not
+  // have to recognize the failure by its prose.
+  const captureFailedHandles = new Set<string>();
   const seedContext = { correlation_id: `${storyboardCorrelationPrefix(storyboard)}--__seeding__` };
   let seedOptions = options;
   let discoveryOptions = options;
@@ -660,6 +970,8 @@ async function runDeclaredFixtureResolution(
   let passedCount = 0;
   let failedCount = 0;
   let fixtureUnsatisfied = false;
+  let fixtureUnavailable: string | undefined;
+  const unavailableResolutions = new Set<string>();
 
   for (const call of orderedCalls) {
     const spec = resolutionSpecForCall(call, specByKey);
@@ -692,6 +1004,20 @@ async function runDeclaredFixtureResolution(
     const attempts: FixtureResolutionAttempt[] = [];
     let boundIds: FixtureResolutionRecord['seller_ids'];
     let chosenStrategy: FixtureResolutionRecord['strategy'];
+    /**
+     * The strategy whose wire call actually ran, successful or not.
+     *
+     * `chosenStrategy` is only assigned when a strategy RESOLVES, so a
+     * discover-only handle that failed left it undefined and the step
+     * label fell through to `comply_test_controller` — claiming a
+     * controller seed for a run whose only traffic was `get_products`.
+     */
+    let attemptedStrategy: FixtureResolutionRecord['strategy'];
+    /** Truthful wire evidence for a failed discovery, never fabricated. */
+    let discoveryFailureEvidence:
+      | { request: RunnerRequestRecord; response: RunnerResponseRecord | null; extraction?: RunnerExtractionRecord }
+      | undefined;
+    let discoverySchemaFailure: Extract<DiscoveryCatalogResult, { ok: false }>['schemaFailure'];
     let failure: string | undefined;
     const stepStart = Date.now();
     const parentStatus = spec.parentProductHandle ? productStatuses.get(spec.parentProductHandle) : undefined;
@@ -703,7 +1029,16 @@ async function runDeclaredFixtureResolution(
           ? `parent product handle "${spec.parentProductHandle}" failed resolution`
           : `parent product handle "${spec.parentProductHandle}" is unavailable`;
       attempts.push({ strategy, disposition: parentStatus === 'failed' ? 'failed' : 'unavailable', detail });
-      if (parentStatus === 'failed') failure = detail;
+      if (parentStatus === 'failed') {
+        failure = detail;
+        if (
+          spec.parentProductHandle &&
+          unavailableResolutions.has(
+            resolutionSpecKey({ ...spec, entityType: 'product', handle: spec.parentProductHandle })
+          )
+        )
+          unavailableResolutions.add(resolutionSpecKey(spec));
+      }
     }
 
     for (const strategy of parentUnavailable ? [] : spec.strategies) {
@@ -720,6 +1055,7 @@ async function runDeclaredFixtureResolution(
           });
           continue;
         }
+        attemptedStrategy = strategy;
         try {
           const controllerRequest = applyFixtureBindingsToRequest(
             { scenario: call.scenario, params: call.params },
@@ -730,6 +1066,7 @@ async function runDeclaredFixtureResolution(
           const raw = await callControllerRaw(
             seedClient,
             {
+              ...storyboardSeedScope(storyboard, context, seedOptions, call),
               scenario: call.scenario,
               params: isPlainRecord(controllerRequest.params) ? controllerRequest.params : call.params,
               context: seedContext,
@@ -739,6 +1076,49 @@ async function runDeclaredFixtureResolution(
           const data = raw.data as { success?: boolean; error?: string; error_detail?: string } | undefined;
           if (raw.success && data?.success === true) {
             boundIds = bindSeededFixture(spec, bindings);
+            // A seeded entity's authored fixture body IS the graph the seller
+            // was instructed to create, so it is the honest capture source.
+            // No seller catalog read is substituted for it.
+            const seedSnapshot: Record<string, unknown> = {
+              ...spec.fixture,
+              ...(spec.entityType === 'product'
+                ? { product_id: boundIds.product_id }
+                : { pricing_option_id: boundIds.pricing_option_id }),
+            };
+            const seedWitness = matchFixtureRequirementsWithWitness(seedSnapshot, spec.clauses).witness;
+            if (seedWitness) retainedWitnesses.set(spec.handle, seedWitness);
+            const seedCaptures = collectDeclaredCaptures(spec, seedSnapshot, seedWitness);
+            if (!seedCaptures.ok) {
+              failure = seedCaptures.detail;
+              captureFailure ??= seedCaptures.detail;
+              captureFailures.set(spec.handle, {
+                ...(seedCaptures.path !== undefined && { pointer: toJsonPointer(seedCaptures.path) }),
+                exchange: {
+                  request: {
+                    transport: 'mcp',
+                    operation: 'comply_test_controller',
+                    // The object actually handed to `callControllerRaw`,
+                    // not `controllerRequest` — the call substitutes
+                    // `call.params` when the bound params are not a plain
+                    // record, and adds the seeding correlation context.
+                    payload: redactSecrets({
+                      ...storyboardSeedScope(storyboard, context, seedOptions, call),
+                      scenario: call.scenario,
+                      params: isPlainRecord(controllerRequest.params) ? controllerRequest.params : call.params,
+                      context: seedContext,
+                    }),
+                  },
+                  response: { transport: 'mcp', payload: redactSecrets(raw.data ?? raw.error ?? null) },
+                },
+              });
+              captureFailedHandles.add(spec.handle);
+              attempts.push({ strategy, disposition: 'failed', detail: seedCaptures.detail });
+              boundIds = undefined;
+              break;
+            }
+            pendingCaptures.push(
+              ...seedCaptures.captures.map(c => ({ ...c, sourceTask: 'comply_test_controller' as const }))
+            );
             if (spec.entityType === 'product') {
               recordIdentityClaim(claimedProducts, boundIds.product_id!, spec.allowReuse);
             } else {
@@ -784,10 +1164,22 @@ async function runDeclaredFixtureResolution(
           });
           continue;
         }
+        attemptedStrategy = strategy;
         const discovered = await catalog();
         if (!discovered.ok) {
           failure = discovered.error;
-          attempts.push({ strategy, disposition: 'failed', detail: failure, response: discovered.evidence });
+          if (discovered.unavailable) {
+            fixtureUnavailable = discovered.error;
+            unavailableResolutions.add(resolutionSpecKey(spec));
+          }
+          discoveryFailureEvidence = discovered.exchange;
+          discoverySchemaFailure = discovered.schemaFailure;
+          attempts.push({
+            strategy,
+            disposition: discovered.unavailable ? 'unavailable' : 'failed',
+            detail: failure,
+            response: discovered.evidence,
+          });
           break;
         }
         const selected = selectDiscoveredFixture(
@@ -795,7 +1187,13 @@ async function runDeclaredFixtureResolution(
           discovered.catalog.products,
           bindings,
           claimedProducts,
-          claimedPricingOptions
+          claimedPricingOptions,
+          spec.entityType === 'product'
+            ? specs.filter(
+                candidate =>
+                  candidate.entityType === 'product_pricing_option' && candidate.parentProductHandle === spec.handle
+              )
+            : []
         );
         if (!selected.ok) {
           if (selected.failed) {
@@ -818,6 +1216,27 @@ async function runDeclaredFixtureResolution(
         }
         boundIds = selected.boundIds;
         chosenStrategy = strategy;
+        if (selected.witness) retainedWitnesses.set(spec.handle, selected.witness);
+        const collected = collectDeclaredCaptures(spec, selected.snapshot, selected.witness);
+        if (!collected.ok) {
+          failure = collected.detail;
+          captureFailure ??= collected.detail;
+          const failureExchange = discoveryExchangeFor(discovered.catalog, selected.boundIds.product_id);
+          captureFailures.set(spec.handle, {
+            ...(collected.path !== undefined && { pointer: toJsonPointer(collected.path) }),
+            ...(failureExchange && { exchange: failureExchange }),
+          });
+          captureFailedHandles.add(spec.handle);
+          attempts.push({
+            strategy,
+            disposition: 'failed',
+            detail: collected.detail,
+            response: { ...discovered.catalog.evidence, selected: selected.boundIds },
+          });
+          boundIds = undefined;
+          break;
+        }
+        pendingCaptures.push(...collected.captures.map(c => ({ ...c, sourceTask: 'get_products' as const })));
         attempts.push({
           strategy,
           disposition: 'resolved',
@@ -837,32 +1256,127 @@ async function runDeclaredFixtureResolution(
       requirements: spec.clauses,
       strategies_attempted: attempts,
       status,
+      ...(unavailableResolutions.has(resolutionSpecKey(spec)) && {
+        unavailable_reason: 'runner_budget_exhausted' as const,
+      }),
       ...(chosenStrategy && { strategy: chosenStrategy }),
       ...(boundIds && { seller_ids: boundIds }),
     };
     records.push(record);
 
     if (status !== 'unsatisfied') {
+      const captureFailed = status === 'failed' && captureFailedHandles.has(spec.handle);
       steps.push({
         storyboard_id: storyboard.id,
         step_id: call.step_id,
         phase_id: CONTROLLER_SEEDING_PHASE_ID,
         title: call.title,
-        task: chosenStrategy === 'discover' ? 'get_products' : 'comply_test_controller',
-        passed: status !== 'failed',
+        // The task that ACTUALLY ran, else the one this handle declared.
+        // Falling back to the controller whenever no strategy RESOLVED
+        // attributed a failed discover-only handle to a seed call that
+        // never happened — and a handle abandoned because its parent
+        // failed makes no call at all, so it is named by the strategy it
+        // declared rather than by a different tool. Such a step carries
+        // no request record, so nothing implies a call was made.
+        task:
+          (chosenStrategy ?? attemptedStrategy ?? spec.strategies[0]) === 'discover'
+            ? 'get_products'
+            : 'comply_test_controller',
+        passed: status !== 'failed' || unavailableResolutions.has(resolutionSpecKey(spec)),
+        ...(unavailableResolutions.has(resolutionSpecKey(spec)) && {
+          skipped: true,
+          skip_reason: 'not_applicable' as const,
+          skip: { reason: 'not_applicable' as const, detail: fixtureUnavailable ?? failure! },
+        }),
         duration_ms: Date.now() - stepStart,
-        validations: [],
+        // An unbuildable capture gets a `check` discriminator like the other
+        // two failure classes, so a report renderer keys on `check` for all
+        // three instead of regexing prose for this one.
+        validations: captureFailed
+          ? [
+              {
+                check: 'fixture_capture_unbuildable',
+                passed: false,
+                description: 'Every declared fixture capture must be buildable from the pinned entity',
+                error: failure,
+                // The contract's analogue, `capture_path_not_resolvable`,
+                // requires the RFC 6901 form of the `context_outputs` path
+                // that failed. `null` only for the witness and size/depth
+                // arms, which genuinely have no path.
+                json_pointer: captureFailures.get(spec.handle)?.pointer ?? null,
+                expected: 'a value at the declared selected-entity path, or a derivable witness',
+                actual: null,
+                // required_on_failure: null only when the check is not a
+                // response_schema check, which this never is.
+                schema_id: null,
+                schema_url: null,
+                ...(captureFailures.get(spec.handle)?.exchange ?? {}),
+              },
+            ]
+          : discoverySchemaFailure !== undefined
+            ? [
+                // A page that parsed but failed its response schema is a
+                // `response_schema` failure, not a capture failure. Using
+                // the contract's own kind keeps the schema identity where
+                // consumers already look for it.
+                {
+                  check: 'response_schema',
+                  passed: false,
+                  description: 'Fixture discovery response must satisfy the get_products response schema',
+                  error: discoverySchemaFailure.detail,
+                  json_pointer: null,
+                  schema_id: discoverySchemaFailure.schema_id,
+                  schema_url: discoverySchemaFailure.schema_url,
+                  expected: discoverySchemaFailure.schema_id,
+                  actual: 'schema_validation_failed',
+                  ...(discoveryFailureEvidence && {
+                    request: discoveryFailureEvidence.request,
+                    response: discoveryFailureEvidence.response,
+                  }),
+                },
+              ]
+            : [],
         context,
-        extraction: { path: 'none' },
+        extraction: discoveryFailureEvidence?.extraction ?? { path: 'none' },
+        // The REAL exchange the failing strategy made. Absent rather than
+        // invented when the strategy never reached the wire.
+        ...(discoveryFailureEvidence && {
+          request: discoveryFailureEvidence.request,
+          ...(discoveryFailureEvidence.response && { response_record: discoveryFailureEvidence.response }),
+        }),
         ...(failure && { error: failure }),
       });
     }
-    if (status === 'failed') failedCount++;
+    if (status === 'failed' && !unavailableResolutions.has(resolutionSpecKey(spec))) failedCount++;
     else if (status === 'unsatisfied') fixtureUnsatisfied = true;
-    else passedCount++;
+    else if (status === 'resolved') passedCount++;
   }
 
   const allPassed = failedCount === 0;
+  // All-or-nothing: a capture is published only when every declared fixture
+  // in the graph resolved. A partial graph publishes nothing, so a step can
+  // never read a pinned identity whose sibling price never bound.
+  const graphComplete =
+    allPassed && !fixtureUnsatisfied && captureFailure === undefined && records.every(r => r.status === 'resolved');
+  const preparedCaptures: PreparedFixtureCaptures | undefined =
+    graphComplete && pendingCaptures.length > 0
+      ? {
+          values: Object.fromEntries(pendingCaptures.map(entry => [entry.key, entry.value])),
+          provenance: Object.fromEntries(
+            pendingCaptures.map(entry => [
+              entry.key,
+              {
+                source_step_id: CONTROLLER_SEEDING_PHASE_ID,
+                source_kind: 'fixture_preparation' as const,
+                source_task: entry.sourceTask,
+                fixture_handle: entry.spec.handle,
+                ...(entry.spec.parentProductHandle && { fixture_product_handle: entry.spec.parentProductHandle }),
+              },
+            ])
+          ),
+          witnesses: Object.fromEntries(retainedWitnesses),
+        }
+      : undefined;
   return {
     phase: {
       phase_id: CONTROLLER_SEEDING_PHASE_ID,
@@ -875,9 +1389,166 @@ async function runDeclaredFixtureResolution(
     passedCount,
     failedCount,
     fixtureUnsatisfied,
+    ...(fixtureUnavailable && { fixtureUnavailable }),
     bindings,
     resolutionRecords: records,
+    ...(preparedCaptures && { preparedCaptures }),
   };
+}
+
+/**
+ * Dotted storyboard capture path → RFC 6901 JSON pointer.
+ *
+ * `pricing_options[0].rate` → `/pricing_options/0/rate`. `~` and `/` are
+ * escaped per RFC 6901 before the segments are joined.
+ */
+function toJsonPointer(path: string | undefined): string | undefined {
+  if (path === undefined || path.length === 0) return undefined;
+  const segments = path
+    .replace(/\[(\d+)\]/g, '.$1')
+    .split('.')
+    .filter(segment => segment.length > 0)
+    .map(segment => segment.replace(/~/g, '~0').replace(/\//g, '~1'));
+  return segments.length > 0 ? `/${segments.join('/')}` : undefined;
+}
+
+type CollectedCaptures =
+  | { ok: true; captures: Array<{ spec: FixtureResolutionSpec; key: string; value: unknown }> }
+  | {
+      ok: false;
+      detail: string;
+      /**
+       * The declared capture path that failed to resolve, when the failure
+       * HAS one.
+       *
+       * `runner-output-contract.yaml` requires the contract's analogue,
+       * `capture_path_not_resolvable`, to carry the RFC 6901 form of the
+       * path in `json_pointer`. The path was in hand at the failure site
+       * and was being interpolated into prose and then discarded, so the
+       * structured pointer could not be emitted. Absent for the witness
+       * and size/depth arms, which genuinely have no path.
+       */
+      path?: string;
+    };
+
+/**
+ * Pages whose `get_products` RESPONSE is retained as capture-failure
+ * evidence. Requests are retained for every page regardless.
+ */
+const DISCOVERY_RETAINED_RESPONSE_PAGES = 16;
+
+/** Maximum nesting depth a declared capture may carry. */
+const CAPTURE_MAX_DEPTH = 64;
+/** Maximum serialized size, in bytes, of a single declared capture. */
+const CAPTURE_MAX_BYTES = 512 * 1024;
+
+/**
+ * Reject a capture the funnel could not detach safely.
+ *
+ * `snapshot: selected_entity` commits a seller-controlled catalog object,
+ * and `structuredClone` throws a `RangeError` somewhere around 1,800 levels
+ * of nesting while `JSON.parse` accepts hundreds of thousands. Inheriting
+ * V8's stack limit as the de-facto bound would let the graded agent turn a
+ * failing verdict into a crash — which reads as infrastructure flake and
+ * gets retried, rather than being recorded. Bound it explicitly and grade
+ * the overrun as the setup failure it is.
+ */
+function describeUncapturableValue(value: unknown, key: string): string | undefined {
+  let depth = 0;
+  const walk = (node: unknown, level: number): boolean => {
+    if (level > depth) depth = level;
+    if (depth > CAPTURE_MAX_DEPTH) return false;
+    if (node === null || typeof node !== 'object') return true;
+    if (Array.isArray(node)) return node.every(item => walk(item, level + 1));
+    return Object.values(node as Record<string, unknown>).every(item => walk(item, level + 1));
+  };
+  if (!walk(value, 1)) {
+    return `fixture capture "${key}" nests deeper than the ${CAPTURE_MAX_DEPTH}-level capture limit`;
+  }
+  let size: number;
+  try {
+    // Byte length, not `String.length`: the latter counts UTF-16 code units,
+    // so 200,000 three-byte CJK characters would pass a 512 KiB check while
+    // serializing to ~600 KiB.
+    size = Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
+  } catch {
+    return `fixture capture "${key}" is not JSON-serializable and cannot be detached`;
+  }
+  if (size > CAPTURE_MAX_BYTES) {
+    return `fixture capture "${key}" serializes to ${size} bytes, over the ${CAPTURE_MAX_BYTES}-byte capture limit`;
+  }
+  return undefined;
+}
+
+function collectDeclaredCaptures(
+  spec: FixtureResolutionSpec,
+  snapshot: Record<string, unknown>,
+  witness: CollectionSelectionWitness | undefined
+): CollectedCaptures {
+  if (spec.contextOutputs.length === 0) return { ok: true, captures: [] };
+  const captures: Array<{ spec: FixtureResolutionSpec; key: string; value: unknown }> = [];
+  for (const output of spec.contextOutputs) {
+    if (output.snapshot !== undefined) {
+      // The whole selected entity. Optional fields stay absent rather than
+      // failing the capture or being defaulted; the funnel deep-clones and
+      // deep-freezes it on commit.
+      //
+      // Redacted first. This is the only capture form that commits a WHOLE
+      // seller-controlled object, and a committed capture is echoed in
+      // every subsequent step's `context` and can be rendered into a
+      // `context_value_rejected` hint. The repo already refuses to extract
+      // `auth_token` into storyboard context for exactly this reason
+      // (`context.ts`), so a snapshot must not reintroduce the surface for
+      // a token-shaped field the catalog happens to carry. Only
+      // secret-shaped KEYS are replaced; `product_id`, pricing and
+      // collections are untouched, so nothing a declaration reads changes.
+      captures.push({ spec, key: output.key, value: redactSecrets(snapshot) });
+      continue;
+    }
+    if (output.witness !== undefined) {
+      const read = readCollectionWitness(witness, output.witness);
+      if (!read.ok) {
+        return {
+          ok: false,
+          detail: `fixture capture "${output.key}" for handle "${spec.handle}" could not be built: ${read.detail}`,
+        };
+      }
+      captures.push({ spec, key: output.key, value: read.value });
+      continue;
+    }
+    // Resolved from the REDACTED snapshot, not redacted after resolving:
+    // `redactSecrets` matches by field NAME, and a path that lands on a
+    // scalar hands it a bare string with the name already gone, so
+    // capturing `auth_token` would have come through verbatim.
+    const value = resolvePath(redactSecrets(snapshot) as Record<string, unknown>, output.path!);
+    // Null and "" are as unusable downstream as an absent path: substituting
+    // either fabricates state the selected entity does not carry.
+    if (value === undefined || value === null || value === '') {
+      const pinned =
+        spec.entityType === 'product'
+          ? `product "${String(snapshot.product_id ?? spec.handle)}"`
+          : `pricing option "${String(snapshot.pricing_option_id ?? spec.handle)}" on product "${spec.parentProductHandle}"`;
+      return {
+        ok: false,
+        path: output.path!,
+        detail:
+          `fixture capture "${output.key}" (handle "${spec.handle}", pinned ${pinned}) found no usable value at ` +
+          `selected-entity path "${output.path}" — resolved to ${value === undefined ? 'absent' : JSON.stringify(value)}. ` +
+          `Either the path does not exist on this entity shape (top-level keys: ${Object.keys(snapshot).join(', ')}), ` +
+          `or this seller does not populate it. If the field is OPTIONAL in the schema (fixed_price and ` +
+          `min_spend_per_package both are), capture the whole entity with ` +
+          `{ key: "${output.key}", snapshot: selected_entity } so absence stays absence. Add a match predicate ` +
+          `for "${output.path}" only when carrying that field is a real eligibility requirement — gating on it ` +
+          `stops a conformant seller qualifying at all.`,
+      };
+    }
+    captures.push({ spec, key: output.key, value });
+  }
+  for (const capture of captures) {
+    const unusable = describeUncapturableValue(capture.value, capture.key);
+    if (unusable) return { ok: false, detail: unusable };
+  }
+  return { ok: true, captures };
 }
 
 function resolutionSpecKey(spec: FixtureResolutionSpec): string {
@@ -926,7 +1597,12 @@ async function executeLegacySeedCall(
   try {
     const raw = await callControllerRaw(
       client,
-      { scenario: call.scenario, params: call.params, context: seedContext },
+      {
+        ...storyboardSeedScope(storyboard, context, options, call),
+        scenario: call.scenario,
+        params: call.params,
+        context: seedContext,
+      },
       options
     );
     const data = raw.data as { success?: boolean; error?: string; error_detail?: string } | undefined;
@@ -990,6 +1666,49 @@ async function executeLegacySeedCall(
   }
 }
 
+/**
+ * `{ schema_id, schema_url }` for the `get_products` response schema.
+ *
+ * Mirrors `resolveSchemaIdentity` in `validations.ts`: the id follows the
+ * `/schemas/<version>/<path>.json` convention cached schemas use for
+ * `$id`, and the url dereferences against the public docs origin so an
+ * implementor can fetch exactly what the page was graded against.
+ */
+function resolveDiscoverySchemaIdentity(adcpVersion: string): { schema_id: string; schema_url: string } {
+  const schemaId = `/schemas/${adcpVersion}/media-buy/get-products-response.json`;
+  return { schema_id: schemaId, schema_url: `https://adcontextprotocol.org${schemaId}` };
+}
+
+/**
+ * AJV detail for a discovery page that does not satisfy the `get_products`
+ * response schema, or `undefined` when it does.
+ */
+function describeDiscoverySchemaFailure(
+  data: unknown,
+  options: StoryboardRunOptions
+): { error: string; schemaFailure?: { detail: string; schema_id: string; schema_url: string } } | undefined {
+  try {
+    const version = options.adcpVersion ?? ADCP_VERSION;
+    const validator = getValidator('get_products', 'sync', version);
+    let detail: string;
+    if (validator) {
+      const schemaData = isPlainRecord(data) ? injectLegacyEnvelopeStatus(data, { toolName: 'get_products' }) : data;
+      if (validator(schemaData)) return undefined;
+      detail = (validator.errors ?? [])
+        .map(error => `${error.instancePath || '/'} ${error.message ?? error.keyword}`)
+        .join('; ');
+    } else {
+      const schema = validateResponseSchema('get_products', data, options.adcpVersion);
+      if (schema.passed) return undefined;
+      detail = schema.error ?? schema.details ?? 'schema validation failed';
+    }
+    return { error: detail, schemaFailure: { detail, ...resolveDiscoverySchemaIdentity(version) } };
+  } catch (err) {
+    // Missing runner schemas are a setup failure, not evidence against the seller.
+    return { error: `response schema unavailable: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 async function discoverProductCatalog(
   client: TestClient,
   options: StoryboardRunOptions,
@@ -1009,77 +1728,263 @@ async function discoverProductCatalog(
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   let pageCount = 0;
-  do {
+  let restarts = 0;
+  let feedIdentity: string | undefined;
+  const query = structuredClone({
+    buying_mode: 'wholesale',
+    brand,
+    account,
+    ext: { adcp: { creative_wire: 'canonical' } },
+  });
+  let lastExchange: Extract<DiscoveryCatalogResult, { ok: false }>['exchange'];
+  const exchanges: DiscoveryExchange[] = [];
+  const pageOfProduct = new Map<string, number>();
+  while (true) {
+    options.signal?.throwIfAborted();
     if (pageCount >= 1_000) {
-      return { ok: false, error: 'fixture discovery pagination exceeded the 1,000-page safety limit' };
-    }
-    const request: Record<string, unknown> = {
-      buying_mode: 'wholesale',
-      brand,
-      account,
-      pagination: { max_results: 100, ...(cursor && { cursor }) },
-      // Fixture match declarations target the canonical product shape.
-      ext: { adcp: { creative_wire: 'canonical' } },
-    };
-    let result;
-    try {
-      result = await executeStoryboardTask(client, 'get_products', request, { signal: options.signal });
-    } catch (err) {
       return {
         ok: false,
-        error: `fixture discovery transport failure: ${err instanceof Error ? err.message : String(err)}`,
+        unavailable: true,
+        evidence: { page_count: pageCount, restart_count: restarts },
+        ...(lastExchange && { exchange: lastExchange }),
+        error: 'fixture discovery pagination exceeded the runner’s 1,000-page safety limit',
+      };
+    }
+    const request: Record<string, unknown> = {
+      ...structuredClone(query),
+      pagination: { max_results: 100, ...(cursor && { cursor }) },
+    };
+    let result;
+    let observedResponse: RawHttpCapture | undefined;
+    const toolResponse = (captures: RawHttpCapture[]) =>
+      [...captures].reverse().find(capture => capture.requestAdcpSkill === 'get_products');
+    const pageStart = Date.now();
+    // Recorded BEFORE dispatch. A transport failure never reaches the
+    // response, but the request it sent is real and is the only evidence
+    // an implementor has to reproduce the failure.
+    const requestRecord: RunnerRequestRecord = {
+      transport: options.protocol === 'a2a' ? 'a2a' : 'mcp',
+      operation: 'get_products',
+      payload: redactSecrets(request),
+    };
+    try {
+      // MCP's official SDK trace already supplies its parsed protocol response.
+      // Capturing its HTTP streams would buffer an unrelated SSE subscription.
+      if (options.protocol === 'a2a') {
+        const captured = await withRawResponseCapture(
+          () => executeStoryboardTask(client, 'get_products', request, { signal: options.signal }),
+          { maxBodyBytes: 65_536, maxCaptures: 8, maxTotalBodyBytes: 262_144 }
+        );
+        result = captured.result;
+        observedResponse = toolResponse(captured.captures);
+      } else {
+        result = await executeStoryboardTask(client, 'get_products', request, { signal: options.signal });
+      }
+    } catch (err) {
+      const observed = toolResponse(getCapturesFromError(err) ?? []);
+      return {
+        ok: false,
+        error: `fixture discovery transport failure: ${redactCredentialPatterns(err instanceof Error ? err.message : String(err), false)}`,
+        evidence: { page_count: pageCount + 1, request: requestRecord.payload },
+        // Explicitly null: no response was received. Not a placeholder.
+        exchange: {
+          request: requestRecord,
+          response: observed
+            ? {
+                transport: requestRecord.transport,
+                payload: redactDiscoveryResponse(observed.body),
+                status: observed.status,
+                duration_ms: Date.now() - pageStart,
+              }
+            : null,
+        },
       };
     }
     pageCount++;
+    // The official clients retain the received protocol response before SDK
+    // validation/projection. A connection error has no such response entry.
+    let wireResponse = result.debug_logs
+      ?.slice()
+      .reverse()
+      .find(
+        log =>
+          typeof log.message === 'string' &&
+          (log.message.startsWith('MCP: Tool get_products response received') ||
+            log.message.startsWith('A2A: Response received')) &&
+          log.response !== undefined
+      )?.response;
+    if (wireResponse === undefined && observedResponse && !observedResponse.bodyTruncated) {
+      try {
+        wireResponse = JSON.parse(observedResponse.body);
+      } catch {
+        // Raw diagnostics remain available; protocol decoding belongs to the SDK.
+      }
+    }
+    // An executor error is SDK diagnostic text, not a seller response. Retain
+    // a response only when a tool body or actual HTTP exchange was observed.
+    if (
+      (!result.success || result.data === undefined) &&
+      result._extraction_path === undefined &&
+      observedResponse === undefined &&
+      wireResponse === undefined
+    ) {
+      return {
+        ok: false,
+        error: `fixture discovery get_products rejected: ${redactCredentialPatterns(result.error ?? result.adcp_error?.code ?? 'unknown error', false)}`,
+        evidence: { page_count: pageCount, request: requestRecord.payload },
+        exchange: { request: requestRecord, response: null },
+      };
+    }
+    const extraction: RunnerExtractionRecord = {
+      path: result._extraction_path ?? 'none',
+      ...(observedResponse?.bodyTruncated && { note: 'Raw HTTP response capture was truncated at its body budget.' }),
+    };
+    const failedExchange = {
+      request: requestRecord,
+      extraction,
+      response: {
+        transport: requestRecord.transport,
+        payload: redactDiscoveryResponse(wireResponse ?? observedResponse?.body ?? result.data),
+        ...(observedResponse && { status: observedResponse.status }),
+        duration_ms: Date.now() - pageStart,
+      },
+    };
+    lastExchange = failedExchange;
+    // Recorded for EVERY page, success or not: a schema-invalid or rejected
+    // page is exactly the exchange a reader needs to see.
+    // The request is tiny and always retained. The RESPONSE is a second
+    // full copy of a page of products on top of the `products` array this
+    // loop already accumulates, so retaining every page of a deep catalog
+    // doubled peak memory for evidence that is read only when a capture
+    // fails. Past the budget the page records that it was not retained,
+    // rather than silently reading as an empty response.
+    const retainResponse = exchanges.length < DISCOVERY_RETAINED_RESPONSE_PAGES;
+    const pageIndex =
+      exchanges.push({
+        request: requestRecord,
+        response: retainResponse
+          ? { ...failedExchange.response, payload: redactSecrets(result.data) }
+          : {
+              transport: requestRecord.transport,
+              payload: {
+                response_not_retained: `page ${exchanges.length + 1} is past the runner's ${DISCOVERY_RETAINED_RESPONSE_PAGES}-page discovery-evidence budget; the request for this page is recorded in full`,
+              },
+              duration_ms: Date.now() - pageStart,
+            },
+      }) - 1;
+    // Graded whether or not the executor accepted the page. A seller that
+    // returns a malformed body makes the executor reject in strict mode,
+    // and classifying that as a bare protocol error hid WHICH of the two
+    // it was — the one thing a `response_schema` record exists to say.
+    let schemaData = result.success ? result.data : undefined;
+    if (!result.success && wireResponse !== undefined && result._extraction_path !== 'error') {
+      try {
+        schemaData = unwrapProtocolResponse(wireResponse, undefined, options.protocol === 'a2a' ? 'a2a' : 'mcp');
+        extraction.path = readExtractionPath(schemaData) ?? extraction.path;
+      } catch {
+        // Protocol decoding errors retain their original classification.
+        schemaData = undefined;
+      }
+    }
+    const nativeResult =
+      isPlainRecord(wireResponse) && isPlainRecord(wireResponse.result) ? wireResponse.result : undefined;
+    const nativeState = nativeResult && isPlainRecord(nativeResult.status) ? nativeResult.status.state : undefined;
+    const sellerRejected =
+      result._extraction_path === 'error' ||
+      (isPlainRecord(schemaData) &&
+        (schemaData.adcp_error !== undefined || schemaData.status === 'failed' || schemaData.status === 'rejected')) ||
+      nativeState === 'failed' ||
+      nativeState === 'rejected' ||
+      nativeState === 'canceled';
+    const schemaCheck =
+      sellerRejected || schemaData === undefined ? undefined : describeDiscoverySchemaFailure(schemaData, options);
     if (!result.success) {
       return {
         ok: false,
-        error: `fixture discovery get_products rejected: ${result.error ?? result.adcp_error?.code ?? 'unknown error'}`,
-        evidence: { page_count: pageCount, request },
+        error: `fixture discovery get_products rejected: ${redactCredentialPatterns(result.error ?? result.adcp_error?.code ?? 'unknown error', false)}`,
+        evidence: { page_count: pageCount, request: requestRecord.payload },
+        exchange: failedExchange,
+        ...(schemaCheck?.schemaFailure && { schemaFailure: schemaCheck.schemaFailure }),
       };
     }
-    let schemaFailure: string | undefined;
-    try {
-      const validator = getValidator('get_products', 'sync', options.adcpVersion ?? ADCP_VERSION);
-      if (validator) {
-        const responseData: unknown = result.data;
-        const schemaData = isPlainRecord(responseData)
-          ? injectLegacyEnvelopeStatus(responseData, { toolName: 'get_products' })
-          : responseData;
-        if (!validator(schemaData)) {
-          schemaFailure = (validator.errors ?? [])
-            .map(error => `${error.instancePath || '/'} ${error.message ?? error.keyword}`)
-            .join('; ');
-        }
-      } else {
-        const schema = validateResponseSchema('get_products', result.data, options.adcpVersion);
-        if (!schema.passed) schemaFailure = schema.error ?? schema.details ?? 'schema validation failed';
-      }
-    } catch (err) {
-      schemaFailure = `response schema unavailable: ${err instanceof Error ? err.message : String(err)}`;
-    }
-    if (schemaFailure) {
+    if (schemaCheck) {
       return {
         ok: false,
-        error: `fixture discovery returned malformed get_products response: ${schemaFailure}`,
+        error: `fixture discovery get_products validation failed: ${schemaCheck.error}`,
         evidence: { page_count: pageCount },
+        exchange: failedExchange,
+        ...(schemaCheck.schemaFailure && { schemaFailure: schemaCheck.schemaFailure }),
       };
     }
     if (!isPlainRecord(result.data)) {
-      return { ok: false, error: 'fixture discovery returned a non-object get_products response' };
+      return {
+        ...{ ok: false, error: 'fixture discovery returned a non-object get_products response' },
+        exchange: failedExchange,
+      };
     }
+    if (result.data.unchanged === true) {
+      return {
+        ok: false,
+        error: 'fixture discovery received unchanged without sending a conditional feed token',
+        exchange: failedExchange,
+      };
+    }
+    const pagination = isPlainRecord(result.data.pagination) ? result.data.pagination : undefined;
+    if (pagination?.has_more === true && (typeof pagination.cursor !== 'string' || pagination.cursor.length === 0)) {
+      return {
+        ok: false,
+        error: 'fixture discovery pagination is broken: has_more=true without cursor',
+        exchange: failedExchange,
+      };
+    }
+    // Versions are opaque, scope-keyed identities. Absence is part of the
+    // identity too. A changed page belongs to a different enumeration.
+    const identity = JSON.stringify([
+      result.data.cache_scope,
+      result.data.wholesale_feed_version,
+      result.data.pricing_version,
+    ]);
+    if (feedIdentity !== undefined && identity !== feedIdentity) {
+      if (restarts >= 3) {
+        return {
+          ok: false,
+          unavailable: true,
+          error: 'fixture discovery could not enumerate a stable feed within the runner’s 3-restart budget',
+          evidence: { page_count: pageCount, restart_count: restarts },
+          exchange: failedExchange,
+        };
+      }
+      restarts++;
+      products.length = 0;
+      seenProductIds.clear();
+      cursors.length = 0;
+      seenCursors.clear();
+      exchanges.length = 0;
+      pageOfProduct.clear();
+      cursor = undefined;
+      feedIdentity = undefined;
+      continue;
+    }
+    feedIdentity = identity;
     const pageProducts = result.data.products;
     if (pageProducts !== undefined && !Array.isArray(pageProducts)) {
-      return { ok: false, error: 'fixture discovery get_products.products is not an array' };
+      return {
+        ...{ ok: false, error: 'fixture discovery get_products.products is not an array' },
+        exchange: failedExchange,
+      };
     }
     for (const product of pageProducts ?? []) {
       if (!isPlainRecord(product) || typeof product.product_id !== 'string' || product.product_id.length === 0) {
-        return { ok: false, error: 'fixture discovery returned a product without a non-empty product_id' };
+        return {
+          ...{ ok: false, error: 'fixture discovery returned a product without a non-empty product_id' },
+          exchange: failedExchange,
+        };
       }
       if (seenProductIds.has(product.product_id)) {
         return {
           ok: false,
           error: `fixture discovery returned duplicate product_id "${product.product_id}"; response order cannot resolve duplicate identities`,
+          exchange: failedExchange,
         };
       }
       seenProductIds.add(product.product_id);
@@ -1091,24 +1996,28 @@ async function discoverProductCatalog(
             return {
               ok: false,
               error: `fixture discovery returned duplicate pricing option identity "${product.product_id}\u0000${option.pricing_option_id}"`,
+              exchange: failedExchange,
             };
           }
           seenPricingIds.add(option.pricing_option_id);
         }
       }
+      pageOfProduct.set(product.product_id, pageIndex);
       products.push(product);
       if (products.length > 100_000) {
-        return { ok: false, error: 'fixture discovery exceeded the 100,000-product safety limit' };
+        return {
+          ...{ ok: false, error: 'fixture discovery exceeded the 100,000-product safety limit' },
+          exchange: failedExchange,
+        };
       }
     }
-    const pagination = isPlainRecord(result.data.pagination) ? result.data.pagination : undefined;
     if (pagination?.has_more === true) {
-      const next = pagination.cursor;
-      if (typeof next !== 'string' || next.length === 0) {
-        return { ok: false, error: 'fixture discovery pagination is broken: has_more=true without cursor' };
-      }
+      const next = pagination.cursor as string;
       if (seenCursors.has(next)) {
-        return { ok: false, error: `fixture discovery pagination is broken: repeated cursor "${next}"` };
+        return {
+          ...{ ok: false, error: `fixture discovery pagination is broken: repeated cursor "${next}"` },
+          exchange: failedExchange,
+        };
       }
       seenCursors.add(next);
       cursors.push(next);
@@ -1116,10 +2025,21 @@ async function discoverProductCatalog(
     } else {
       cursor = undefined;
     }
-  } while (cursor);
+    if (!cursor) break;
+  }
   return {
     ok: true,
-    catalog: { products, evidence: { page_count: pageCount, product_count: products.length, cursors } },
+    catalog: {
+      products,
+      evidence: {
+        page_count: pageCount,
+        product_count: products.length,
+        cursors,
+        ...(restarts > 0 && { restart_count: restarts }),
+      },
+      exchanges,
+      pageOfProduct,
+    },
   };
 }
 
@@ -1132,7 +2052,15 @@ function utf8Compare(a: string, b: string): number {
 }
 
 type SelectedFixture =
-  | { ok: true; boundIds: NonNullable<FixtureResolutionRecord['seller_ids']>; detail: string }
+  | {
+      ok: true;
+      boundIds: NonNullable<FixtureResolutionRecord['seller_ids']>;
+      detail: string;
+      /** The exact entity the resolver pinned, for declaration-local captures. */
+      snapshot: Record<string, unknown>;
+      /** Witness retained from the candidate that was selected, if any. */
+      witness?: CollectionSelectionWitness;
+    }
   | { ok: false; failed: boolean; detail: string };
 
 function selectDiscoveredFixture(
@@ -1140,16 +2068,50 @@ function selectDiscoveredFixture(
   products: Array<Record<string, unknown>>,
   bindings: FixtureBindingRegistry,
   claimedProducts: Map<string, boolean>,
-  claimedPricingOptions: Map<string, boolean>
+  claimedPricingOptions: Map<string, boolean>,
+  dependentPricingSpecs: readonly FixtureResolutionSpec[] = []
 ): SelectedFixture {
   if (spec.entityType === 'product') {
-    const candidates = products
-      .filter(product => matchesFixtureRequirements(product, spec.clauses))
-      .filter(product => identityCanBeClaimed(claimedProducts, product.product_id as string, spec.allowReuse))
-      .sort((a, b) => utf8Compare(a.product_id as string, b.product_id as string));
-    const selected = candidates[0];
-    if (!selected)
-      return { ok: false, failed: false, detail: 'no discovered product satisfied the authored requirements' };
+    // Qualification is applied to every complete validated candidate BEFORE
+    // deterministic ordering, so a nonqualifying earlier product can never
+    // conceal a later qualifying one. Each candidate is also required to
+    // carry a pricing option its declared children can bind: otherwise the
+    // bytewise-first product can win the parent selection and then strand
+    // the whole graph on a child that another product would have satisfied.
+    // Rejection reasons are counted, not discarded. Against a real seller's
+    // catalog, "nothing satisfied the requirements" with no handle, no
+    // candidate count and no reason is the least useful sentence the runner
+    // can emit — and three different filters used to collapse into it.
+    const rejections = new Map<string, number>();
+    let claimedElsewhere = 0;
+    let strandedChild = 0;
+    const matched: Array<{ product: Record<string, unknown>; witness?: CollectionSelectionWitness }> = [];
+    for (const product of products) {
+      const match = matchFixtureRequirementsWithWitness(product, spec.clauses);
+      if (!match.matched) {
+        const reason = match.reason ?? 'did not satisfy the authored match predicates';
+        rejections.set(reason, (rejections.get(reason) ?? 0) + 1);
+        continue;
+      }
+      if (!identityCanBeClaimed(claimedProducts, product.product_id as string, spec.allowReuse)) {
+        claimedElsewhere++;
+        continue;
+      }
+      if (!dependentPricingSpecs.every(child => productCanSatisfyPricingSpec(product, child))) {
+        strandedChild++;
+        continue;
+      }
+      matched.push({ product, ...(match.witness && { witness: match.witness }) });
+    }
+    matched.sort((a, b) => utf8Compare(a.product.product_id as string, b.product.product_id as string));
+    const selected = matched[0]?.product;
+    if (!selected) {
+      return {
+        ok: false,
+        failed: false,
+        detail: describeProductNoMatch(spec, products.length, rejections, claimedElsewhere, strandedChild),
+      };
+    }
     const productId = selected.product_id as string;
     bindings.bindProduct(spec.handle, productId);
     recordIdentityClaim(claimedProducts, productId, spec.allowReuse);
@@ -1157,6 +2119,8 @@ function selectDiscoveredFixture(
       ok: true,
       boundIds: { product_id: productId },
       detail: `selected product_id "${productId}" by UTF-8 bytewise order`,
+      snapshot: selected,
+      ...(matched[0]!.witness && { witness: matched[0]!.witness }),
     };
   }
 
@@ -1197,7 +2161,16 @@ function selectDiscoveredFixture(
     return {
       ok: false,
       failed: false,
-      detail: 'no pricing option on the bound product satisfied the authored requirements',
+      detail:
+        `no pricing option on bound product "${sellerProductId}" satisfied fixture handle ` +
+        `"${parentHandle}/${spec.handle}" — ${options.length} option(s) on the pinned product` +
+        (options.length > 0
+          ? `, pricing_option_id(s): ${options
+              .filter(isPlainRecord)
+              .map(option => String(option.pricing_option_id))
+              .slice(0, 10)
+              .join(', ')}`
+          : ''),
     };
   }
   const pricingOptionId = selected.pricing_option_id as string;
@@ -1207,7 +2180,74 @@ function selectDiscoveredFixture(
     ok: true,
     boundIds: { product_id: sellerProductId, pricing_option_id: pricingOptionId },
     detail: `selected pricing option "${sellerProductId}\u0000${pricingOptionId}" by UTF-8 bytewise order`,
+    // The scoped price comes out of the same pinned product graph, so a
+    // captured currency / fixed_price / min_spend_per_package describes the
+    // option the buy will actually reference.
+    snapshot: selected,
   };
+}
+
+/**
+ * True when the candidate product carries at least one pricing option the
+ * declared child could bind.
+ *
+ * Only applied to a discover-ONLY child. A child whose ladder still contains
+ * `seed` can have its option created on whichever parent is chosen, so
+ * requiring a pre-existing catalog match there would reject parents that the
+ * controller would have seeded onto perfectly well.
+ *
+ * Existence only, and deliberately claim-blind: if two children each need a
+ * distinct option and the chosen parent carries only one, the second child
+ * still strands with "no pricing option on the bound product satisfied the
+ * authored requirements". Threading the claim map through would make parent
+ * selection depend on child resolution order, which is a larger change than
+ * this foundation justifies — the stranding case is visible and diagnosable,
+ * not silent.
+ *
+ * (Declared on `productCanSatisfyPricingSpec`, below.)
+ */
+
+/** Name the handle, the candidate count, and why each group was rejected. */
+function describeProductNoMatch(
+  spec: FixtureResolutionSpec,
+  candidateCount: number,
+  rejections: ReadonlyMap<string, number>,
+  claimedElsewhere: number,
+  strandedChild: number
+): string {
+  const parts = [
+    `no discovered product satisfied fixture handle "${spec.handle}" — ${candidateCount} candidate(s) enumerated from the complete paginated catalog`,
+  ];
+  const top = [...rejections]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([reason, count]) => `${count}x ${reason}`);
+  // ` | `, not `; ` — an individual reason can itself contain a semicolon.
+  if (top.length > 0) parts.push(`rejected by the authored match: ${top.join(' | ')}`);
+  if (claimedElsewhere > 0) {
+    parts.push(
+      `${claimedElsewhere} otherwise-matching product(s) were already pinned to another handle — set allow_reuse: true on this declaration to share one seller entity`
+    );
+  }
+  if (strandedChild > 0) {
+    parts.push(
+      `${strandedChild} matched but carried no pricing option the declared child pricing_options could bind — loosen the child match, or give the child a seed strategy`
+    );
+  }
+  return parts.join('. ');
+}
+
+function productCanSatisfyPricingSpec(product: Record<string, unknown>, child: FixtureResolutionSpec): boolean {
+  if (child.strategies.length !== 1 || child.strategies[0] !== 'discover') return true;
+  const options = Array.isArray(product.pricing_options) ? product.pricing_options : [];
+  return options
+    .filter(isPlainRecord)
+    .some(
+      option =>
+        typeof option.pricing_option_id === 'string' &&
+        option.pricing_option_id.length > 0 &&
+        matchesFixtureRequirements(option, child.clauses)
+    );
 }
 
 /** A seller identity may be shared only when every claimant opts into reuse. */

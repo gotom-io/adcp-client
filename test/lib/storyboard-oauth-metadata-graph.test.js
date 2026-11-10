@@ -136,7 +136,7 @@ async function startGraphServer(protectedResourceOverride) {
 
 describe('oauth_metadata_graph storyboard integration', () => {
   it('keeps the pinned 3.1 compliance bundle free of the 3.2 OAuth storyboard', () => {
-    assert.doesNotMatch(loadComplianceIndex({ version: '3.1.29' }).universal.join(','), /oauth-setup/);
+    assert.doesNotMatch(loadComplianceIndex({ version: '3.1.30' }).universal.join(','), /oauth-setup/);
   });
 
   it('loads and executes oauth_setup through comply() from an external 3.2 bundle', async () => {
@@ -183,9 +183,9 @@ describe('oauth_metadata_graph storyboard integration', () => {
       });
 
       assert.deepStrictEqual(result.storyboards_executed, ['oauth_setup']);
-      assert.strictEqual(result.overall_status, 'partial', JSON.stringify(result, null, 2));
+      assert.strictEqual(result.overall_status, 'passing', JSON.stringify(result, null, 2));
       assert.strictEqual(result.tracks[0].track, 'security_transport');
-      assert.strictEqual(result.tracks[0].status, 'silent');
+      assert.strictEqual(result.tracks[0].status, 'pass');
       assert.strictEqual(result.summary.steps_failed, 0);
     } finally {
       fs.rmSync(tempRoot, { recursive: true, force: true });
